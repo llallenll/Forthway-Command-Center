@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Forthway Command Center</title>
+<style>
+  :root{
+    --ink:#1b1815; --ink-2:#5d564e; --ink-3:#8d857a;
+    --line:#e8e2d8; --bg:#faf7f2; --card:#fff;
+    --accent:#b8892b; --accent-dk:#8f6a1c; --accent-bg:#fdf6e6;
+    --bad-bg:#fdeceb;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font:14.5px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);background:var(--bg);display:grid;place-items:center;padding:24px}
+  .box{width:100%;max-width:380px}
+  .mark{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;margin:0 auto 16px;
+    background:linear-gradient(145deg,var(--accent),var(--accent-dk));color:#fff;font-weight:750;font-size:14px;
+    letter-spacing:.5px}
+  h1{font-size:19px;margin:0 0 4px;text-align:center;font-weight:650}
+  p.sub{margin:0 0 22px;text-align:center;color:var(--ink-3);font-size:13px}
+  form{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+  label{display:block;font-size:12px;font-weight:650;color:var(--ink-2);margin-bottom:6px}
+  input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14.5px;
+    font-family:inherit;background:#fdfcfa;color:var(--ink)}
+  input:focus{outline:none;border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
+  button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:9px;background:var(--ink);color:#fff;
+    font-size:14.5px;font-weight:600;cursor:pointer;font-family:inherit}
+  button:hover{background:#000}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .err{background:var(--bad-bg);color:#7e1a15;padding:9px 11px;border-radius:8px;font-size:13px;margin-top:12px;display:none}
+  .err.show{display:block}
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="mark">FCC</div>
+    <h1>Forthway Command Center</h1>
+    <p class="sub">Sign in to continue</p>
+    <form id="f">
+      <label for="pw">Password</label>
+      <input id="pw" type="password" autocomplete="current-password" autofocus />
+      <button id="go" type="submit">Sign in</button>
+      <div class="err" id="err"></div>
+    </form>
+  </div>
+<script>
+  const f = document.getElementById('f'), pw = document.getElementById('pw');
+  const err = document.getElementById('err'), go = document.getElementById('go');
+  f.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.classList.remove('show');
+    go.disabled = true; go.textContent = 'Signing in...';
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: pw.value }),
+      });
+      if (res.ok) { location.href = '/'; return; }
+      const j = await res.json().catch(() => ({}));
+      err.textContent = j.error || 'Sign in failed.';
+      err.classList.add('show');
+      pw.select();
+    } catch (e2) {
+      err.textContent = 'Could not reach the Command Center.';
+      err.classList.add('show');
+    }
+    go.disabled = false; go.textContent = 'Sign in';
+  });
+</script>
+</body>
+</html>

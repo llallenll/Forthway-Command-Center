@@ -1,0 +1,1489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Forthway Command Center</title>
+<style>
+  :root{
+    --ink:#1b1815; --ink-2:#5d564e; --ink-3:#8d857a;
+    --line:#e8e2d8; --line-2:#f2ede4; --bg:#faf7f2; --card:#fff;
+    --accent:#b8892b; --accent-dk:#8f6a1c; --accent-bg:#fdf6e6;
+    --ok:#1f7a4d; --ok-bg:#eaf6ef;
+    --warn:#9a6a00; --warn-bg:#fdf3dc;
+    --bad:#b3261e; --bad-bg:#fdeceb;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{font:14.5px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);background:var(--bg);padding-bottom:60px}
+  a{color:var(--accent-dk)}
+  .wrap{max-width:1280px;margin:0 auto;padding:0 20px}
+
+  header{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+  header .wrap{display:flex;align-items:center;gap:12px;height:60px}
+  .mark{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;flex:none;
+    background:linear-gradient(145deg,var(--accent),var(--accent-dk));color:#fff;font-weight:750;font-size:11px;
+    letter-spacing:.4px}
+  header h1{font-size:16px;margin:0;font-weight:650;white-space:nowrap}
+  header .spacer{flex:1}
+  .conn{font-size:12px;color:var(--ink-3);display:flex;align-items:center;gap:6px;white-space:nowrap}
+  @media (max-width:700px){ header h1{display:none} }
+
+  .btn{border:1px solid var(--line);background:#fff;color:var(--ink);padding:7px 13px;border-radius:8px;
+    font-size:13.5px;font-weight:550;cursor:pointer;font-family:inherit;
+    display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .btn:hover{background:#faf8f4;border-color:#d9d2c6}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn.primary{background:var(--ink);border-color:var(--ink);color:#fff}
+  .btn.primary:hover{background:#000}
+  .btn.accent{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.accent:hover{background:var(--accent-dk)}
+  .btn.danger{color:var(--bad);border-color:#f0d4d2}
+  .btn.danger:hover{background:var(--bad-bg)}
+  .btn.sm{padding:4px 9px;font-size:12.5px;border-radius:7px}
+  .btn.ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
+  .btn.ghost:hover{background:#f2ede4}
+
+  .grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));margin-top:20px}
+  @media (max-width:600px){ .grid{grid-template-columns:1fr} .wrap{padding:0 14px} }
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .card > .head{padding:15px 18px;border-bottom:1px solid var(--line-2);display:flex;align-items:flex-start;gap:10px}
+  .card h2{font-size:15.5px;margin:0 0 3px;font-weight:650;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .card .head .sub{font-size:12.5px;color:var(--ink-3)}
+  .card .body{padding:16px 18px}
+  .card .head .tools{margin-left:auto;display:flex;gap:5px;align-items:center}
+
+  .dot{width:8px;height:8px;border-radius:50%;flex:none;display:inline-block}
+  .dot.on{background:#22a55f;box-shadow:0 0 0 3px #22a55f22}
+  .dot.off{background:#c9c2b7}
+  .dot.bad{background:var(--bad);box-shadow:0 0 0 3px #b3261e22}
+  .dot.new{background:var(--accent);box-shadow:0 0 0 3px #b8892b22}
+
+  .pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;
+    padding:3px 8px;border-radius:999px;letter-spacing:.2px}
+  .pill.ok{background:var(--ok-bg);color:var(--ok)}
+  .pill.warn{background:var(--warn-bg);color:var(--warn)}
+  .pill.bad{background:var(--bad-bg);color:var(--bad)}
+  .pill.mute{background:#f3efe8;color:var(--ink-3)}
+  .pill.accent{background:var(--accent-bg);color:var(--accent-dk)}
+
+  .versions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+  .vbox{border:1px solid var(--line-2);border-radius:10px;padding:11px 12px;background:#fdfcfa;min-width:0}
+  .vbox .lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);font-weight:700}
+  .vbox .val{font-size:22px;font-weight:680;font-family:var(--mono);margin-top:3px;letter-spacing:-.5px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vbox .meta{font-size:11.5px;color:var(--ink-3);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vbox.live{background:linear-gradient(180deg,#fffdf7,#fdfaf2);border-color:#eadfc4}
+
+  .banner{padding:9px 12px;border-radius:9px;font-size:13px;margin-bottom:14px;display:flex;gap:8px;
+    align-items:center;line-height:1.45}
+  .banner.warn{background:var(--warn-bg);color:#6b4a00}
+  .banner.bad{background:var(--bad-bg);color:#7e1a15}
+  .banner.ok{background:var(--ok-bg);color:#0f5c37}
+  .banner.info{background:#f2ede4;color:var(--ink-2)}
+  .banner .btn{margin-left:auto;flex:none}
+  .banner .txt{min-width:0}
+
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .facts{font-size:12.5px;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:4px 14px;margin:12px 0 0}
+  .facts b{color:var(--ink-2);font-weight:600}
+
+  .sources{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
+  @media (max-width:680px){ .sources{grid-template-columns:1fr} }
+  .drop{border:1.5px dashed #ddd4c2;border-radius:11px;padding:13px;text-align:center;background:#fdfbf6;
+    color:var(--ink-2);font-size:12.8px;cursor:pointer;transition:.12s}
+  .drop:hover,.drop.over{border-color:var(--accent);background:var(--accent-bg)}
+  .drop b{color:var(--ink);display:block;font-size:13.5px;margin-bottom:2px}
+  .gh{border:1px solid var(--line);border-radius:11px;padding:11px 13px;background:#fdfcfa;font-size:12.8px}
+  .gh b{display:block;font-size:13.5px;margin-bottom:2px}
+  .gh .repo{font-family:var(--mono);font-size:12px;color:var(--ink-2);margin:4px 0 8px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .prog{height:5px;border-radius:99px;background:var(--line);overflow:hidden;margin-top:10px;display:none}
+  .prog>i{display:block;height:100%;background:var(--accent);width:0%;transition:width .15s}
+
+  h3.sec{font-size:11.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--ink-3);
+    margin:20px 0 8px;font-weight:700;display:flex;align-items:center;gap:8px}
+  h3.sec .count{background:#f3efe8;color:var(--ink-3);border-radius:99px;padding:1px 7px;font-size:10.5px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-3);
+    font-weight:700;padding:0 8px 6px 0;border-bottom:1px solid var(--line-2)}
+  td{padding:8px 8px 8px 0;border-bottom:1px solid var(--line-2);vertical-align:middle}
+  tr:last-child td{border-bottom:0}
+  .mono{font-family:var(--mono)}
+  .muted{color:var(--ink-3)}
+  .nowrap{white-space:nowrap}
+  .empty{color:var(--ink-3);font-size:13px;padding:10px 0}
+  .trunc{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;
+    vertical-align:middle}
+
+  .cmdrun{display:flex;gap:7px;margin-top:12px}
+  .cmdrun input{flex:1;min-width:0;padding:7px 11px;border:1px solid var(--line);border-radius:8px;
+    font-family:var(--mono);font-size:12.5px;background:#fdfcfa;color:var(--ink)}
+  .cmdrun input:focus{outline:none;border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
+
+  .welcome{background:#fff;border:1px solid var(--line);border-radius:16px;padding:36px 32px;margin:26px auto 0;
+    text-align:center;max-width:640px}
+  .welcome h2{font-size:20px;margin:0 0 8px;font-weight:650}
+  .welcome p{color:var(--ink-2);margin:0 auto 20px;max-width:460px;line-height:1.6}
+  .welcome ol{text-align:left;max-width:440px;margin:22px auto 0;padding:0;list-style:none;
+    font-size:13.5px;color:var(--ink-2)}
+  .welcome ol li{display:flex;gap:11px;padding:7px 0}
+  .welcome .n{width:21px;height:21px;border-radius:50%;background:var(--accent-bg);color:var(--accent-dk);
+    display:grid;place-items:center;font-size:11.5px;font-weight:700;flex:none;margin-top:1px}
+
+  #console{position:fixed;left:0;right:0;bottom:0;height:0;background:#17140f;color:#e8e2d5;
+    border-top:1px solid #2c261c;transition:height .18s;z-index:40;display:flex;flex-direction:column}
+  #console.open{height:min(58vh,520px)}
+  #console .bar{display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid #2c261c;
+    font-size:12.5px;color:#bdb4a3;flex:none}
+  #console .bar .title{color:#fff;font-weight:600;white-space:nowrap}
+  #console .bar #conSub{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #console pre{margin:0;flex:1;overflow:auto;padding:12px 16px;font-family:var(--mono);font-size:12.2px;
+    line-height:1.55;white-space:pre-wrap;word-break:break-word}
+  #console .x{background:transparent;border:1px solid #3a3227;color:#cfc6b5;border-radius:7px;padding:3px 9px;
+    cursor:pointer;font-size:12px;font-family:inherit}
+  #console .x:hover{background:#241f17}
+  .l-step{color:#e5b34b;font-weight:600}
+  .l-cmd{color:#7fb3ff}
+  .l-err{color:#ff8b80}
+  .l-ok{color:#7ede9f}
+
+  dialog{border:0;border-radius:14px;padding:0;max-width:580px;width:calc(100% - 32px);
+    box-shadow:0 24px 70px rgba(40,30,10,.28);color:var(--ink)}
+  dialog.wide{max-width:700px}
+  dialog::backdrop{background:rgba(28,22,12,.45)}
+  dialog .dh{padding:18px 20px 0}
+  dialog h3{margin:0 0 4px;font-size:16.5px;font-weight:650}
+  dialog .dh .sub{font-size:13px;color:var(--ink-3);line-height:1.5}
+  dialog .db{padding:14px 20px;max-height:min(70vh,640px);overflow:auto}
+  dialog .df{padding:14px 20px 18px;display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--line-2);
+    margin-top:6px;flex-wrap:wrap}
+  dialog .df .left{margin-right:auto}
+  .chk{display:flex;gap:9px;align-items:flex-start;font-size:13.5px;margin:9px 0}
+  .chk input{margin-top:3px;flex:none}
+  .chk .d{font-size:12.5px;color:var(--ink-3);display:block;margin-top:1px}
+
+  .field{margin-bottom:14px}
+  .field label{display:block;font-size:12px;font-weight:650;color:var(--ink-2);margin-bottom:5px}
+  .field .hint{font-size:12px;color:var(--ink-3);margin-top:5px;line-height:1.45}
+  .field input[type=text],.field input[type=password],.field input[type=number],.field select,.field textarea{
+    width:100%;padding:8px 11px;border:1px solid var(--line);border-radius:8px;font-size:13.5px;
+    font-family:inherit;background:#fdfcfa;color:var(--ink)}
+  .field input.mono,.field textarea.mono{font-family:var(--mono);font-size:12.5px}
+  .field textarea{min-height:76px;resize:vertical}
+  .field input:focus,.field select:focus,.field textarea:focus{
+    outline:none;border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
+  .field input:disabled{background:#f4f0ea;color:var(--ink-3)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:520px){ .two{grid-template-columns:1fr} }
+  fieldset{border:1px solid var(--line-2);border-radius:11px;padding:14px 14px 2px;margin:0 0 16px}
+  legend{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);font-weight:700;padding:0 6px}
+  .danger-zone{border-color:#f0d4d2;background:#fffbfb}
+  .danger-zone legend{color:var(--bad)}
+
+  .radios{display:grid;gap:9px;margin-bottom:6px}
+  .radio{border:1px solid var(--line);border-radius:10px;padding:11px 13px;cursor:pointer;display:flex;gap:10px;
+    align-items:flex-start;background:#fdfcfa}
+  .radio:hover{border-color:#d9d2c6}
+  .radio.on{border-color:var(--accent);background:var(--accent-bg)}
+  .radio input{margin-top:3px;flex:none}
+  .radio b{display:block;font-size:13.5px;font-weight:640}
+  .radio span{font-size:12.5px;color:var(--ink-3);line-height:1.45}
+
+  .cmdbox{background:#17140f;color:#e8e2d5;border-radius:10px;padding:12px 13px;font-family:var(--mono);
+    font-size:12.3px;line-height:1.55;word-break:break-all;position:relative;white-space:pre-wrap}
+  .cmdbox .copy{position:absolute;top:8px;right:8px;background:transparent;border:1px solid #3a3227;color:#cfc6b5;
+    border-radius:7px;padding:3px 9px;cursor:pointer;font-size:12px;font-family:inherit}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:13px;margin:0}
+  .kv dt{color:var(--ink-3)}
+  .kv dd{margin:0;font-family:var(--mono);font-size:12.5px;word-break:break-all}
+
+  #toasts{position:fixed;right:16px;bottom:16px;z-index:60;display:flex;flex-direction:column;gap:8px;
+    max-width:min(380px,calc(100vw - 32px))}
+  .toast{background:var(--ink);color:#fff;padding:10px 13px;border-radius:9px;font-size:13.2px;
+    box-shadow:0 10px 30px rgba(30,22,10,.25);animation:tin .18s ease-out}
+  .toast.bad{background:#8c211a}
+  .toast.ok{background:#1c6b45}
+  @keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="mark">FCC</div>
+    <h1>Forthway Command Center</h1>
+    <span class="conn"><span class="dot off" id="liveDot"></span><span id="liveText">connecting...</span></span>
+    <div class="spacer"></div>
+    <button class="btn accent" id="btnAdd">+ Add site</button>
+    <button class="btn ghost" id="btnSettings">Settings</button>
+    <button class="btn ghost" id="btnLogout">Sign out</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="grid" id="sites"></div>
+  <div id="welcome" style="display:none"></div>
+</div>
+
+<div id="console">
+  <div class="bar">
+    <span class="title" id="conTitle">Console</span>
+    <span id="conSub"></span>
+    <button class="x" id="conCopy">Copy</button>
+    <button class="x" id="conClose">Close</button>
+  </div>
+  <pre id="conOut"></pre>
+</div>
+
+<div id="toasts"></div>
+
+<!-- add site -->
+<dialog id="dlgAdd">
+  <div class="dh"><h3>Add a site</h3><div class="sub">One card per app you deploy.</div></div>
+  <div class="db">
+    <div class="field">
+      <label for="addName">Name</label>
+      <input type="text" id="addName" placeholder="Customer site" />
+    </div>
+    <div class="field">
+      <label>Where does it run?</label>
+      <div class="radios">
+        <label class="radio on" id="rLocal"><input type="radio" name="runner" value="local" checked />
+          <span><b>On this machine</b><span>The Command Center deploys it directly. No agent, nothing to install.</span></span></label>
+        <label class="radio" id="rAgent"><input type="radio" name="runner" value="agent" />
+          <span><b>On another machine</b><span>You get a one-line installer to run there. It dials back to this panel.</span></span></label>
+      </div>
+    </div>
+    <div class="two">
+      <div class="field"><label for="addDir">App directory <span class="muted">(optional now)</span></label>
+        <input type="text" class="mono" id="addDir" placeholder="/home/container/mysite" /></div>
+      <div class="field"><label for="addPort">Port <span class="muted">(optional)</span></label>
+        <input type="number" id="addPort" placeholder="3000" min="1" max="65535" /></div>
+    </div>
+    <div class="field">
+      <label for="addUrl">Public URL <span class="muted">(optional)</span></label>
+      <input type="text" id="addUrl" placeholder="https://example.com" />
+      <div class="hint">Just a link on the card, so you can jump to the live site.</div>
+    </div>
+    <div class="banner bad" id="addErr" style="display:none"></div>
+  </div>
+  <div class="df">
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn accent" id="addGo">Create site</button>
+  </div>
+</dialog>
+
+<!-- agent installer -->
+<dialog id="dlgInstall">
+  <div class="dh"><h3 id="insTitle">Install the agent</h3>
+    <div class="sub">Run this on the machine that runs this site.</div></div>
+  <div class="db">
+    <div class="cmdbox" id="insCmd"><button class="copy" id="insCopy">Copy</button></div>
+    <div class="hint" style="font-size:12.5px;color:var(--ink-3);margin-top:10px;line-height:1.5">
+      It installs Node and pm2 if that box does not have them, drops the agent in
+      <span class="mono">/opt/forthway-agent</span>, starts it under pm2, and checks in here.
+      Everything else is set from this card.
+    </div>
+    <fieldset style="margin-top:16px">
+      <legend>Or set it up by hand</legend>
+      <dl class="kv">
+        <dt>Hub URL</dt><dd id="insHub"></dd>
+        <dt>Site id</dt><dd id="insId"></dd>
+        <dt>Token</dt><dd id="insToken"></dd>
+      </dl>
+      <div class="hint" style="margin:10px 0 12px">
+        Put those in <span class="mono">agent/agent.config.json</span> beside copies of
+        <span class="mono">agent/</span> and <span class="mono">shared/</span>, then
+        <span class="mono">pm2 start agent/agent.mjs</span>.
+      </div>
+    </fieldset>
+  </div>
+  <div class="df"><button class="btn primary" data-close>Done</button></div>
+</dialog>
+
+<!-- site settings -->
+<dialog id="dlgSettings" class="wide">
+  <div class="dh"><h3 id="setTitle">Site settings</h3>
+    <div class="sub">Saved here and applied immediately — for a remote site they reach the agent within a second.</div></div>
+  <div class="db">
+    <fieldset>
+      <legend>Identity</legend>
+      <div class="two">
+        <div class="field"><label>Name</label><input type="text" id="setName" /></div>
+        <div class="field"><label>Public URL</label><input type="text" id="setPublicUrl" placeholder="https://example.com" /></div>
+      </div>
+      <div class="field"><label>Runs on</label>
+        <select id="setRunner">
+          <option value="local">This machine — no agent needed</option>
+          <option value="agent">Another machine — via an agent</option>
+        </select>
+        <div class="hint" id="setRunnerHint"></div></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Where the app lives</legend>
+      <div class="two">
+        <div class="field"><label>App directory <span style="color:var(--bad)">*</span></label>
+          <input type="text" class="mono" id="setAppDir" placeholder="/home/container/mysite" />
+          <div class="hint">The folder holding the app. A <span class="mono">.forthway/</span> directory
+            inside it holds the staging build and the rollback snapshot; deploys never touch it.</div></div>
+        <div class="field"><label>Port</label>
+          <input type="number" id="setPort" placeholder="3000" min="1" max="65535" />
+          <div class="hint">The port the app listens on. Used for the health and version checks below,
+            and passed to it as <span class="mono">PORT</span>.</div></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Starting and stopping</legend>
+      <div class="field">
+        <label>Restart mode</label>
+        <select id="setMode">
+          <option value="pm2">pm2 — the app is a pm2 process</option>
+          <option value="systemd">systemd — the app is a systemd service</option>
+          <option value="command">Command — your own stop and start commands</option>
+          <option value="child">Supervised — the Command Center runs the app itself</option>
+        </select>
+      </div>
+      <div id="modePm2">
+        <div class="two">
+          <div class="field"><label>pm2 process name</label><input type="text" class="mono" id="setService" placeholder="mysite" /></div>
+          <div class="field"><label>First start command</label><input type="text" class="mono" id="setPm2Start" placeholder="npm start" />
+            <div class="hint">Used only when pm2 has never seen this process, to register it.</div></div>
+        </div>
+      </div>
+      <div id="modeSystemd" style="display:none">
+        <div class="two">
+          <div class="field"><label>Service name</label><input type="text" class="mono" id="setUnit" placeholder="mysite" /></div>
+          <div class="field"><label style="visibility:hidden">.</label>
+            <label class="chk" style="margin:6px 0 0"><input type="checkbox" id="setSudo" />
+              <span>Prefix with <span class="mono">sudo</span><span class="d">Only when the runner is not root.</span></span></label></div>
+        </div>
+      </div>
+      <div id="modeCommand" style="display:none">
+        <div class="field"><label>Stop command</label><input type="text" class="mono" id="setStop" placeholder="docker compose stop web" /></div>
+        <div class="field"><label>Start command</label><input type="text" class="mono" id="setStart" placeholder="docker compose up -d web" /></div>
+      </div>
+      <div id="modeChild" style="display:none">
+        <div class="field"><label>Start command</label><input type="text" class="mono" id="setChildStart" placeholder="npm start" />
+          <div class="hint">The app is run as a child process, so the stop is certain — useful where there is no
+            service manager. Its output streams into the console below.</div></div>
+      </div>
+      <div class="field"><label>Extra environment</label><textarea class="mono" id="setEnv" placeholder="NODE_ENV=production&#10;DATABASE_URL=..."></textarea>
+        <div class="hint">One <span class="mono">KEY=value</span> per line, passed to the app and to every command run for it.</div></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Proving it came back</legend>
+      <div class="two">
+        <div class="field"><label>Health URL</label><input type="text" class="mono" id="setHealth" placeholder="from the port above" /></div>
+        <div class="field"><label>Version URL</label><input type="text" class="mono" id="setVersion" placeholder="from the port above" /></div>
+      </div>
+      <div class="hint" style="margin:-6px 0 14px">
+        Left blank these default to <span class="mono">http://127.0.0.1:PORT/api/health</span> and
+        <span class="mono">/api/version</span>. The version check catches the nastiest failure there is:
+        a stop that silently did nothing, so the <i>old</i> process keeps answering health checks perfectly
+        while the new code never loads. See <span class="mono">patches/</span> for the two routes.
+      </div>
+      <div class="two">
+        <div class="field"><label>Health timeout (seconds)</label><input type="number" id="setHealthTimeout" min="10" max="3600" /></div>
+        <div class="field"><label>Stop grace period (seconds)</label><input type="number" id="setStopGrace" min="1" max="300" /></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Build pipeline</legend>
+      <div class="field"><label>Install</label><input type="text" class="mono" id="setInstall" placeholder="npm install --no-audit --no-fund" />
+        <div class="hint">Runs in a staging copy, never against the live app. Blank to skip.</div></div>
+      <div class="field"><label>Prepare</label><input type="text" class="mono" id="setPrepare" placeholder="npx prisma generate" />
+        <div class="hint">Optional step between install and build. Left blank, a Prisma schema is detected and generated for you.</div></div>
+      <div class="field"><label>Build</label><input type="text" class="mono" id="setBuild" placeholder="npm run build" />
+        <div class="hint">Blank for apps that do not need building.</div></div>
+      <div class="field"><label>Must exist after a build</label><input type="text" class="mono" id="setArtifact" placeholder=".next/BUILD_ID" />
+        <div class="hint">Checked after the build — catches a build command that exits 0 without producing anything.</div></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Files</legend>
+      <div class="field"><label>Swapped whole</label><input type="text" class="mono" id="setSwap" placeholder="node_modules, .next" />
+        <div class="hint">Generated directories moved into place in one step instead of file by file. Comma separated.</div></div>
+      <div class="field"><label>Never touched</label><textarea class="mono" id="setPreserve"></textarea>
+        <div class="hint">One per line. These survive every deploy and rollback — secrets, uploads, logs.</div></div>
+      <label class="chk"><input type="checkbox" id="setSmart" />
+        <span>Skip the install step when nothing changed<span class="d">Compares package.json and the lockfile against the running build.</span></span></label>
+      <label class="chk"><input type="checkbox" id="setRollback" />
+        <span>Roll back automatically if the new build does not come up<span class="d">Recommended. Off means a broken deploy stays live.</span></span></label>
+      <label class="chk" style="margin-bottom:14px"><input type="checkbox" id="setAutoPrepare" />
+        <span>Detect Prisma and generate the client<span class="d">Only applies when the prepare step is blank.</span></span></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>GitHub</legend>
+      <div class="two">
+        <div class="field"><label>Repository</label><input type="text" class="mono" id="setRepo" placeholder="owner/name" /></div>
+        <div class="field"><label>Branch or tag</label><input type="text" class="mono" id="setRef" placeholder="main" /></div>
+      </div>
+      <div class="field"><label>Token for this repo <span class="muted">(optional)</span></label>
+        <input type="password" id="setGhToken" placeholder="leave blank to keep the current one" autocomplete="off" />
+        <div class="hint"><span id="setGhState"></span> Only needed for a private repo the panel-wide token cannot reach.
+          <a href="#" id="setClearGh">Clear the stored token</a></div></div>
+    </fieldset>
+
+    <fieldset class="danger-zone">
+      <legend>Danger zone</legend>
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn sm" id="setRotate">Rotate token</button>
+        <span class="hint" style="margin:0">Invalidates the current one — the installer has to be run again on that box.</span>
+      </div>
+      <div class="row" style="margin-bottom:14px">
+        <button class="btn sm danger" id="setRemove">Remove this site</button>
+        <span class="hint" style="margin:0">Removes it here along with its releases and history. Nothing on the server itself is touched.</span>
+      </div>
+    </fieldset>
+    <div class="banner bad" id="setErr" style="display:none"></div>
+  </div>
+  <div class="df">
+    <button class="btn left" id="setInstallBtn">Show installer</button>
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn accent" id="setSave">Save</button>
+  </div>
+</dialog>
+
+<!-- github -->
+<dialog id="dlgGithub">
+  <div class="dh"><h3>Pull from GitHub</h3>
+    <div class="sub">The archive is downloaded here and kept as a release, so you can roll back to it later.</div></div>
+  <div class="db">
+    <div class="field"><label>Repository</label>
+      <input type="text" class="mono" id="ghRepo" placeholder="owner/name, or a github.com URL" />
+      <div class="hint">Paste anything — a URL, <span class="mono">owner/name</span>, or an SSH remote.</div></div>
+    <div class="field"><label>Branch, tag or commit</label>
+      <input type="text" class="mono" id="ghRef" list="ghRefs" placeholder="main" />
+      <datalist id="ghRefs"></datalist>
+      <div class="hint"><a href="#" id="ghLoad">Load branches and tags</a> <span id="ghRepoInfo" class="muted"></span></div></div>
+    <div class="field"><label>Token <span class="muted">(private repos)</span></label>
+      <input type="password" id="ghToken" autocomplete="off" placeholder="ghp_..." />
+      <div class="hint" id="ghTokenState"></div>
+      <label class="chk" style="margin-top:6px"><input type="checkbox" id="ghSaveToken" />
+        <span>Remember this token for this site</span></label></div>
+    <label class="chk"><input type="checkbox" id="ghDeploy" checked />
+      <span>Deploy it as soon as it downloads<span class="d">Otherwise it just lands in the release list.</span></span></label>
+    <div class="banner bad" id="ghErr" style="display:none"></div>
+  </div>
+  <div class="df">
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn accent" id="ghGo">Pull</button>
+  </div>
+</dialog>
+
+<!-- deploy confirm -->
+<dialog id="dlgDeploy">
+  <div class="dh"><h3>Deploy</h3><div class="sub" id="depSub"></div></div>
+  <div class="db" id="depBody"></div>
+  <div class="df">
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn accent" id="depGo">Deploy</button>
+  </div>
+</dialog>
+
+<!-- hub settings -->
+<dialog id="dlgHub">
+  <div class="dh"><h3>Command Center settings</h3><div class="sub" id="hubSub"></div></div>
+  <div class="db">
+    <fieldset>
+      <legend>GitHub</legend>
+      <div class="field"><label>Personal access token</label>
+        <input type="password" id="hubGh" autocomplete="off" placeholder="ghp_..." />
+        <div class="hint" id="hubGhState"></div></div>
+    </fieldset>
+    <fieldset>
+      <legend>This panel</legend>
+      <div class="two">
+        <div class="field"><label>Port</label><input type="number" id="hubPort" min="1" max="65535" />
+          <div class="hint" id="hubPortHint"></div></div>
+        <div class="field"><label>Release archives kept per site</label><input type="number" id="hubKeep" min="1" max="50" />
+          <div class="hint">The live release, the one before it and anything pinned are always kept.</div></div>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Change the password</legend>
+      <div class="two">
+        <div class="field"><label>Current password</label><input type="password" id="hubPwOld" autocomplete="current-password" /></div>
+        <div class="field"><label>New password</label><input type="password" id="hubPwNew" autocomplete="new-password" /></div>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>This machine</legend>
+      <dl class="kv" id="hubFacts"></dl>
+    </fieldset>
+    <div class="banner bad" id="hubErr" style="display:none"></div>
+  </div>
+  <div class="df">
+    <button class="btn left danger" id="hubRestart">Restart the panel</button>
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn accent" id="hubSave">Save</button>
+  </div>
+</dialog>
+
+<!-- generic confirm -->
+<dialog id="dlgConfirm">
+  <div class="dh"><h3 id="cfTitle">Are you sure?</h3></div>
+  <div class="db"><div id="cfBody"></div></div>
+  <div class="df">
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn danger" id="cfGo">Confirm</button>
+  </div>
+</dialog>
+
+<script>
+'use strict';
+
+// --------------------------------------------------------------- plumbing
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+let STATE = { sites: [] };
+let SETTINGS = {};
+let openJob = null;          // job whose log the console is showing
+const logCache = new Map();  // jobId -> text
+
+function toast(msg, kind = '') {
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), kind === 'bad' ? 7000 : 4000);
+}
+
+async function api(path, body, method = 'POST') {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { location.reload(); throw new Error('signed out'); }
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || ('Request failed (' + res.status + ')'));
+  return json;
+}
+
+function site(id) { return STATE.sites.find((s) => s.id === id); }
+
+// --------------------------------------------------------------- formatting
+
+function ago(iso) {
+  if (!iso) return 'never';
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 5) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+
+function shortTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function bytesHuman(n) {
+  if (!n && n !== 0) return '—';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+}
+
+// -------------------------------------------------------------- rendering
+
+function render() {
+  const wrap = $('sites');
+  if (!STATE.sites.length) {
+    wrap.innerHTML = '';
+    $('welcome').style.display = '';
+    $('welcome').innerHTML =
+      '<div class="welcome">' +
+      '<h2>Nothing here yet</h2>' +
+      '<p>Add your first site and the Command Center takes it from there — upload a zip or pull a branch, ' +
+      'and it installs, builds, restarts and checks that the new version is really the one serving traffic.</p>' +
+      '<button class="btn accent" onclick="document.getElementById(\'btnAdd\').click()">+ Add your first site</button>' +
+      '<ol>' +
+      '<li><span class="n">1</span><span><b>Name it</b> and say whether it runs on this machine or another one.</span></li>' +
+      '<li><span class="n">2</span><span><b>Point it at its folder</b> and say how to start it — pm2, systemd, or a command.</span></li>' +
+      '<li><span class="n">3</span><span><b>Deploy</b> and watch the build happen in the console.</span></li>' +
+      '</ol></div>';
+    return;
+  }
+  $('welcome').style.display = 'none';
+
+  // Rebuild only what changed, so an open text field is not yanked away.
+  const seen = new Set();
+  for (const s of STATE.sites) {
+    seen.add(s.id);
+    let card = document.getElementById('card-' + s.id);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'card';
+      card.id = 'card-' + s.id;
+      wrap.appendChild(card);
+    }
+    const html = cardHtml(s);
+    if (card.dataset.html !== html) {
+      card.dataset.html = html;
+      card.innerHTML = html;
+      wireCard(card, s);
+    }
+  }
+  for (const el of [...wrap.children]) {
+    if (!seen.has(el.id.replace('card-', ''))) el.remove();
+  }
+}
+
+function statusPills(s) {
+  const out = [];
+  if (s.runner === 'local') out.push('<span class="pill mute">this machine</span>');
+  else out.push('<span class="pill mute">agent</span>');
+
+  if (s.activeJob) {
+    out.push('<span class="pill accent">' + esc(s.activeJob.type) +
+      (s.activeJob.step ? ' · ' + esc(s.activeJob.step) : '') + '</span>');
+  } else if (!s.configured) {
+    out.push('<span class="pill warn">not configured</span>');
+  } else if (s.health && s.health.ok === true) {
+    out.push('<span class="pill ok">healthy</span>');
+  } else if (s.health && s.health.ok === false) {
+    // A site that has never been deployed is not "down", it just has not
+    // started yet — saying otherwise makes a fresh card look broken.
+    out.push(s.lastDeployAt || s.serving
+      ? '<span class="pill bad">not answering</span>'
+      : '<span class="pill mute">not started</span>');
+  }
+  if (s.restartPending) out.push('<span class="pill warn">restart pending</span>');
+  if (s.queuedJobs) out.push('<span class="pill mute">' + s.queuedJobs + ' queued</span>');
+  return out.join(' ');
+}
+
+function cardHtml(s) {
+  const dotClass = !s.everConnected ? 'new' : s.online ? (s.health && s.health.ok === false ? 'bad' : 'on') : 'off';
+  const disk = s.deployed || {};
+  const live = s.serving || {};
+  const rel = s.releases.find((r) => r.id === s.currentReleaseId);
+
+  let h = '';
+  h += '<div class="head">';
+  h += '<div style="min-width:0"><h2><span class="dot ' + dotClass + '"></span>' + esc(s.name) + statusPills(s) + '</h2>';
+  h += '<div class="sub">' + (s.publicUrl ? '<a href="' + esc(s.publicUrl) + '" target="_blank" rel="noopener">' + esc(s.publicUrl.replace(/^https?:\/\//, '')) + '</a> · ' : '') +
+       '<span class="mono">' + esc(s.id) + '</span>' +
+       (s.settings.appDir ? ' · <span class="mono muted">' + esc(s.settings.appDir) + '</span>' : '') + '</div></div>';
+  h += '<div class="tools">' +
+       '<button class="btn sm" data-act="refresh">Refresh</button>' +
+       '<button class="btn sm" data-act="settings">Settings</button>' +
+       '</div></div>';
+
+  h += '<div class="body">';
+
+  if (!s.configured) {
+    h += '<div class="banner warn"><span class="txt">This site has no app directory yet, so nothing can be deployed to it.</span>' +
+         '<button class="btn sm" data-act="settings">Configure</button></div>';
+  } else if (s.runner === 'agent' && !s.everConnected) {
+    h += '<div class="banner info"><span class="txt">Waiting for the agent on that machine to check in.</span>' +
+         '<button class="btn sm" data-act="install">Show installer</button></div>';
+  } else if (s.runner === 'agent' && !s.online) {
+    h += '<div class="banner bad"><span class="txt">The agent has not checked in since ' + esc(ago(s.lastHeartbeat)) +
+         '. Jobs will queue until it is back.</span></div>';
+  } else if (s.restartPending) {
+    h += '<div class="banner warn"><span class="txt">Version ' + esc(disk.version || '?') + ' is on disk, but ' +
+         esc(live.version || '?') + ' is still serving. Restart to pick it up.</span>' +
+         '<button class="btn sm" data-act="restart">Restart</button></div>';
+  } else if (s.lastError) {
+    h += '<div class="banner bad"><span class="txt">Last job failed: ' + esc(s.lastError) + '</span></div>';
+  }
+
+  h += '<div class="versions">';
+  h += '<div class="vbox"><div class="lbl">On disk</div><div class="val">' + esc(disk.version || '—') + '</div>' +
+       '<div class="meta">' + (disk.deployedAt ? esc(ago(disk.deployedAt)) : (disk.name ? esc(disk.name) : 'not deployed yet')) + '</div></div>';
+  h += '<div class="vbox live"><div class="lbl">Serving now</div><div class="val">' + esc(live.version || (s.health && s.health.ok === false ? 'down' : '—')) + '</div>' +
+       '<div class="meta">' + (live.checkedAt ? 'checked ' + esc(ago(live.checkedAt)) : 'no version endpoint') + '</div></div>';
+  h += '</div>';
+
+  // sources
+  h += '<div class="sources">';
+  h += '<div class="drop" data-act="pick"><b>Upload a zip</b>drop it here, or click to choose' +
+       '<div class="prog"><i></i></div></div>';
+  h += '<div class="gh"><b>Pull from GitHub</b>' +
+       (s.github.repo
+         ? '<div class="repo">' + esc(s.github.repo) + (s.github.ref ? ' @ ' + esc(s.github.ref) : '') + '</div>' +
+           '<div class="row"><button class="btn sm accent" data-act="ghQuick">Pull &amp; deploy</button>' +
+           '<button class="btn sm" data-act="github">Change...</button></div>'
+         : '<div class="repo muted">no repository set</div>' +
+           '<button class="btn sm" data-act="github">Choose a repository</button>') +
+       '</div>';
+  h += '</div>';
+
+  // actions
+  h += '<div class="row" style="margin-top:14px">';
+  h += '<button class="btn" data-act="restart"' + (s.activeJob ? ' disabled' : '') + '>Restart</button>';
+  h += '<button class="btn sm" data-act="stop"' + (s.activeJob ? ' disabled' : '') + '>Stop</button>';
+  h += '<button class="btn sm" data-act="start"' + (s.activeJob ? ' disabled' : '') + '>Start</button>';
+  if (s.previousReleaseId) h += '<button class="btn sm" data-act="rollback"' + (s.activeJob ? ' disabled' : '') + '>Roll back</button>';
+  if (s.activeJob) h += '<button class="btn sm" data-act="watch">Watch console</button>';
+  h += '</div>';
+
+  h += '<div class="cmdrun"><input type="text" placeholder="run a command in the app directory, e.g. pm2 logs --lines 50" data-cmd />' +
+       '<button class="btn sm" data-act="runCmd"' + (s.activeJob ? ' disabled' : '') + '>Run</button></div>';
+
+  // facts
+  const rt = s.runtime || {};
+  const facts = [];
+  if (rt.host) facts.push('<b>host</b> ' + esc(rt.host));
+  if (s.settings.port) facts.push('<b>port</b> ' + esc(s.settings.port));
+  facts.push('<b>restart</b> ' + esc(s.settings.restart.mode) + (s.settings.restart.service ? ' · ' + esc(s.settings.restart.service) : ''));
+  if (rt.node) facts.push('<b>node</b> ' + esc(rt.node));
+  if (rt.disk && rt.disk.freeBytes != null) facts.push('<b>free</b> ' + bytesHuman(rt.disk.freeBytes));
+  if (s.appRunning === false) facts.push('<b>process</b> stopped');
+  if (s.runner === 'agent') facts.push('<b>agent</b> ' + esc(s.runnerVersion || '?') + ' · ' + esc(ago(s.lastHeartbeat)));
+  if (rel) facts.push('<b>live release</b> ' + esc(rel.filename));
+  h += '<div class="facts">' + facts.join('') + '</div>';
+
+  // migrations
+  if (s.migrations && s.migrations.length) {
+    h += '<h3 class="sec">Migrations <span class="count">' + s.migrations.length + '</span></h3><div class="row">';
+    for (const m of s.migrations) {
+      h += '<button class="btn sm" data-act="migrate" data-script="' + esc(m) + '"' + (s.activeJob ? ' disabled' : '') + '>' + esc(m) + '</button>';
+    }
+    h += '</div>';
+  }
+
+  // releases
+  h += '<h3 class="sec">Releases <span class="count">' + s.releases.length + '</span></h3>';
+  if (!s.releases.length) {
+    h += '<div class="empty">Nothing uploaded or pulled yet.</div>';
+  } else {
+    h += '<table><thead><tr><th>Version</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
+    for (const r of s.releases.slice(0, 8)) {
+      const isLive = r.id === s.currentReleaseId;
+      h += '<tr><td class="nowrap"><span class="mono">' + esc(r.version || '—') + '</span>' +
+           (isLive ? ' <span class="pill ok">live</span>' : '') +
+           (r.pinned ? ' <span class="pill mute">pinned</span>' : '') + '</td>';
+      h += '<td class="muted"><span class="trunc" title="' + esc(r.filename) + '">' +
+           (r.source.type === 'github'
+             ? esc(r.source.ref || '') + (r.source.shortSha ? ' · ' + esc(r.source.shortSha) : '')
+             : 'upload') + '</span></td>';
+      h += '<td class="muted nowrap">' + esc(ago(r.uploadedAt)) + '</td>';
+      h += '<td class="nowrap" style="text-align:right">' +
+           '<button class="btn sm" data-act="deploy" data-rel="' + esc(r.id) + '"' + (s.activeJob ? ' disabled' : '') + '>Deploy</button> ' +
+           '<button class="btn sm ghost" data-act="pin" data-rel="' + esc(r.id) + '">' + (r.pinned ? 'Unpin' : 'Pin') + '</button>' +
+           (isLive ? '' : ' <button class="btn sm ghost" data-act="delrel" data-rel="' + esc(r.id) + '">×</button>') +
+           '</td></tr>';
+    }
+    h += '</tbody></table>';
+  }
+
+  // jobs
+  h += '<h3 class="sec">Recent jobs</h3>';
+  if (!s.jobs.length) {
+    h += '<div class="empty">Nothing has run yet.</div>';
+  } else {
+    h += '<table><tbody>';
+    for (const j of s.jobs.slice(0, 6)) {
+      const pill = j.status === 'success' ? 'ok' : j.status === 'failed' ? 'bad'
+        : j.status === 'running' ? 'accent' : 'mute';
+      h += '<tr><td class="nowrap"><span class="pill ' + pill + '">' + esc(j.status) + '</span></td>';
+      h += '<td>' + esc(j.type) + (j.releaseVersion ? ' <span class="muted mono">' + esc(j.releaseVersion) + '</span>' : '') +
+           (j.command ? ' <span class="muted mono trunc" title="' + esc(j.command) + '">' + esc(j.command) + '</span>' : '') +
+           (j.error ? '<div class="muted" style="font-size:12px">' + esc(j.error) + '</div>' : '') + '</td>';
+      h += '<td class="muted nowrap">' + esc(shortTime(j.createdAt)) + '</td>';
+      h += '<td class="nowrap" style="text-align:right"><button class="btn sm ghost" data-act="log" data-job="' + esc(j.id) + '">Log</button>' +
+           (j.status === 'queued' ? ' <button class="btn sm ghost" data-act="cancel" data-job="' + esc(j.id) + '">Cancel</button>' : '') +
+           '</td></tr>';
+    }
+    h += '</tbody></table>';
+  }
+
+  h += '</div>';
+  return h;
+}
+
+function wireCard(card, s) {
+  const id = s.id;
+
+  card.querySelectorAll('[data-act]').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      const act = el.dataset.act;
+      const rel = el.dataset.rel;
+      const job = el.dataset.job;
+
+      if (act === 'settings') return openSettings(id);
+      if (act === 'install') return showInstaller(id);
+      if (act === 'github') return openGithub(id);
+      if (act === 'ghQuick') return ghQuick(id);
+      if (act === 'pick') return pickFile(id, card);
+      if (act === 'refresh') return act0('/api/refresh', { siteId: id }, 'Refreshed');
+      if (act === 'restart') return confirmThen('Restart ' + s.name + '?', 'The site will be briefly unavailable.',
+        () => act0('/api/restart', { siteId: id }, 'Restarting', true));
+      if (act === 'stop') return confirmThen('Stop ' + s.name + '?', 'It will stay down until you start it again.',
+        () => act0('/api/stop', { siteId: id }, 'Stopping', true));
+      if (act === 'start') return act0('/api/start', { siteId: id }, 'Starting', true);
+      if (act === 'rollback') return confirmThen('Roll back ' + s.name + '?',
+        'The previous build is restored and the app restarted.',
+        () => act0('/api/rollback', { siteId: id }, 'Rolling back', true));
+      if (act === 'migrate') return confirmThen('Run ' + el.dataset.script + '?',
+        'Migrations are not undone by a rollback.',
+        () => act0('/api/migrate', { siteId: id, script: el.dataset.script }, 'Running migration', true));
+      if (act === 'runCmd') {
+        const input = card.querySelector('[data-cmd]');
+        const command = input.value.trim();
+        if (!command) return;
+        input.value = '';
+        return act0('/api/command', { siteId: id, command }, 'Running', true);
+      }
+      if (act === 'deploy') return openDeploy(id, rel);
+      if (act === 'pin') {
+        const r = s.releases.find((x) => x.id === rel);
+        return act0('/api/release/update', { releaseId: rel, pinned: !r.pinned }, r.pinned ? 'Unpinned' : 'Pinned');
+      }
+      if (act === 'delrel') return confirmThen('Delete this release?', 'The archive is removed from this machine.',
+        () => act0('/api/release/delete', { releaseId: rel }, 'Deleted'));
+      if (act === 'log') return openConsole(job);
+      if (act === 'cancel') return act0('/api/cancel', { jobId: job }, 'Cancelled');
+      if (act === 'watch') return openConsole(s.activeJob.id);
+    });
+  });
+
+  const input = card.querySelector('[data-cmd]');
+  if (input) {
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Enter') return;
+      const command = input.value.trim();
+      if (!command) return;
+      input.value = '';
+      act0('/api/command', { siteId: id, command }, 'Running', true);
+    });
+  }
+
+  const drop = card.querySelector('.drop');
+  if (drop) {
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', (e) => {
+      e.preventDefault();
+      drop.classList.remove('over');
+      const f = e.dataTransfer.files[0];
+      if (f) uploadFile(id, f, drop);
+    });
+  }
+}
+
+async function act0(path, body, okMsg, watch) {
+  try {
+    const r = await api(path, body);
+    if (okMsg) toast(okMsg, 'ok');
+    if (watch && r.job) openConsole(r.job.id, true);
+    refresh();
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
+}
+
+// ------------------------------------------------------------------ upload
+
+function pickFile(siteId, card) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.zip,application/zip';
+  input.addEventListener('change', () => {
+    if (input.files[0]) uploadFile(siteId, input.files[0], card.querySelector('.drop'));
+  });
+  input.click();
+}
+
+function uploadFile(siteId, file, dropEl) {
+  if (!/\.zip$/i.test(file.name)) return toast('That is not a .zip file.', 'bad');
+  const prog = dropEl.querySelector('.prog');
+  const bar = prog.querySelector('i');
+  prog.style.display = 'block';
+  bar.style.width = '0%';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?site=' + encodeURIComponent(siteId) + '&filename=' + encodeURIComponent(file.name));
+  xhr.upload.addEventListener('progress', (e) => {
+    if (e.lengthComputable) bar.style.width = Math.round((e.loaded / e.total) * 100) + '%';
+  });
+  xhr.addEventListener('load', () => {
+    prog.style.display = 'none';
+    let j = {};
+    try { j = JSON.parse(xhr.responseText); } catch (e) {}
+    if (xhr.status === 200 && j.release) {
+      toast('Uploaded ' + (j.release.version || file.name), 'ok');
+      refresh().then(() => openDeploy(siteId, j.release.id));
+    } else {
+      toast(j.error || 'Upload failed.', 'bad');
+    }
+  });
+  xhr.addEventListener('error', () => { prog.style.display = 'none'; toast('Upload failed.', 'bad'); });
+  xhr.send(file);
+}
+
+// ------------------------------------------------------------------ dialogs
+
+document.querySelectorAll('dialog [data-close]').forEach((b) =>
+  b.addEventListener('click', () => b.closest('dialog').close()));
+
+function confirmThen(title, body, fn) {
+  $('cfTitle').textContent = title;
+  $('cfBody').textContent = body;
+  const go = $('cfGo');
+  const clone = go.cloneNode(true);
+  go.replaceWith(clone);
+  clone.addEventListener('click', () => { $('dlgConfirm').close(); fn(); });
+  $('dlgConfirm').showModal();
+}
+
+// ---- add site
+$('btnAdd').addEventListener('click', () => {
+  $('addName').value = '';
+  $('addUrl').value = '';
+  $('addDir').value = '';
+  $('addPort').value = '';
+  $('addErr').style.display = 'none';
+  document.querySelector('input[name=runner][value=local]').checked = true;
+  syncRunnerRadios();
+  $('dlgAdd').showModal();
+  $('addName').focus();
+});
+
+function syncRunnerRadios() {
+  document.querySelectorAll('input[name=runner]').forEach((r) => {
+    r.closest('.radio').classList.toggle('on', r.checked);
+  });
+}
+document.querySelectorAll('input[name=runner]').forEach((r) => r.addEventListener('change', syncRunnerRadios));
+
+$('addGo').addEventListener('click', async () => {
+  const runner = document.querySelector('input[name=runner]:checked').value;
+  const settings = {};
+  if ($('addDir').value.trim()) settings.appDir = $('addDir').value.trim();
+  if ($('addPort').value) settings.port = +$('addPort').value;
+  try {
+    const r = await api('/api/sites/create', {
+      name: $('addName').value,
+      runner,
+      publicUrl: $('addUrl').value,
+      settings,
+    });
+    $('dlgAdd').close();
+    await refresh();
+    if (runner === 'agent') showInstaller(r.site.id);
+    else openSettings(r.site.id);
+  } catch (err) {
+    $('addErr').textContent = err.message;
+    $('addErr').style.display = '';
+  }
+});
+
+// ---- installer
+function installCommand(s) {
+  const url = location.origin + '/install/agent.sh?site=' + encodeURIComponent(s.id) + '&token=' + encodeURIComponent(s.token);
+  return 'curl -fsSL "' + url + '" | sudo bash';
+}
+
+function showInstaller(id) {
+  const s = site(id);
+  if (!s) return;
+  $('insTitle').textContent = 'Install the agent for ' + s.name;
+  const cmd = installCommand(s);
+  $('insCmd').innerHTML = '<button class="copy" id="insCopy">Copy</button>' + esc(cmd);
+  $('insCopy').addEventListener('click', () => {
+    navigator.clipboard.writeText(cmd).then(() => toast('Copied', 'ok'), () => toast('Could not copy', 'bad'));
+  });
+  $('insHub').textContent = location.origin;
+  $('insId').textContent = s.id;
+  $('insToken').textContent = s.token;
+  $('dlgInstall').showModal();
+}
+
+// ---- site settings
+let settingsSiteId = null;
+
+function openSettings(id) {
+  const s = site(id);
+  if (!s) return;
+  settingsSiteId = id;
+  const st = s.settings;
+
+  $('setTitle').textContent = s.name;
+  $('setErr').style.display = 'none';
+  $('setName').value = s.name;
+  $('setPublicUrl').value = s.publicUrl || '';
+  $('setRunner').value = s.runner;
+  $('setAppDir').value = st.appDir || '';
+  $('setPort').value = st.port || '';
+  $('setMode').value = st.restart.mode;
+  $('setService').value = st.restart.mode === 'pm2' ? (st.restart.service || '') : (st.restart.service || '');
+  $('setUnit').value = st.restart.service || '';
+  $('setPm2Start').value = st.restart.pm2Start || '';
+  $('setSudo').checked = !!st.restart.useSudo;
+  $('setStop').value = st.restart.stop || '';
+  $('setStart').value = st.restart.start || '';
+  $('setChildStart').value = st.restart.start || '';
+  $('setEnv').value = Object.entries(st.restart.env || {}).map(([k, v]) => k + '=' + v).join('\n');
+  $('setHealth').value = st.healthUrl || '';
+  $('setVersion').value = st.versionUrl || '';
+  $('setHealthTimeout').value = Math.round((st.healthTimeoutMs || 180000) / 1000);
+  $('setStopGrace').value = Math.round((st.stopGraceMs || 10000) / 1000);
+  $('setInstall').value = st.build.install || '';
+  $('setPrepare').value = st.build.prepare || '';
+  $('setBuild').value = st.build.build || '';
+  $('setArtifact').value = st.build.artifact || '';
+  $('setSwap').value = (st.swapDirs || []).join(', ');
+  $('setPreserve').value = (st.preserve || []).join('\n');
+  $('setSmart').checked = !!st.smartInstall;
+  $('setRollback').checked = !!st.autoRollback;
+  $('setAutoPrepare').checked = !!st.autoPrepare;
+  $('setRepo').value = s.github.repo || '';
+  $('setRef').value = s.github.ref || '';
+  $('setGhToken').value = '';
+  $('setGhState').textContent = s.github.hasToken ? 'A token is stored for this site.' : '';
+  $('setInstallBtn').style.display = s.runner === 'agent' ? '' : 'none';
+  syncModeFields();
+  syncRunnerHint();
+  $('dlgSettings').showModal();
+}
+
+function syncModeFields() {
+  const m = $('setMode').value;
+  $('modePm2').style.display = m === 'pm2' ? '' : 'none';
+  $('modeSystemd').style.display = m === 'systemd' ? '' : 'none';
+  $('modeCommand').style.display = m === 'command' ? '' : 'none';
+  $('modeChild').style.display = m === 'child' ? '' : 'none';
+}
+$('setMode').addEventListener('change', syncModeFields);
+
+function syncRunnerHint() {
+  const isLocal = $('setRunner').value === 'local';
+  $('setRunnerHint').textContent = isLocal
+    ? 'The Command Center runs the commands itself. Nothing to install.'
+    : 'An agent on that machine does the work. Use "Show installer" for the one-liner.';
+  $('setInstallBtn').style.display = isLocal ? 'none' : '';
+}
+$('setRunner').addEventListener('change', syncRunnerHint);
+
+$('setClearGh').addEventListener('click', async (e) => {
+  e.preventDefault();
+  try {
+    await api('/api/sites/update', { id: settingsSiteId, github: { repo: $('setRepo').value, ref: $('setRef').value, clearToken: true } });
+    $('setGhState').textContent = 'Cleared.';
+    toast('Token cleared', 'ok');
+    refresh();
+  } catch (err) { toast(err.message, 'bad'); }
+});
+
+$('setRotate').addEventListener('click', () => {
+  confirmThen('Rotate this site\'s token?', 'The agent on that machine will stop working until you run the installer again.',
+    async () => {
+      try {
+        await api('/api/sites/rotate-token', { id: settingsSiteId });
+        toast('Token rotated', 'ok');
+        await refresh();
+        showInstaller(settingsSiteId);
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+});
+
+$('setRemove').addEventListener('click', () => {
+  const s = site(settingsSiteId);
+  confirmThen('Remove ' + (s ? s.name : 'this site') + '?',
+    'It disappears from here along with its releases and job history. Nothing on the server is deleted, ' +
+    'and the app keeps running.',
+    async () => {
+      try {
+        await api('/api/sites/delete', { id: settingsSiteId });
+        $('dlgSettings').close();
+        toast('Removed', 'ok');
+        refresh();
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+});
+
+$('setInstallBtn').addEventListener('click', () => showInstaller(settingsSiteId));
+
+$('setSave').addEventListener('click', async () => {
+  const mode = $('setMode').value;
+  const env = {};
+  for (const line of $('setEnv').value.split('\n')) {
+    const i = line.indexOf('=');
+    if (i <= 0) continue;
+    env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  const restart = { mode, env, useSudo: $('setSudo').checked, pm2Start: $('setPm2Start').value };
+  if (mode === 'pm2') restart.service = $('setService').value;
+  else if (mode === 'systemd') restart.service = $('setUnit').value;
+  else if (mode === 'command') { restart.stop = $('setStop').value; restart.start = $('setStart').value; }
+  else if (mode === 'child') restart.start = $('setChildStart').value;
+
+  const payload = {
+    id: settingsSiteId,
+    name: $('setName').value,
+    publicUrl: $('setPublicUrl').value,
+    runner: $('setRunner').value,
+    settings: {
+      appDir: $('setAppDir').value,
+      port: $('setPort').value === '' ? null : +$('setPort').value,
+      restart,
+      healthUrl: $('setHealth').value,
+      versionUrl: $('setVersion').value,
+      healthTimeoutMs: (+$('setHealthTimeout').value || 180) * 1000,
+      stopGraceMs: (+$('setStopGrace').value || 10) * 1000,
+      build: {
+        install: $('setInstall').value,
+        prepare: $('setPrepare').value,
+        build: $('setBuild').value,
+        artifact: $('setArtifact').value,
+      },
+      swapDirs: $('setSwap').value.split(',').map((x) => x.trim()).filter(Boolean),
+      preserve: $('setPreserve').value.split('\n').map((x) => x.trim()).filter(Boolean),
+      smartInstall: $('setSmart').checked,
+      autoRollback: $('setRollback').checked,
+      autoPrepare: $('setAutoPrepare').checked,
+    },
+    github: { repo: $('setRepo').value, ref: $('setRef').value, token: $('setGhToken').value },
+  };
+  try {
+    await api('/api/sites/update', payload);
+    $('dlgSettings').close();
+    toast('Saved', 'ok');
+    refresh();
+  } catch (err) {
+    $('setErr').textContent = err.message;
+    $('setErr').style.display = '';
+  }
+});
+
+// ---- github
+let ghSiteId = null;
+
+function openGithub(id) {
+  const s = site(id);
+  if (!s) return;
+  ghSiteId = id;
+  $('ghRepo').value = s.github.repo || '';
+  $('ghRef').value = s.github.ref || '';
+  $('ghToken').value = '';
+  $('ghSaveToken').checked = false;
+  $('ghDeploy').checked = !!s.configured;
+  $('ghErr').style.display = 'none';
+  $('ghRepoInfo').textContent = '';
+  $('ghRefs').innerHTML = '';
+  $('ghTokenState').textContent = s.github.hasToken
+    ? 'A token is stored for this site.'
+    : (STATE.hasGithubToken ? 'The panel-wide token' + (STATE.githubUser ? ' (' + STATE.githubUser + ')' : '') + ' will be used.' : '');
+  $('dlgGithub').showModal();
+}
+
+$('ghLoad').addEventListener('click', async (e) => {
+  e.preventDefault();
+  $('ghErr').style.display = 'none';
+  $('ghRepoInfo').textContent = 'loading...';
+  try {
+    const r = await api('/api/github/refs', { repo: $('ghRepo').value, token: $('ghToken').value, siteId: ghSiteId });
+    $('ghRefs').innerHTML = [...r.branches, ...r.tags]
+      .map((x) => '<option value="' + esc(x.name) + '"></option>').join('');
+    $('ghRepoInfo').textContent = r.info.private ? 'private · default ' + r.info.defaultBranch : 'public · default ' + r.info.defaultBranch;
+    if (!$('ghRef').value) $('ghRef').value = r.info.defaultBranch;
+  } catch (err) {
+    $('ghRepoInfo').textContent = '';
+    $('ghErr').textContent = err.message;
+    $('ghErr').style.display = '';
+  }
+});
+
+$('ghGo').addEventListener('click', async () => {
+  $('ghErr').style.display = 'none';
+  const btn = $('ghGo');
+  btn.disabled = true;
+  btn.textContent = 'Pulling...';
+  try {
+    const r = await api('/api/github/fetch', {
+      siteId: ghSiteId,
+      repo: $('ghRepo').value,
+      ref: $('ghRef').value,
+      token: $('ghToken').value,
+      saveToken: $('ghSaveToken').checked,
+      deploy: $('ghDeploy').checked,
+    });
+    $('dlgGithub').close();
+    if (r.warning) toast(r.warning, 'bad');
+    else toast('Pulled ' + (r.release.version || r.release.filename), 'ok');
+    await refresh();
+    if (r.job) openConsole(r.job.id, true);
+  } catch (err) {
+    $('ghErr').textContent = err.message;
+    $('ghErr').style.display = '';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Pull';
+});
+
+async function ghQuick(id) {
+  const s = site(id);
+  if (!s || !s.github.repo) return openGithub(id);
+  confirmThen('Pull ' + s.github.repo + ' @ ' + (s.github.ref || 'default') + '?',
+    'It downloads the archive and deploys it to ' + s.name + '.',
+    async () => {
+      try {
+        toast('Pulling from GitHub...');
+        const r = await api('/api/github/fetch', {
+          siteId: id, repo: s.github.repo, ref: s.github.ref, deploy: true,
+        });
+        if (r.warning) toast(r.warning, 'bad');
+        await refresh();
+        if (r.job) openConsole(r.job.id, true);
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+}
+
+// ---- deploy confirm
+let depRelId = null;
+
+function openDeploy(siteId, releaseId) {
+  const s = site(siteId);
+  const r = s && s.releases.find((x) => x.id === releaseId);
+  if (!s || !r) return;
+  depRelId = releaseId;
+  const cur = (s.deployed && s.deployed.version) || '?';
+
+  $('depSub').textContent = s.name + ' · ' + cur + ' → ' + (r.version || 'unversioned');
+
+  let h = '<dl class="kv" style="margin-bottom:14px">';
+  h += '<dt>Archive</dt><dd>' + esc(r.filename) + '</dd>';
+  h += '<dt>Size</dt><dd>' + esc(r.sizeHuman) + ' · ' + r.fileCount + ' files</dd>';
+  if (r.source.type === 'github') {
+    h += '<dt>From</dt><dd>' + esc(r.source.repo) + ' @ ' + esc(r.source.ref) +
+         (r.source.shortSha ? ' (' + esc(r.source.shortSha) + ')' : '') + '</dd>';
+    if (r.source.message) h += '<dt>Commit</dt><dd>' + esc(r.source.message) + '</dd>';
+  }
+  h += '</dl>';
+
+  for (const w of r.warnings || []) h += '<div class="banner warn"><span class="txt">' + esc(w) + '</span></div>';
+
+  if (r.migrationScripts && r.migrationScripts.length) {
+    h += '<fieldset><legend>Migrations in this archive</legend>';
+    for (const m of r.migrationScripts) {
+      h += '<label class="chk"><input type="checkbox" data-mig value="' + esc(m) + '" />' +
+           '<span class="mono">' + esc(m) + '</span></label>';
+    }
+    h += '<div class="hint" style="margin-bottom:12px">Ticked scripts run after the files are in place and before the health check. A rollback does not undo them.</div></fieldset>';
+  }
+
+  h += '<label class="chk"><input type="checkbox" id="depSkipBuild" />' +
+       '<span>Skip the build step<span class="d">Only when the archive already contains a built app.</span></span></label>';
+
+  $('depBody').innerHTML = h;
+  $('dlgDeploy').showModal();
+}
+
+$('depGo').addEventListener('click', async () => {
+  const migs = [...document.querySelectorAll('#depBody [data-mig]:checked')].map((c) => c.value);
+  try {
+    const r = await api('/api/deploy', {
+      releaseId: depRelId,
+      runMigrations: migs.length > 0,
+      migrationScripts: migs,
+      skipBuild: $('depSkipBuild') && $('depSkipBuild').checked,
+    });
+    $('dlgDeploy').close();
+    openConsole(r.job.id, true);
+    refresh();
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
+});
+
+// ---- hub settings
+$('btnSettings').addEventListener('click', async () => {
+  try {
+    SETTINGS = await api('/api/settings', null, 'GET');
+  } catch (err) { return toast(err.message, 'bad'); }
+  $('hubErr').style.display = 'none';
+  $('hubSub').textContent = 'Version ' + SETTINGS.version + (SETTINGS.managedByPm2 ? ' · running under pm2' : '');
+  $('hubGh').value = '';
+  $('hubGhState').textContent = SETTINGS.hasGithubToken
+    ? 'A token is stored' + (SETTINGS.githubUser ? ' for ' + SETTINGS.githubUser : '') + '. Type a new one to replace it, or clear the box and save to remove it.'
+    : 'No token stored — public repositories only.';
+  $('hubKeep').value = SETTINGS.keepReleases;
+  $('hubPort').value = SETTINGS.configuredPort;
+  $('hubPort').disabled = SETTINGS.portLocked;
+  $('hubPortHint').textContent = SETTINGS.portLocked
+    ? 'Set by ' + SETTINGS.portSource + ' in this environment — change it in the panel that starts this container.'
+    : 'Changing this restarts the panel, and the address you use to reach it changes with it.';
+  $('hubPwOld').value = '';
+  $('hubPwNew').value = '';
+  $('hubFacts').innerHTML =
+    '<dt>Listening on</dt><dd>' + esc(SETTINGS.host) + ':' + esc(SETTINGS.port) + '</dd>' +
+    '<dt>Reachable at</dt><dd>' + SETTINGS.urls.map(esc).join('<br>') + '</dd>' +
+    '<dt>Host</dt><dd>' + esc(SETTINGS.hostname) + ' · ' + esc(SETTINGS.platform) + '</dd>' +
+    '<dt>Node</dt><dd>' + esc(SETTINGS.node) + '</dd>' +
+    '<dt>Data</dt><dd>' + esc(SETTINGS.dataDir) + '</dd>';
+  $('dlgHub').showModal();
+});
+
+$('hubSave').addEventListener('click', async () => {
+  const body = { keepReleases: +$('hubKeep').value };
+  if ($('hubGh').value !== '') body.githubToken = $('hubGh').value;
+  if (!$('hubPort').disabled) body.port = +$('hubPort').value;
+  if ($('hubPwNew').value) { body.newPassword = $('hubPwNew').value; body.currentPassword = $('hubPwOld').value; }
+  try {
+    const r = await api('/api/settings', body);
+    $('dlgHub').close();
+    if (r.restartNeeded) {
+      toast('Restarting on port ' + r.port + '...', 'ok');
+      setTimeout(() => { location.href = location.protocol + '//' + location.hostname + ':' + r.port + '/'; }, 2500);
+    } else {
+      toast('Saved', 'ok');
+    }
+  } catch (err) {
+    $('hubErr').textContent = err.message;
+    $('hubErr').style.display = '';
+  }
+});
+
+$('hubRestart').addEventListener('click', () => {
+  confirmThen('Restart the Command Center?', 'Running jobs are marked as interrupted. pm2 brings it straight back.',
+    async () => {
+      try {
+        await api('/api/restart-hub', {});
+        $('dlgHub').close();
+        toast('Restarting...', 'ok');
+        setTimeout(() => location.reload(), 3000);
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+});
+
+$('btnLogout').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  location.reload();
+});
+
+// ------------------------------------------------------------------ console
+
+const con = $('console'), conOut = $('conOut');
+
+function openConsole(jobId, follow) {
+  openJob = jobId;
+  con.classList.add('open');
+  let j = null;
+  for (const s of STATE.sites) {
+    const found = s.jobs.find((x) => x.id === jobId);
+    if (found) { j = found; $('conTitle').textContent = s.name + ' · ' + found.type; break; }
+  }
+  $('conSub').textContent = j ? (j.step || j.status) : '';
+  conOut.textContent = logCache.get(jobId) || 'loading...';
+  fetch('/api/log/' + encodeURIComponent(jobId))
+    .then((r) => r.text())
+    .then((t) => {
+      if (openJob !== jobId) return;
+      logCache.set(jobId, t);
+      paintLog(t);
+    })
+    .catch(() => {});
+}
+
+function paintLog(text) {
+  const html = esc(text)
+    .replace(/^(--? .*)$/gm, '<span class="l-step">$1</span>')
+    .replace(/^(\$ .*)$/gm, '<span class="l-cmd">$1</span>')
+    .replace(/^(!!.*)$/gm, '<span class="l-err">$1</span>')
+    .replace(/^(.*(?:Healthy after|finished in|Back up|Connected).*)$/gm, '<span class="l-ok">$1</span>');
+  const atBottom = conOut.scrollHeight - conOut.scrollTop - conOut.clientHeight < 60;
+  conOut.innerHTML = html;
+  if (atBottom) conOut.scrollTop = conOut.scrollHeight;
+}
+
+$('conClose').addEventListener('click', () => { con.classList.remove('open'); openJob = null; });
+$('conCopy').addEventListener('click', () => {
+  navigator.clipboard.writeText(conOut.textContent).then(() => toast('Copied', 'ok'), () => {});
+});
+
+// ------------------------------------------------------------------ live
+
+async function refresh() {
+  try {
+    STATE = await api('/api/state', null, 'GET');
+    render();
+  } catch (err) { /* the SSE stream will catch up */ }
+}
+
+let es = null;
+function connect() {
+  if (es) es.close();
+  es = new EventSource('/api/events');
+
+  es.addEventListener('open', () => {
+    $('liveDot').className = 'dot on';
+    $('liveText').textContent = 'live';
+  });
+
+  es.addEventListener('state', (e) => {
+    STATE = JSON.parse(e.data);
+    render();
+    if (openJob) {
+      for (const s of STATE.sites) {
+        const j = s.jobs.find((x) => x.id === openJob);
+        if (j) { $('conSub').textContent = j.step || j.status; break; }
+      }
+    }
+  });
+
+  es.addEventListener('log', (e) => {
+    const d = JSON.parse(e.data);
+    const prev = logCache.get(d.jobId) || '';
+    const next = prev + d.lines.join('\n') + '\n';
+    logCache.set(d.jobId, next);
+    if (openJob === d.jobId) paintLog(next);
+  });
+
+  es.addEventListener('app-output', (e) => {
+    const d = JSON.parse(e.data);
+    if (!openJob) return;
+    // The supervised app's own stdout, shown while you are watching a job.
+    const prev = logCache.get(openJob) || '';
+    const next = prev + d.text;
+    logCache.set(openJob, next);
+    paintLog(next);
+  });
+
+  es.addEventListener('job-finished', (e) => {
+    const d = JSON.parse(e.data);
+    const s = site(d.siteId);
+    const name = s ? s.name : d.siteId;
+    if (d.ok) toast(name + ': done', 'ok');
+    else toast(name + ': ' + (d.error || 'failed'), 'bad');
+    if (openJob === d.jobId) {
+      fetch('/api/log/' + encodeURIComponent(d.jobId)).then((r) => r.text()).then((t) => {
+        logCache.set(d.jobId, t);
+        if (openJob === d.jobId) paintLog(t);
+      });
+    }
+  });
+
+  es.addEventListener('error', () => {
+    $('liveDot').className = 'dot bad';
+    $('liveText').textContent = 'reconnecting';
+    es.close();
+    setTimeout(connect, 3000);
+  });
+}
+
+refresh().then(connect);
+setInterval(() => { if (!es || es.readyState === 2) refresh(); }, 15000);
+</script>
+</body>
+</html>

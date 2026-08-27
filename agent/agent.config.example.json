@@ -1,0 +1,18 @@
+{
+  "_comment": "Only needed for a site on a DIFFERENT machine from the Command Center. You normally never write this by hand — adding a site with the 'another machine' runner gives you a one-line installer that creates it. Everything else about the site is configured in the browser.",
+
+  "hubUrl": "http://YOUR-COMMAND-CENTER:4000",
+  "siteId": "PASTE_THE_SITE_ID",
+  "agentToken": "PASTE_THE_TOKEN",
+
+  "_optional": "Everything below is optional.",
+
+  "workDir": ".forthway",
+  "_workDir": "Scratch directory kept inside the app directory: staging builds, the rollback snapshot, the file manifest. Never touched by a deploy.",
+
+  "appDir": "",
+  "_appDir": "Leave blank to use whatever the Command Center says. Set it to pin this machine to one directory that cannot be changed remotely.",
+
+  "autoStart": true,
+  "_autoStart": "Only used when the restart mode is 'supervised': start the app as soon as the agent has its settings."
+}
