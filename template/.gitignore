@@ -1,0 +1,22 @@
+node_modules/
+.next/
+out/
+build/
+
+# Written into the app directory by every Command Center deploy — never committed.
+build-info.json
+.forthway/
+
+.env
+.env.local
+.env*.local
+
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+.DS_Store
+*.pem
+.vercel
+next-env.d.ts
+tsconfig.tsbuildinfo

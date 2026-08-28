@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* Design tokens. Change these and the whole site follows — it is the quickest
+   way to stop a throwaway test site from looking like a throwaway test site.
+   Every token here is usable as a Tailwind class: --color-ink gives you
+   text-ink, bg-ink, border-ink, and so on. */
+@theme {
+  --color-ink: #17150f;
+  --color-ink-soft: #5c554a;
+  --color-ink-faint: #8d857a;
+  --color-surface: #ffffff;
+  --color-canvas: #faf7f2;
+  --color-line: #e8e2d8;
+  --color-accent: #b8892b;
+  --color-accent-strong: #8f6a1c;
+
+  --font-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
+}

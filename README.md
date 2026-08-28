@@ -188,11 +188,24 @@ forever. The live release and the one before it are never pruned.
 
 ---
 
+## Starting a new site
+
+`template/` is a Next.js + TypeScript starter, ready to deploy from here. Push
+it to its own GitHub repository once; after that a new test site is: fork the
+repo, add a site in the panel, point it at the fork, **Pull & deploy**.
+
+It already has the `/api/health` and `/api/version` routes, so the version
+confirmation and automatic rollback work from the very first deploy — and a
+`CLAUDE.md` explaining the project to Claude. See `template/README.md`.
+
+---
+
 ## Layout
 
 ```
 Forthway Command Center/
   install.sh          one-command installer
+  template/           Next.js starter for new sites — push it as its own repo
   hub/                the panel — runs on ONE machine
     server.mjs
     lib/              sites, storage, auth, GitHub, the local runner
