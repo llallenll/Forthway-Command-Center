@@ -54,6 +54,7 @@ import {
   RUNNERS,
 } from "./lib/sites.mjs";
 import { normalizeRepo, repoInfo, listRefs, resolveCommit, downloadZipball, checkToken } from "./lib/github.mjs";
+import { Tunnel } from "./lib/tunnel.mjs";
 import { inspectZip } from "../shared/zip.mjs";
 import { ensureDir, readJson, writeJson, exists, humanBytes } from "../shared/fsx.mjs";
 
@@ -94,6 +95,10 @@ function defaultConfig() {
     keepReleases: 8,
     tls: null, // { key: "/path/key.pem", cert: "/path/cert.pem" }
     github: { token: "", username: "" }, // optional hub-wide credential
+    // Cloudflare Tunnel. One connector token for the whole machine; which
+    // hostname points at which local port is decided in the Cloudflare
+    // dashboard, which is what a connector token is for.
+    tunnel: { token: "", autoStart: true },
     sites: [], // a fresh install has none
   };
 }
@@ -160,6 +165,13 @@ function saveConfig() {
   }
 }
 
+/** Enough of a token to recognise which one is stored, never enough to use. */
+function tokenHint(token) {
+  if (!token) return "";
+  const t = String(token);
+  return t.length <= 12 ? "..." : `${t.slice(0, 6)}…${t.slice(-4)} (${t.length} chars)`;
+}
+
 function setupComplete() {
   return !!(config.passwordHash && config.passwordSalt);
 }
@@ -204,6 +216,22 @@ const local = new LocalRunner({
 local.sync();
 local.startPolling();
 
+// ------------------------------------------------------------ the tunnel
+
+const tunnel = new Tunnel({
+  dataDir: config.dataDir,
+  onChange: () => pushState(),
+  onLog: (line) => broadcast("tunnel-log", { line }),
+});
+
+tunnel.readVersion();
+
+if (config.tunnel?.token && config.tunnel?.autoStart !== false) {
+  tunnel.start(config.tunnel.token).catch((err) => {
+    console.error(`[fcc] tunnel did not start: ${err.message}`);
+  });
+}
+
 /** Agents parked on a long poll, keyed by site id. */
 const pollWaiters = new Map();
 
@@ -228,6 +256,7 @@ function buildDashboardState() {
     serverTime: new Date().toISOString(),
     hasGithubToken: !!config.github?.token,
     githubUser: config.github?.username || "",
+    tunnel: { ...tunnel.status(), hasToken: !!config.tunnel?.token, autoStart: config.tunnel?.autoStart !== false },
     sites: config.sites.map((sc) => {
       const s = store.site(sc.id);
       const isLocal = sc.runner === "local";
@@ -688,6 +717,12 @@ async function handleApi(req, res, url) {
       keepReleases: config.keepReleases,
       hasGithubToken: !!config.github?.token,
       githubUser: config.github?.username || "",
+      tunnel: {
+        ...tunnel.status(),
+        hasToken: !!config.tunnel?.token,
+        tokenHint: tokenHint(config.tunnel?.token),
+        autoStart: config.tunnel?.autoStart !== false,
+      },
       tls: !!config.tls,
       dataDir: config.dataDir,
       urls: localUrls(),
@@ -716,6 +751,18 @@ async function handleApi(req, res, url) {
     }
     if (Number.isFinite(+body.keepReleases)) config.keepReleases = Math.max(1, Math.min(50, +body.keepReleases));
 
+    // ---- Cloudflare Tunnel ------------------------------------------------
+    let tunnelAction = null;
+    if (typeof body.tunnelToken === "string") {
+      const token = body.tunnelToken.trim();
+      config.tunnel = { ...(config.tunnel || {}), token };
+      // A changed token means the running connector is using the old one.
+      tunnelAction = token ? "restart" : "stop";
+    }
+    if (typeof body.tunnelAutoStart === "boolean") {
+      config.tunnel = { ...(config.tunnel || {}), autoStart: body.tunnelAutoStart };
+    }
+
     if (Number.isFinite(+body.port) && +body.port !== config.port) {
       if (PORT_ENV) {
         return sendJson(res, 400, {
@@ -739,6 +786,17 @@ async function handleApi(req, res, url) {
     }
 
     saveConfig();
+
+    if (tunnelAction) {
+      await tunnel.stop().catch(() => {});
+      if (tunnelAction === "restart" && config.tunnel.autoStart !== false) {
+        tunnel.start(config.tunnel.token).catch((err) => {
+          tunnel.line(`Could not start: ${err.message}`);
+          pushState();
+        });
+      }
+    }
+
     pushState();
     sendJson(res, 200, {
       ok: true,
@@ -746,6 +804,7 @@ async function handleApi(req, res, url) {
       port: config.port,
       hasGithubToken: !!config.github?.token,
       githubUser: config.github?.username || "",
+      tunnel: tunnel.status(),
     });
 
     if (restartNeeded) {
@@ -758,6 +817,43 @@ async function handleApi(req, res, url) {
       }, 400);
     }
     return;
+  }
+
+  // ---- Cloudflare Tunnel controls --------------------------------------
+  if (url.pathname === "/api/tunnel" && req.method === "GET") {
+    return sendJson(res, 200, {
+      ...tunnel.status(),
+      hasToken: !!config.tunnel?.token,
+      tokenHint: tokenHint(config.tunnel?.token),
+      autoStart: config.tunnel?.autoStart !== false,
+      log: tunnel.recentLog(120),
+    });
+  }
+
+  if (url.pathname === "/api/tunnel/start" && req.method === "POST") {
+    if (!config.tunnel?.token) return sendJson(res, 400, { error: "Add a tunnel token first." });
+    try {
+      await tunnel.start(config.tunnel.token);
+      pushState();
+      return sendJson(res, 200, { ok: true, ...tunnel.status() });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  if (url.pathname === "/api/tunnel/stop" && req.method === "POST") {
+    await tunnel.stop();
+    pushState();
+    return sendJson(res, 200, { ok: true, ...tunnel.status() });
+  }
+
+  if (url.pathname === "/api/tunnel/install" && req.method === "POST") {
+    try {
+      await tunnel.download();
+      return sendJson(res, 200, { ok: true, ...tunnel.status() });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
   }
 
   if (url.pathname === "/api/restart-hub" && req.method === "POST") {
@@ -1240,8 +1336,10 @@ setInterval(() => {
 }, 10_000).unref();
 
 for (const sig of ["SIGTERM", "SIGINT"]) {
-  process.on(sig, () => {
+  process.on(sig, async () => {
     store.save({ immediate: true });
+    // Leave no orphaned connector behind when the panel restarts.
+    await tunnel.stop().catch(() => {});
     process.exit(0);
   });
 }

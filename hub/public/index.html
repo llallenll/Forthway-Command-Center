@@ -217,6 +217,8 @@
     <div class="mark">FCC</div>
     <h1>Forthway Command Center</h1>
     <span class="conn"><span class="dot off" id="liveDot"></span><span id="liveText">connecting...</span></span>
+    <span class="conn" id="tunPill" style="display:none" title="Cloudflare Tunnel">
+      <span class="dot off" id="tunDot"></span><span id="tunText">tunnel</span></span>
     <div class="spacer"></div>
     <button class="btn accent" id="btnAdd">+ Add site</button>
     <button class="btn ghost" id="btnSettings">Settings</button>
@@ -500,6 +502,28 @@
         <input type="password" id="hubGh" autocomplete="off" placeholder="ghp_..." />
         <div class="hint" id="hubGhState"></div></div>
     </fieldset>
+    <fieldset>
+      <legend>Cloudflare Tunnel</legend>
+      <div class="banner info" id="tunState" style="margin-bottom:12px"><span class="txt">…</span></div>
+      <div class="field">
+        <label for="tunToken">Connector token</label>
+        <input type="password" id="tunToken" autocomplete="off" placeholder="eyJhIjoi…" />
+        <div class="hint" id="tunTokenState"></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="tunAutoStart" />
+        <span>Start the tunnel with the panel<span class="d">Otherwise it only runs when you start it here.</span></span></label>
+      <div class="row" style="margin:12px 0 14px">
+        <button class="btn sm" id="tunStart">Start</button>
+        <button class="btn sm" id="tunStop">Stop</button>
+        <button class="btn sm ghost" id="tunLog">Show log</button>
+      </div>
+      <div class="hint" style="margin-bottom:14px">
+        Which hostname points at which local port is set in the Cloudflare dashboard — that is what a
+        connector token is for. Paste the token here and this machine dials out to Cloudflare; nothing
+        needs to be port-forwarded to it.
+      </div>
+    </fieldset>
+
     <fieldset>
       <legend>This panel</legend>
       <div class="two">
@@ -1326,6 +1350,8 @@ $('btnSettings').addEventListener('click', async () => {
     : 'Changing this restarts the panel, and the address you use to reach it changes with it.';
   $('hubPwOld').value = '';
   $('hubPwNew').value = '';
+  paintTunnelSettings(SETTINGS.tunnel);
+  $('tunToken').value = '';
   $('hubFacts').innerHTML =
     '<dt>Listening on</dt><dd>' + esc(SETTINGS.host) + ':' + esc(SETTINGS.port) + '</dd>' +
     '<dt>Reachable at</dt><dd>' + SETTINGS.urls.map(esc).join('<br>') + '</dd>' +
@@ -1338,6 +1364,8 @@ $('btnSettings').addEventListener('click', async () => {
 $('hubSave').addEventListener('click', async () => {
   const body = { keepReleases: +$('hubKeep').value };
   if ($('hubGh').value !== '') body.githubToken = $('hubGh').value;
+  if ($('tunToken').value !== '') body.tunnelToken = $('tunToken').value;
+  body.tunnelAutoStart = $('tunAutoStart').checked;
   if (!$('hubPort').disabled) body.port = +$('hubPort').value;
   if ($('hubPwNew').value) { body.newPassword = $('hubPwNew').value; body.currentPassword = $('hubPwOld').value; }
   try {
@@ -1418,8 +1446,95 @@ async function refresh() {
   try {
     STATE = await api('/api/state', null, 'GET');
     render();
+    paintTunnelPill();
   } catch (err) { /* the SSE stream will catch up */ }
 }
+
+// ------------------------------------------------------------------ tunnel
+
+function paintTunnelPill() {
+  const t = STATE.tunnel;
+  const pill = $('tunPill');
+  if (!t || !t.hasToken) { pill.style.display = 'none'; return; }
+  pill.style.display = '';
+  const dot = $('tunDot');
+  if (t.connected) {
+    dot.className = 'dot on';
+    $('tunText').textContent = 'tunnel · ' + t.connections;
+    pill.title = 'Cloudflare Tunnel: ' + t.connections + ' connection' + (t.connections === 1 ? '' : 's');
+  } else if (t.running) {
+    dot.className = 'dot new';
+    $('tunText').textContent = 'tunnel · connecting';
+    pill.title = 'Cloudflare Tunnel: starting up';
+  } else {
+    dot.className = 'dot ' + (t.lastError ? 'bad' : 'off');
+    $('tunText').textContent = 'tunnel · off';
+    pill.title = t.lastError || 'Cloudflare Tunnel is not running';
+  }
+}
+
+function tunnelSummary(t) {
+  if (!t) return ['info', 'Loading…'];
+  if (t.downloading) return ['info', 'Downloading cloudflared…'];
+  if (t.connected) {
+    return ['ok', `Connected — ${t.connections} connection${t.connections === 1 ? '' : 's'} to Cloudflare` +
+      (t.version ? ' · ' + t.version : '')];
+  }
+  if (t.running) return ['warn', 'cloudflared is running but has not registered a connection yet.'];
+  if (t.lastError) return ['bad', 'Not running. Last error: ' + t.lastError];
+  if (!t.hasToken) return ['info', 'No token yet. Paste a connector token below and save.'];
+  if (!t.supported) return ['warn', 'No official cloudflared build for this machine — install it yourself and it will be used.'];
+  return ['info', 'Not running.'];
+}
+
+function paintTunnelSettings(t) {
+  const [kind, text] = tunnelSummary(t);
+  const el = $('tunState');
+  el.className = 'banner ' + kind;
+  el.innerHTML = '<span class="txt">' + esc(text) + '</span>';
+  $('tunTokenState').textContent = t && t.hasToken
+    ? 'A token is stored (' + t.tokenHint + '). Type a new one to replace it, or clear the box and save to remove it.'
+    : 'From Cloudflare: Zero Trust → Networks → Tunnels → your tunnel → Install connector. Copy the long token out of the command.';
+  $('tunAutoStart').checked = !t || t.autoStart !== false;
+  $('tunStart').disabled = !t || !t.hasToken || t.running;
+  $('tunStop').disabled = !t || !t.running;
+}
+
+async function refreshTunnel() {
+  try {
+    const t = await api('/api/tunnel', null, 'GET');
+    paintTunnelSettings(t);
+    return t;
+  } catch (err) { toast(err.message, 'bad'); }
+}
+
+$('tunStart').addEventListener('click', async () => {
+  try {
+    await api('/api/tunnel/start', {});
+    toast('Tunnel starting', 'ok');
+    setTimeout(refreshTunnel, 1200);
+  } catch (err) { toast(err.message, 'bad'); }
+});
+
+$('tunStop').addEventListener('click', async () => {
+  try {
+    await api('/api/tunnel/stop', {});
+    toast('Tunnel stopped', 'ok');
+    refreshTunnel();
+  } catch (err) { toast(err.message, 'bad'); }
+});
+
+$('tunLog').addEventListener('click', async () => {
+  const t = await refreshTunnel();
+  if (!t) return;
+  openJob = 'tunnel';
+  con.classList.add('open');
+  $('conTitle').textContent = 'Cloudflare Tunnel';
+  $('conSub').textContent = tunnelSummary(t)[1];
+  const text = (t.log || []).join('\n') || '(nothing logged yet)';
+  logCache.set('tunnel', text);
+  paintLog(text);
+});
 
 let es = null;
 function connect() {
@@ -1434,6 +1549,7 @@ function connect() {
   es.addEventListener('state', (e) => {
     STATE = JSON.parse(e.data);
     render();
+    paintTunnelPill();
     if (openJob) {
       for (const s of STATE.sites) {
         const j = s.jobs.find((x) => x.id === openJob);
@@ -1448,6 +1564,14 @@ function connect() {
     const next = prev + d.lines.join('\n') + '\n';
     logCache.set(d.jobId, next);
     if (openJob === d.jobId) paintLog(next);
+  });
+
+  es.addEventListener('tunnel-log', (e) => {
+    const d = JSON.parse(e.data);
+    const prev = logCache.get('tunnel') || '';
+    const next = prev + (prev ? '\n' : '') + d.line;
+    logCache.set('tunnel', next);
+    if (openJob === 'tunnel') paintLog(next);
   });
 
   es.addEventListener('app-output', (e) => {

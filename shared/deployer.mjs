@@ -413,6 +413,42 @@ export class Deployer {
     return { ok: false, error: "health check timed out", checkedAt: new Date().toISOString() };
   }
 
+  /**
+   * When the app does not answer, "fetch failed" is useless on its own — the
+   * reason is in the app's own output, which pm2 and systemd capture where the
+   * operator cannot see it. Pull it into the job log so the failure explains
+   * itself instead of just timing out.
+   */
+  async dumpAppLog(log, lines = 60) {
+    if (!log) return;
+    try {
+      log.setStep?.("App log");
+      log.line("The app did not answer. This is its own output:");
+      const mode = this.S.restart.mode;
+      if (mode === "pm2" && this.S.restart.service) {
+        await this.run(`pm2 logs ${this._pm2Name()} --lines ${lines} --nostream`, {
+          log,
+          timeoutMs: 45_000,
+          allowFail: true,
+        });
+      } else if (mode === "systemd" && this.S.restart.service) {
+        const sudo = this.S.restart.useSudo ? "sudo " : "";
+        await this.run(`${sudo}journalctl -u ${JSON.stringify(this.S.restart.service)} -n ${lines} --no-pager`, {
+          log,
+          timeoutMs: 45_000,
+          allowFail: true,
+        });
+      } else if (mode === "child") {
+        const tail = this.childOutput.slice(-lines).join("");
+        log.line(tail.trim() || "(the supervised process produced no output)");
+      } else {
+        log.line("(no log source for this restart mode — check the app's own logging)");
+      }
+    } catch (err) {
+      log.line(`(could not read the app log: ${err.message})`);
+    }
+  }
+
   /** What the files on disk say. */
   readDeployedInfo() {
     if (!this.S.appDir || !exists(this.S.appDir)) return null;
@@ -788,6 +824,8 @@ export class Deployer {
     const versionCheck = health.ok === false ? { confirmed: null } : await this.waitForVersion(newVersion, log);
     const failed = health.ok === false || versionCheck.confirmed === false;
 
+    if (failed) await this.dumpAppLog(log);
+
     if (failed && this.S.autoRollback) {
       log.setStep("Automatic rollback");
       log.line("!! The new build did not come up. Rolling back to the previous one.");
@@ -848,6 +886,7 @@ export class Deployer {
     await this.restartApp(log);
     const health = await this.waitForHealthy(log);
     if (health.ok === false) {
+      await this.dumpAppLog(log);
       throw Object.assign(new Error("The app did not come back up after the restart."), {
         deployed: onDisk,
         serving: await this.readServingInfo(),
@@ -882,6 +921,7 @@ export class Deployer {
     log.setStep("Start");
     await this.startApp(log);
     const health = await this.waitForHealthy(log);
+    if (health.ok === false) await this.dumpAppLog(log);
     return {
       deployed: this.readDeployedInfo(),
       serving: await this.readServingInfo(),

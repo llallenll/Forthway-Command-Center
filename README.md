@@ -188,6 +188,33 @@ forever. The live release and the one before it are never pruned.
 
 ---
 
+## Reaching it from outside: Cloudflare Tunnel
+
+**Settings → Cloudflare Tunnel.** Paste the connector token from your tunnel in
+the Cloudflare dashboard (Zero Trust → Networks → Tunnels → your tunnel →
+Install connector; the token is the long string in the command it shows you),
+save, and this machine dials out to Cloudflare. Nothing needs port-forwarding
+to it, and it does not need a public address of its own.
+
+Which hostname points at which local port is decided in the Cloudflare
+dashboard — that is what a connector token is for — so one token covers the
+panel and every site on the machine.
+
+- **cloudflared installs itself.** If it is not already on PATH the panel
+  downloads the official build into `hub/data/bin/`, which matters in a
+  container with no root. There is also an explicit install button.
+- **The token never reaches the process list.** It is passed as `TUNNEL_TOKEN`
+  in the environment, not as an argument, so it does not show up in `ps`.
+  Stored in `hub/config.json`, and the UI only ever shows you a masked hint.
+- **A bad token stops rather than spins.** cloudflared exits immediately on an
+  invalid token; the panel notices, says so, and does not retry. A connection
+  that drops for any other reason is retried with a growing backoff.
+- The header shows a tunnel indicator with the live connection count, and
+  **Show log** puts cloudflared's own output in the console at the bottom of
+  the page.
+
+---
+
 ## Starting a new site
 
 `template/` is a Next.js + TypeScript starter, ready to deploy from here. Push
@@ -208,11 +235,11 @@ Forthway Command Center/
   template/           Next.js starter for new sites — push it as its own repo
   hub/                the panel — runs on ONE machine
     server.mjs
-    lib/              sites, storage, auth, GitHub, the local runner
+    lib/              sites, storage, auth, GitHub, the local runner, the tunnel
     public/           setup · login · dashboard
     templates/        the agent installer, with tokens filled in per site
     config.json       created on first run; holds sites and the password hash
-    data/             release archives, job logs, state
+    data/             release archives, job logs, state, cloudflared
   agent/              only for sites on OTHER machines
     agent.mjs
   shared/
