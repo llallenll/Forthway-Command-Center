@@ -68,7 +68,7 @@ import { ensureDir, readJson, writeJson, exists, humanBytes } from "../shared/fs
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.1.0";
+const FCC_VERSION = "2.2.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 
