@@ -20,6 +20,7 @@
 
 import crypto from "node:crypto";
 import { defaultSettings, RESTART_MODES } from "../../shared/deployer.mjs";
+import { cleanEnvValue, isEnvKey } from "../../shared/env.mjs";
 
 export const RUNNERS = ["local", "agent"];
 export { RESTART_MODES, defaultSettings };
@@ -66,7 +67,11 @@ export function sanitizeSettings(input = {}, base = defaultSettings()) {
     if (r.env && typeof r.env === "object" && !Array.isArray(r.env)) {
       out.restart.env = {};
       for (const [k, v] of Object.entries(r.env)) {
-        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) out.restart.env[k] = String(v).slice(0, 2000);
+        // cleanEnvValue here as well as in the browser, so a value that came
+        // from the API, an older config file or a hand edit is treated the
+        // same as one typed into the settings pane. A quoted value pasted out
+        // of a .env file is the normal case, not the exception.
+        if (isEnvKey(k)) out.restart.env[k] = cleanEnvValue(v).slice(0, 4000);
       }
     }
   }
@@ -80,7 +85,7 @@ export function sanitizeSettings(input = {}, base = defaultSettings()) {
   if (Array.isArray(s.swapDirs)) out.swapDirs = cleanList(s.swapDirs, 20);
   if (Array.isArray(s.preserve)) out.preserve = cleanList(s.preserve, 60);
 
-  for (const flag of ["smartInstall", "autoRollback", "autoPrepare"]) {
+  for (const flag of ["smartInstall", "autoRollback", "autoPrepare", "writeEnvFile"]) {
     if (typeof s[flag] === "boolean") out[flag] = s[flag];
   }
   return out;

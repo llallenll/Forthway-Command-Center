@@ -24,6 +24,7 @@ import { spawn } from "node:child_process";
 
 import { extractZip, inspectZip } from "./zip.mjs";
 import { ensureDir, rmrf, exists, readJson, writeJson, mirror, copyDir, hardlinkDir, makeMatcher, sha1File, humanBytes } from "./fsx.mjs";
+import { mergeEnvFile, shadowedKeys, lintEnv } from "./env.mjs";
 
 export const ENGINE_VERSION = "2.0.0";
 export const RESTART_MODES = ["pm2", "systemd", "command", "child"];
@@ -61,6 +62,10 @@ export function defaultSettings() {
     smartInstall: true,
     autoRollback: true,
     autoPrepare: true,
+    // Passing variables through the process environment reaches the running
+    // app but not the tools that read a .env file for themselves — prisma
+    // generate, prisma migrate, next build. So they are written there too.
+    writeEnvFile: true,
   };
 }
 
@@ -184,6 +189,49 @@ export class Deployer {
     const env = { ...(this.S.restart.env || {}) };
     if (this.S.port) env.PORT = String(this.S.port);
     return env;
+  }
+
+  /**
+   * Write this site's variables into the app's .env, inside a marked block.
+   *
+   * The process environment is not enough on its own. `prisma generate` reads
+   * .env for itself, so does `prisma migrate`, and so does `next build` — a
+   * variable that exists only in the environment of the restart command is
+   * invisible to all three. Worse, it fails late and confusingly: the build
+   * succeeds and the app dies on its first query.
+   *
+   * Everything the panel owns lives between two markers, so a hand-written
+   * .env keeps its own lines and only the managed block is rewritten. PORT is
+   * deliberately not included: it already reaches the app through the process
+   * environment, and a second copy in a file is one more place for the two to
+   * disagree.
+   */
+  writeEnvFile(dir, log = this.log) {
+    if (this.S.writeEnvFile === false) return null;
+    const env = { ...(this.S.restart.env || {}) };
+    if (!Object.keys(env).length) return null;
+    if (!dir || !exists(dir)) return null;
+
+    const file = path.join(dir, ".env");
+    const current = exists(file) ? fs.readFileSync(file, "utf8") : "";
+
+    // Say the awkward things out loud rather than letting them be discovered
+    // at 1am in a stack trace.
+    for (const note of lintEnv(env)) log?.line(`.env: ${note}`);
+    const shadowed = shadowedKeys(current, env);
+    if (shadowed.length) {
+      log?.line(
+        `.env: ${shadowed.join(", ")} ${shadowed.length === 1 ? "is" : "are"} also set outside the managed ` +
+          `block in this file. The panel's value wins, because the block is written last.`,
+      );
+    }
+
+    const next = mergeEnvFile(current, env);
+    if (next === null) return file; // already correct — leave the mtime alone
+    fs.writeFileSync(file, next, { mode: 0o600 });
+    const n = Object.keys(env).length;
+    log?.line(`Wrote ${n} variable${n === 1 ? "" : "s"} into ${file}.`);
+    return file;
   }
 
   // ------------------------------------------------------ process control
@@ -591,6 +639,10 @@ export class Deployer {
   }
 
   async _buildStaging(p, job, log, zipInfo) {
+    // Before anything reads it: prisma generate and next build both look for
+    // a .env in the directory they are run from, which is staging.
+    this.writeEnvFile(p.staging, log);
+
     const hashIf = (f) => (exists(f) ? sha1File(f) : null);
     const liveLock = hashIf(path.join(p.appDir, "package-lock.json"));
     const newLock = hashIf(path.join(p.staging, "package-lock.json"));
@@ -811,6 +863,10 @@ export class Deployer {
     this._snapshotPrevious(p, log);
     const swap = this._swapIntoPlace(p, log);
 
+    // The swap protects .env from being overwritten by the archive, which is
+    // right — but it also means the staging copy never lands. Write it here.
+    this.writeEnvFile(p.appDir, log);
+
     let migrationsRan = [];
     if (job.runMigrations && job.migrationScripts?.length) {
       log.setStep("Migrations");
@@ -883,6 +939,7 @@ export class Deployer {
     this._require(log);
     log.setStep("Restart");
     const onDisk = this.readDeployedInfo();
+    this.writeEnvFile(this.S.appDir, log);
     await this.restartApp(log);
     const health = await this.waitForHealthy(log);
     if (health.ok === false) {
@@ -919,6 +976,7 @@ export class Deployer {
   async doStart(job, log) {
     this._require(log);
     log.setStep("Start");
+    this.writeEnvFile(this.S.appDir, log);
     await this.startApp(log);
     const health = await this.waitForHealthy(log);
     if (health.ok === false) await this.dumpAppLog(log);
@@ -946,6 +1004,7 @@ export class Deployer {
   async doMigrate(job, log) {
     const p = this._require(log);
     log.setStep("Migration");
+    this.writeEnvFile(p.appDir, log);
     const ran = await this._runMigrations(p, [job.script], log);
     return { summary: { migrationsRan: ran }, migrations: this.listMigrationScripts() };
   }

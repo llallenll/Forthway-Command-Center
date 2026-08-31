@@ -376,7 +376,15 @@
             service manager. Its output streams into the console below.</div></div>
       </div>
       <div class="field"><label>Extra environment</label><textarea class="mono" id="setEnv" placeholder="NODE_ENV=production&#10;DATABASE_URL=..."></textarea>
-        <div class="hint">One <span class="mono">KEY=value</span> per line, passed to the app and to every command run for it.</div></div>
+        <div class="hint">One <span class="mono">KEY=value</span> per line, passed to the app and to every command
+          run for it. Quotes around a value are treated as quoting and removed, the same as in a
+          <span class="mono">.env</span> file — so pasting a line straight out of one works.</div></div>
+      <label class="chk" style="margin-bottom:14px"><input type="checkbox" id="setEnvFile" />
+        <span>Also write these into the app's <span class="mono">.env</span>
+          <span class="d">The process environment reaches the running app, but not tools that read
+            <span class="mono">.env</span> for themselves — <span class="mono">prisma generate</span>,
+            <span class="mono">prisma migrate</span>, <span class="mono">next build</span>. They go in a marked
+            block; anything else in the file is left alone.</span></span></label>
     </fieldset>
 
     <fieldset>
@@ -497,6 +505,30 @@
   <div class="dh"><h3>Command Center settings</h3><div class="sub" id="hubSub"></div></div>
   <div class="db">
     <fieldset>
+      <legend>Updates</legend>
+      <div class="banner info" id="updState" style="margin-bottom:12px"><span class="txt">Checking…</span></div>
+      <div class="row" style="margin:0 0 12px">
+        <button class="btn sm" id="updCheck">Check now</button>
+        <button class="btn sm accent" id="updApply" style="display:none">Update &amp; restart</button>
+        <button class="btn sm ghost" id="updNotes" style="display:none">What changed</button>
+      </div>
+      <pre class="mono" id="updNotesBody" style="display:none"></pre>
+      <details style="margin-bottom:12px">
+        <summary class="hint" style="cursor:pointer">Where updates come from</summary>
+        <div class="two" style="margin-top:10px">
+          <div class="field"><label>Repository</label><input type="text" class="mono" id="updRepo" placeholder="llallenll/Forthway-Command-Center" /></div>
+          <div class="field"><label>Branch or tag</label><input type="text" class="mono" id="updRef" placeholder="newest release" /></div>
+        </div>
+        <label class="chk"><input type="checkbox" id="updAuto" />
+          <span>Check for updates automatically<span class="d">Once a few hours. Nothing is installed without you pressing the button.</span></span></label>
+        <div class="hint" style="margin-top:10px">
+          Your settings, releases and data are never touched by an update, and the install is backed up
+          first — so a bad version is one button to undo.
+        </div>
+        <div id="updBackups" class="hint" style="margin-top:10px"></div>
+      </details>
+    </fieldset>
+    <fieldset>
       <legend>GitHub</legend>
       <div class="field"><label>Personal access token</label>
         <input type="password" id="hubGh" autocomplete="off" placeholder="ghp_..." />
@@ -563,6 +595,16 @@
   </div>
 </dialog>
 
+<!--
+  The environment-variable parser is the same file the server uses, served as a
+  module. Two implementations of "what does DATABASE_URL=... mean" is exactly
+  how the quoting bug got in.
+-->
+<script type="module">
+  import * as envlib from '/lib/env.mjs';
+  window.ENVLIB = envlib;
+  window.dispatchEvent(new Event('envlib'));
+</script>
 <script>
 'use strict';
 
@@ -1058,7 +1100,10 @@ function openSettings(id) {
   $('setStop').value = st.restart.stop || '';
   $('setStart').value = st.restart.start || '';
   $('setChildStart').value = st.restart.start || '';
-  $('setEnv').value = Object.entries(st.restart.env || {}).map(([k, v]) => k + '=' + v).join('\n');
+  $('setEnv').value = window.ENVLIB
+    ? window.ENVLIB.formatEnvText(st.restart.env || {})
+    : Object.entries(st.restart.env || {}).map(([k, v]) => k + '=' + v).join('\n');
+  $('setEnvFile').checked = st.writeEnvFile !== false;
   $('setHealth').value = st.healthUrl || '';
   $('setVersion').value = st.versionUrl || '';
   $('setHealthTimeout').value = Math.round((st.healthTimeoutMs || 180000) / 1000);
@@ -1137,15 +1182,47 @@ $('setRemove').addEventListener('click', () => {
     });
 });
 
+/**
+ * Parse the environment textarea. Uses the shared module when it has loaded;
+ * the fallback is deliberately the same rule for the case that matters —
+ * matching quotes around a value are quoting, not part of the value.
+ */
+function parseEnv(text) {
+  if (window.ENVLIB) return window.ENVLIB.parseEnvText(text);
+  const env = {};
+  const errors = [];
+  const lines = String(text || '').split('\n');
+  for (let n = 0; n < lines.length; n++) {
+    const bare = lines[n].trim();
+    if (!bare || bare.startsWith('#')) continue;
+    const line = bare.replace(/^export\s+/, '');
+    const i = line.indexOf('=');
+    if (i < 1) { errors.push({ line: n + 1, error: 'no = on this line' }); continue; }
+    const key = line.slice(0, i).trim();
+    let v = line.slice(i + 1).trim();
+    if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) { errors.push({ line: n + 1, error: '"' + key + '" is not a usable variable name' }); continue; }
+    env[key] = v;
+  }
+  return { env, errors };
+}
+
+function envNotes(env) {
+  return window.ENVLIB ? window.ENVLIB.lintEnv(env) : [];
+}
+
 $('setInstallBtn').addEventListener('click', () => showInstaller(settingsSiteId));
 
 $('setSave').addEventListener('click', async () => {
   const mode = $('setMode').value;
-  const env = {};
-  for (const line of $('setEnv').value.split('\n')) {
-    const i = line.indexOf('=');
-    if (i <= 0) continue;
-    env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  const parsed = parseEnv($('setEnv').value);
+  const env = parsed.env;
+  if (parsed.errors.length) {
+    const first = parsed.errors[0];
+    $('setErr').textContent = 'Line ' + first.line + ' of the environment box: ' + first.error +
+      (parsed.errors.length > 1 ? ' (and ' + (parsed.errors.length - 1) + ' more)' : '');
+    $('setErr').style.display = '';
+    return;
   }
   const restart = { mode, env, useSudo: $('setSudo').checked, pm2Start: $('setPm2Start').value };
   if (mode === 'pm2') restart.service = $('setService').value;
@@ -1177,6 +1254,7 @@ $('setSave').addEventListener('click', async () => {
       smartInstall: $('setSmart').checked,
       autoRollback: $('setRollback').checked,
       autoPrepare: $('setAutoPrepare').checked,
+      writeEnvFile: $('setEnvFile').checked,
     },
     github: { repo: $('setRepo').value, ref: $('setRef').value, token: $('setGhToken').value },
   };
@@ -1184,6 +1262,9 @@ $('setSave').addEventListener('click', async () => {
     await api('/api/sites/update', payload);
     $('dlgSettings').close();
     toast('Saved', 'ok');
+    // A password with an "@" in a database URL is valid text and invalid URL —
+    // worth saying now rather than after the deploy fails.
+    for (const note of envNotes(env)) toast(note, 'bad');
     refresh();
   } catch (err) {
     $('setErr').textContent = err.message;
@@ -1351,6 +1432,7 @@ $('btnSettings').addEventListener('click', async () => {
   $('hubPwOld').value = '';
   $('hubPwNew').value = '';
   paintTunnelSettings(SETTINGS.tunnel);
+  paintUpdate(SETTINGS.update);
   $('tunToken').value = '';
   $('hubFacts').innerHTML =
     '<dt>Listening on</dt><dd>' + esc(SETTINGS.host) + ':' + esc(SETTINGS.port) + '</dd>' +
@@ -1362,7 +1444,10 @@ $('btnSettings').addEventListener('click', async () => {
 });
 
 $('hubSave').addEventListener('click', async () => {
-  const body = { keepReleases: +$('hubKeep').value };
+  const body = {
+    keepReleases: +$('hubKeep').value,
+    update: { repo: $('updRepo').value, ref: $('updRef').value, autoCheck: $('updAuto').checked },
+  };
   if ($('hubGh').value !== '') body.githubToken = $('hubGh').value;
   if ($('tunToken').value !== '') body.tunnelToken = $('tunToken').value;
   body.tunnelAutoStart = $('tunAutoStart').checked;
@@ -1392,6 +1477,126 @@ $('hubRestart').addEventListener('click', () => {
         toast('Restarting...', 'ok');
         setTimeout(() => location.reload(), 3000);
       } catch (err) { toast(err.message, 'bad'); }
+    });
+});
+
+// ---- updating the Command Center itself
+
+let UPDATE = null;
+
+function paintUpdate(u) {
+  UPDATE = u || {};
+  $('updRepo').value = UPDATE.repo || '';
+  $('updRef').value = UPDATE.ref || '';
+  $('updAuto').checked = UPDATE.autoCheck !== false;
+
+  const banner = $('updState');
+  const txt = banner.querySelector('.txt');
+  const last = UPDATE.last;
+  const inst = UPDATE.installed || {};
+  const here = 'This panel: ' + esc(inst.version || '?') + (inst.shortSha ? ' · ' + esc(inst.shortSha) : '');
+
+  $('updApply').style.display = 'none';
+  $('updNotes').style.display = 'none';
+  $('updNotesBody').style.display = 'none';
+
+  if (UPDATE.running) {
+    banner.className = 'banner info';
+    txt.innerHTML = '<b>Updating…</b><br>' + esc((UPDATE.lines || []).slice(-1)[0] || '');
+  } else if (!last) {
+    banner.className = 'banner info';
+    txt.innerHTML = here + '<br>Not checked yet.';
+  } else if (last.error) {
+    banner.className = 'banner warn';
+    txt.innerHTML = here + '<br>Could not check: ' + esc(last.error);
+  } else if (last.updateAvailable === true) {
+    banner.className = 'banner warn';
+    const l = last.latest || {};
+    txt.innerHTML = '<b>An update is available.</b><br>' + here +
+      '<br>On GitHub: ' + esc(l.version || l.name || l.ref || '?') +
+      (l.shortSha ? ' · ' + esc(l.shortSha) : '') +
+      (l.publishedAt ? ' · ' + esc(ago(l.publishedAt)) : '');
+    $('updApply').style.display = '';
+    if ((l.notes || '').trim()) $('updNotes').style.display = '';
+  } else if (last.updateAvailable === false) {
+    banner.className = 'banner ok';
+    txt.innerHTML = here + '<br>Up to date. Checked ' + esc(ago(last.checkedAt)) + '.';
+  } else {
+    // "Cannot tell" is a real answer, and saying so beats a confident guess.
+    banner.className = 'banner info';
+    txt.innerHTML = here + '<br>' + esc(last.reason || 'Could not compare versions.');
+    $('updApply').style.display = '';
+  }
+
+  const backups = UPDATE.backups || [];
+  $('updBackups').innerHTML = backups.length
+    ? 'Backups kept: ' + backups.map((b) =>
+        '<a href="#" data-restore="' + esc(b.id) + '">' + esc(b.id.replace('T', ' ').slice(0, 16)) + '</a>').join(' · ')
+    : 'No update backups yet — the first update through this panel makes one.';
+}
+
+$('updBackups').addEventListener('click', (e) => {
+  const id = e.target.getAttribute && e.target.getAttribute('data-restore');
+  if (!id) return;
+  e.preventDefault();
+  confirmThen('Restore the panel from ' + id + '?',
+    'The panel files go back to how they were at that moment and it restarts. Your settings, sites and releases are not affected.',
+    async () => {
+      try {
+        await api('/api/update/rollback', { id });
+        $('dlgHub').close();
+        toast('Restoring and restarting…', 'ok');
+        setTimeout(() => location.reload(), 4000);
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+});
+
+$('updCheck').addEventListener('click', async () => {
+  $('updCheck').disabled = true;
+  const txt = $('updState').querySelector('.txt');
+  txt.textContent = 'Asking GitHub…';
+  try {
+    paintUpdate(await api('/api/update/check', {}));
+  } catch (err) {
+    toast(err.message, 'bad');
+    paintUpdate(UPDATE);
+  } finally {
+    $('updCheck').disabled = false;
+  }
+});
+
+$('updNotes').addEventListener('click', () => {
+  const body = $('updNotesBody');
+  const notes = (UPDATE && UPDATE.last && UPDATE.last.latest && UPDATE.last.latest.notes) || '';
+  body.textContent = notes || 'No release notes.';
+  body.style.display = body.style.display === 'none' ? '' : 'none';
+});
+
+$('updApply').addEventListener('click', () => {
+  const l = (UPDATE && UPDATE.last && UPDATE.last.latest) || {};
+  confirmThen('Update the Command Center to ' + (l.version || l.shortSha || l.ref || 'the newest version') + '?',
+    'The current install is backed up first, then the new files are written and the panel restarts. ' +
+    'Your settings, sites, releases and data are left alone. Running jobs are marked interrupted.',
+    async () => {
+      $('updApply').disabled = true;
+      const txt = $('updState').querySelector('.txt');
+      $('updState').className = 'banner info';
+      txt.textContent = 'Downloading and installing…';
+      try {
+        const r = await api('/api/update/apply', {});
+        $('dlgHub').close();
+        toast('Updated: ' + r.added + ' added, ' + r.updated + ' replaced. Restarting…', 'ok');
+        if (r.dependencyChange) {
+          toast('package.json changed in this update — run npm install in the panel folder if it does not come back.', 'bad');
+        }
+        setTimeout(() => location.reload(), 5000);
+      } catch (err) {
+        $('updState').className = 'banner bad';
+        txt.textContent = err.message;
+        toast(err.message, 'bad');
+      } finally {
+        $('updApply').disabled = false;
+      }
     });
 });
 

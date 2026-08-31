@@ -55,12 +55,20 @@ import {
 } from "./lib/sites.mjs";
 import { normalizeRepo, repoInfo, listRefs, resolveCommit, downloadZipball, checkToken } from "./lib/github.mjs";
 import { Tunnel } from "./lib/tunnel.mjs";
+import {
+  DEFAULT_REPO as UPDATE_REPO,
+  checkForUpdate,
+  applyUpdate,
+  installedVersion,
+  listBackups,
+  restoreBackup,
+} from "./lib/updates.mjs";
 import { inspectZip } from "../shared/zip.mjs";
 import { ensureDir, readJson, writeJson, exists, humanBytes } from "../shared/fsx.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.0.0";
+const FCC_VERSION = "2.1.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 
@@ -99,6 +107,10 @@ function defaultConfig() {
     // hostname points at which local port is decided in the Cloudflare
     // dashboard, which is what a connector token is for.
     tunnel: { token: "", autoStart: true },
+    // Where this panel gets its own updates from. The repo is settable so a
+    // fork stays updatable from its own origin; ref empty means "newest
+    // release, or the default branch if the repo publishes none".
+    update: { repo: UPDATE_REPO, ref: "", autoCheck: true },
     sites: [], // a fresh install has none
   };
 }
@@ -384,6 +396,63 @@ async function readJsonBody(req) {
   const buf = await readBody(req);
   if (!buf.length) return {};
   return JSON.parse(buf.toString("utf8"));
+}
+
+// ------------------------------------------------- Command Center updates
+
+let lastUpdateCheck = null;
+let updateJob = { running: false, startedAt: null, lines: [], error: null, result: null };
+const UPDATE_CHECK_EVERY_MS = 6 * 60 * 60_000;
+
+/** What the panel knows about its own version, without going to GitHub. */
+function updateStatus() {
+  return {
+    repo: config.update?.repo || UPDATE_REPO,
+    ref: config.update?.ref || "",
+    autoCheck: config.update?.autoCheck !== false,
+    installed: installedVersion(FCC_VERSION),
+    last: lastUpdateCheck,
+    running: updateJob.running,
+    lines: updateJob.lines.slice(-200),
+    error: updateJob.error,
+    backups: listBackups(config.dataDir).slice(0, 5),
+  };
+}
+
+/**
+ * Ask GitHub what the newest version is, at most every six hours unless asked
+ * to look again. Rate limits are per-IP for an anonymous check, and a panel
+ * that polls on every page load would spend them on nothing.
+ */
+async function runUpdateCheck({ force = false } = {}) {
+  if (!force) {
+    if (config.update?.autoCheck === false) return lastUpdateCheck;
+    const age = lastUpdateCheck ? Date.now() - new Date(lastUpdateCheck.checkedAt).getTime() : Infinity;
+    if (age < UPDATE_CHECK_EVERY_MS) return lastUpdateCheck;
+  }
+  try {
+    lastUpdateCheck = await checkForUpdate({
+      repo: config.update?.repo || UPDATE_REPO,
+      ref: config.update?.ref || "",
+      token: config.github?.token || "",
+      currentVersion: FCC_VERSION,
+    });
+    lastUpdateCheck.error = null;
+  } catch (err) {
+    // A failed check must not look like "you are up to date".
+    lastUpdateCheck = {
+      checkedAt: new Date().toISOString(),
+      repo: config.update?.repo || UPDATE_REPO,
+      installed: installedVersion(FCC_VERSION),
+      latest: null,
+      updateAvailable: null,
+      certainty: "unknown",
+      error: err.message,
+    };
+    if (force) throw err;
+  }
+  pushState();
+  return lastUpdateCheck;
 }
 
 function serveStatic(res, relPath, contentType) {
@@ -723,6 +792,7 @@ async function handleApi(req, res, url) {
         tokenHint: tokenHint(config.tunnel?.token),
         autoStart: config.tunnel?.autoStart !== false,
       },
+      update: updateStatus(),
       tls: !!config.tls,
       dataDir: config.dataDir,
       urls: localUrls(),
@@ -750,6 +820,24 @@ async function handleApi(req, res, url) {
       }
     }
     if (Number.isFinite(+body.keepReleases)) config.keepReleases = Math.max(1, Math.min(50, +body.keepReleases));
+
+    // ---- where this panel updates from ------------------------------------
+    if (body.update && typeof body.update === "object") {
+      const u = { ...(config.update || {}) };
+      if (typeof body.update.repo === "string") {
+        const repo = body.update.repo.trim();
+        if (!repo) u.repo = UPDATE_REPO;
+        else {
+          const norm = normalizeRepo(repo);
+          if (!norm) return sendJson(res, 400, { error: `"${repo}" is not a GitHub repository this can read.` });
+          u.repo = norm;
+        }
+      }
+      if (typeof body.update.ref === "string") u.ref = body.update.ref.trim();
+      if (typeof body.update.autoCheck === "boolean") u.autoCheck = body.update.autoCheck;
+      config.update = u;
+      lastUpdateCheck = null; // the answer we cached was about a different source
+    }
 
     // ---- Cloudflare Tunnel ------------------------------------------------
     let tunnelAction = null;
@@ -851,6 +939,83 @@ async function handleApi(req, res, url) {
     try {
       await tunnel.download();
       return sendJson(res, 200, { ok: true, ...tunnel.status() });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  // ---- updating the Command Center itself ------------------------------
+  if (url.pathname === "/api/update" && req.method === "GET") {
+    return sendJson(res, 200, updateStatus());
+  }
+
+  if (url.pathname === "/api/update/check" && req.method === "POST") {
+    try {
+      await runUpdateCheck({ force: true });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message, ...updateStatus() });
+    }
+    return sendJson(res, 200, updateStatus());
+  }
+
+  if (url.pathname === "/api/update/apply" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    if (updateJob.running) return sendJson(res, 409, { error: "An update is already running." });
+    updateJob = { running: true, startedAt: new Date().toISOString(), lines: [], error: null, result: null };
+    const log = (line) => {
+      updateJob.lines.push(line);
+      console.log(`[fcc:update] ${line}`);
+      pushState();
+    };
+    try {
+      const result = await applyUpdate({
+        repo: config.update?.repo || UPDATE_REPO,
+        ref: typeof body.ref === "string" && body.ref.trim() ? body.ref.trim() : config.update?.ref || "",
+        token: config.github?.token || "",
+        dataDir: config.dataDir,
+        currentVersion: FCC_VERSION,
+        dryRun: !!body.dryRun,
+        log,
+      });
+      updateJob.running = false;
+      updateJob.result = result;
+      if (!result.dryRun) {
+        lastUpdateCheck = null; // whatever we knew is now about the old version
+        // A restart has to wait for this response to reach the browser, or the
+        // page reloads into a closed socket and reads as a failed update.
+        if (body.restart !== false) {
+          sendJson(res, 200, { ok: true, ...result, restarting: true });
+          console.log("[fcc] update applied — restarting");
+          setTimeout(() => {
+            store.save({ immediate: true });
+            process.exit(0);
+          }, 900);
+          return;
+        }
+      }
+      return sendJson(res, 200, { ok: true, ...result, restarting: false });
+    } catch (err) {
+      updateJob.running = false;
+      updateJob.error = err.message;
+      log(`Update failed: ${err.message}`);
+      return sendJson(res, 400, { error: err.message, lines: updateJob.lines });
+    }
+  }
+
+  if (url.pathname === "/api/update/backups" && req.method === "GET") {
+    return sendJson(res, 200, { backups: listBackups(config.dataDir) });
+  }
+
+  if (url.pathname === "/api/update/rollback" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    try {
+      const r = restoreBackup(body.id, { dataDir: config.dataDir, log: (l) => console.log(`[fcc:update] ${l}`) });
+      sendJson(res, 200, { ok: true, ...r, restarting: true });
+      setTimeout(() => {
+        store.save({ immediate: true });
+        process.exit(0);
+      }, 900);
+      return;
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
@@ -1275,6 +1440,14 @@ async function handler(req, res) {
       return serveStatic(res, "index.html", "text/html; charset=utf-8");
     }
     if (url.pathname === "/login") return serveStatic(res, "login.html", "text/html; charset=utf-8");
+    // The settings pane parses environment variables with exactly the same
+    // code the server does, rather than a second implementation that drifts.
+    if (url.pathname === "/lib/env.mjs") {
+      return send(res, 200, fs.readFileSync(path.join(ROOT, "shared/env.mjs")), {
+        "Content-Type": "text/javascript; charset=utf-8",
+        "Cache-Control": "no-cache",
+      });
+    }
 
     return send(res, 404, "Not found");
   } catch (err) {
@@ -1315,6 +1488,14 @@ server.on("error", (err) => {
   }
   throw err;
 });
+
+// Check for a newer Command Center shortly after boot, then every few hours.
+// Deliberately after listen: a slow or unreachable GitHub must never delay the
+// panel coming up.
+if (config.update?.autoCheck !== false) {
+  setTimeout(() => runUpdateCheck().catch(() => {}), 8_000).unref();
+  setInterval(() => runUpdateCheck().catch(() => {}), UPDATE_CHECK_EVERY_MS).unref();
+}
 
 // Keep the dashboard honest about which agents are actually there.
 setInterval(() => {
