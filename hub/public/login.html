@@ -8,10 +8,13 @@
 <title>Forthway Command Center</title>
 <style>
   :root{
-    --ink:#1b1815; --ink-2:#5d564e; --ink-3:#8d857a;
-    --line:#e8e2d8; --bg:#faf7f2; --card:#fff;
-    --accent:#b8892b; --accent-dk:#8f6a1c; --accent-bg:#fdf6e6;
-    --bad-bg:#fdeceb;
+    /* Forthway Systems palette — forthway.ca */
+    --ground:#0E1116; --surface:#161B22; --surface-hi:#1D242E; --surface-lo:#12171E;
+    --line-bright:#38424F; --paper:#EDEFF2; --fog:#8792A2; --fog-dim:#5B6674;
+    --ink:var(--paper); --ink-2:#A3ADBB; --ink-3:var(--fog);
+    --line:#262E38; --bg:var(--ground); --card:var(--surface);
+    --accent:#FF9E2C; --accent-dk:#B36D1C; --accent-bg:rgba(255,158,44,.14);
+    --bad:#FF6B5E; --bad-bg:rgba(255,107,94,.13);
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%}
@@ -19,20 +22,20 @@
     color:var(--ink);background:var(--bg);display:grid;place-items:center;padding:24px}
   .box{width:100%;max-width:380px}
   .mark{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;margin:0 auto 16px;
-    background:linear-gradient(145deg,var(--accent),var(--accent-dk));color:#fff;font-weight:750;font-size:14px;
+    background:linear-gradient(145deg,var(--accent),var(--accent-dk));color:var(--ground);font-weight:750;font-size:14px;
     letter-spacing:.5px}
   h1{font-size:19px;margin:0 0 4px;text-align:center;font-weight:650}
   p.sub{margin:0 0 22px;text-align:center;color:var(--ink-3);font-size:13px}
   form{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
   label{display:block;font-size:12px;font-weight:650;color:var(--ink-2);margin-bottom:6px}
   input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14.5px;
-    font-family:inherit;background:#fdfcfa;color:var(--ink)}
-  input:focus{outline:none;border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
-  button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:9px;background:var(--ink);color:#fff;
+    font-family:inherit;background:var(--surface-lo);color:var(--ink)}
+  input:focus{outline:none;border-color:var(--accent);background:var(--surface-hi);box-shadow:0 0 0 3px var(--accent-bg)}
+  button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:9px;background:var(--paper);color:var(--ground);
     font-size:14.5px;font-weight:600;cursor:pointer;font-family:inherit}
-  button:hover{background:#000}
+  button:hover{background:#fff}
   button:disabled{opacity:.5;cursor:not-allowed}
-  .err{background:var(--bad-bg);color:#7e1a15;padding:9px 11px;border-radius:8px;font-size:13px;margin-top:12px;display:none}
+  .err{background:var(--bad-bg);color:var(--bad);padding:9px 11px;border-radius:8px;font-size:13px;margin-top:12px;display:none}
   .err.show{display:block}
 </style>
 </head>

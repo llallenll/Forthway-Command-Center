@@ -149,6 +149,12 @@ target machine.
 
 ## The dashboard
 
+The panel wears the Forthway Systems palette from forthway.ca — the same
+ground, surfaces, amber and cyan, read from that site's own custom properties
+so the two stay in step. Every colour lives in one `:root` block at the top of
+`hub/public/index.html`.
+
+
 Each site gets a small card: whether it is up, what version is on disk, what
 version is actually serving, and anything that needs attention. Two menus sit
 on it for the things you do without thinking —
