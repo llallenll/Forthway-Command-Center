@@ -71,7 +71,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.3.0";
+const FCC_VERSION = "2.3.1";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 
@@ -817,12 +817,14 @@ const cfLogin = {
   url: "",
   error: "",
   startedAt: 0,
+  output: [],
   certPath: path.join(config.dataDir, "cloudflared", "cert.pem"),
 
   async start() {
     this.cancel();
     this.url = "";
     this.error = "";
+    this.output = [];
     ensureDir(path.dirname(this.certPath));
     // A certificate from a previous attempt would look like instant success.
     try {
@@ -834,19 +836,36 @@ const cfLogin = {
     const bin = await tunnel.resolveBinary();
     if (!bin) throw new Error("cloudflared is not installed here yet, and could not be downloaded.");
 
-    const proc = spawn(bin, ["tunnel", "login", "--origincert", this.certPath], {
-      env: { ...process.env, HOME: process.env.HOME || os.homedir() },
+    // Where the certificate lands is set through the environment, not a flag:
+    // --origincert is a global flag in cloudflared, so passing it after the
+    // subcommand is a usage error and the process dies on the spot.
+    const proc = spawn(bin, ["tunnel", "login"], {
+      env: {
+        ...process.env,
+        HOME: process.env.HOME || os.homedir(),
+        TUNNEL_ORIGIN_CERT: this.certPath,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.proc = proc;
 
     const onData = (chunk) => {
       const text = chunk.toString();
+      for (const line of text.split("\n")) {
+        const l = line.trim();
+        if (!l) continue;
+        this.output.push(l);
+        if (this.output.length > 40) this.output.shift();
+      }
       const m = text.match(/https:\/\/dash\.cloudflare\.com\/argotunnel\S*/);
       if (m && !this.url) this.url = m[0];
     };
     proc.stdout.on("data", onData);
     proc.stderr.on("data", onData);
+    proc.once("error", (err) => {
+      this.output.push(`could not run cloudflared: ${err.message}`);
+      this.proc = null;
+    });
     proc.once("exit", () => {
       this.proc = null;
     });
@@ -857,11 +876,21 @@ const cfLogin = {
       await new Promise((r) => setTimeout(r, 200));
     }
     if (!this.url) {
+      const said = this.lastWords();
       this.cancel();
-      throw new Error("cloudflared did not print a login link. Use an API token instead.");
+      throw new Error(
+        `cloudflared did not print a login link${said ? `: ${said}` : "."} Use an API token instead.`,
+      );
     }
     this.startedAt = Date.now();
     return { ok: true, url: this.url };
+  },
+
+  /** What cloudflared actually said, so a failure explains itself. */
+  lastWords() {
+    const noise = /Version |GOOS|GOARCH|settings:|cloudflared will not automatically update/i;
+    const lines = this.output.filter((l) => !noise.test(l));
+    return lines.slice(-2).join(" ").slice(0, 300);
   },
 
   /** Has the certificate turned up, and is what is in it any use? */
@@ -869,7 +898,16 @@ const cfLogin = {
     const waiting = { running: !!this.proc, url: this.url, done: false, error: this.error };
     if (!exists(this.certPath)) {
       if (!this.proc && this.startedAt) {
-        return { ...waiting, error: this.error || "The login was cancelled or timed out." };
+        const said = this.lastWords();
+        this.startedAt = 0; // reported once; do not keep shouting it
+        return {
+          ...waiting,
+          error:
+            this.error ||
+            (said
+              ? `cloudflared stopped before the login finished: ${said}`
+              : "cloudflared stopped before the login finished."),
+        };
       }
       return waiting;
     }

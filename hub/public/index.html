@@ -904,7 +904,8 @@
 
               <div id="cfLoginWait" style="display:none;margin-top:10px">
                 <div class="banner info" style="margin-bottom:8px"><span class="txt">
-                  Open this link and pick the domain to use. This page keeps waiting.</span></div>
+                  A Cloudflare window should have opened — approve it there and pick the domain to use.
+                  If it did not, the link is below. This page keeps waiting.</span></div>
                 <div class="cmdbox" id="cfLoginUrl"><button class="copy" id="cfLoginCopy">Copy</button></div>
                 <div class="row" style="margin-top:9px">
                   <a class="btn sm accent" id="cfLoginOpen" target="_blank" rel="noopener">Open it</a>
@@ -3568,13 +3569,24 @@ function cfLoginStop() {
 $('cfLogin').addEventListener('click', async () => {
   $('cfLogin').disabled = true;
   $('cfTokenState').innerHTML = '<span class="spin"></span> Starting cloudflared…';
+  // The window has to be opened inside the click, before any await: a popup
+  // opened after one has lost the user gesture and the browser blocks it. So
+  // it opens blank now, and is pointed at the link once cloudflared prints one.
+  const win = window.open('', '_blank');
   try {
     const r = await api('/api/cloudflare/login', {});
     $('cfTokenState').textContent = '';
     $('cfLoginWait').style.display = '';
     $('cfLoginUrl').innerHTML = '<button class="copy" id="cfLoginCopy">Copy</button>' + esc(r.url);
     $('cfLoginOpen').href = r.url;
-    $('cfLoginState').innerHTML = '<span class="spin"></span> Waiting for you to approve it…';
+    if (win) {
+      win.location.href = r.url;
+      win.focus();
+      $('cfLoginState').innerHTML = '<span class="spin"></span> Approve it in the window that opened…';
+    } else {
+      // Blocked, or a browser that would not. The link is right there anyway.
+      $('cfLoginState').innerHTML = '<span class="spin"></span> Open the link to approve it…';
+    }
     $('cfLoginCopy').addEventListener('click', () => {
       navigator.clipboard.writeText(r.url).then(() => toast('Copied', 'ok'), () => toast('Could not copy', 'bad'));
     });
@@ -3600,6 +3612,7 @@ $('cfLogin').addEventListener('click', async () => {
       }
     }, 2000);
   } catch (err) {
+    if (win) win.close(); // nothing to show it
     $('cfLogin').disabled = false;
     $('cfTokenState').innerHTML = '<span style="color:var(--bad)">' + esc(err.message) + '</span>';
     $('cfTokenWrap').open = true;
