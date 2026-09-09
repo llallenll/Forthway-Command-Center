@@ -3575,6 +3575,17 @@ $('cfLogin').addEventListener('click', async () => {
   const win = window.open('', '_blank');
   try {
     const r = await api('/api/cloudflare/login', {});
+    // Already logged in on that machine — the certificate was there, so there
+    // was nothing to approve and no window to send anywhere.
+    if (r.done) {
+      if (win) win.close();
+      $('cfLogin').disabled = false;
+      $('cfTokenState').textContent = '';
+      toast('Used the Cloudflare login already on that machine' +
+        (r.accountName ? ' · ' + r.accountName : ''), 'ok');
+      loadCloudflare(true);
+      return;
+    }
     $('cfTokenState').textContent = '';
     $('cfLoginWait').style.display = '';
     $('cfLoginUrl').innerHTML = '<button class="copy" id="cfLoginCopy">Copy</button>' + esc(r.url);

@@ -71,7 +71,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.3.1";
+const FCC_VERSION = "2.3.2";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 
@@ -818,15 +818,80 @@ const cfLogin = {
   error: "",
   startedAt: 0,
   output: [],
-  certPath: path.join(config.dataDir, "cloudflared", "cert.pem"),
+  // `cloudflared tunnel login` ignores --origincert and TUNNEL_ORIGIN_CERT:
+  // it checks, and writes, the default path derived from $HOME. So rather
+  // than fight it, it is given a HOME of its own — which also means the
+  // certificate someone already has in their real home directory is neither
+  // read by accident nor overwritten.
+  home: path.join(config.dataDir, "cloudflared-home"),
+  get certPath() {
+    return path.join(this.home, ".cloudflared", "cert.pem");
+  },
+
+  /** Every certificate on this machine that a login might already have left. */
+  candidateCerts() {
+    const homes = [this.home, process.env.HOME, os.homedir()].filter(Boolean);
+    const seen = new Set();
+    return homes
+      .map((h) => path.join(h, ".cloudflared", "cert.pem"))
+      .filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
+  },
+
+  /**
+   * Already logged in on this box? Then there is nothing to log in to.
+   *
+   * cloudflared refuses to log in over an existing certificate, and it is
+   * right to: that certificate is the login. So it is read instead, and the
+   * browser is never opened.
+   */
+  async adoptExistingCert() {
+    for (const file of this.candidateCerts()) {
+      if (!exists(file)) continue;
+      let creds = null;
+      try {
+        creds = cf.readOriginCert(fs.readFileSync(file, "utf8"));
+      } catch {
+        continue;
+      }
+      if (!creds) continue;
+      const can = await cf.canManageTunnels(creds.apiToken, creds.accountId);
+      if (!can.ok) continue; // a certificate we cannot use is not an answer
+      await this.store(creds);
+      return { certPath: file, accountName: config.cloudflare.accountName };
+    }
+    return null;
+  },
+
+  async store(creds) {
+    config.cloudflare = {
+      ...(config.cloudflare || {}),
+      apiToken: creds.apiToken,
+      accountId: creds.accountId,
+      accountName: config.cloudflare?.accountName || "",
+      viaLogin: true,
+    };
+    try {
+      const accounts = await cf.listAccounts(creds.apiToken);
+      const mine = accounts.find((a) => a.id === creds.accountId);
+      if (mine) config.cloudflare.accountName = mine.name;
+    } catch {
+      /* the name is a nicety, not a requirement */
+    }
+    saveConfig();
+  },
 
   async start() {
     this.cancel();
     this.url = "";
     this.error = "";
     this.output = [];
+
+    const already = await this.adoptExistingCert();
+    if (already) return { ok: true, done: true, ...already };
+
     ensureDir(path.dirname(this.certPath));
-    // A certificate from a previous attempt would look like instant success.
+    // A certificate from a previous attempt would look like instant success —
+    // and would also make cloudflared refuse to log in at all.
     try {
       fs.unlinkSync(this.certPath);
     } catch {
@@ -836,14 +901,11 @@ const cfLogin = {
     const bin = await tunnel.resolveBinary();
     if (!bin) throw new Error("cloudflared is not installed here yet, and could not be downloaded.");
 
-    // Where the certificate lands is set through the environment, not a flag:
-    // --origincert is a global flag in cloudflared, so passing it after the
-    // subcommand is a usage error and the process dies on the spot.
     const proc = spawn(bin, ["tunnel", "login"], {
       env: {
         ...process.env,
-        HOME: process.env.HOME || os.homedir(),
-        TUNNEL_ORIGIN_CERT: this.certPath,
+        HOME: this.home,
+        TUNNEL_ORIGIN_CERT: this.certPath, // ignored by login, used by everything else
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -943,21 +1005,7 @@ const cfLogin = {
       };
     }
 
-    config.cloudflare = {
-      ...(config.cloudflare || {}),
-      apiToken: creds.apiToken,
-      accountId: creds.accountId,
-      accountName: config.cloudflare?.accountName || "",
-      viaLogin: true,
-    };
-    try {
-      const accounts = await cf.listAccounts(creds.apiToken);
-      const mine = accounts.find((a) => a.id === creds.accountId);
-      if (mine) config.cloudflare.accountName = mine.name;
-    } catch {
-      /* the name is a nicety, not a requirement */
-    }
-    saveConfig();
+    await this.store(creds);
     return { running: false, url: this.url, done: true, error: "", accountName: config.cloudflare.accountName };
   },
 

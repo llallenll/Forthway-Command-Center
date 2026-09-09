@@ -239,10 +239,16 @@ forever. The live release and the one before it are never pruned.
 and the sites on it are reachable by name without port-forwarding anything or
 having a public address.
 
-**Log in with Cloudflare** and the panel does the rest itself. It runs
-`cloudflared tunnel login`, shows you the approval link (rather than trying to
-open a browser on a machine you may be nowhere near), and takes the credentials
-out of the certificate Cloudflare writes back.
+**Log in with Cloudflare** and the panel does the rest itself. If that machine
+has already been through a `cloudflared tunnel login` at some point, its
+certificate is read and you are connected without a browser at all. Otherwise
+it runs the login, opens the approval page for you (and shows the link, for
+when the panel is somewhere a browser is not), and takes the credentials out of
+the certificate Cloudflare writes back.
+
+cloudflared is given a home directory of its own under `hub/data/`, so a
+certificate already sitting in yours is neither overwritten nor read by
+accident.
 
 1. **The connector.** Create one, or adopt a tunnel already in the account. It
    is created remotely-managed, so its routes live in Zero Trust → Networks →
