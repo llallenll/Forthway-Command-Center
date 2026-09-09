@@ -400,6 +400,34 @@
   }
 
   /* ---- cloudflare */
+  /* Inputs and selects were a border apart in height, which reads as sloppy
+     when they sit side by side. One height, set once. */
+  .field input[type=text],.field input[type=password],.field input[type=number],
+  .field select,.hostbox,.pathbox{min-height:37px}
+  .field select{appearance:none;background-image:
+    linear-gradient(45deg,transparent 50%,var(--ink-3) 50%),
+    linear-gradient(135deg,var(--ink-3) 50%,transparent 50%);
+    background-position:calc(100% - 16px) center,calc(100% - 11px) center;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:30px}
+
+  /* subdomain · domain, as two segments of one control */
+  .hostbox{display:flex;align-items:stretch;border:1px solid var(--line);border-radius:8px;
+    background:var(--surface-lo);overflow:hidden;min-width:0}
+  .hostbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+  .hostbox input{flex:1 1 40%;min-width:0;border:0!important;background:transparent!important;
+    box-shadow:none!important;border-radius:0!important;padding:8px 4px 8px 11px!important}
+  .hostbox .dot-sep{display:flex;align-items:center;font-family:var(--mono);font-size:12.5px;
+    color:var(--ink-3);padding:0 2px}
+  .hostbox select{flex:1 1 60%;min-width:0;border:0!important;border-left:1px solid var(--line)!important;
+    background-color:transparent!important;box-shadow:none!important;border-radius:0!important;
+    font-family:var(--mono);font-size:12.5px;padding-left:9px!important;margin-left:4px}
+
+  /* pick one, or make one — with the "or" between them saying so */
+  .pickrow{margin-top:10px}
+  .orline{display:flex;align-items:center;gap:10px;margin:2px 0 12px;
+    font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);font-weight:700}
+  .orline::before,.orline::after{content:"";flex:1;height:1px;background:var(--line-2)}
+
   .steps-v{display:flex;flex-direction:column;gap:10px}
   .cfstep{border:1px solid var(--line);border-radius:11px;padding:12px 14px;background:var(--surface-lo)}
   .cfstep.done{border-color:rgba(62,207,142,.34);background:rgba(62,207,142,.07)}
@@ -965,8 +993,8 @@
             <div class="body">
               <div class="row" id="cfLoginRow">
                 <button class="btn sm accent" id="cfLogin">Log in with Cloudflare</button>
-                <button class="btn sm ghost" id="cfDisconnect" style="display:none">Disconnect</button>
-                <span class="hint" id="cfTokenState" style="margin:0"></span>
+                <span class="hint" id="cfTokenState" style="margin:0;min-width:0"></span>
+                <button class="btn sm ghost" id="cfDisconnect" style="display:none;margin-left:auto">Disconnect</button>
               </div>
 
               <div id="cfLoginWait" style="display:none;margin-top:10px">
@@ -1005,16 +1033,23 @@
             <div class="d" id="cfTunnelDesc">One connector serves this whole machine. Create a new one, or
               adopt one that already exists in this account.</div>
             <div class="body" id="cfTunnelBody">
-              <div class="two">
-                <div class="field"><label for="cfTunnelPick">Use an existing connector</label>
-                  <select id="cfTunnelPick"></select></div>
-                <div class="field"><label for="cfTunnelName">…or create one called</label>
-                  <input type="text" class="mono" id="cfTunnelName" placeholder="fcc-this-machine" /></div>
-              </div>
-              <div class="row">
-                <button class="btn sm accent" id="cfTunnelGo">Create and connect</button>
-                <button class="btn sm" id="cfTunnelAdopt">Use the selected one</button>
-              </div>
+              <details id="cfTunnelPanel">
+                <summary class="hint" id="cfTunnelSummary" style="cursor:pointer">Change the connector</summary>
+                <div class="pickrow">
+                  <div class="field"><label for="cfTunnelPick">Use one that already exists</label>
+                    <div class="row" style="flex-wrap:nowrap">
+                      <select id="cfTunnelPick" style="flex:1 1 auto;min-width:0"></select>
+                      <button class="btn sm" id="cfTunnelAdopt">Use this one</button>
+                    </div></div>
+                  <div class="orline"><span>or</span></div>
+                  <div class="field"><label for="cfTunnelName">Create a new one</label>
+                    <div class="row" style="flex-wrap:nowrap">
+                      <input type="text" class="mono" id="cfTunnelName" placeholder="a name for it"
+                        autocomplete="off" style="flex:1 1 auto;min-width:0" />
+                      <button class="btn sm accent" id="cfTunnelGo" disabled>Create it</button>
+                    </div></div>
+                </div>
+              </details>
             </div>
           </div>
 
@@ -1028,12 +1063,10 @@
               <table class="routes" id="cfRoutes"></table>
               <div class="two" style="margin-top:12px">
                 <div class="field" style="margin-bottom:8px"><label for="cfSub">Hostname</label>
-                  <div class="pathbox">
-                    <input type="text" class="mono" id="cfSub" placeholder="app" autocomplete="off"
-                      style="flex:1 1 0;min-width:0" />
-                    <span class="pre" style="padding:8px 4px 8px 0">.</span>
-                    <select id="cfZone" style="border:0;background:transparent;box-shadow:none;flex:0 1 auto;
-                      width:auto;font-family:var(--mono);font-size:12.5px;padding-left:0"></select>
+                  <div class="hostbox">
+                    <input type="text" class="mono" id="cfSub" placeholder="app" autocomplete="off" />
+                    <span class="dot-sep">.</span>
+                    <select id="cfZone"></select>
                   </div>
                   <div class="hint" id="cfZoneHint"></div></div>
                 <div class="field" style="margin-bottom:8px"><label for="cfTarget">Sends it to</label>
@@ -3486,9 +3519,8 @@ function paintCloudflare() {
   $('cfTokenState').innerHTML = c.error
     ? '<span style="color:var(--bad)">' + esc(c.error) + '</span>'
     : connected
-      ? 'Connected' + (c.viaLogin ? ' by login' : ' with an API token') +
-        (c.accountName ? ' · <b>' + esc(c.accountName) + '</b>' : '') +
-        (c.tokenHint ? ' <span class="muted">(' + esc(c.tokenHint) + ')</span>' : '')
+      ? (c.accountName ? '<b>' + esc(c.accountName) + '</b> · ' : '') +
+        (c.viaLogin ? 'connected by login' : 'connected with an API token')
       : '';
 
   const accounts = c.accounts || [];
@@ -3506,15 +3538,20 @@ function paintCloudflare() {
     : '<option value="">none in this account</option>';
   $('cfTunnelPick').disabled = !tunnels.length;
   $('cfTunnelAdopt').disabled = !tunnels.length;
-  if (!$('cfTunnelName').value) $('cfTunnelName').value = 'fcc-' + (SETTINGS.hostname || 'panel').split('.')[0];
+  $('cfTunnelGo').disabled = !$('cfTunnelName').value.trim();
   $('cfTunnelDesc').innerHTML = !connected || !c.accountId
     ? 'Connect an account first.'
     : hasTunnel
-      ? 'Using <b>' + esc(c.tunnelName) + '</b> — ' + esc(c.tunnel.status || 'unknown') + ', ' +
-        c.tunnel.connections + ' connection' + (c.tunnel.connections === 1 ? '' : 's') +
-        '. This panel holds its connector token.'
-      : 'One connector serves this whole machine. Create a new one, or adopt one that already exists in this account.';
+      ? 'Running <b>' + esc(c.tunnelName) + '</b> — ' + esc(c.tunnel.status || 'unknown') + ' on ' +
+        c.tunnel.connections + ' connection' + (c.tunnel.connections === 1 ? '' : 's') + '.'
+      : 'One connector serves this whole machine. Pick one that exists, or make a new one.';
   $('cfTunnelBody').style.display = connected && c.accountId ? '' : 'none';
+  // A step that is done should look done: the way to change it stays folded
+  // away until there is nothing set up, or until you go looking for it.
+  $('cfTunnelSummary').textContent = hasTunnel ? 'Use a different connector' : 'Set the connector up';
+  // Open while there is nothing set up, folded once there is — including
+  // straight after you set one up, which is when it stops being the point.
+  $('cfTunnelPanel').open = !hasTunnel;
   if (c.warning) $('cfTunnelDesc').innerHTML += '<br><span style="color:var(--bad)">' + esc(c.warning) + '</span>';
 
   // step 3 — the routes
@@ -3589,12 +3626,15 @@ function paintCfZoneHint() {
   }
   const host = cfHostname();
   $('cfZoneHint').innerHTML = host
-    ? '<b>' + esc(host) + '</b> — a proxied CNAME in ' + esc($('cfZone').value) +
-      ', and a public hostname on the connector.'
-    : 'Leave the first box empty to use the domain itself.';
+    ? 'Adds <b>' + esc(host) + '</b> — a proxied CNAME, and a public hostname on the connector.'
+    : 'Leave the name empty to use the domain on its own.';
 }
 $('cfSub').addEventListener('input', paintCfZoneHint);
 $('cfZone').addEventListener('change', paintCfZoneHint);
+
+$('cfTunnelName').addEventListener('input', () => {
+  $('cfTunnelGo').disabled = !$('cfTunnelName').value.trim();
+});
 
 $('cfTarget').addEventListener('change', () => {
   $('cfCustomWrap').style.display = $('cfTarget').value === '__custom' ? '' : 'none';
