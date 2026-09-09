@@ -85,11 +85,38 @@ pm2 restart forthway
 
 ## Adding a site
 
-**+ Add site**, give it a name, and say where it runs.
+**+ Add site** opens a walkthrough that asks one thing at a time and works out
+the rest for itself:
 
-**On this machine** — the normal case. Fill in the app directory and you are
-done; there is no agent, no token and nothing to install. The panel runs the
-commands itself.
+1. **Name** it, and say whether it runs on this machine or another one.
+2. **Folder and port** — apps live under `/home/container`, so this only asks
+   for the folder name and fills it in from the site name. (Set `appRoot` in
+   `hub/config.json`, or `FCC_APP_ROOT`, for a machine laid out differently;
+   there is still a box for a path somewhere else entirely.) If the folder is
+   not there yet it is created now, so the `.env` written two steps later has
+   somewhere to go. The port is required — it is what the health and version
+   checks after a deploy are pointed at.
+3. **Code** — pull the repository from GitHub now. It is downloaded here and
+   kept as a release, and the two steps after this one read the app's own
+   `package.json` and `.env.example` straight out of it, so they can offer real
+   answers instead of asking you to remember them. You can skip this and upload
+   a zip later.
+4. **Start** — pm2 by default, named after the site. The first start command is
+   a list of what `package.json` actually declares, each shown with the command
+   it runs; `npm start` is the default.
+5. **Environment** — a row per variable the app expects, taken from its
+   `.env.example`, prefilled from any `.env` already on disk, with room to add
+   your own. A variable left blank is not written. Saving writes the app's
+   `.env` there and then, inside a marked block that leaves the rest of the file
+   alone.
+6. **Done** — settings saved and, if you pulled a release, deployed.
+
+Health checks, the build pipeline, which files survive a deploy and the GitHub
+repo all live behind **Show advanced options** in the site's settings; the
+defaults suit a Next.js app.
+
+**On this machine** — the normal case. There is no agent, no token and nothing
+to install; the panel runs the commands itself.
 
 **On another machine** — you get a one-line installer with the site's id and
 token already in it:
@@ -107,11 +134,12 @@ here, in the browser.
 | | |
 |---|---|
 | **App directory** | The folder the app lives in. The agent keeps its staging build, rollback snapshot and file manifest in `.forthway/` inside it, and deploys never touch that. |
-| **Port** | What the app listens on. It fills in the health and version checks, and is passed to the app as `PORT`. |
+| **Port** | Required. What the app listens on. It fills in the health and version checks, and is passed to the app as `PORT`. |
 | **Restart mode** | **pm2** (name the process), **systemd** (name the unit), **command** (your own stop and start), or **supervised** (the panel runs the app itself and so knows for certain when it has stopped). |
-| **Health / version URL** | Optional. Left blank they default to `http://127.0.0.1:PORT/api/health` and `/api/version`. |
-| **Build pipeline** | Install, an optional prepare step, and build — each one a command, each one skippable. Defaults suit a Next.js app; blank them out for anything that does not need building. A Prisma schema is detected and generated for you. |
-| **Files** | Which generated directories get swapped whole (`node_modules`, `.next`), and which paths a deploy must never touch (`.env`, uploads, logs). |
+| **Environment** | A row per variable, or a plain `KEY=value` block behind **Edit as text**. **Load from .env.example** re-reads the app's own list at any time. Written to the app's `.env` as soon as you save. |
+| **Health / version URL** | Advanced. Left blank they default to `http://127.0.0.1:PORT/api/health` and `/api/version`. |
+| **Build pipeline** | Advanced. Install, an optional prepare step, and build — each one a command, each one skippable. Defaults suit a Next.js app; blank them out for anything that does not need building. A Prisma schema is detected and generated for you. |
+| **Files** | Advanced. Which generated directories get swapped whole (`node_modules`, `.next`), and which paths a deploy must never touch (`.env`, uploads, logs). |
 
 Everything is editable at any time. For a remote site the change reaches the
 agent on its next poll, a second or two later — you never edit a file on the
@@ -119,10 +147,27 @@ target machine.
 
 ---
 
+## The dashboard
+
+Each site gets a small card: whether it is up, what version is on disk, what
+version is actually serving, and anything that needs attention. Two menus sit
+on it for the things you do without thinking —
+
+- **Actions** — restart, stop, start, refresh, roll back, pull & deploy.
+- **Run** — the app's own npm scripts, read from its `package.json`, minus the
+  ones that run the app itself (`start`, `dev`). So `db:migrate`, `seed` or
+  `typecheck` are one click, and the output streams into the console.
+
+**Click the card** for everything else: uploading a zip, pulling a branch,
+the release list, deploy and rollback, recent jobs and their logs, and a box
+for any command you want to run in the app directory.
+
+---
+
 ## Deploying
 
-**Upload a zip** — drop it on the card. It reads the version out of
-`package.json` and shows you `1.4.2 → 1.5.0` before you commit.
+**Upload a zip** — drop it in the site's view (click its card). It reads the
+version out of `package.json` and shows you `1.4.2 → 1.5.0` before you commit.
 
 **Pull from GitHub** — give it `owner/name` and a branch or tag. The archive is
 downloaded here and kept as a release, so rolling back is a file operation
@@ -190,15 +235,40 @@ forever. The live release and the one before it are never pruned.
 
 ## Reaching it from outside: Cloudflare Tunnel
 
-**Settings → Cloudflare Tunnel.** Paste the connector token from your tunnel in
-the Cloudflare dashboard (Zero Trust → Networks → Tunnels → your tunnel →
-Install connector; the token is the long string in the command it shows you),
-save, and this machine dials out to Cloudflare. Nothing needs port-forwarding
-to it, and it does not need a public address of its own.
+**Settings → Cloudflare.** This machine dials out to Cloudflare, so the panel
+and the sites on it are reachable by name without port-forwarding anything or
+having a public address.
 
-Which hostname points at which local port is decided in the Cloudflare
-dashboard — that is what a connector token is for — so one token covers the
-panel and every site on the machine.
+**Log in with Cloudflare** and the panel does the rest itself. It runs
+`cloudflared tunnel login`, shows you the approval link (rather than trying to
+open a browser on a machine you may be nowhere near), and takes the credentials
+out of the certificate Cloudflare writes back.
+
+1. **The connector.** Create one, or adopt a tunnel already in the account. It
+   is created remotely-managed, so its routes live in Zero Trust → Networks →
+   Tunnels and stay editable there as well as here. The panel takes its
+   connector token, stores it, and starts running it.
+2. **Host routes.** Type a name, pick the domain from the list of zones your
+   account actually owns, and choose what it reaches — this panel, or any local
+   site, by name and port. These are Zero Trust public hostnames pointing at
+   `127.0.0.1`, so the app itself never has to listen on anything but localhost.
+   The panel writes both halves: the tunnel's ingress rule *and* the proxied
+   CNAME that makes the name resolve. Removing a route removes both again.
+
+It only ever touches DNS records it created (a CNAME to `*.cfargotunnel.com`);
+anything else in the zone is left alone and reported rather than overwritten.
+
+Two other ways in, if the login does not suit:
+
+- **An API token** — Account · Cloudflare Tunnel · Edit, Zone · DNS · Edit,
+  Zone · Zone · Read — under "Use an API token instead". Identical from there on.
+- **A connector token** (Zero Trust → Networks → Tunnels → your tunnel → Install
+  connector) under "Paste a connector token instead". No account access at all;
+  hostnames are then set in the Cloudflare dashboard rather than here.
+
+`127.0.0.1` rather than `localhost`, deliberately: on a dual-stack machine
+`localhost` can resolve to `::1` first, and an app bound only to IPv4 then
+refuses the connector's connection for reasons that look like nothing at all.
 
 - **cloudflared installs itself.** If it is not already on PATH the panel
   downloads the official build into `hub/data/bin/`, which matters in a

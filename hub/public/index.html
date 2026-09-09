@@ -47,7 +47,7 @@
   .btn.ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
   .btn.ghost:hover{background:#f2ede4}
 
-  .grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));margin-top:20px}
+  .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(370px,1fr));margin-top:20px}
   @media (max-width:600px){ .grid{grid-template-columns:1fr} .wrap{padding:0 14px} }
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
   .card > .head{padding:15px 18px;border-bottom:1px solid var(--line-2);display:flex;align-items:flex-start;gap:10px}
@@ -178,6 +178,7 @@
     outline:none;border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
   .field input:disabled{background:#f4f0ea;color:var(--ink-3)}
   .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .two > *{min-width:0}
   @media (max-width:520px){ .two{grid-template-columns:1fr} }
   fieldset{border:1px solid var(--line-2);border-radius:11px;padding:14px 14px 2px;margin:0 0 16px}
   legend{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);font-weight:700;padding:0 6px}
@@ -200,6 +201,154 @@
   .kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:13px;margin:0}
   .kv dt{color:var(--ink-3)}
   .kv dd{margin:0;font-family:var(--mono);font-size:12.5px;word-break:break-all}
+
+  /* ---- step-by-step wizard */
+  .steps{display:flex;gap:6px;align-items:center;margin:14px 0 2px;flex-wrap:wrap}
+  .steps .s{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink-3);font-weight:600}
+  .steps .s .n{width:19px;height:19px;border-radius:50%;background:#f3efe8;color:var(--ink-3);display:grid;
+    place-items:center;font-size:10.5px;font-weight:700;flex:none}
+  .steps .s.on{color:var(--ink)}
+  .steps .s.on .n{background:var(--accent);color:#fff}
+  .steps .s.done .n{background:var(--ok-bg);color:var(--ok)}
+  .steps .bar{width:14px;height:1.5px;background:var(--line);flex:none}
+  @media (max-width:560px){ .steps .s span.t{display:none} .steps .bar{width:8px} }
+  .wstep{display:none}
+  .wstep.on{display:block}
+  .wstep > h4{margin:2px 0 3px;font-size:14.5px;font-weight:650}
+  .wstep > .lead{font-size:12.8px;color:var(--ink-3);margin:0 0 14px;line-height:1.5;overflow-wrap:anywhere}
+
+  .tasks{margin:6px 0 12px;display:flex;flex-direction:column;gap:7px}
+  .task{display:flex;gap:9px;align-items:flex-start;font-size:13px;color:var(--ink-3)}
+  .task.run{color:var(--ink)}
+  .task.done{color:var(--ink-2)}
+  .task.fail{color:var(--bad)}
+  .task .ic{width:15px;height:15px;flex:none;margin-top:3px;border-radius:50%;border:1.5px solid var(--line);
+    display:grid;place-items:center;font-size:9.5px;color:#fff}
+  .task.run .ic{border-color:var(--accent);border-top-color:transparent;animation:spin .7s linear infinite}
+  .task.done .ic{background:var(--ok);border-color:var(--ok)}
+  .task.done .ic::after{content:"\2713"}
+  .task.fail .ic{background:var(--bad);border-color:var(--bad)}
+  .task.fail .ic::after{content:"\2715"}
+  .task .d{display:block;font-size:12px;color:var(--ink-3);margin-top:1px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spin{width:13px;height:13px;border-radius:50%;border:1.5px solid var(--line);border-top-color:transparent;
+    display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px}
+  .df .busy{margin-right:auto;font-size:12.5px;color:var(--ink-3);display:none;align-items:center;gap:8px}
+  .df .busy.on{display:flex}
+
+  .pathbox{display:flex;align-items:stretch;border:1px solid var(--line);border-radius:8px;background:#fdfcfa;
+    overflow:hidden;min-width:0}
+  .pathbox .pre{padding:8px 2px 8px 11px;font-family:var(--mono);font-size:12.5px;color:var(--ink-3);
+    white-space:nowrap;display:flex;align-items:center;max-width:70%;overflow:hidden;text-overflow:ellipsis;
+    flex:0 1 auto}
+  .pathbox input{min-width:0;flex:1 1 0;width:auto}
+  .pathbox input{border:0!important;background:transparent!important;box-shadow:none!important;padding-left:2px!important}
+  .pathbox:focus-within{border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
+
+  /* ---- environment editor */
+  .envrow{display:grid;grid-template-columns:minmax(120px,1fr) minmax(140px,1.6fr) 28px;gap:7px;
+    align-items:start;margin-bottom:7px}
+  .envrow input{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;
+    font-family:var(--mono);font-size:12.3px;background:#fdfcfa;color:var(--ink)}
+  .envrow input:focus{outline:none;border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
+  .envrow input.miss{border-color:#e6bdb9;background:#fffbfb}
+  .envrow .rm{border:1px solid var(--line);background:#fff;border-radius:7px;color:var(--ink-3);cursor:pointer;
+    font-size:13px;line-height:1;padding:0;height:31px;font-family:inherit}
+  .envrow .rm:hover{color:var(--bad);border-color:#f0d4d2;background:var(--bad-bg)}
+  .envrow .note{grid-column:1/4;font-size:11.5px;color:var(--ink-3);margin:-3px 0 4px;line-height:1.4}
+  .envhead{display:flex;align-items:center;gap:8px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;
+    color:var(--ink-3);font-weight:700;margin:12px 0 7px}
+  .envhead:first-child{margin-top:0}
+  .envhead .line{flex:1;height:1px;background:var(--line-2)}
+  .envempty{font-size:12.5px;color:var(--ink-3);padding:4px 0 8px}
+
+  .advtoggle{width:100%;justify-content:center;margin-bottom:16px}
+  .advtoggle .car{transition:transform .15s;display:inline-block}
+  .advtoggle.open .car{transform:rotate(90deg)}
+
+  /* ---- the card is a summary; the detail is a click away */
+  .card.compact{cursor:pointer;transition:border-color .12s,box-shadow .12s}
+  .card.compact:hover{border-color:#d9d2c6;box-shadow:0 6px 20px rgba(40,30,10,.07)}
+  .card.compact:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+  .card .head.tight{padding:13px 15px;border-bottom:0}
+  .card .body.tight{padding:0 15px 13px}
+  .mini{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:11px}
+  .mini .b{border:1px solid var(--line-2);border-radius:9px;padding:7px 10px;background:#fdfcfa;min-width:0}
+  .mini .b.live{background:linear-gradient(180deg,#fffdf7,#fdfaf2);border-color:#eadfc4}
+  .mini .lbl{font-size:9.5px;text-transform:uppercase;letter-spacing:.6px;color:var(--ink-3);font-weight:700}
+  .mini .val{font-size:16px;font-weight:670;font-family:var(--mono);letter-spacing:-.3px;margin-top:1px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mini .meta{font-size:11px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card .quick{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .card .quick .more{margin-left:auto;font-size:12.5px;color:var(--ink-3)}
+  .card .banner{margin-bottom:11px;font-size:12.5px;padding:7px 10px}
+  .caret{font-size:9px;opacity:.6;margin-left:1px}
+
+  /* ---- drop-down menus */
+  .menu{position:fixed;z-index:70;background:#fff;border:1px solid var(--line);border-radius:11px;
+    box-shadow:0 16px 44px rgba(40,30,10,.20);padding:5px;min-width:210px;max-width:320px;
+    max-height:min(62vh,440px);overflow:auto}
+  .menu button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:7px 10px;
+    border-radius:7px;font-family:inherit;font-size:13.5px;color:var(--ink);cursor:pointer}
+  .menu button:hover:not(:disabled){background:#f7f3ec}
+  .menu button:disabled{opacity:.4;cursor:not-allowed}
+  .menu button b{font-weight:550;display:block}
+  .menu button .d{display:block;font-size:11.5px;color:var(--ink-3);margin-top:1px;font-family:var(--mono);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .menu button.danger{color:var(--bad)}
+  .menu button.danger:hover:not(:disabled){background:var(--bad-bg)}
+  .menu .sep{height:1px;background:var(--line-2);margin:5px 4px}
+  .menu .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--ink-3);font-weight:700;
+    padding:7px 10px 4px}
+  .menu .note{padding:7px 10px;font-size:12.5px;color:var(--ink-3);line-height:1.45}
+
+  /* ---- a settings dialog with its sections down the side */
+  dialog.xwide{max-width:920px}
+  .tabbed{display:grid;grid-template-columns:186px 1fr;min-height:min(66vh,560px)}
+  .tabbed > nav{border-right:1px solid var(--line-2);padding:14px 10px 14px 14px;background:#fdfcfa}
+  .tabbed > nav button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;
+    background:transparent;padding:8px 10px;border-radius:8px;font-family:inherit;font-size:13.5px;
+    font-weight:550;color:var(--ink-2);cursor:pointer;margin-bottom:2px}
+  .tabbed > nav button:hover{background:#f3efe8;color:var(--ink)}
+  .tabbed > nav button.on{background:var(--accent-bg);color:var(--accent-dk);font-weight:640}
+  .tabbed > nav .grp{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);
+    font-weight:700;padding:12px 10px 5px}
+  .tabbed > nav .grp:first-child{padding-top:0}
+  .tabbed > nav .badge{margin-left:auto;width:7px;height:7px;border-radius:50%;flex:none}
+  .tabbed > .panes{padding:16px 20px;overflow:auto;max-height:min(66vh,560px)}
+  .pane{display:none}
+  .pane.on{display:block}
+  .pane h4{margin:0 0 4px;font-size:15px;font-weight:650}
+  .pane > .lead{font-size:12.8px;color:var(--ink-3);margin:0 0 16px;line-height:1.5;max-width:62ch}
+  .pane fieldset{border:0;padding:0;margin:0 0 18px}
+  .pane fieldset > legend{display:none}
+  .pane .sub-h{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-3);
+    font-weight:700;margin:0 0 9px;display:flex;align-items:center;gap:8px}
+  .pane .sub-h::after{content:"";flex:1;height:1px;background:var(--line-2)}
+  @media (max-width:640px){
+    .tabbed{grid-template-columns:1fr}
+    .tabbed > nav{border-right:0;border-bottom:1px solid var(--line-2);display:flex;gap:4px;overflow-x:auto;
+      padding:10px 12px}
+    .tabbed > nav button{width:auto;white-space:nowrap;margin:0}
+    .tabbed > nav .grp{display:none}
+    .tabbed > .panes{max-height:none}
+  }
+
+  /* ---- cloudflare */
+  .steps-v{display:flex;flex-direction:column;gap:10px}
+  .cfstep{border:1px solid var(--line);border-radius:11px;padding:12px 14px;background:#fdfcfa}
+  .cfstep.done{border-color:#cfe6da;background:#f8fcfa}
+  .cfstep .t{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:640;margin-bottom:3px}
+  .cfstep .n{width:19px;height:19px;border-radius:50%;background:#f3efe8;color:var(--ink-3);display:grid;
+    place-items:center;font-size:10.5px;font-weight:700;flex:none}
+  .cfstep.done .n{background:var(--ok);color:#fff}
+  .cfstep .d{font-size:12.3px;color:var(--ink-3);line-height:1.45}
+  .cfstep .body{margin-top:10px}
+  .routes{width:100%;border-collapse:collapse;font-size:12.8px;margin-top:4px}
+  .routes th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-3);
+    font-weight:700;padding:0 8px 6px 0;border-bottom:1px solid var(--line-2)}
+  .routes td{padding:7px 8px 7px 0;border-bottom:1px solid var(--line-2);vertical-align:middle}
+  .routes tr:last-child td{border-bottom:0}
 
   #toasts{position:fixed;right:16px;bottom:16px;z-index:60;display:flex;flex-direction:column;gap:8px;
     max-width:min(380px,calc(100vw - 32px))}
@@ -243,39 +392,169 @@
 
 <div id="toasts"></div>
 
-<!-- add site -->
-<dialog id="dlgAdd">
-  <div class="dh"><h3>Add a site</h3><div class="sub">One card per app you deploy.</div></div>
+<!-- add site: a walkthrough, one question at a time -->
+<dialog id="dlgAdd" class="wide">
+  <div class="dh">
+    <h3 id="wizTitle">Add a site</h3>
+    <div class="sub" id="wizSub">One card per app you deploy.</div>
+    <div class="steps" id="wizSteps"></div>
+  </div>
   <div class="db">
-    <div class="field">
-      <label for="addName">Name</label>
-      <input type="text" id="addName" placeholder="Customer site" />
-    </div>
-    <div class="field">
-      <label>Where does it run?</label>
-      <div class="radios">
-        <label class="radio on" id="rLocal"><input type="radio" name="runner" value="local" checked />
-          <span><b>On this machine</b><span>The Command Center deploys it directly. No agent, nothing to install.</span></span></label>
-        <label class="radio" id="rAgent"><input type="radio" name="runner" value="agent" />
-          <span><b>On another machine</b><span>You get a one-line installer to run there. It dials back to this panel.</span></span></label>
+
+    <!-- 1 ---------------------------------------------------------------- -->
+    <section class="wstep" data-step="name">
+      <h4>What is this site?</h4>
+      <p class="lead">The name is yours — it labels the card, the folder and the pm2 process.</p>
+      <div class="field">
+        <label for="addName">Name</label>
+        <input type="text" id="addName" placeholder="Customer site" autocomplete="off" />
+        <div class="hint" id="addNameHint"></div>
       </div>
-    </div>
-    <div class="two">
-      <div class="field"><label for="addDir">App directory <span class="muted">(optional now)</span></label>
-        <input type="text" class="mono" id="addDir" placeholder="/home/container/mysite" /></div>
-      <div class="field"><label for="addPort">Port <span class="muted">(optional)</span></label>
-        <input type="number" id="addPort" placeholder="3000" min="1" max="65535" /></div>
-    </div>
-    <div class="field">
-      <label for="addUrl">Public URL <span class="muted">(optional)</span></label>
-      <input type="text" id="addUrl" placeholder="https://example.com" />
-      <div class="hint">Just a link on the card, so you can jump to the live site.</div>
-    </div>
+      <div class="field">
+        <label>Where does it run?</label>
+        <div class="radios">
+          <label class="radio on" id="rLocal"><input type="radio" name="runner" value="local" checked />
+            <span><b>On this machine</b><span>The Command Center deploys it directly. No agent, nothing to install.</span></span></label>
+          <label class="radio" id="rAgent"><input type="radio" name="runner" value="agent" />
+            <span><b>On another machine</b><span>You get a one-line installer to run there. It dials back to this panel.</span></span></label>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2 ---------------------------------------------------------------- -->
+    <section class="wstep" data-step="folder">
+      <h4>Where does it live?</h4>
+      <p class="lead">Apps sit under <span class="mono" id="addRootEcho">/home/container</span> on this machine,
+        so all this needs is the folder name.</p>
+      <div class="two">
+        <div class="field"><label for="addFolder">Folder</label>
+          <div class="pathbox"><span class="pre" id="addRootPre">/home/container/</span>
+            <input type="text" class="mono" id="addFolder" placeholder="mysite" autocomplete="off" /></div>
+          <div class="hint" id="addDirHint">Filled in from the name. Change it if the folder is called something else.</div>
+        </div>
+        <div class="field"><label for="addPort">Port <span style="color:var(--bad)">*</span></label>
+          <input type="number" id="addPort" placeholder="3000" min="1" max="65535" />
+          <div class="hint">What the app listens on. Passed to it as <span class="mono">PORT</span>, and it is what
+            the health and version checks are pointed at after a deploy.</div>
+        </div>
+      </div>
+      <details id="addPathAdv">
+        <summary class="hint" style="cursor:pointer">The folder is somewhere else entirely</summary>
+        <div class="field" style="margin-top:10px"><label for="addDir">Full path</label>
+          <input type="text" class="mono" id="addDir" placeholder="/var/www/mysite" />
+        </div>
+      </details>
+      <div class="tasks" id="scanTasks" style="display:none"></div>
+    </section>
+
+    <!-- 3 ---------------------------------------------------------------- -->
+    <section class="wstep" data-step="source">
+      <h4>Where does the code come from?</h4>
+      <p class="lead">Pulling it now means the rest of this walkthrough can read the app's own
+        <span class="mono">package.json</span> and <span class="mono">.env.example</span> instead of asking you
+        to remember them.</p>
+      <div class="field">
+        <div class="radios">
+          <label class="radio on" id="rGh"><input type="radio" name="source" value="github" checked />
+            <span><b>Pull it from GitHub now</b><span>Downloaded here and kept as a release, so you can roll back to it later.</span></span></label>
+          <label class="radio" id="rLater"><input type="radio" name="source" value="later" />
+            <span><b>Not yet</b><span>Upload a zip or pull a branch from the site's card afterwards.</span></span></label>
+        </div>
+      </div>
+      <div id="addGhFields">
+        <div class="two">
+          <div class="field"><label for="addRepo">Repository</label>
+            <input type="text" class="mono" id="addRepo" placeholder="owner/name, or a github.com URL" autocomplete="off" />
+            <div class="hint">Paste anything — a URL, <span class="mono">owner/name</span>, or an SSH remote.</div></div>
+          <div class="field"><label for="addRef">Branch, tag or commit</label>
+            <input type="text" class="mono" id="addRef" list="addRefs" placeholder="the default branch" autocomplete="off" />
+            <datalist id="addRefs"></datalist>
+            <div class="hint"><a href="#" id="addGhLoad">Load branches and tags</a> <span id="addGhInfo" class="muted"></span></div></div>
+        </div>
+        <div class="field"><label for="addGhToken">Token <span class="muted">(private repositories)</span></label>
+          <input type="password" id="addGhToken" autocomplete="off" placeholder="ghp_..." />
+          <div class="hint" id="addGhTokenState"></div>
+          <label class="chk" style="margin-top:6px"><input type="checkbox" id="addGhSave" />
+            <span>Remember this token for this site</span></label></div>
+      </div>
+      <div class="tasks" id="pullTasks" style="display:none"></div>
+    </section>
+
+    <!-- 4 ---------------------------------------------------------------- -->
+    <section class="wstep" data-step="start">
+      <h4>How is it started and stopped?</h4>
+      <p class="lead" id="addStartLead">A deploy has to be able to take the app down and bring it back up.</p>
+      <div class="field">
+        <label for="addMode">Restart mode</label>
+        <select id="addMode">
+          <option value="pm2">pm2 — the app is a pm2 process</option>
+          <option value="systemd">systemd — the app is a systemd service</option>
+          <option value="command">Command — your own stop and start commands</option>
+          <option value="child">Supervised — the Command Center runs the app itself</option>
+        </select>
+      </div>
+      <div id="addModePm2">
+        <div class="two">
+          <div class="field"><label for="addService">pm2 process name</label>
+            <input type="text" class="mono" id="addService" placeholder="mysite" />
+            <div class="hint">Defaults to the site name.</div></div>
+          <div class="field"><label for="addPm2Start">First start command</label>
+            <select id="addPm2Start"></select>
+            <div class="hint" id="addPm2StartHint">Used only when pm2 has never seen this process, to register it.</div></div>
+        </div>
+        <div class="field" id="addPm2Custom" style="display:none"><label for="addPm2StartCustom">Command</label>
+          <input type="text" class="mono" id="addPm2StartCustom" placeholder="node server.js" /></div>
+      </div>
+      <div id="addModeSystemd" style="display:none">
+        <div class="field"><label for="addUnit">Service name</label>
+          <input type="text" class="mono" id="addUnit" placeholder="mysite" /></div>
+        <label class="chk"><input type="checkbox" id="addSudo" />
+          <span>Prefix with <span class="mono">sudo</span><span class="d">Only when the runner is not root.</span></span></label>
+      </div>
+      <div id="addModeCommand" style="display:none">
+        <div class="field"><label for="addStop">Stop command</label>
+          <input type="text" class="mono" id="addStop" placeholder="docker compose stop web" /></div>
+        <div class="field"><label for="addStart">Start command</label>
+          <input type="text" class="mono" id="addStart" placeholder="docker compose up -d web" /></div>
+      </div>
+      <div id="addModeChild" style="display:none">
+        <div class="field"><label for="addChildStart">Start command</label>
+          <input type="text" class="mono" id="addChildStart" placeholder="npm start" />
+          <div class="hint">The app runs as a child process of the panel, so the stop is certain.</div></div>
+      </div>
+    </section>
+
+    <!-- 5 ---------------------------------------------------------------- -->
+    <section class="wstep" data-step="env">
+      <h4>Environment</h4>
+      <p class="lead" id="addEnvLead">These reach the app as environment variables.</p>
+      <div id="addEnvEditor"></div>
+      <label class="chk" style="margin-top:12px"><input type="checkbox" id="addEnvFile" checked />
+        <span>Write these into the app's <span class="mono">.env</span>
+          <span class="d">On top of the process environment, so tools that read <span class="mono">.env</span>
+            themselves — <span class="mono">prisma</span>, <span class="mono">next build</span> — see them too.
+            They go in a marked block; anything else in the file is left alone.</span></span></label>
+      <label class="chk" id="addDeployWrap" style="display:none"><input type="checkbox" id="addDeployNow" checked />
+        <span>Deploy the release you pulled as soon as this is done
+          <span class="d">Installs, builds, writes the <span class="mono">.env</span> and starts the app —
+            with the console open so you can watch it.</span></span></label>
+    </section>
+
+    <!-- 6 ---------------------------------------------------------------- -->
+    <section class="wstep" data-step="create">
+      <h4 id="addDoneTitle">Setting it up</h4>
+      <p class="lead" id="addDoneLead">This only takes a moment.</p>
+      <div class="tasks" id="createTasks"></div>
+      <div id="addSummary"></div>
+    </section>
+
     <div class="banner bad" id="addErr" style="display:none"></div>
   </div>
   <div class="df">
-    <button class="btn" data-close>Cancel</button>
-    <button class="btn accent" id="addGo">Create site</button>
+    <span class="busy" id="wizBusy"><span class="spin"></span><span id="wizBusyText"></span></span>
+    <button class="btn" id="wizCancel" data-close>Cancel</button>
+    <button class="btn" id="wizBack">Back</button>
+    <button class="btn accent" id="wizNext">Continue</button>
   </div>
 </dialog>
 
@@ -307,6 +586,19 @@
   <div class="df"><button class="btn primary" data-close>Done</button></div>
 </dialog>
 
+<!-- everything about one site: the card is the summary, this is the rest -->
+<dialog id="dlgSite" class="wide">
+  <div class="dh">
+    <h3 id="siteTitle">Site</h3>
+    <div class="sub" id="siteSub"></div>
+  </div>
+  <div class="db" id="siteBody"></div>
+  <div class="df">
+    <button class="btn left" id="siteSettings">Settings</button>
+    <button class="btn" data-close>Close</button>
+  </div>
+</dialog>
+
 <!-- site settings -->
 <dialog id="dlgSettings" class="wide">
   <div class="dh"><h3 id="setTitle">Site settings</h3>
@@ -314,10 +606,7 @@
   <div class="db">
     <fieldset>
       <legend>Identity</legend>
-      <div class="two">
-        <div class="field"><label>Name</label><input type="text" id="setName" /></div>
-        <div class="field"><label>Public URL</label><input type="text" id="setPublicUrl" placeholder="https://example.com" /></div>
-      </div>
+      <div class="field"><label>Name</label><input type="text" id="setName" /></div>
       <div class="field"><label>Runs on</label>
         <select id="setRunner">
           <option value="local">This machine — no agent needed</option>
@@ -333,7 +622,7 @@
           <input type="text" class="mono" id="setAppDir" placeholder="/home/container/mysite" />
           <div class="hint">The folder holding the app. A <span class="mono">.forthway/</span> directory
             inside it holds the staging build and the rollback snapshot; deploys never touch it.</div></div>
-        <div class="field"><label>Port</label>
+        <div class="field"><label>Port <span style="color:var(--bad)">*</span></label>
           <input type="number" id="setPort" placeholder="3000" min="1" max="65535" />
           <div class="hint">The port the app listens on. Used for the health and version checks below,
             and passed to it as <span class="mono">PORT</span>.</div></div>
@@ -353,10 +642,15 @@
       </div>
       <div id="modePm2">
         <div class="two">
-          <div class="field"><label>pm2 process name</label><input type="text" class="mono" id="setService" placeholder="mysite" /></div>
-          <div class="field"><label>First start command</label><input type="text" class="mono" id="setPm2Start" placeholder="npm start" />
-            <div class="hint">Used only when pm2 has never seen this process, to register it.</div></div>
+          <div class="field"><label>pm2 process name</label>
+            <input type="text" class="mono" id="setService" placeholder="mysite" />
+            <div class="hint">Defaults to the site name.</div></div>
+          <div class="field"><label>First start command</label>
+            <select id="setPm2Start"></select>
+            <div class="hint" id="setPm2StartHint">Used only when pm2 has never seen this process, to register it.</div></div>
         </div>
+        <div class="field" id="setPm2Custom" style="display:none"><label>Command</label>
+          <input type="text" class="mono" id="setPm2StartCustom" placeholder="node server.js" /></div>
       </div>
       <div id="modeSystemd" style="display:none">
         <div class="two">
@@ -375,10 +669,11 @@
           <div class="hint">The app is run as a child process, so the stop is certain — useful where there is no
             service manager. Its output streams into the console below.</div></div>
       </div>
-      <div class="field"><label>Extra environment</label><textarea class="mono" id="setEnv" placeholder="NODE_ENV=production&#10;DATABASE_URL=..."></textarea>
-        <div class="hint">One <span class="mono">KEY=value</span> per line, passed to the app and to every command
-          run for it. Quotes around a value are treated as quoting and removed, the same as in a
-          <span class="mono">.env</span> file — so pasting a line straight out of one works.</div></div>
+      <div class="field"><label>Environment</label>
+        <div id="setEnvEditor"></div>
+        <div class="hint">Passed to the app and to every command run for it. Quotes around a value are treated as
+          quoting and removed, the same as in a <span class="mono">.env</span> file — so pasting a value straight
+          out of one works.</div></div>
       <label class="chk" style="margin-bottom:14px"><input type="checkbox" id="setEnvFile" />
         <span>Also write these into the app's <span class="mono">.env</span>
           <span class="d">The process environment reaches the running app, but not tools that read
@@ -387,6 +682,10 @@
             block; anything else in the file is left alone.</span></span></label>
     </fieldset>
 
+    <button class="btn advtoggle" id="setAdvToggle" type="button" aria-expanded="false" aria-controls="setAdvanced">
+      <span class="car">&#9656;</span> <span id="setAdvLabel">Show advanced options</span>
+    </button>
+    <div id="setAdvanced" hidden>
     <fieldset>
       <legend>Proving it came back</legend>
       <div class="two">
@@ -442,6 +741,8 @@
         <div class="hint"><span id="setGhState"></span> Only needed for a private repo the panel-wide token cannot reach.
           <a href="#" id="setClearGh">Clear the stored token</a></div></div>
     </fieldset>
+
+    </div>
 
     <fieldset class="danger-zone">
       <legend>Danger zone</legend>
@@ -501,86 +802,215 @@
 </dialog>
 
 <!-- hub settings -->
-<dialog id="dlgHub">
+<dialog id="dlgHub" class="xwide">
   <div class="dh"><h3>Command Center settings</h3><div class="sub" id="hubSub"></div></div>
-  <div class="db">
-    <fieldset>
-      <legend>Updates</legend>
-      <div class="banner info" id="updState" style="margin-bottom:12px"><span class="txt">Checking…</span></div>
-      <div class="row" style="margin:0 0 12px">
-        <button class="btn sm" id="updCheck">Check now</button>
-        <button class="btn sm accent" id="updApply" style="display:none">Update &amp; restart</button>
-        <button class="btn sm ghost" id="updNotes" style="display:none">What changed</button>
-      </div>
-      <pre class="mono" id="updNotesBody" style="display:none"></pre>
-      <details style="margin-bottom:12px">
-        <summary class="hint" style="cursor:pointer">Where updates come from</summary>
-        <div class="two" style="margin-top:10px">
+  <div class="tabbed">
+    <nav id="hubTabs">
+      <div class="grp">This panel</div>
+      <button type="button" class="on" data-tab="updates">Updates<span class="badge" id="tabDotUpd"></span></button>
+      <button type="button" data-tab="panel">Panel</button>
+      <button type="button" data-tab="password">Password</button>
+      <div class="grp">Connections</div>
+      <button type="button" data-tab="github">GitHub</button>
+      <button type="button" data-tab="cloudflare">Cloudflare<span class="badge" id="tabDotCf"></span></button>
+      <div class="grp">Reference</div>
+      <button type="button" data-tab="about">This machine</button>
+    </nav>
+    <div class="panes">
+
+      <!-- updates -->
+      <section class="pane on" data-pane="updates">
+        <h4>Updates</h4>
+        <p class="lead">Your settings, releases and data are never touched by an update, and the install is
+          backed up first — so a bad version is one button to undo.</p>
+        <div class="banner info" id="updState"><span class="txt">Checking…</span></div>
+        <div class="row" style="margin:0 0 14px">
+          <button class="btn sm" id="updCheck">Check now</button>
+          <button class="btn sm accent" id="updApply" style="display:none">Update &amp; restart</button>
+          <button class="btn sm ghost" id="updNotes" style="display:none">What changed</button>
+        </div>
+        <pre class="mono" id="updNotesBody" style="display:none"></pre>
+        <div class="sub-h">Where updates come from</div>
+        <div class="two">
           <div class="field"><label>Repository</label><input type="text" class="mono" id="updRepo" placeholder="llallenll/Forthway-Command-Center" /></div>
           <div class="field"><label>Branch or tag</label><input type="text" class="mono" id="updRef" placeholder="newest release" /></div>
         </div>
         <label class="chk"><input type="checkbox" id="updAuto" />
           <span>Check for updates automatically<span class="d">Once a few hours. Nothing is installed without you pressing the button.</span></span></label>
-        <div class="hint" style="margin-top:10px">
-          Your settings, releases and data are never touched by an update, and the install is backed up
-          first — so a bad version is one button to undo.
-        </div>
-        <div id="updBackups" class="hint" style="margin-top:10px"></div>
-      </details>
-    </fieldset>
-    <fieldset>
-      <legend>GitHub</legend>
-      <div class="field"><label>Personal access token</label>
-        <input type="password" id="hubGh" autocomplete="off" placeholder="ghp_..." />
-        <div class="hint" id="hubGhState"></div></div>
-    </fieldset>
-    <fieldset>
-      <legend>Cloudflare Tunnel</legend>
-      <div class="banner info" id="tunState" style="margin-bottom:12px"><span class="txt">…</span></div>
-      <div class="field">
-        <label for="tunToken">Connector token</label>
-        <input type="password" id="tunToken" autocomplete="off" placeholder="eyJhIjoi…" />
-        <div class="hint" id="tunTokenState"></div>
-      </div>
-      <label class="chk"><input type="checkbox" id="tunAutoStart" />
-        <span>Start the tunnel with the panel<span class="d">Otherwise it only runs when you start it here.</span></span></label>
-      <div class="row" style="margin:12px 0 14px">
-        <button class="btn sm" id="tunStart">Start</button>
-        <button class="btn sm" id="tunStop">Stop</button>
-        <button class="btn sm ghost" id="tunLog">Show log</button>
-      </div>
-      <div class="hint" style="margin-bottom:14px">
-        Which hostname points at which local port is set in the Cloudflare dashboard — that is what a
-        connector token is for. Paste the token here and this machine dials out to Cloudflare; nothing
-        needs to be port-forwarded to it.
-      </div>
-    </fieldset>
+        <div id="updBackups" class="hint" style="margin-top:12px"></div>
+      </section>
 
-    <fieldset>
-      <legend>This panel</legend>
-      <div class="two">
-        <div class="field"><label>Port</label><input type="number" id="hubPort" min="1" max="65535" />
-          <div class="hint" id="hubPortHint"></div></div>
-        <div class="field"><label>Release archives kept per site</label><input type="number" id="hubKeep" min="1" max="50" />
-          <div class="hint">The live release, the one before it and anything pinned are always kept.</div></div>
-      </div>
-    </fieldset>
-    <fieldset>
-      <legend>Change the password</legend>
-      <div class="two">
-        <div class="field"><label>Current password</label><input type="password" id="hubPwOld" autocomplete="current-password" /></div>
-        <div class="field"><label>New password</label><input type="password" id="hubPwNew" autocomplete="new-password" /></div>
-      </div>
-    </fieldset>
-    <fieldset>
-      <legend>This machine</legend>
-      <dl class="kv" id="hubFacts"></dl>
-    </fieldset>
-    <div class="banner bad" id="hubErr" style="display:none"></div>
+      <!-- panel -->
+      <section class="pane" data-pane="panel">
+        <h4>Panel</h4>
+        <p class="lead">How this panel itself runs.</p>
+        <div class="two">
+          <div class="field"><label>Port</label><input type="number" id="hubPort" min="1" max="65535" />
+            <div class="hint" id="hubPortHint"></div></div>
+          <div class="field"><label>Release archives kept per site</label><input type="number" id="hubKeep" min="1" max="50" />
+            <div class="hint">The live release, the one before it and anything pinned are always kept.</div></div>
+        </div>
+        <div class="sub-h">Danger</div>
+        <div class="row">
+          <button class="btn sm danger" id="hubRestart">Restart the panel</button>
+          <span class="hint" style="margin:0">Running jobs are marked interrupted. pm2 brings it straight back.</span>
+        </div>
+      </section>
+
+      <!-- password -->
+      <section class="pane" data-pane="password">
+        <h4>Password</h4>
+        <p class="lead">One password guards the whole panel — and the panel can run any command on this
+          machine, so it is worth a good one.</p>
+        <div class="field"><label>Current password</label>
+          <input type="password" id="hubPwOld" autocomplete="current-password" /></div>
+        <div class="field"><label>New password</label>
+          <input type="password" id="hubPwNew" autocomplete="new-password" />
+          <div class="hint">Saved as a hash. Other browsers stay signed in until their session expires.</div></div>
+      </section>
+
+      <!-- github -->
+      <section class="pane" data-pane="github">
+        <h4>GitHub</h4>
+        <p class="lead">A personal access token lets the panel pull private repositories. A site can
+          override it with a token of its own in that site's settings.</p>
+        <div class="banner ok" id="hubGhHas" style="display:none"><span class="txt"></span>
+          <button class="btn sm" id="hubGhClear">Remove it</button></div>
+        <div class="field"><label id="hubGhLabel">Personal access token</label>
+          <input type="password" id="hubGh" autocomplete="off" placeholder="ghp_..." />
+          <div class="hint" id="hubGhState"></div></div>
+        <div class="hint">It needs <span class="mono">repo</span> scope for a classic token, or read access to
+          contents for a fine-grained one.</div>
+      </section>
+
+      <!-- cloudflare -->
+      <section class="pane" data-pane="cloudflare">
+        <h4>Cloudflare Tunnel</h4>
+        <p class="lead">This machine dials out to Cloudflare, so the panel and the sites on it are reachable
+          by name without opening a port or knowing the box's address.</p>
+        <div class="banner info" id="tunState"><span class="txt">…</span></div>
+
+        <div class="steps-v" id="cfSteps">
+          <!-- 1 -->
+          <div class="cfstep" id="cfStep1">
+            <div class="t"><span class="n">1</span> Connect your Cloudflare account</div>
+            <div class="d">So the panel can create the connector and add hostnames for you, in your account.</div>
+            <div class="body">
+              <div class="row" id="cfLoginRow">
+                <button class="btn sm accent" id="cfLogin">Log in with Cloudflare</button>
+                <button class="btn sm ghost" id="cfDisconnect" style="display:none">Disconnect</button>
+                <span class="hint" id="cfTokenState" style="margin:0"></span>
+              </div>
+
+              <div id="cfLoginWait" style="display:none;margin-top:10px">
+                <div class="banner info" style="margin-bottom:8px"><span class="txt">
+                  Open this link and pick the domain to use. This page keeps waiting.</span></div>
+                <div class="cmdbox" id="cfLoginUrl"><button class="copy" id="cfLoginCopy">Copy</button></div>
+                <div class="row" style="margin-top:9px">
+                  <a class="btn sm accent" id="cfLoginOpen" target="_blank" rel="noopener">Open it</a>
+                  <button class="btn sm ghost" id="cfLoginCancel">Cancel</button>
+                  <span class="hint" id="cfLoginState" style="margin:0"><span class="spin"></span> Waiting for you to approve it…</span>
+                </div>
+              </div>
+
+              <details id="cfTokenWrap" style="margin-top:10px">
+                <summary class="hint" style="cursor:pointer">Use an API token instead</summary>
+                <div class="hint" style="margin:8px 0">It needs <b>Account · Cloudflare Tunnel · Edit</b>,
+                  <b>Zone · DNS · Edit</b> and <b>Zone · Zone · Read</b>.
+                  <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">Make one</a>.</div>
+                <div class="field" style="margin-bottom:8px">
+                  <input type="password" id="cfToken" autocomplete="off" placeholder="Cloudflare API token" />
+                </div>
+                <button class="btn sm" id="cfConnect">Use this token</button>
+              </details>
+
+              <div class="field" id="cfAccountWrap" style="display:none;margin:10px 0 0">
+                <label for="cfAccount">Account</label>
+                <select id="cfAccount"></select>
+              </div>
+            </div>
+          </div>
+
+          <!-- 2 -->
+          <div class="cfstep" id="cfStep2">
+            <div class="t"><span class="n">2</span> The connector</div>
+            <div class="d" id="cfTunnelDesc">One connector serves this whole machine. Create a new one, or
+              adopt one that already exists in this account.</div>
+            <div class="body" id="cfTunnelBody">
+              <div class="two">
+                <div class="field"><label for="cfTunnelPick">Use an existing connector</label>
+                  <select id="cfTunnelPick"></select></div>
+                <div class="field"><label for="cfTunnelName">…or create one called</label>
+                  <input type="text" class="mono" id="cfTunnelName" placeholder="fcc-this-machine" /></div>
+              </div>
+              <div class="row">
+                <button class="btn sm accent" id="cfTunnelGo">Create and connect</button>
+                <button class="btn sm" id="cfTunnelAdopt">Use the selected one</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 3 -->
+          <div class="cfstep" id="cfStep3">
+            <div class="t"><span class="n">3</span> Host routes</div>
+            <div class="d">Zero Trust public hostnames: each one reaches a port on <span class="mono">127.0.0.1</span>
+              here, through the connector, so the app itself only ever listens on localhost. The DNS record is
+              written for you, so the name works as soon as it is added.</div>
+            <div class="body">
+              <table class="routes" id="cfRoutes"></table>
+              <div class="two" style="margin-top:12px">
+                <div class="field" style="margin-bottom:8px"><label for="cfSub">Hostname</label>
+                  <div class="pathbox">
+                    <input type="text" class="mono" id="cfSub" placeholder="app" autocomplete="off"
+                      style="flex:1 1 0;min-width:0" />
+                    <span class="pre" style="padding:8px 4px 8px 0">.</span>
+                    <select id="cfZone" style="border:0;background:transparent;box-shadow:none;flex:0 1 auto;
+                      width:auto;font-family:var(--mono);font-size:12.5px;padding-left:0"></select>
+                  </div>
+                  <div class="hint" id="cfZoneHint"></div></div>
+                <div class="field" style="margin-bottom:8px"><label for="cfTarget">Sends it to</label>
+                  <select id="cfTarget"></select>
+                  <div class="hint" id="cfCustomWrap" style="display:none">
+                    <input type="text" class="mono" id="cfService" placeholder="http://127.0.0.1:3000" style="margin-top:6px" />
+                  </div></div>
+              </div>
+              <button class="btn sm accent" id="cfAddRoute">Add the route</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sub-h" style="margin-top:18px">The connector process</div>
+        <div class="row" style="margin:0 0 12px">
+          <button class="btn sm" id="tunStart">Start</button>
+          <button class="btn sm" id="tunStop">Stop</button>
+          <button class="btn sm ghost" id="tunLog">Show log</button>
+        </div>
+        <label class="chk"><input type="checkbox" id="tunAutoStart" />
+          <span>Start the tunnel with the panel<span class="d">Otherwise it only runs when you start it here.</span></span></label>
+        <details style="margin-top:12px">
+          <summary class="hint" style="cursor:pointer">Paste a connector token instead</summary>
+          <div class="field" style="margin-top:10px">
+            <input type="password" id="tunToken" autocomplete="off" placeholder="eyJhIjoi…" />
+            <div class="hint" id="tunTokenState">From the Cloudflare dashboard: Zero Trust → Networks → Tunnels →
+              your tunnel → Install connector. Hostnames are then set over there rather than here.</div>
+          </div>
+        </details>
+      </section>
+
+      <!-- about -->
+      <section class="pane" data-pane="about">
+        <h4>This machine</h4>
+        <p class="lead">What the panel is running on, for when something does not add up.</p>
+        <dl class="kv" id="hubFacts"></dl>
+      </section>
+
+    </div>
+  </div>
+  <div class="db" style="padding-top:0;padding-bottom:0">
+    <div class="banner bad" id="hubErr" style="display:none;margin:12px 0 0"></div>
   </div>
   <div class="df">
-    <button class="btn left danger" id="hubRestart">Restart the panel</button>
-    <button class="btn" data-close>Cancel</button>
+    <button class="btn" data-close>Close</button>
     <button class="btn accent" id="hubSave">Save</button>
   </div>
 </dialog>
@@ -628,11 +1058,18 @@ function toast(msg, kind = '') {
 }
 
 async function api(path, body, method = 'POST') {
-  const res = await fetch(path, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    // "Failed to fetch" says nothing. The panel not answering is nearly always
+    // the panel being restarted or updated, and it comes back on its own.
+    throw new Error('The Command Center did not answer — it may be restarting. Try again in a moment.');
+  }
   if (res.status === 401) { location.reload(); throw new Error('signed out'); }
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error || ('Request failed (' + res.status + ')'));
@@ -682,7 +1119,8 @@ function render() {
       '<button class="btn accent" onclick="document.getElementById(\'btnAdd\').click()">+ Add your first site</button>' +
       '<ol>' +
       '<li><span class="n">1</span><span><b>Name it</b> and say whether it runs on this machine or another one.</span></li>' +
-      '<li><span class="n">2</span><span><b>Point it at its folder</b> and say how to start it — pm2, systemd, or a command.</span></li>' +
+      '<li><span class="n">2</span><span><b>Pull the code</b> from GitHub, and the walkthrough reads its ' +
+      'package.json and .env.example so it can fill the rest in.</span></li>' +
       '<li><span class="n">3</span><span><b>Deploy</b> and watch the build happen in the console.</span></li>' +
       '</ol></div>';
     return;
@@ -696,8 +1134,10 @@ function render() {
     let card = document.getElementById('card-' + s.id);
     if (!card) {
       card = document.createElement('div');
-      card.className = 'card';
+      card.className = 'card compact';
       card.id = 'card-' + s.id;
+      card.tabIndex = 0;
+      card.setAttribute('role', 'button');
       wrap.appendChild(card);
     }
     const html = cardHtml(s);
@@ -710,6 +1150,7 @@ function render() {
   for (const el of [...wrap.children]) {
     if (!seen.has(el.id.replace('card-', ''))) el.remove();
   }
+  paintSiteDetail();
 }
 
 function statusPills(s) {
@@ -736,47 +1177,311 @@ function statusPills(s) {
   return out.join(' ');
 }
 
+// ---------------------------------------------------------------- menus
+
+let openMenuEl = null;
+
+function closeMenu() {
+  if (!openMenuEl) return;
+  openMenuEl.remove();
+  openMenuEl = null;
+  document.removeEventListener('mousedown', onMenuOutside, true);
+  document.removeEventListener('keydown', onMenuKey, true);
+  window.removeEventListener('resize', closeMenu);
+  window.removeEventListener('scroll', closeMenu, true);
+}
+function onMenuOutside(ev) { if (openMenuEl && !openMenuEl.contains(ev.target)) closeMenu(); }
+function onMenuKey(ev) { if (ev.key === 'Escape') { ev.stopPropagation(); closeMenu(); } }
+
+/**
+ * A drop-down anchored to a button.
+ *
+ * items: { label, detail, danger, disabled, onClick } | { separator:true } |
+ *        { heading } | { note }
+ * Returns the element, so a menu that is still loading can be filled in later.
+ */
+function openMenu(anchor, items) {
+  closeMenu();
+  const el = document.createElement('div');
+  el.className = 'menu';
+  el.setAttribute('role', 'menu');
+  // A modal <dialog> paints in the top layer, above everything in the page no
+  // matter what z-index says. A menu opened from inside one has to live in
+  // that dialog or it is simply not visible.
+  (anchor.closest('dialog[open]') || document.body).appendChild(el);
+  openMenuEl = el;
+  fillMenu(el, items);
+  positionMenu(el, anchor);
+  // Deferred so the click that opened it does not immediately close it.
+  setTimeout(() => {
+    document.addEventListener('mousedown', onMenuOutside, true);
+    document.addEventListener('keydown', onMenuKey, true);
+    window.addEventListener('resize', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+  }, 0);
+  const first = el.querySelector('button:not(:disabled)');
+  if (first) first.focus();
+  return el;
+}
+
+function fillMenu(el, items) {
+  el.innerHTML = '';
+  for (const item of items) {
+    if (!item) continue;
+    if (item.separator) {
+      const d = document.createElement('div');
+      d.className = 'sep';
+      el.appendChild(d);
+      continue;
+    }
+    if (item.heading) {
+      const d = document.createElement('div');
+      d.className = 'lbl';
+      d.textContent = item.heading;
+      el.appendChild(d);
+      continue;
+    }
+    if (item.note) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = item.note;
+      el.appendChild(d);
+      continue;
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitem');
+    if (item.danger) b.classList.add('danger');
+    b.disabled = !!item.disabled;
+    b.innerHTML = '<b></b>' + (item.detail ? '<span class="d"></span>' : '');
+    b.querySelector('b').textContent = item.label;
+    if (item.detail) b.querySelector('.d').textContent = item.detail;
+    b.addEventListener('click', () => {
+      closeMenu();
+      item.onClick && item.onClick();
+    });
+    el.appendChild(b);
+  }
+}
+
+function positionMenu(el, anchor) {
+  const r = anchor.getBoundingClientRect();
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  let left = r.left;
+  if (left + w > window.innerWidth - 8) left = Math.max(8, r.right - w);
+  let top = r.bottom + 5;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 5);
+  el.style.left = Math.round(left) + 'px';
+  el.style.top = Math.round(top) + 'px';
+}
+
+// ------------------------------------------------------- what a site can run
+
+// package.json is read on demand, keyed so a deploy or a folder change drops
+// the stale answer rather than offering scripts the new build does not have.
+const scriptCache = new Map();
+
+async function siteScripts(s) {
+  const key = s.id + '|' + (s.settings.appDir || '') + '|' + (s.currentReleaseId || '');
+  if (scriptCache.has(key)) return scriptCache.get(key);
+  let scan = null;
+  if (s.runner === 'local' && s.settings.appDir) scan = await scanApp(s.settings.appDir, s.runner, s.id);
+  const thin = (x) => !x || !x.ok || !x.packageJson || x.packageJson.error;
+  // A remote site's folder is out of reach, and a local folder may not have
+  // been deployed into yet — the release that is live answers just as well.
+  if (thin(scan) && s.currentReleaseId) {
+    const fromRelease = await scanApp(null, s.runner, s.id, s.currentReleaseId);
+    if (!thin(fromRelease)) scan = fromRelease;
+  }
+  scriptCache.set(key, scan);
+  return scan;
+}
+
+/** Scripts worth offering as a one-off: not the ones that run the app itself. */
+const SCRIPT_SKIP = ['start', 'dev'];
+
+function runnableScripts(scan) {
+  const pkg = scan && scan.ok && scan.packageJson && !scan.packageJson.error ? scan.packageJson : null;
+  if (!pkg) return [];
+  const pm = pkg.packageManager || 'npm';
+  return Object.entries(pkg.scripts || {})
+    .filter(([name]) => !SCRIPT_SKIP.includes(name))
+    .map(([name, body]) => ({
+      name,
+      body,
+      command: pm + (pm === 'npm' ? ' run ' : ' ') + name,
+    }));
+}
+
+// ------------------------------------------------------------------ actions
+
+function siteActionsMenu(anchor, s) {
+  const busy = !!s.activeJob;
+  const items = [
+    { heading: 'The app' },
+    {
+      label: 'Restart',
+      detail: s.settings.restart.mode + (s.settings.restart.service ? ' · ' + s.settings.restart.service : ''),
+      disabled: busy,
+      onClick: () => confirmThen('Restart ' + s.name + '?', 'The site will be briefly unavailable.',
+        () => act0('/api/restart', { siteId: s.id }, 'Restarting', true)),
+    },
+    {
+      label: 'Stop',
+      disabled: busy,
+      danger: true,
+      onClick: () => confirmThen('Stop ' + s.name + '?', 'It will stay down until you start it again.',
+        () => act0('/api/stop', { siteId: s.id }, 'Stopping', true)),
+    },
+    { label: 'Start', disabled: busy, onClick: () => act0('/api/start', { siteId: s.id }, 'Starting', true) },
+    { separator: true },
+    { heading: 'This site' },
+    { label: 'Refresh status', onClick: () => act0('/api/refresh', { siteId: s.id }, 'Refreshed') },
+  ];
+  if (s.previousReleaseId) {
+    items.push({
+      label: 'Roll back',
+      detail: 'to the build before this one',
+      disabled: busy,
+      danger: true,
+      onClick: () => confirmThen('Roll back ' + s.name + '?',
+        'The previous build is restored and the app restarted.',
+        () => act0('/api/rollback', { siteId: s.id }, 'Rolling back', true)),
+    });
+  }
+  if (s.github.repo) {
+    items.push({
+      label: 'Pull & deploy',
+      detail: s.github.repo + (s.github.ref ? ' @ ' + s.github.ref : ''),
+      disabled: busy,
+      onClick: () => ghQuick(s.id),
+    });
+  }
+  if (s.activeJob) items.push({ label: 'Watch the console', onClick: () => openConsole(s.activeJob.id) });
+  if (s.runner === 'agent') items.push({ label: 'Show the agent installer', onClick: () => showInstaller(s.id) });
+  items.push({ separator: true });
+  // No point offering to open what is already open.
+  if (detailSiteId !== s.id) {
+    items.push({ label: 'Open ' + s.name, detail: 'releases, deploys, jobs', onClick: () => openSiteDetail(s.id) });
+  }
+  items.push({ label: 'Settings', onClick: () => openSettings(s.id) });
+  openMenu(anchor, items);
+}
+
+/** The app's own npm scripts, read out of its package.json when you ask. */
+function scriptsMenu(anchor, s) {
+  const el = openMenu(anchor, [{ heading: 'Run a script' }, { note: 'Reading package.json…' }]);
+  siteScripts(s).then((scan) => {
+    if (openMenuEl !== el) return; // they moved on
+    const scripts = runnableScripts(scan);
+    if (!scripts.length) {
+      fillMenu(el, [
+        { heading: 'Run a script' },
+        {
+          note: scan && scan.ok
+            ? 'No scripts in package.json beyond the ones that run the app.'
+            : 'Could not read this app\'s package.json' + (scan && scan.reason ? ' — ' + scan.reason : '.'),
+        },
+      ]);
+      positionMenu(el, anchor);
+      return;
+    }
+    fillMenu(el, [
+      { heading: 'Run a script' },
+      ...scripts.map((x) => ({
+        label: x.name,
+        detail: x.body,
+        disabled: !!s.activeJob,
+        onClick: () => confirmThen('Run ' + x.command + '?',
+          'It runs in ' + (s.settings.appDir || 'the app directory') + ' with this site\'s environment. ' +
+          'Its output goes to the console.',
+          () => act0('/api/command', { siteId: s.id, command: x.command }, 'Running ' + x.name, true)),
+      })),
+    ]);
+    positionMenu(el, anchor);
+  });
+}
+
+// -------------------------------------------------------------- the card
+
 function cardHtml(s) {
   const dotClass = !s.everConnected ? 'new' : s.online ? (s.health && s.health.ok === false ? 'bad' : 'on') : 'off';
   const disk = s.deployed || {};
   const live = s.serving || {};
-  const rel = s.releases.find((r) => r.id === s.currentReleaseId);
 
   let h = '';
-  h += '<div class="head">';
+  h += '<div class="head tight">';
   h += '<div style="min-width:0"><h2><span class="dot ' + dotClass + '"></span>' + esc(s.name) + statusPills(s) + '</h2>';
-  h += '<div class="sub">' + (s.publicUrl ? '<a href="' + esc(s.publicUrl) + '" target="_blank" rel="noopener">' + esc(s.publicUrl.replace(/^https?:\/\//, '')) + '</a> · ' : '') +
-       '<span class="mono">' + esc(s.id) + '</span>' +
-       (s.settings.appDir ? ' · <span class="mono muted">' + esc(s.settings.appDir) + '</span>' : '') + '</div></div>';
-  h += '<div class="tools">' +
-       '<button class="btn sm" data-act="refresh">Refresh</button>' +
-       '<button class="btn sm" data-act="settings">Settings</button>' +
-       '</div></div>';
+  h += '<div class="sub"><span class="mono">' + esc(s.id) + '</span>' +
+       (s.settings.appDir ? ' · <span class="mono muted trunc" title="' + esc(s.settings.appDir) + '">' +
+         esc(s.settings.appDir) + '</span>' : '') + '</div></div>';
+  h += '<div class="tools"><button class="btn sm ghost" data-act="settings" title="Settings">Settings</button></div>';
+  h += '</div>';
 
-  h += '<div class="body">';
+  h += '<div class="body tight">';
 
+  // Only the things that need doing something about.
   if (!s.configured) {
-    h += '<div class="banner warn"><span class="txt">This site has no app directory yet, so nothing can be deployed to it.</span>' +
+    h += '<div class="banner warn"><span class="txt">No app directory yet — nothing can be deployed.</span>' +
          '<button class="btn sm" data-act="settings">Configure</button></div>';
   } else if (s.runner === 'agent' && !s.everConnected) {
-    h += '<div class="banner info"><span class="txt">Waiting for the agent on that machine to check in.</span>' +
-         '<button class="btn sm" data-act="install">Show installer</button></div>';
+    h += '<div class="banner info"><span class="txt">Waiting for the agent to check in.</span>' +
+         '<button class="btn sm" data-act="install">Installer</button></div>';
   } else if (s.runner === 'agent' && !s.online) {
-    h += '<div class="banner bad"><span class="txt">The agent has not checked in since ' + esc(ago(s.lastHeartbeat)) +
-         '. Jobs will queue until it is back.</span></div>';
+    h += '<div class="banner bad"><span class="txt">Agent last seen ' + esc(ago(s.lastHeartbeat)) +
+         '. Jobs queue until it is back.</span></div>';
   } else if (s.restartPending) {
-    h += '<div class="banner warn"><span class="txt">Version ' + esc(disk.version || '?') + ' is on disk, but ' +
-         esc(live.version || '?') + ' is still serving. Restart to pick it up.</span>' +
+    h += '<div class="banner warn"><span class="txt">' + esc(disk.version || '?') + ' is on disk, ' +
+         esc(live.version || '?') + ' is serving.</span>' +
          '<button class="btn sm" data-act="restart">Restart</button></div>';
   } else if (s.lastError) {
-    h += '<div class="banner bad"><span class="txt">Last job failed: ' + esc(s.lastError) + '</span></div>';
+    h += '<div class="banner bad"><span class="txt trunc" title="' + esc(s.lastError) + '">Last job failed: ' +
+         esc(s.lastError) + '</span></div>';
+  }
+
+  h += '<div class="mini">';
+  h += '<div class="b"><div class="lbl">On disk</div><div class="val">' + esc(disk.version || '—') + '</div>' +
+       '<div class="meta">' + (disk.deployedAt ? esc(ago(disk.deployedAt)) : 'not deployed yet') + '</div></div>';
+  h += '<div class="b live"><div class="lbl">Serving now</div><div class="val">' +
+       esc(live.version || (s.health && s.health.ok === false ? 'down' : '—')) + '</div>' +
+       '<div class="meta">' + (live.checkedAt ? 'checked ' + esc(ago(live.checkedAt)) : 'no version endpoint') +
+       '</div></div>';
+  h += '</div>';
+
+  h += '<div class="quick">';
+  h += '<button class="btn sm" data-act="menu"' + (s.configured ? '' : ' disabled') + '>Actions <span class="caret">&#9660;</span></button>';
+  h += '<button class="btn sm" data-act="scripts"' + (s.configured ? '' : ' disabled') + '>Run <span class="caret">&#9660;</span></button>';
+  if (s.activeJob) {
+    h += '<button class="btn sm ghost" data-act="watch">Watch</button>';
+  }
+  h += '<span class="more">Open &rarr;</span>';
+  h += '</div>';
+
+  h += '</div>';
+  return h;
+}
+
+// ---------------------------------------------------- the rest of a site
+
+function siteDetailHtml(s) {
+  const rel = s.releases.find((r) => r.id === s.currentReleaseId);
+  let h = '';
+
+  if (s.activeJob) {
+    h += '<div class="banner info"><span class="txt"><b>' + esc(s.activeJob.type) + '</b>' +
+         (s.activeJob.step ? ' — ' + esc(s.activeJob.step) : '') + ' is running.</span>' +
+         '<button class="btn sm" data-act="watch">Watch console</button></div>';
   }
 
   h += '<div class="versions">';
-  h += '<div class="vbox"><div class="lbl">On disk</div><div class="val">' + esc(disk.version || '—') + '</div>' +
-       '<div class="meta">' + (disk.deployedAt ? esc(ago(disk.deployedAt)) : (disk.name ? esc(disk.name) : 'not deployed yet')) + '</div></div>';
-  h += '<div class="vbox live"><div class="lbl">Serving now</div><div class="val">' + esc(live.version || (s.health && s.health.ok === false ? 'down' : '—')) + '</div>' +
-       '<div class="meta">' + (live.checkedAt ? 'checked ' + esc(ago(live.checkedAt)) : 'no version endpoint') + '</div></div>';
+  h += '<div class="vbox"><div class="lbl">On disk</div><div class="val">' + esc((s.deployed || {}).version || '—') + '</div>' +
+       '<div class="meta">' + ((s.deployed || {}).deployedAt ? esc(ago(s.deployed.deployedAt))
+         : ((s.deployed || {}).name ? esc(s.deployed.name) : 'not deployed yet')) + '</div></div>';
+  h += '<div class="vbox live"><div class="lbl">Serving now</div><div class="val">' +
+       esc((s.serving || {}).version || (s.health && s.health.ok === false ? 'down' : '—')) + '</div>' +
+       '<div class="meta">' + ((s.serving || {}).checkedAt ? 'checked ' + esc(ago(s.serving.checkedAt))
+         : 'no version endpoint') + '</div></div>';
   h += '</div>';
 
   // sources
@@ -786,23 +1491,20 @@ function cardHtml(s) {
   h += '<div class="gh"><b>Pull from GitHub</b>' +
        (s.github.repo
          ? '<div class="repo">' + esc(s.github.repo) + (s.github.ref ? ' @ ' + esc(s.github.ref) : '') + '</div>' +
-           '<div class="row"><button class="btn sm accent" data-act="ghQuick">Pull &amp; deploy</button>' +
+           '<div class="row"><button class="btn sm accent" data-act="ghQuick"' + (s.activeJob ? ' disabled' : '') +
+           '>Pull &amp; deploy</button>' +
            '<button class="btn sm" data-act="github">Change...</button></div>'
          : '<div class="repo muted">no repository set</div>' +
            '<button class="btn sm" data-act="github">Choose a repository</button>') +
        '</div>';
   h += '</div>';
 
-  // actions
   h += '<div class="row" style="margin-top:14px">';
-  h += '<button class="btn" data-act="restart"' + (s.activeJob ? ' disabled' : '') + '>Restart</button>';
-  h += '<button class="btn sm" data-act="stop"' + (s.activeJob ? ' disabled' : '') + '>Stop</button>';
-  h += '<button class="btn sm" data-act="start"' + (s.activeJob ? ' disabled' : '') + '>Start</button>';
-  if (s.previousReleaseId) h += '<button class="btn sm" data-act="rollback"' + (s.activeJob ? ' disabled' : '') + '>Roll back</button>';
-  if (s.activeJob) h += '<button class="btn sm" data-act="watch">Watch console</button>';
+  h += '<button class="btn" data-act="menu">Actions <span class="caret">&#9660;</span></button>';
+  h += '<button class="btn" data-act="scripts">Run a script <span class="caret">&#9660;</span></button>';
   h += '</div>';
 
-  h += '<div class="cmdrun"><input type="text" placeholder="run a command in the app directory, e.g. pm2 logs --lines 50" data-cmd />' +
+  h += '<div class="cmdrun"><input type="text" placeholder="or run any command in the app directory, e.g. pm2 logs --lines 50" data-cmd />' +
        '<button class="btn sm" data-act="runCmd"' + (s.activeJob ? ' disabled' : '') + '>Run</button></div>';
 
   // facts
@@ -818,7 +1520,6 @@ function cardHtml(s) {
   if (rel) facts.push('<b>live release</b> ' + esc(rel.filename));
   h += '<div class="facts">' + facts.join('') + '</div>';
 
-  // migrations
   if (s.migrations && s.migrations.length) {
     h += '<h3 class="sec">Migrations <span class="count">' + s.migrations.length + '</span></h3><div class="row">';
     for (const m of s.migrations) {
@@ -827,7 +1528,6 @@ function cardHtml(s) {
     h += '</div>';
   }
 
-  // releases
   h += '<h3 class="sec">Releases <span class="count">' + s.releases.length + '</span></h3>';
   if (!s.releases.length) {
     h += '<div class="empty">Nothing uploaded or pulled yet.</div>';
@@ -852,13 +1552,12 @@ function cardHtml(s) {
     h += '</tbody></table>';
   }
 
-  // jobs
   h += '<h3 class="sec">Recent jobs</h3>';
   if (!s.jobs.length) {
     h += '<div class="empty">Nothing has run yet.</div>';
   } else {
     h += '<table><tbody>';
-    for (const j of s.jobs.slice(0, 6)) {
+    for (const j of s.jobs.slice(0, 8)) {
       const pill = j.status === 'success' ? 'ok' : j.status === 'failed' ? 'bad'
         : j.status === 'running' ? 'accent' : 'mute';
       h += '<tr><td class="nowrap"><span class="pill ' + pill + '">' + esc(j.status) + '</span></td>';
@@ -872,40 +1571,79 @@ function cardHtml(s) {
     }
     h += '</tbody></table>';
   }
-
-  h += '</div>';
   return h;
 }
 
-function wireCard(card, s) {
+let detailSiteId = null;
+
+function openSiteDetail(id) {
+  const s = site(id);
+  if (!s) return;
+  detailSiteId = id;
+  paintSiteDetail(true);
+  $('dlgSite').showModal();
+}
+
+function paintSiteDetail(force) {
+  if (!detailSiteId) return;
+  const s = site(detailSiteId);
+  if (!s) { $('dlgSite').close(); detailSiteId = null; return; }
+  $('siteTitle').innerHTML = '<span class="dot ' +
+    (!s.everConnected ? 'new' : s.online ? (s.health && s.health.ok === false ? 'bad' : 'on') : 'off') +
+    '"></span> ' + esc(s.name);
+  $('siteSub').innerHTML = '<span class="mono">' + esc(s.id) + '</span>' +
+    (s.settings.appDir ? ' · <span class="mono">' + esc(s.settings.appDir) + '</span>' : '') +
+    (s.settings.port ? ' · port ' + esc(s.settings.port) : '');
+  const body = $('siteBody');
+  const html = siteDetailHtml(s);
+  // Rebuilding on every heartbeat would eat whatever is half-typed in the
+  // command box, so only when something actually changed.
+  if (!force && body.dataset.html === html) return;
+  body.dataset.html = html;
+  body.innerHTML = html;
+  wireSite(body, s);
+}
+
+$('siteSettings').addEventListener('click', () => { if (detailSiteId) openSettings(detailSiteId); });
+$('dlgSite').addEventListener('close', () => { detailSiteId = null; });
+
+// --------------------------------------------------------------- wiring
+
+/** One handler for both the card and the detail view — same buttons, same acts. */
+function wireSite(root, s) {
   const id = s.id;
 
-  card.querySelectorAll('[data-act]').forEach((el) => {
+  root.querySelectorAll('[data-act]').forEach((el) => {
     el.addEventListener('click', (ev) => {
       ev.preventDefault();
+      ev.stopPropagation(); // never let it also count as "open the card"
       const act = el.dataset.act;
       const rel = el.dataset.rel;
       const job = el.dataset.job;
+      const cur = site(id) || s;
 
+      if (act === 'menu') return siteActionsMenu(el, cur);
+      if (act === 'scripts') return scriptsMenu(el, cur);
+      if (act === 'open') return openSiteDetail(id);
       if (act === 'settings') return openSettings(id);
       if (act === 'install') return showInstaller(id);
       if (act === 'github') return openGithub(id);
       if (act === 'ghQuick') return ghQuick(id);
-      if (act === 'pick') return pickFile(id, card);
+      if (act === 'pick') return pickFile(id, root);
       if (act === 'refresh') return act0('/api/refresh', { siteId: id }, 'Refreshed');
-      if (act === 'restart') return confirmThen('Restart ' + s.name + '?', 'The site will be briefly unavailable.',
+      if (act === 'restart') return confirmThen('Restart ' + cur.name + '?', 'The site will be briefly unavailable.',
         () => act0('/api/restart', { siteId: id }, 'Restarting', true));
-      if (act === 'stop') return confirmThen('Stop ' + s.name + '?', 'It will stay down until you start it again.',
+      if (act === 'stop') return confirmThen('Stop ' + cur.name + '?', 'It will stay down until you start it again.',
         () => act0('/api/stop', { siteId: id }, 'Stopping', true));
       if (act === 'start') return act0('/api/start', { siteId: id }, 'Starting', true);
-      if (act === 'rollback') return confirmThen('Roll back ' + s.name + '?',
+      if (act === 'rollback') return confirmThen('Roll back ' + cur.name + '?',
         'The previous build is restored and the app restarted.',
         () => act0('/api/rollback', { siteId: id }, 'Rolling back', true));
       if (act === 'migrate') return confirmThen('Run ' + el.dataset.script + '?',
         'Migrations are not undone by a rollback.',
         () => act0('/api/migrate', { siteId: id, script: el.dataset.script }, 'Running migration', true));
       if (act === 'runCmd') {
-        const input = card.querySelector('[data-cmd]');
+        const input = root.querySelector('[data-cmd]');
         const command = input.value.trim();
         if (!command) return;
         input.value = '';
@@ -913,19 +1651,20 @@ function wireCard(card, s) {
       }
       if (act === 'deploy') return openDeploy(id, rel);
       if (act === 'pin') {
-        const r = s.releases.find((x) => x.id === rel);
+        const r = cur.releases.find((x) => x.id === rel);
         return act0('/api/release/update', { releaseId: rel, pinned: !r.pinned }, r.pinned ? 'Unpinned' : 'Pinned');
       }
       if (act === 'delrel') return confirmThen('Delete this release?', 'The archive is removed from this machine.',
         () => act0('/api/release/delete', { releaseId: rel }, 'Deleted'));
       if (act === 'log') return openConsole(job);
       if (act === 'cancel') return act0('/api/cancel', { jobId: job }, 'Cancelled');
-      if (act === 'watch') return openConsole(s.activeJob.id);
+      if (act === 'watch') return openConsole((site(id) || s).activeJob?.id);
     });
   });
 
-  const input = card.querySelector('[data-cmd]');
+  const input = root.querySelector('[data-cmd]');
   if (input) {
+    input.addEventListener('click', (ev) => ev.stopPropagation());
     input.addEventListener('keydown', (ev) => {
       if (ev.key !== 'Enter') return;
       const command = input.value.trim();
@@ -935,7 +1674,7 @@ function wireCard(card, s) {
     });
   }
 
-  const drop = card.querySelector('.drop');
+  const drop = root.querySelector('.drop');
   if (drop) {
     drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
     drop.addEventListener('dragleave', () => drop.classList.remove('over'));
@@ -946,6 +1685,24 @@ function wireCard(card, s) {
       if (f) uploadFile(id, f, drop);
     });
   }
+}
+
+/** The card itself opens the site — anything clickable on it stops the event. */
+function wireCard(card, s) {
+  wireSite(card, s);
+  // The card element outlives its contents: it is re-filled whenever the state
+  // moves, and adding these again each time would open the site once per
+  // render. The id is read at click time so a stale closure cannot mislead.
+  if (card.dataset.wired) return;
+  card.dataset.wired = '1';
+  const id = () => card.id.replace('card-', '');
+  card.addEventListener('click', () => openSiteDetail(id()));
+  card.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      openSiteDetail(id());
+    }
+  });
 }
 
 async function act0(path, body, okMsg, watch) {
@@ -1013,15 +1770,430 @@ function confirmThen(title, body, fn) {
   $('dlgConfirm').showModal();
 }
 
-// ---- add site
+// ------------------------------------------------------- shared field logic
+
+/** "Customer Site" -> "customer-site". Same rule the server uses for site ids. */
+function slugify(name) {
+  return String(name || '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
+function appRoot() {
+  return (SETTINGS.appRoot || '/home/container').replace(/\/+$/, '');
+}
+
+function joinAppDir(folder) {
+  const f = String(folder || '').trim().replace(/^\/+|\/+$/g, '');
+  return f ? appRoot() + '/' + f : '';
+}
+
+/** Ask the server what is actually in a folder. Never throws — "no" is an answer. */
+async function scanApp(appDir, runner, siteId, releaseId) {
+  try {
+    return await api('/api/sites/scan', { appDir, runner, siteId, releaseId });
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
+/**
+ * A checklist that fills in as the work happens, so a step that takes a
+ * second says what it is doing instead of freezing the dialog.
+ */
+function taskList(el) {
+  el.style.display = '';
+  el.innerHTML = '';
+  // A local scan finishes in single-digit milliseconds, and a checklist that
+  // appears and vanishes in one frame tells you nothing. Each row is held
+  // long enough to be read.
+  const FLOOR_MS = 340;
+  const beat = (started) => new Promise((r) => setTimeout(r, Math.max(0, FLOOR_MS - (Date.now() - started))));
+  const add = (label) => {
+    const row = document.createElement('div');
+    row.className = 'task';
+    row.innerHTML = '<span class="ic"></span><span class="tx"><b class="lbl"></b><span class="d"></span></span>';
+    row.querySelector('.lbl').textContent = label;
+    el.appendChild(row);
+    return row;
+  };
+  return {
+    reset() { el.innerHTML = ''; },
+    /** Run fn while the row spins; the string it returns becomes the row's detail. */
+    async run(label, fn) {
+      const row = add(label);
+      row.classList.add('run');
+      const started = Date.now();
+      try {
+        const detail = await fn();
+        await beat(started);
+        row.classList.remove('run');
+        row.classList.add('done');
+        if (detail) row.querySelector('.d').textContent = detail;
+        return detail;
+      } catch (err) {
+        await beat(started);
+        row.classList.remove('run');
+        row.classList.add('fail');
+        row.querySelector('.d').textContent = err.message;
+        throw err;
+      }
+    },
+    note(label, detail, kind) {
+      const row = add(label);
+      row.classList.add(kind || 'done');
+      if (detail) row.querySelector('.d').textContent = detail;
+    },
+  };
+}
+
+/**
+ * The start commands this app actually has.
+ *
+ * Everything in package.json's "scripts" is offered, with the command it runs
+ * shown beside it, because "npm run serve" means nothing until you can see
+ * that it is "node dist/main.js". npm start stays the default and stays first.
+ */
+function startCommandChoices(scan, current) {
+  const out = [];
+  const seen = new Set();
+  const add = (value, label) => {
+    const v = String(value || '').trim();
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    out.push({ value: v, label: label || v });
+  };
+
+  const pkg = scan && scan.packageJson && !scan.packageJson.error ? scan.packageJson : null;
+  const scripts = (pkg && pkg.scripts) || {};
+  const pm = (pkg && pkg.packageManager) || 'npm';
+  const invoke = (name) => (name === 'start' ? pm + ' start' : pm + (pm === 'npm' ? ' run ' : ' ') + name);
+  const withBody = (name) => {
+    const body = String(scripts[name] || '');
+    return invoke(name) + (body ? '  —  ' + (body.length > 46 ? body.slice(0, 45) + '…' : body) : '');
+  };
+
+  // npm start is the default whether or not the app declares it.
+  if (scripts.start) add('npm start', withBody('start'));
+  else add('npm start', 'npm start' + (pkg ? '  —  no "start" script in package.json' : ''));
+
+  for (const name of Object.keys(scripts)) {
+    if (name === 'start' && pm === 'npm') continue;
+    add(invoke(name), withBody(name));
+  }
+  if (pkg && pkg.main) add('node ' + pkg.main, 'node ' + pkg.main + '  —  package.json "main"');
+  if (current) add(current, current + '  —  what this site uses now');
+  return out;
+}
+
+/** Wire a start-command <select> with a "Something else" escape hatch. */
+function fillStartSelect(select, customWrap, customInput, scan, current) {
+  const choices = startCommandChoices(scan, current);
+  select.innerHTML =
+    choices.map((c) => '<option value="' + esc(c.value) + '">' + esc(c.label) + '</option>').join('') +
+    '<option value="__custom">Something else…</option>';
+  const want = String(current || 'npm start').trim() || 'npm start';
+  if (choices.some((c) => c.value === want)) select.value = want;
+  else { select.value = '__custom'; customInput.value = want === 'npm start' ? '' : want; }
+  const sync = () => { customWrap.style.display = select.value === '__custom' ? '' : 'none'; };
+  select.onchange = sync;
+  sync();
+  return choices.length;
+}
+
+function readStartSelect(select, customInput) {
+  return (select.value === '__custom' ? customInput.value : select.value).trim();
+}
+
+// ------------------------------------------------------ environment editor
+
+/**
+ * A row per variable instead of a wall of KEY=value text.
+ *
+ * The rows are seeded from the app's own .env.example — the list of things it
+ * expects is already written down there, so asking someone to retype it is
+ * asking them to get it wrong. Values already in the app's .env are filled in.
+ * "Edit as text" is still there for pasting a block in wholesale.
+ */
+function envEditor(container, opts = {}) {
+  const onScan = opts.onScan || (async () => null);
+  container.innerHTML =
+    '<div data-rows></div>' +
+    '<div class="envempty" data-empty>No variables yet.</div>' +
+    '<div class="row" style="margin:8px 0 2px">' +
+      '<button type="button" class="btn sm" data-add>+ Add variable</button>' +
+      '<button type="button" class="btn sm ghost" data-load>Load from .env.example</button>' +
+      '<button type="button" class="btn sm ghost" data-raw>Edit as text</button>' +
+      '<span class="hint" style="margin:0" data-state></span>' +
+    '</div>' +
+    '<textarea class="mono" data-text style="display:none;width:100%;min-height:120px;padding:8px 11px;' +
+      'border:1px solid var(--line);border-radius:8px;font-size:12.5px;background:#fdfcfa;color:var(--ink)" ' +
+      'placeholder="NODE_ENV=production&#10;DATABASE_URL=..."></textarea>';
+
+  const rowsEl = container.querySelector('[data-rows]');
+  const emptyEl = container.querySelector('[data-empty]');
+  const textEl = container.querySelector('[data-text]');
+  const stateEl = container.querySelector('[data-state]');
+  const btnLoad = container.querySelector('[data-load]');
+  const btnRaw = container.querySelector('[data-raw]');
+  let raw = false;
+  let canLoad = true; // there is something on this machine to read
+
+  function addRow(key, value, note) {
+    const row = document.createElement('div');
+    row.className = 'envrow';
+    row.innerHTML =
+      '<input type="text" data-k placeholder="KEY" autocomplete="off" spellcheck="false" />' +
+      '<input type="text" data-v placeholder="value" autocomplete="off" spellcheck="false" />' +
+      '<button type="button" class="rm" title="Remove">&#10005;</button>' +
+      (note ? '<div class="note"></div>' : '');
+    row.querySelector('[data-k]').value = key || '';
+    const vEl = row.querySelector('[data-v]');
+    vEl.value = value == null ? '' : value;
+    // A key the app asks for but has no value for is the whole reason to show
+    // this list — mark it before anyone presses save.
+    if (key && !String(vEl.value).trim()) vEl.classList.add('miss');
+    vEl.addEventListener('input', () => vEl.classList.toggle('miss', !vEl.value.trim() && !!key));
+    if (note) row.querySelector('.note').textContent = note;
+    row.querySelector('.rm').addEventListener('click', () => { row.remove(); paint(); });
+    rowsEl.appendChild(row);
+    return row;
+  }
+
+  function paint() {
+    emptyEl.style.display = raw || rowsEl.children.length ? 'none' : '';
+    rowsEl.style.display = raw ? 'none' : '';
+    textEl.style.display = raw ? '' : 'none';
+    btnRaw.textContent = raw ? 'Back to a row per variable' : 'Edit as text';
+    container.querySelector('[data-add]').style.display = raw ? 'none' : '';
+    btnLoad.style.display = raw || !canLoad ? 'none' : '';
+  }
+
+  function readRows() {
+    const env = {};
+    const errors = [];
+    const missing = [];
+    for (const row of rowsEl.children) {
+      const kEl = row.querySelector('[data-k]');
+      const vEl = row.querySelector('[data-v]');
+      const key = kEl.value.trim();
+      const value = vEl.value;
+      vEl.classList.remove('miss');
+      kEl.classList.remove('miss');
+      if (!key && !String(value).trim()) continue;
+      if (!key) { kEl.classList.add('miss'); errors.push({ line: 0, error: 'a value with no variable name' }); continue; }
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        kEl.classList.add('miss');
+        errors.push({ line: 0, error: '"' + key + '" is not a usable variable name' });
+        continue;
+      }
+      // A key with no value is left out rather than written as KEY="" — an
+      // empty string and an unset variable behave differently, and the app's
+      // own default is the better of the two.
+      if (!String(value).trim()) { vEl.classList.add('miss'); missing.push(key); continue; }
+      env[key] = window.ENVLIB ? window.ENVLIB.cleanEnvValue(value) : String(value).trim();
+    }
+    return { env, errors, missing };
+  }
+
+  const self = {
+    /** Replace every row. entries: [{key, value, comment}] */
+    set(entries) {
+      rowsEl.innerHTML = '';
+      for (const e of entries || []) addRow(e.key, e.value, e.comment);
+      paint();
+    },
+    setFromObject(obj) {
+      self.set(Object.entries(obj || {}).map(([key, value]) => ({ key, value })));
+    },
+    /** Merge what a scan found: example keys first, then anything only in .env. */
+    applyScan(scan, { quiet = false } = {}) {
+      if (!scan || !scan.ok) {
+        if (!quiet) stateEl.textContent = (scan && scan.reason) || 'Could not read that folder.';
+        return 0;
+      }
+      const have = readRows().env;
+      const known = new Set(Object.keys(have));
+      const current = {};
+      for (const e of (scan.envFile && scan.envFile.entries) || []) current[e.key] = e.value;
+
+      let added = 0;
+      const seed = [];
+      for (const e of scan.entries || []) {
+        if (known.has(e.key)) continue;
+        known.add(e.key);
+        seed.push({ key: e.key, value: current[e.key] != null ? current[e.key] : e.value, comment: e.comment });
+        added++;
+      }
+      for (const [key, value] of Object.entries(current)) {
+        if (known.has(key)) continue;
+        known.add(key);
+        seed.push({ key, value, comment: 'Already in the app\'s .env.' });
+        added++;
+      }
+      for (const e of seed) addRow(e.key, e.value, e.comment);
+      paint();
+      if (!quiet) {
+        stateEl.textContent = added
+          ? 'Added ' + added + ' from ' + (scan.envExample || '.env') + '.'
+          : (scan.envExample ? 'Nothing new in ' + scan.envExample + '.' : 'No .env.example in that folder.');
+      }
+      return added;
+    },
+    /** { env, errors, missing } — missing lists keys left blank. */
+    read() {
+      if (raw) {
+        const parsed = window.ENVLIB
+          ? window.ENVLIB.parseEnvText(textEl.value)
+          : { env: {}, errors: [{ line: 0, error: 'the parser has not loaded yet' }] };
+        return { env: parsed.env, errors: parsed.errors, missing: [] };
+      }
+      return readRows();
+    },
+    setState(text) { stateEl.textContent = text || ''; },
+    showLoad(on) { canLoad = !!on; paint(); },
+  };
+
+  container.querySelector('[data-add]').addEventListener('click', () => { addRow('', '', ''); paint(); });
+  btnRaw.addEventListener('click', () => {
+    if (!raw) {
+      const { env } = readRows();
+      textEl.value = window.ENVLIB
+        ? window.ENVLIB.formatEnvText(env)
+        : Object.entries(env).map(([k, v]) => k + '=' + v).join('\n');
+    } else {
+      const parsed = window.ENVLIB ? window.ENVLIB.parseEnvText(textEl.value) : { env: {} };
+      self.setFromObject(parsed.env);
+    }
+    raw = !raw;
+    paint();
+  });
+  btnLoad.addEventListener('click', async () => {
+    btnLoad.disabled = true;
+    stateEl.innerHTML = '<span class="spin"></span> Looking for .env.example…';
+    try {
+      self.applyScan(await onScan());
+    } finally {
+      btnLoad.disabled = false;
+    }
+  });
+
+  paint();
+  return self;
+}
+
+// ---- add site: a walkthrough
+
+const WIZ_STEPS = [
+  { key: 'name', label: 'Name' },
+  { key: 'folder', label: 'Folder' },
+  { key: 'source', label: 'Code' },
+  { key: 'start', label: 'Start' },
+  { key: 'env', label: 'Environment' },
+  { key: 'create', label: 'Done' },
+];
+
+const wiz = {
+  at: 0,
+  runner: 'local',
+  scan: null,      // what the folder said
+  release: null,   // the release pulled from GitHub, if any
+  createdId: null, // the site exists from the "Code" step onwards
+  env: null,       // the editor
+};
+
+function wizPaint() {
+  const step = WIZ_STEPS[wiz.at];
+  document.querySelectorAll('#dlgAdd .wstep').forEach((el) => {
+    el.classList.toggle('on', el.dataset.step === step.key);
+  });
+  $('wizSteps').innerHTML = WIZ_STEPS.map((s, i) =>
+    '<span class="s' + (i === wiz.at ? ' on' : i < wiz.at ? ' done' : '') + '">' +
+      '<span class="n">' + (i < wiz.at ? '&#10003;' : i + 1) + '</span>' +
+      '<span class="t">' + esc(s.label) + '</span></span>').join('<span class="bar"></span>');
+
+  const done = step.key === 'create';
+  $('wizBack').style.display = wiz.at === 0 || done ? 'none' : '';
+  $('wizCancel').style.display = done ? 'none' : '';
+  // Once the site exists, backing out of the dialog leaves it behind rather
+  // than throwing it away — say so on the button.
+  $('wizCancel').textContent = wiz.createdId ? 'Finish later' : 'Cancel';
+  $('wizNext').textContent = done ? 'Finish' : step.key === 'env' ? 'Save and finish' : 'Continue';
+  $('wizNext').style.display = done && !wiz.createdId ? 'none' : '';
+  $('addErr').style.display = 'none';
+}
+
+function wizBusy(text) {
+  $('wizBusyText').textContent = text || '';
+  $('wizBusy').classList.toggle('on', !!text);
+  $('wizNext').disabled = !!text;
+  $('wizBack').disabled = !!text;
+}
+
+function wizFail(message) {
+  $('addErr').textContent = message;
+  $('addErr').style.display = '';
+}
+
+function wizAppDir() {
+  const full = $('addDir').value.trim();
+  return full || joinAppDir($('addFolder').value);
+}
+
 $('btnAdd').addEventListener('click', () => {
+  wiz.at = 0;
+  wiz.runner = 'local';
+  wiz.scan = null;
+  wiz.createdId = null;
+  wiz.deployJobId = null;
   $('addName').value = '';
-  $('addUrl').value = '';
+  $('addFolder').value = '';
   $('addDir').value = '';
   $('addPort').value = '';
-  $('addErr').style.display = 'none';
+  $('addNameHint').textContent = '';
+  $('addPathAdv').open = false;
+  $('addMode').value = 'pm2';
+  $('addService').value = '';
+  $('addPm2StartCustom').value = '';
+  $('addUnit').value = '';
+  $('addSudo').checked = false;
+  $('addStop').value = '';
+  $('addStart').value = '';
+  $('addChildStart').value = '';
+  $('addEnvFile').checked = true;
+  $('addSummary').innerHTML = '';
+  $('scanTasks').style.display = 'none';
+  $('scanTasks').innerHTML = '';
+  $('pullTasks').style.display = 'none';
+  $('pullTasks').innerHTML = '';
+  $('createTasks').innerHTML = '';
+  wiz.release = null;
+  $('addRepo').value = '';
+  $('addRef').value = '';
+  $('addRefs').innerHTML = '';
+  $('addGhToken').value = '';
+  $('addGhSave').checked = false;
+  $('addGhInfo').textContent = '';
+  $('addGhTokenState').textContent = SETTINGS.hasGithubToken
+    ? 'A panel-wide token is stored' + (SETTINGS.githubUser ? ' for ' + SETTINGS.githubUser : '') + ' — leave this blank to use it.'
+    : 'Only needed for a private repository.';
+  $('addDeployWrap').style.display = 'none';
+  $('addDeployNow').checked = true;
+  document.querySelector('input[name=source][value=github]').checked = true;
+  syncSourceRadios();
+  $('addRootEcho').textContent = appRoot();
+  $('addRootPre').textContent = appRoot() + '/';
+  fillStartSelect($('addPm2Start'), $('addPm2Custom'), $('addPm2StartCustom'), null, 'npm start');
+  wiz.env = envEditor($('addEnvEditor'), {
+    onScan: () => (wiz.release
+      ? scanApp(null, wiz.runner, wiz.createdId, wiz.release.id)
+      : scanApp(wizAppDir(), wiz.runner)),
+  });
+  wiz.env.set([]);
   document.querySelector('input[name=runner][value=local]').checked = true;
   syncRunnerRadios();
+  syncAddMode();
+  wizBusy('');
+  wizPaint();
   $('dlgAdd').showModal();
   $('addName').focus();
 });
@@ -1033,27 +2205,410 @@ function syncRunnerRadios() {
 }
 document.querySelectorAll('input[name=runner]').forEach((r) => r.addEventListener('change', syncRunnerRadios));
 
-$('addGo').addEventListener('click', async () => {
-  const runner = document.querySelector('input[name=runner]:checked').value;
-  const settings = {};
-  if ($('addDir').value.trim()) settings.appDir = $('addDir').value.trim();
-  if ($('addPort').value) settings.port = +$('addPort').value;
+function syncSourceRadios() {
+  document.querySelectorAll('input[name=source]').forEach((r) => {
+    r.closest('.radio').classList.toggle('on', r.checked);
+  });
+  $('addGhFields').style.display = wizSource() === 'github' ? '' : 'none';
+}
+document.querySelectorAll('input[name=source]').forEach((r) => r.addEventListener('change', syncSourceRadios));
+
+function wizSource() {
+  const picked = document.querySelector('input[name=source]:checked');
+  return picked ? picked.value : 'github';
+}
+
+$('addGhLoad').addEventListener('click', async (e) => {
+  e.preventDefault();
+  const repo = $('addRepo').value.trim();
+  if (!repo) return wizFail('Type the repository first.');
+  $('addGhInfo').innerHTML = '<span class="spin"></span>';
   try {
-    const r = await api('/api/sites/create', {
-      name: $('addName').value,
-      runner,
-      publicUrl: $('addUrl').value,
-      settings,
-    });
-    $('dlgAdd').close();
-    await refresh();
-    if (runner === 'agent') showInstaller(r.site.id);
-    else openSettings(r.site.id);
+    const r = await api('/api/github/refs', { repo, token: $('addGhToken').value });
+    $('addRefs').innerHTML = [...(r.branches || []), ...(r.tags || [])]
+      .map((x) => '<option value="' + esc(x) + '">').join('');
+    if (!$('addRef').value.trim() && r.info && r.info.defaultBranch) $('addRef').value = r.info.defaultBranch;
+    $('addGhInfo').textContent = (r.branches || []).length + ' branches, ' + (r.tags || []).length + ' tags';
   } catch (err) {
-    $('addErr').textContent = err.message;
-    $('addErr').style.display = '';
+    $('addGhInfo').textContent = '';
+    wizFail(err.message);
   }
 });
+
+// The folder name follows the site name until you type one of your own.
+$('addName').addEventListener('input', () => {
+  const slug = slugify($('addName').value);
+  if (!$('addFolder').dataset.touched) $('addFolder').value = slug;
+  if (!$('addService').dataset.touched) $('addService').value = slug;
+  $('addNameHint').textContent = slug ? 'Folder and pm2 process will be called "' + slug + '".' : '';
+  paintAddDirHint();
+});
+$('addFolder').addEventListener('input', () => {
+  $('addFolder').dataset.touched = '1';
+  paintAddDirHint();
+});
+$('addDir').addEventListener('input', paintAddDirHint);
+
+function paintAddDirHint() {
+  const dir = wizAppDir();
+  $('addDirHint').innerHTML = dir
+    ? 'The app lives in <span class="mono">' + esc(dir) + '</span>.'
+    : 'Filled in from the name. Change it if the folder is called something else.';
+}
+$('addService').addEventListener('input', () => { $('addService').dataset.touched = '1'; });
+
+function syncAddMode() {
+  const m = $('addMode').value;
+  $('addModePm2').style.display = m === 'pm2' ? '' : 'none';
+  $('addModeSystemd').style.display = m === 'systemd' ? '' : 'none';
+  $('addModeCommand').style.display = m === 'command' ? '' : 'none';
+  $('addModeChild').style.display = m === 'child' ? '' : 'none';
+}
+$('addMode').addEventListener('change', syncAddMode);
+
+$('wizBack').addEventListener('click', () => {
+  if (wiz.at > 0) { wiz.at--; wizPaint(); }
+});
+
+$('wizCancel').addEventListener('click', () => {
+  if (!wiz.createdId) return;
+  toast($('addName').value.trim() + ' was created — finish setting it up from its card.', 'ok');
+  refresh();
+});
+
+$('wizNext').addEventListener('click', async () => {
+  const step = WIZ_STEPS[wiz.at].key;
+  $('addErr').style.display = 'none';
+
+  if (step === 'name') {
+    if (!$('addName').value.trim()) return wizFail('Give the site a name.');
+    wiz.runner = document.querySelector('input[name=runner]:checked').value;
+    const slug = slugify($('addName').value);
+    if (!$('addFolder').value.trim()) $('addFolder').value = slug;
+    if (!$('addService').value.trim()) $('addService').value = slug;
+    wiz.at++;
+    wizPaint();
+    $('addFolder').focus();
+    return;
+  }
+
+  if (step === 'folder') {
+    const dir = wizAppDir();
+    if (!dir) return wizFail('Name the folder the app lives in.');
+    const port = +$('addPort').value;
+    if (!$('addPort').value.trim() || !Number.isFinite(port) || port < 1 || port > 65535) {
+      $('addPort').focus();
+      return wizFail('Give the port the app listens on — it is what the health check after a deploy is pointed at.');
+    }
+    await wizScan(dir);
+    return;
+  }
+
+  if (step === 'source') {
+    if (wizSource() === 'github' && !$('addRepo').value.trim()) {
+      return wizFail('Type the repository, or choose "Not yet".');
+    }
+    await wizPull();
+    return;
+  }
+
+  if (step === 'start') {
+    const mode = $('addMode').value;
+    if (mode === 'pm2' && !$('addService').value.trim()) return wizFail('The pm2 process needs a name.');
+    if (mode === 'pm2' && !readStartSelect($('addPm2Start'), $('addPm2StartCustom'))) {
+      return wizFail('Pick the command that starts the app.');
+    }
+    if (mode === 'systemd' && !$('addUnit').value.trim()) return wizFail('Name the systemd service.');
+    if (mode === 'command' && !$('addStart').value.trim()) return wizFail('Give the command that starts the app.');
+    if (mode === 'child' && !$('addChildStart').value.trim()) return wizFail('Give the command that starts the app.');
+    wiz.at++;
+    wizPaint();
+    return;
+  }
+
+  if (step === 'env') {
+    const read = wiz.env.read();
+    if (read.errors.length) return wizFail(read.errors[0].error);
+    if (read.missing.length) {
+      toast(read.missing.length + ' variable' + (read.missing.length === 1 ? '' : 's') +
+        ' left blank — not written: ' + read.missing.slice(0, 4).join(', ') +
+        (read.missing.length > 4 ? '…' : ''));
+    }
+    wiz.at++;
+    wizPaint();
+    await wizCreate(read.env);
+    return;
+  }
+
+  // create -> finish
+  $('dlgAdd').close();
+  const id = wiz.createdId;
+  if (!id) return;
+  if (wiz.runner === 'agent') showInstaller(id);
+  else if (wiz.deployJobId) openConsole(wiz.deployJobId, true);
+});
+
+/** Step 2's work: look in the folder and use what is there for steps 3 and 4. */
+async function wizScan(dir) {
+  const tasks = taskList($('scanTasks'));
+  wizBusy('Reading that folder');
+  try {
+    if (wiz.runner === 'agent') {
+      tasks.note('That app is on another machine', 'The agent reads its folder once it is installed, so these come from you.', 'done');
+      wiz.scan = null;
+    } else {
+      await tasks.run('Looking for the folder', async () => {
+        const scan = await scanApp(dir, wiz.runner);
+        if (!scan.ok) throw new Error(scan.reason || 'Could not read that folder.');
+        wiz.scan = scan;
+        return scan.exists ? scan.appDir : 'Not there yet.';
+      });
+
+      // Make it now rather than at the first deploy, so the .env this
+      // walkthrough writes has somewhere to go.
+      if (!wiz.scan.exists) {
+        await tasks.run('Creating the folder', async () => {
+          const r = await api('/api/sites/ensureDir', { appDir: dir, runner: wiz.runner });
+          wiz.scan = await scanApp(dir, wiz.runner);
+          return r.created ? 'Made ' + r.appDir : r.appDir;
+        });
+      }
+
+      await tasks.run('Reading package.json', async () => {
+        const pkg = wiz.scan.packageJson;
+        if (!pkg) return 'No package.json yet — defaulting to npm start.';
+        if (pkg.error) return pkg.error;
+        const n = Object.keys(pkg.scripts || {}).length;
+        return (pkg.name || 'the app') + (pkg.version ? ' ' + pkg.version : '') +
+          ' · ' + n + ' script' + (n === 1 ? '' : 's') + ' · ' + pkg.packageManager;
+      });
+
+      await tasks.run('Looking for .env.example', async () => {
+        if (!wiz.scan.envExample) return 'None found — add any variables by hand on the next step.';
+        return wiz.scan.envExample + ' · ' + wiz.scan.entries.length + ' variable' +
+          (wiz.scan.entries.length === 1 ? '' : 's');
+      });
+    }
+
+    // Feed what we learned into the steps that come next; the GitHub pull on
+    // the next step may improve on it.
+    wizApplyScan();
+    wiz.env.showLoad(wiz.runner === 'local');
+
+    await new Promise((r) => setTimeout(r, 400));
+    wiz.at++;
+    wizPaint();
+    $('addRepo').focus();
+  } catch (err) {
+    wizFail(err.message);
+  } finally {
+    wizBusy('');
+  }
+}
+
+/**
+ * Step 3's work: create the site, and pull the code into it.
+ *
+ * The site has to exist first — a release belongs to one — and pulling before
+ * the questions about starting and the environment is the whole point: what
+ * comes down the wire answers most of them. The archive is read where it
+ * lies; nothing is written into the app directory until a deploy runs.
+ */
+async function wizPull() {
+  const tasks = taskList($('pullTasks'));
+  const wantGithub = wizSource() === 'github';
+  wizBusy(wantGithub ? 'Pulling the code' : 'Creating the site');
+  try {
+    if (!wiz.createdId) {
+      await tasks.run('Creating the site', async () => {
+        const r = await api('/api/sites/create', {
+          name: $('addName').value.trim(),
+          runner: wiz.runner,
+          settings: { appDir: wizAppDir(), port: +$('addPort').value },
+        });
+        wiz.createdId = r.site.id;
+        return r.site.id;
+      });
+    }
+
+    if (wantGithub) {
+      const repo = $('addRepo').value.trim();
+      const ref = $('addRef').value.trim();
+      await tasks.run('Downloading ' + repo + (ref ? ' @ ' + ref : ''), async () => {
+        const r = await api('/api/github/fetch', {
+          siteId: wiz.createdId,
+          repo,
+          ref,
+          token: $('addGhToken').value,
+          saveToken: $('addGhSave').checked,
+          deploy: false,
+        });
+        wiz.release = r.release;
+        const src = r.release.source || {};
+        return (r.release.filename || '') +
+          (src.shortSha ? ' · ' + src.shortSha : '') +
+          (r.release.fileCount ? ' · ' + r.release.fileCount + ' files' : '') +
+          (r.release.sizeHuman ? ' · ' + r.release.sizeHuman : '');
+      });
+
+      const rscan = await tasks.run('Reading package.json', async () => {
+        const scan = await scanApp(null, wiz.runner, wiz.createdId, wiz.release.id);
+        if (!scan.ok) throw new Error(scan.reason || 'Could not read the release.');
+        // What the release says wins: it is the code that is about to run.
+        wiz.scan = mergeScans(wiz.scan, scan);
+        const pkg = scan.packageJson;
+        if (!pkg) return 'No package.json in that repository.';
+        if (pkg.error) return pkg.error;
+        const n = Object.keys(pkg.scripts || {}).length;
+        return (pkg.name || 'the app') + (pkg.version ? ' ' + pkg.version : '') +
+          ' · ' + n + ' script' + (n === 1 ? '' : 's') + ' · ' + pkg.packageManager;
+      });
+      void rscan;
+
+      await tasks.run('Looking for .env.example', async () => {
+        if (!wiz.scan.envExample) return 'None in the repository — add any variables by hand on the next step.';
+        return wiz.scan.envExample + ' · ' + wiz.scan.entries.length + ' variable' +
+          (wiz.scan.entries.length === 1 ? '' : 's');
+      });
+
+      $('addDeployWrap').style.display = '';
+      wiz.env.showLoad(true); // the archive is here, whichever machine the app runs on
+    }
+
+    wizApplyScan();
+    await new Promise((r) => setTimeout(r, 400));
+    wiz.at++;
+    wizPaint();
+  } catch (err) {
+    wizFail(err.message);
+  } finally {
+    wizBusy('');
+  }
+}
+
+/** The release's package.json and .env.example win; the folder's real .env stays. */
+function mergeScans(folderScan, releaseScan) {
+  if (!releaseScan) return folderScan;
+  return {
+    ...releaseScan,
+    appDir: (folderScan && folderScan.appDir) || '',
+    envFile: (folderScan && folderScan.envFile) || null,
+    packageJson: releaseScan.packageJson || (folderScan && folderScan.packageJson) || null,
+    envExample: releaseScan.envExample || (folderScan && folderScan.envExample) || null,
+    entries: releaseScan.envExample ? releaseScan.entries : (folderScan && folderScan.entries) || [],
+  };
+}
+
+/** Push whatever the scans found into the steps that ask about it. */
+function wizApplyScan() {
+  const scan = wiz.scan;
+  const pkgName = scan && scan.packageJson && scan.packageJson.name;
+  if (!$('addService').value.trim()) $('addService').value = slugify($('addName').value) || slugify(pkgName);
+  const found = fillStartSelect($('addPm2Start'), $('addPm2Custom'), $('addPm2StartCustom'), scan,
+    readStartSelect($('addPm2Start'), $('addPm2StartCustom')) || 'npm start');
+  $('addPm2StartHint').textContent = scan && scan.packageJson && !scan.packageJson.error
+    ? found + ' command' + (found === 1 ? '' : 's') + ' from package.json. Used only when pm2 has never seen this process.'
+    : 'Used only when pm2 has never seen this process, to register it.';
+  if (!$('addChildStart').value.trim()) $('addChildStart').value = 'npm start';
+
+  wiz.env.set([]);
+  if (scan) {
+    wiz.env.applyScan(scan, { quiet: true });
+    $('addEnvLead').textContent = scan.envExample
+      ? 'Taken from ' + scan.envExample + (scan.from === 'release' ? ' in the code you just pulled' : '') +
+        '. Fill in the values — anything left blank is not written.'
+      : 'No .env.example was found, so add whatever the app needs.';
+  } else {
+    $('addEnvLead').textContent = 'Add whatever the app needs. They are written to its .env before it starts.';
+  }
+}
+
+/** The last step: create the site, then save everything the walkthrough collected. */
+async function wizCreate(env) {
+  const tasks = taskList($('createTasks'));
+  wizBusy('Setting it up');
+  $('addDoneTitle').textContent = 'Setting it up';
+  $('addDoneLead').textContent = 'This only takes a moment.';
+  const name = $('addName').value.trim();
+  try {
+    const created = wiz.createdId || await tasks.run('Creating the site', async () => {
+      const r = await api('/api/sites/create', { name, runner: wiz.runner, settings: {} });
+      wiz.createdId = r.site.id;
+      return r.site.id;
+    });
+
+    await tasks.run('Saving its settings', async () => {
+      const mode = $('addMode').value;
+      const restart = { mode, env, useSudo: $('addSudo').checked };
+      if (mode === 'pm2') {
+        restart.service = $('addService').value.trim();
+        restart.pm2Start = readStartSelect($('addPm2Start'), $('addPm2StartCustom'));
+      } else if (mode === 'systemd') {
+        restart.service = $('addUnit').value.trim();
+      } else if (mode === 'command') {
+        restart.stop = $('addStop').value.trim();
+        restart.start = $('addStart').value.trim();
+      } else if (mode === 'child') {
+        restart.start = $('addChildStart').value.trim();
+      }
+      const r = await api('/api/sites/update', {
+        id: created,
+        // Anything edited by stepping back is applied here, not only at create.
+        name: $('addName').value.trim(),
+        runner: wiz.runner,
+        settings: {
+          appDir: wizAppDir(),
+          port: +$('addPort').value,
+          restart,
+          writeEnvFile: $('addEnvFile').checked,
+        },
+      });
+      return r.envFile ? wizAppDir() + ' · wrote ' + r.envFile.split('/').pop() : wizAppDir();
+    });
+
+    await tasks.run('Refreshing the dashboard', async () => {
+      await refresh();
+      return Object.keys(env).length
+        ? Object.keys(env).length + ' environment variable' + (Object.keys(env).length === 1 ? '' : 's') + ' stored'
+        : '';
+    });
+
+    if (wiz.release && $('addDeployNow').checked) {
+      await tasks.run('Deploying ' + (wiz.release.version || wiz.release.filename || 'the release'), async () => {
+        const r = await api('/api/deploy', { releaseId: wiz.release.id });
+        wiz.deployJobId = r.job ? r.job.id : null;
+        await refresh();
+        return 'Running — the console opens when you finish.';
+      });
+    }
+
+    $('addDoneTitle').textContent = name + ' is ready';
+    const advice = wiz.runner === 'agent'
+      ? 'One thing left: run the installer on that machine. Finish to see the one-liner.'
+      : wiz.deployJobId
+        ? 'The deploy is running. Finish to watch it in the console.'
+        : wiz.release
+          ? 'The code is here as a release — deploy it from the site\'s card whenever you are ready.'
+          : 'Upload a zip or pull a branch from GitHub on its card, and it deploys.';
+    $('addDoneLead').textContent = advice;
+    $('addSummary').innerHTML =
+      '<div class="banner info"><span class="txt">Health checks, the build pipeline, which files survive a deploy ' +
+      'and the GitHub repo all live under <b>Show advanced options</b> in this site\'s settings.</span></div>';
+    for (const note of envNotes(env)) toast(note, 'bad');
+  } catch (err) {
+    wizFail(err.message);
+    $('addDoneTitle').textContent = 'That did not finish';
+    $('addDoneLead').textContent = wiz.createdId
+      ? 'The site exists — open its settings to finish setting it up.'
+      : 'Nothing was created. Go back and try again.';
+    $('wizNext').style.display = '';
+  } finally {
+    wizBusy('');
+    wizPaint();
+    $('wizNext').style.display = '';
+    $('wizNext').textContent = 'Finish';
+  }
+}
 
 // ---- installer
 function installCommand(s) {
@@ -1078,6 +2633,7 @@ function showInstaller(id) {
 
 // ---- site settings
 let settingsSiteId = null;
+let settingsEnv = null;
 
 function openSettings(id) {
   const s = site(id);
@@ -1088,21 +2644,24 @@ function openSettings(id) {
   $('setTitle').textContent = s.name;
   $('setErr').style.display = 'none';
   $('setName').value = s.name;
-  $('setPublicUrl').value = s.publicUrl || '';
   $('setRunner').value = s.runner;
-  $('setAppDir').value = st.appDir || '';
+  $('setAppDir').value = st.appDir || joinAppDir(slugify(s.name));
   $('setPort').value = st.port || '';
   $('setMode').value = st.restart.mode;
-  $('setService').value = st.restart.mode === 'pm2' ? (st.restart.service || '') : (st.restart.service || '');
+  // A pm2 process with no name of its own is named after the site.
+  $('setService').value = st.restart.service || slugify(s.name);
   $('setUnit').value = st.restart.service || '';
-  $('setPm2Start').value = st.restart.pm2Start || '';
   $('setSudo').checked = !!st.restart.useSudo;
   $('setStop').value = st.restart.stop || '';
   $('setStart').value = st.restart.start || '';
   $('setChildStart').value = st.restart.start || '';
-  $('setEnv').value = window.ENVLIB
-    ? window.ENVLIB.formatEnvText(st.restart.env || {})
-    : Object.entries(st.restart.env || {}).map(([k, v]) => k + '=' + v).join('\n');
+  // The list of start commands is whatever package.json has; it fills in a
+  // moment later, so it starts with what this site already uses.
+  fillStartSelect($('setPm2Start'), $('setPm2Custom'), $('setPm2StartCustom'), null, st.restart.pm2Start || 'npm start');
+  $('setPm2StartHint').textContent = 'Used only when pm2 has never seen this process, to register it.';
+  settingsEnv = envEditor($('setEnvEditor'), { onScan: () => scanApp($('setAppDir').value.trim(), s.runner, s.id) });
+  settingsEnv.setFromObject(st.restart.env || {});
+  settingsEnv.showLoad(s.runner === 'local');
   $('setEnvFile').checked = st.writeEnvFile !== false;
   $('setHealth').value = st.healthUrl || '';
   $('setVersion').value = st.versionUrl || '';
@@ -1124,8 +2683,34 @@ function openSettings(id) {
   $('setInstallBtn').style.display = s.runner === 'agent' ? '' : 'none';
   syncModeFields();
   syncRunnerHint();
+  showAdvanced(false);
   $('dlgSettings').showModal();
+  // Best effort, in the background: read package.json so the start-command
+  // list is the app's own scripts rather than a guess.
+  if (s.runner === 'local' && st.appDir) {
+    scanApp(st.appDir, s.runner, s.id).then((scan) => {
+      if (settingsSiteId !== id || !scan.ok) return;
+      const found = fillStartSelect($('setPm2Start'), $('setPm2Custom'), $('setPm2StartCustom'),
+        scan, readStartSelect($('setPm2Start'), $('setPm2StartCustom')) || st.restart.pm2Start || 'npm start');
+      if (scan.packageJson && !scan.packageJson.error) {
+        $('setPm2StartHint').textContent = found + ' command' + (found === 1 ? '' : 's') +
+          ' from package.json. Used only when pm2 has never seen this process.';
+      }
+      settingsEnv.setState(scan.envExample
+        ? scan.envExample + ' found in that folder — "Load from .env.example" fills in anything missing.'
+        : '');
+    });
+  }
 }
+
+/** The settings people need are the ones on top; the rest are behind a click. */
+function showAdvanced(on) {
+  $('setAdvanced').hidden = !on;
+  $('setAdvToggle').classList.toggle('open', on);
+  $('setAdvToggle').setAttribute('aria-expanded', on ? 'true' : 'false');
+  $('setAdvLabel').textContent = on ? 'Hide advanced options' : 'Show advanced options';
+}
+$('setAdvToggle').addEventListener('click', () => showAdvanced($('setAdvanced').hidden));
 
 function syncModeFields() {
   const m = $('setMode').value;
@@ -1182,31 +2767,6 @@ $('setRemove').addEventListener('click', () => {
     });
 });
 
-/**
- * Parse the environment textarea. Uses the shared module when it has loaded;
- * the fallback is deliberately the same rule for the case that matters —
- * matching quotes around a value are quoting, not part of the value.
- */
-function parseEnv(text) {
-  if (window.ENVLIB) return window.ENVLIB.parseEnvText(text);
-  const env = {};
-  const errors = [];
-  const lines = String(text || '').split('\n');
-  for (let n = 0; n < lines.length; n++) {
-    const bare = lines[n].trim();
-    if (!bare || bare.startsWith('#')) continue;
-    const line = bare.replace(/^export\s+/, '');
-    const i = line.indexOf('=');
-    if (i < 1) { errors.push({ line: n + 1, error: 'no = on this line' }); continue; }
-    const key = line.slice(0, i).trim();
-    let v = line.slice(i + 1).trim();
-    if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1);
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) { errors.push({ line: n + 1, error: '"' + key + '" is not a usable variable name' }); continue; }
-    env[key] = v;
-  }
-  return { env, errors };
-}
-
 function envNotes(env) {
   return window.ENVLIB ? window.ENVLIB.lintEnv(env) : [];
 }
@@ -1215,16 +2775,29 @@ $('setInstallBtn').addEventListener('click', () => showInstaller(settingsSiteId)
 
 $('setSave').addEventListener('click', async () => {
   const mode = $('setMode').value;
-  const parsed = parseEnv($('setEnv').value);
+  const port = +$('setPort').value;
+  if (!$('setPort').value.trim() || !Number.isFinite(port) || port < 1 || port > 65535) {
+    $('setErr').textContent = 'This site needs a port — it is what the health and version checks after a deploy ' +
+      'are pointed at.';
+    $('setErr').style.display = '';
+    showAdvanced(true); // the checks it feeds are down there
+    $('setPort').focus();
+    return;
+  }
+  const parsed = settingsEnv.read();
   const env = parsed.env;
   if (parsed.errors.length) {
-    const first = parsed.errors[0];
-    $('setErr').textContent = 'Line ' + first.line + ' of the environment box: ' + first.error +
+    $('setErr').textContent = 'The environment section: ' + parsed.errors[0].error +
       (parsed.errors.length > 1 ? ' (and ' + (parsed.errors.length - 1) + ' more)' : '');
     $('setErr').style.display = '';
     return;
   }
-  const restart = { mode, env, useSudo: $('setSudo').checked, pm2Start: $('setPm2Start').value };
+  const restart = {
+    mode,
+    env,
+    useSudo: $('setSudo').checked,
+    pm2Start: readStartSelect($('setPm2Start'), $('setPm2StartCustom')),
+  };
   if (mode === 'pm2') restart.service = $('setService').value;
   else if (mode === 'systemd') restart.service = $('setUnit').value;
   else if (mode === 'command') { restart.stop = $('setStop').value; restart.start = $('setStart').value; }
@@ -1233,11 +2806,10 @@ $('setSave').addEventListener('click', async () => {
   const payload = {
     id: settingsSiteId,
     name: $('setName').value,
-    publicUrl: $('setPublicUrl').value,
     runner: $('setRunner').value,
     settings: {
       appDir: $('setAppDir').value,
-      port: $('setPort').value === '' ? null : +$('setPort').value,
+      port,
       restart,
       healthUrl: $('setHealth').value,
       versionUrl: $('setVersion').value,
@@ -1259,9 +2831,14 @@ $('setSave').addEventListener('click', async () => {
     github: { repo: $('setRepo').value, ref: $('setRef').value, token: $('setGhToken').value },
   };
   try {
-    await api('/api/sites/update', payload);
+    const r = await api('/api/sites/update', payload);
     $('dlgSettings').close();
-    toast('Saved', 'ok');
+    toast(r.envFile ? 'Saved · .env updated' : 'Saved', 'ok');
+    if (parsed.missing.length) {
+      toast(parsed.missing.length + ' variable' + (parsed.missing.length === 1 ? '' : 's') +
+        ' left blank — not written: ' + parsed.missing.slice(0, 4).join(', ') +
+        (parsed.missing.length > 4 ? '…' : ''));
+    }
     // A password with an "@" in a database URL is valid text and invalid URL —
     // worth saying now rather than after the deploy fails.
     for (const note of envNotes(env)) toast(note, 'bad');
@@ -1419,10 +2996,7 @@ $('btnSettings').addEventListener('click', async () => {
   } catch (err) { return toast(err.message, 'bad'); }
   $('hubErr').style.display = 'none';
   $('hubSub').textContent = 'Version ' + SETTINGS.version + (SETTINGS.managedByPm2 ? ' · running under pm2' : '');
-  $('hubGh').value = '';
-  $('hubGhState').textContent = SETTINGS.hasGithubToken
-    ? 'A token is stored' + (SETTINGS.githubUser ? ' for ' + SETTINGS.githubUser : '') + '. Type a new one to replace it, or clear the box and save to remove it.'
-    : 'No token stored — public repositories only.';
+  paintGithubToken();
   $('hubKeep').value = SETTINGS.keepReleases;
   $('hubPort').value = SETTINGS.configuredPort;
   $('hubPort').disabled = SETTINGS.portLocked;
@@ -1434,6 +3008,8 @@ $('btnSettings').addEventListener('click', async () => {
   paintTunnelSettings(SETTINGS.tunnel);
   paintUpdate(SETTINGS.update);
   $('tunToken').value = '';
+  showHubTab('updates');
+  CF = null; // re-read the account each time the pane is opened
   $('hubFacts').innerHTML =
     '<dt>Listening on</dt><dd>' + esc(SETTINGS.host) + ':' + esc(SETTINGS.port) + '</dd>' +
     '<dt>Reachable at</dt><dd>' + SETTINGS.urls.map(esc).join('<br>') + '</dd>' +
@@ -1441,6 +3017,36 @@ $('btnSettings').addEventListener('click', async () => {
     '<dt>Node</dt><dd>' + esc(SETTINGS.node) + '</dd>' +
     '<dt>Data</dt><dd>' + esc(SETTINGS.dataDir) + '</dd>';
   $('dlgHub').showModal();
+});
+
+/** A stored token is invisible by nature, so say plainly that one is there. */
+function paintGithubToken() {
+  const has = !!SETTINGS.hasGithubToken;
+  const banner = $('hubGhHas');
+  banner.style.display = has ? '' : 'none';
+  banner.querySelector('.txt').innerHTML = has
+    ? 'A token is stored' + (SETTINGS.githubUser ? ' for <b>' + esc(SETTINGS.githubUser) + '</b>' : '') +
+      (SETTINGS.githubTokenHint ? ' <span class="mono">' + esc(SETTINGS.githubTokenHint) + '</span>' : '')
+    : '';
+  $('hubGh').value = '';
+  $('hubGh').placeholder = has ? 'stored — type a new one to replace it' : 'ghp_...';
+  $('hubGhLabel').textContent = has ? 'Replace the token' : 'Personal access token';
+  $('hubGhState').textContent = has
+    ? 'Leaving this empty keeps the stored one.'
+    : 'No token stored — public repositories only.';
+}
+
+$('hubGhClear').addEventListener('click', () => {
+  confirmThen('Remove the GitHub token?',
+    'Private repositories stop working unless the site has a token of its own.',
+    async () => {
+      try {
+        await api('/api/settings', { clearGithubToken: true });
+        SETTINGS = await api('/api/settings', null, 'GET');
+        paintGithubToken();
+        toast('Token removed', 'ok');
+      } catch (err) { toast(err.message, 'bad'); }
+    });
 });
 
 $('hubSave').addEventListener('click', async () => {
@@ -1453,18 +3059,34 @@ $('hubSave').addEventListener('click', async () => {
   body.tunnelAutoStart = $('tunAutoStart').checked;
   if (!$('hubPort').disabled) body.port = +$('hubPort').value;
   if ($('hubPwNew').value) { body.newPassword = $('hubPwNew').value; body.currentPassword = $('hubPwOld').value; }
+  const btn = $('hubSave');
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
   try {
     const r = await api('/api/settings', body);
-    $('dlgHub').close();
+    $('hubErr').style.display = 'none';
+    // Changing the port is the one save that has to take the page with it.
     if (r.restartNeeded) {
+      $('dlgHub').close();
       toast('Restarting on port ' + r.port + '...', 'ok');
       setTimeout(() => { location.href = location.protocol + '//' + location.hostname + ':' + r.port + '/'; }, 2500);
-    } else {
-      toast('Saved', 'ok');
+      return;
     }
+    toast('Saved', 'ok');
+    // Everything on this pane is drawn from the settings, so re-read them
+    // rather than leaving stale values behind a dialog that stays open.
+    SETTINGS = await api('/api/settings', null, 'GET');
+    paintGithubToken();
+    paintTunnelSettings(SETTINGS.tunnel);
+    $('hubPwOld').value = '';
+    $('hubPwNew').value = '';
+    $('tunToken').value = '';
   } catch (err) {
     $('hubErr').textContent = err.message;
     $('hubErr').style.display = '';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save';
   }
 });
 
@@ -1741,6 +3363,332 @@ $('tunLog').addEventListener('click', async () => {
   paintLog(text);
 });
 
+
+// ---- settings tabs
+
+function showHubTab(name) {
+  document.querySelectorAll('#hubTabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === name));
+  document.querySelectorAll('#dlgHub .pane').forEach((p) => p.classList.toggle('on', p.dataset.pane === name));
+  const pane = document.querySelector('#dlgHub .panes');
+  if (pane) pane.scrollTop = 0;
+  if (name === 'cloudflare') loadCloudflare();
+}
+document.querySelectorAll('#hubTabs button').forEach((b) => {
+  b.addEventListener('click', () => showHubTab(b.dataset.tab));
+});
+
+// ---- cloudflare
+
+let CF = null;
+let cfLoading = false;
+
+function cfDot(el, kind) {
+  el.style.background = kind === 'ok' ? '#22a55f' : kind === 'warn' ? 'var(--accent)' : 'transparent';
+}
+
+/**
+ * Ask Cloudflare what this account has. Everything on this pane is drawn from
+ * one answer, so a half-finished setup shows exactly how far it got.
+ */
+async function loadCloudflare(force) {
+  if (cfLoading) return;
+  if (CF && !force) return paintCloudflare();
+  cfLoading = true;
+  $('cfTokenState').innerHTML = '<span class="spin"></span> Asking Cloudflare…';
+  try {
+    CF = await api('/api/cloudflare', null, 'GET');
+  } catch (err) {
+    CF = { hasToken: false, error: err.message };
+  } finally {
+    cfLoading = false;
+  }
+  paintCloudflare();
+}
+
+function paintCloudflare() {
+  const c = CF || {};
+
+  // step 1 — the account
+  const connected = !!c.hasToken;
+  $('cfStep1').classList.toggle('done', connected && !!c.accountId);
+  $('cfToken').value = '';
+  $('cfLogin').style.display = connected ? 'none' : '';
+  $('cfTokenWrap').style.display = connected ? 'none' : '';
+  $('cfDisconnect').style.display = connected ? '' : 'none';
+  $('cfTokenState').innerHTML = c.error
+    ? '<span style="color:var(--bad)">' + esc(c.error) + '</span>'
+    : connected
+      ? 'Connected' + (c.viaLogin ? ' by login' : ' with an API token') +
+        (c.accountName ? ' · <b>' + esc(c.accountName) + '</b>' : '') +
+        (c.tokenHint ? ' <span class="muted">(' + esc(c.tokenHint) + ')</span>' : '')
+      : '';
+
+  const accounts = c.accounts || [];
+  $('cfAccountWrap').style.display = connected && accounts.length > 1 ? '' : 'none';
+  $('cfAccount').innerHTML = accounts.map((a) =>
+    '<option value="' + esc(a.id) + '"' + (a.id === c.accountId ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('');
+
+  // step 2 — the connector
+  const hasTunnel = !!(c.tunnelId && c.tunnel);
+  $('cfStep2').classList.toggle('done', hasTunnel);
+  const tunnels = c.tunnels || [];
+  $('cfTunnelPick').innerHTML = tunnels.length
+    ? tunnels.map((t) => '<option value="' + esc(t.id) + '"' + (t.id === c.tunnelId ? ' selected' : '') + '>' +
+        esc(t.name) + ' · ' + esc(t.status || 'unknown') + '</option>').join('')
+    : '<option value="">none in this account</option>';
+  $('cfTunnelPick').disabled = !tunnels.length;
+  $('cfTunnelAdopt').disabled = !tunnels.length;
+  if (!$('cfTunnelName').value) $('cfTunnelName').value = 'fcc-' + (SETTINGS.hostname || 'panel').split('.')[0];
+  $('cfTunnelDesc').innerHTML = !connected || !c.accountId
+    ? 'Connect an account first.'
+    : hasTunnel
+      ? 'Using <b>' + esc(c.tunnelName) + '</b> — ' + esc(c.tunnel.status || 'unknown') + ', ' +
+        c.tunnel.connections + ' connection' + (c.tunnel.connections === 1 ? '' : 's') +
+        '. This panel holds its connector token.'
+      : 'One connector serves this whole machine. Create a new one, or adopt one that already exists in this account.';
+  $('cfTunnelBody').style.display = connected && c.accountId ? '' : 'none';
+  if (c.warning) $('cfTunnelDesc').innerHTML += '<br><span style="color:var(--bad)">' + esc(c.warning) + '</span>';
+
+  // step 3 — the routes
+  $('cfStep3').classList.toggle('done', hasTunnel && (c.routes || []).length > 0);
+  const targets = c.targets || [];
+  $('cfTarget').innerHTML = targets.map((t) =>
+    '<option value="' + esc(t.service) + '">' + esc(t.label) + ' · :' + esc(t.port) + '</option>').join('') +
+    '<option value="__custom">Somewhere else…</option>';
+  const routes = c.routes || [];
+  $('cfRoutes').innerHTML = !hasTunnel
+    ? '<tbody><tr><td class="muted" style="font-size:12.5px">Nothing to route yet — set the connector up first.</td></tr></tbody>'
+    : routes.length
+      ? '<thead><tr><th>Hostname</th><th>Sends it to</th><th></th></tr></thead><tbody>' +
+        routes.map((r) =>
+          '<tr><td><a href="https://' + esc(r.hostname) + '" target="_blank" rel="noopener" class="mono">' +
+            esc(r.hostname) + '</a>' + (r.path ? '<span class="muted mono">' + esc(r.path) + '</span>' : '') + '</td>' +
+          '<td class="mono muted">' + esc(r.service) + '</td>' +
+          '<td style="text-align:right"><button class="btn sm ghost" data-cfdel="' + esc(r.hostname) + '">Remove</button></td></tr>').join('') +
+        '</tbody>'
+      : '<tbody><tr><td class="muted" style="font-size:12.5px">No hostnames point here yet.</td></tr></tbody>';
+
+  $('cfRoutes').querySelectorAll('[data-cfdel]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const hostname = b.dataset.cfdel;
+      confirmThen('Remove ' + hostname + '?',
+        'The route and its DNS record are both deleted, so that name stops resolving.',
+        async () => {
+          try {
+            await api('/api/cloudflare/routes', { hostname, remove: true });
+            toast('Removed ' + hostname, 'ok');
+            loadCloudflare(true);
+          } catch (err) { toast(err.message, 'bad'); }
+        });
+    });
+  });
+
+  cfDot($('tabDotCf'), hasTunnel ? 'ok' : connected ? 'warn' : '');
+  paintCfZones();
+}
+
+/**
+ * The domain list is whatever this token can see, so the hostname is a name
+ * you type plus a domain you pick — no chance of typing one you do not own.
+ */
+function paintCfZones() {
+  const zones = (CF && CF.zones) || [];
+  const keep = $('cfZone').value;
+  $('cfZone').innerHTML = zones.length
+    ? zones.map((z) => '<option value="' + esc(z.name) + '"' + (z.name === keep ? ' selected' : '') + '>' +
+        esc(z.name) + (z.status && z.status !== 'active' ? ' (' + esc(z.status) + ')' : '') + '</option>').join('')
+    : '<option value="">no domains</option>';
+  $('cfZone').disabled = !zones.length;
+  $('cfSub').disabled = !zones.length;
+  paintCfZoneHint();
+}
+
+function cfHostname() {
+  const sub = $('cfSub').value.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  const zone = $('cfZone').value;
+  if (!zone) return '';
+  return sub ? sub + '.' + zone : zone;
+}
+
+/** Say exactly what will be created before anything is. */
+function paintCfZoneHint() {
+  const zones = (CF && CF.zones) || [];
+  if (!zones.length) {
+    $('cfZoneHint').textContent = CF && CF.hasToken
+      ? 'No domains visible to this token — it needs Zone · Zone · Read, and the domain has to be in this account.'
+      : '';
+    return;
+  }
+  const host = cfHostname();
+  $('cfZoneHint').innerHTML = host
+    ? '<b>' + esc(host) + '</b> — a proxied CNAME in ' + esc($('cfZone').value) +
+      ', and a public hostname on the connector.'
+    : 'Leave the first box empty to use the domain itself.';
+}
+$('cfSub').addEventListener('input', paintCfZoneHint);
+$('cfZone').addEventListener('change', paintCfZoneHint);
+
+$('cfTarget').addEventListener('change', () => {
+  $('cfCustomWrap').style.display = $('cfTarget').value === '__custom' ? '' : 'none';
+});
+
+$('cfConnect').addEventListener('click', async () => {
+  const token = $('cfToken').value.trim();
+  if (!token) {
+    // "Replace" with an empty box means they want to type one.
+    $('cfToken').style.display = '';
+    $('cfToken').focus();
+    return;
+  }
+  $('cfTokenState').innerHTML = '<span class="spin"></span> Checking the token…';
+  try {
+    const r = await api('/api/cloudflare/token', { token });
+    $('cfToken').value = '';
+    toast(r.accounts && r.accounts.length === 1
+      ? 'Connected to ' + r.accounts[0].name
+      : 'Token accepted — pick an account', 'ok');
+    loadCloudflare(true);
+  } catch (err) {
+    $('cfTokenState').innerHTML = '<span style="color:var(--bad)">' + esc(err.message) + '</span>';
+  }
+});
+
+
+// ---- logging in to Cloudflare, rather than making a token by hand
+
+let cfPollTimer = null;
+
+function cfLoginStop() {
+  if (cfPollTimer) clearInterval(cfPollTimer);
+  cfPollTimer = null;
+  $('cfLoginWait').style.display = 'none';
+  $('cfLogin').disabled = false;
+}
+
+$('cfLogin').addEventListener('click', async () => {
+  $('cfLogin').disabled = true;
+  $('cfTokenState').innerHTML = '<span class="spin"></span> Starting cloudflared…';
+  try {
+    const r = await api('/api/cloudflare/login', {});
+    $('cfTokenState').textContent = '';
+    $('cfLoginWait').style.display = '';
+    $('cfLoginUrl').innerHTML = '<button class="copy" id="cfLoginCopy">Copy</button>' + esc(r.url);
+    $('cfLoginOpen').href = r.url;
+    $('cfLoginState').innerHTML = '<span class="spin"></span> Waiting for you to approve it…';
+    $('cfLoginCopy').addEventListener('click', () => {
+      navigator.clipboard.writeText(r.url).then(() => toast('Copied', 'ok'), () => toast('Could not copy', 'bad'));
+    });
+    // cloudflared writes the certificate the moment the browser approves, so
+    // watching for it is the whole handshake.
+    cfPollTimer = setInterval(async () => {
+      let st;
+      try {
+        st = await api('/api/cloudflare/login', null, 'GET');
+      } catch (err) {
+        return;
+      }
+      if (st.done) {
+        cfLoginStop();
+        toast('Connected to Cloudflare' + (st.accountName ? ' · ' + st.accountName : ''), 'ok');
+        loadCloudflare(true);
+        return;
+      }
+      if (st.error) {
+        cfLoginStop();
+        $('cfTokenState').innerHTML = '<span style="color:var(--bad)">' + esc(st.error) + '</span>';
+        $('cfTokenWrap').open = true; // the fallback they now need
+      }
+    }, 2000);
+  } catch (err) {
+    $('cfLogin').disabled = false;
+    $('cfTokenState').innerHTML = '<span style="color:var(--bad)">' + esc(err.message) + '</span>';
+    $('cfTokenWrap').open = true;
+  }
+});
+
+$('cfLoginCancel').addEventListener('click', async () => {
+  cfLoginStop();
+  $('cfTokenState').textContent = '';
+  try { await api('/api/cloudflare/login/cancel', {}); } catch (err) { /* it was going to die anyway */ }
+});
+
+$('cfDisconnect').addEventListener('click', () => {
+  confirmThen('Disconnect the Cloudflare account?',
+    'The panel forgets the API token. The connector keeps running on the token it already has, and no ' +
+    'hostname stops working — you just cannot add or remove routes from here.',
+    async () => {
+      try {
+        await api('/api/cloudflare/token', { token: '' });
+        toast('Disconnected', 'ok');
+        loadCloudflare(true);
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+});
+
+$('cfAccount').addEventListener('change', async () => {
+  try {
+    await api('/api/cloudflare/account', { accountId: $('cfAccount').value });
+    loadCloudflare(true);
+  } catch (err) { toast(err.message, 'bad'); }
+});
+
+async function cfUseTunnel(body, what) {
+  const btns = [$('cfTunnelGo'), $('cfTunnelAdopt')];
+  btns.forEach((b) => (b.disabled = true));
+  $('cfTunnelDesc').innerHTML = '<span class="spin"></span> ' + esc(what);
+  try {
+    const r = await api('/api/cloudflare/tunnel', body);
+    toast(r.started ? 'Connector ' + r.tunnel.name + ' is running' : 'Connector ' + r.tunnel.name + ' is set up', 'ok');
+    if (r.startError) toast('It did not start: ' + r.startError, 'bad');
+    await refreshTunnel();
+    loadCloudflare(true);
+  } catch (err) {
+    toast(err.message, 'bad');
+    loadCloudflare(true);
+  } finally {
+    btns.forEach((b) => (b.disabled = false));
+  }
+}
+
+$('cfTunnelGo').addEventListener('click', () => {
+  const name = $('cfTunnelName').value.trim();
+  if (!name) return toast('Name the connector first.', 'bad');
+  confirmThen('Create the connector "' + name + '"?',
+    'It is created in your Cloudflare account, and this panel starts running it straight away.',
+    () => cfUseTunnel({ name }, 'Creating it…'));
+});
+
+$('cfTunnelAdopt').addEventListener('click', () => {
+  const tunnelId = $('cfTunnelPick').value;
+  if (!tunnelId) return;
+  const name = $('cfTunnelPick').selectedOptions[0].textContent.split(' · ')[0];
+  confirmThen('Use the connector "' + name + '"?',
+    'This panel takes its token and runs it here. If it is already running somewhere else, it will be ' +
+    'running in both places, and Cloudflare will send traffic to whichever answers.',
+    () => cfUseTunnel({ tunnelId }, 'Taking its token…'));
+});
+
+$('cfAddRoute').addEventListener('click', async () => {
+  const hostname = cfHostname();
+  if (!hostname) return toast('Pick a domain first.', 'bad');
+  const service = $('cfTarget').value === '__custom' ? $('cfService').value.trim() : $('cfTarget').value;
+  if (!service) return toast('Say where it should go.', 'bad');
+  const btn = $('cfAddRoute');
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  try {
+    const r = await api('/api/cloudflare/routes', { hostname, service });
+    toast(hostname + ' → ' + service + (r.dns && r.dns.created ? ' · DNS added' : ''), 'ok');
+    $('cfSub').value = '';
+    loadCloudflare(true);
+  } catch (err) {
+    toast(err.message, 'bad');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Add the route';
+  }
+});
+
 let es = null;
 function connect() {
   if (es) es.close();
@@ -1811,6 +3759,9 @@ function connect() {
   });
 }
 
+// The panel's own settings are wanted before the first click — the new-site
+// walkthrough needs to know where apps live on this machine.
+api('/api/settings', null, 'GET').then((s) => { SETTINGS = s; }).catch(() => {});
 refresh().then(connect);
 setInterval(() => { if (!es || es.readyState === 2) refresh(); }, 15000);
 </script>

@@ -28,6 +28,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { Store } from "./lib/store.mjs";
@@ -55,6 +56,7 @@ import {
 } from "./lib/sites.mjs";
 import { normalizeRepo, repoInfo, listRefs, resolveCommit, downloadZipball, checkToken } from "./lib/github.mjs";
 import { Tunnel } from "./lib/tunnel.mjs";
+import * as cf from "./lib/cloudflare.mjs";
 import {
   DEFAULT_REPO as UPDATE_REPO,
   checkForUpdate,
@@ -63,8 +65,9 @@ import {
   listBackups,
   restoreBackup,
 } from "./lib/updates.mjs";
-import { inspectZip } from "../shared/zip.mjs";
+import { inspectZip, readZipFile } from "../shared/zip.mjs";
 import { ensureDir, readJson, writeJson, exists, humanBytes } from "../shared/fsx.mjs";
+import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -100,6 +103,9 @@ function defaultConfig() {
     passwordSalt: null,
     sessionSecret: crypto.randomBytes(32).toString("hex"),
     dataDir: "./data",
+    // The parent folder every site lives under on this machine. The new-site
+    // wizard only asks for the folder name and joins it onto this.
+    appRoot: "/home/container",
     keepReleases: 8,
     tls: null, // { key: "/path/key.pem", cert: "/path/cert.pem" }
     github: { token: "", username: "" }, // optional hub-wide credential
@@ -107,6 +113,9 @@ function defaultConfig() {
     // hostname points at which local port is decided in the Cloudflare
     // dashboard, which is what a connector token is for.
     tunnel: { token: "", autoStart: true },
+    // The API token, and which account and connector it manages. Set from the
+    // panel; without it the tunnel still runs from a pasted connector token.
+    cloudflare: { apiToken: "", accountId: "", accountName: "", tunnelId: "", tunnelName: "" },
     // Where this panel gets its own updates from. The repo is settable so a
     // fork stays updatable from its own origin; ref empty means "newest
     // release, or the default branch if the repo publishes none".
@@ -161,6 +170,16 @@ function loadConfig() {
 const config = loadConfig();
 const PORT_ENV = envPort();
 const LISTEN_PORT = PORT_ENV?.port ?? config.port ?? 4000;
+
+/**
+ * Where apps live on this box.
+ *
+ * Every site on a Pterodactyl-style host sits under the same parent, so the
+ * new-site wizard asks for a folder name rather than a full path and joins it
+ * onto this. Overridable for a machine laid out differently, but never
+ * something you have to type per site.
+ */
+const APP_ROOT = String(process.env.FCC_APP_ROOT || config.appRoot || "/home/container").replace(/\/+$/, "") || "/";
 
 const store = new Store(config.dataDir);
 const throttle = new LoginThrottle();
@@ -554,6 +573,368 @@ function githubTokenFor(site, override) {
   return String(override || "").trim() || site?.github?.token || config.github?.token || "";
 }
 
+// ---------------------------------------------------------- app inspection
+
+const ENV_EXAMPLE_NAMES = [
+  ".env.example",
+  ".env.sample",
+  ".env.template",
+  ".env.dist",
+  "env.example",
+  ".env.local.example",
+];
+const SCAN_MAX_BYTES = 512 * 1024;
+
+/** Read a small text file, or null. Anything unreadable is simply "not there". */
+function readSmallFile(file) {
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile() || st.size > SCAN_MAX_BYTES) return null;
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Split "value  # what it is" into the two halves.
+ *
+ * dotenv treats a "#" after a quoted value, or after whitespace, as the start
+ * of a comment, so the app itself never sees it — and .env.example files use
+ * exactly that to document a key. A "#" inside the value (an unquoted
+ * password, a URL fragment) is left alone, which is why the whitespace is
+ * required.
+ */
+function splitInlineComment(raw) {
+  const s = String(raw ?? "");
+  const t = s.trimStart();
+  const q = t[0];
+  if (q === '"' || q === "'" || q === "`") {
+    for (let i = 1; i < t.length; i++) {
+      if (t[i] === "\\") {
+        i++;
+        continue;
+      }
+      if (t[i] !== q) continue;
+      const rest = t.slice(i + 1);
+      const m = rest.match(/^\s*#\s?(.*)$/);
+      return { value: t.slice(0, i + 1), comment: m ? m[1].trim() : "" };
+    }
+    return { value: s, comment: "" }; // an unbalanced quote is not a comment
+  }
+  const m = s.match(/^([^#]*?)\s+#\s?(.*)$/);
+  return m ? { value: m[1], comment: m[2].trim() } : { value: s, comment: "" };
+}
+
+/**
+ * Parse a .env-style file into ordered entries, keeping the comment that sits
+ * above each key. That comment is the only documentation most .env.example
+ * files have, so it becomes the hint under the field in the browser.
+ */
+function parseEnvEntries(text) {
+  const out = [];
+  let comment = [];
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) {
+      comment = [];
+      continue;
+    }
+    if (line.startsWith("#")) {
+      comment.push(line.replace(/^#+\s?/, ""));
+      continue;
+    }
+    const body = line.replace(/^export\s+/, "");
+    const eq = body.indexOf("=");
+    if (eq < 1) {
+      comment = [];
+      continue;
+    }
+    const key = body.slice(0, eq).trim();
+    if (!isEnvKey(key)) {
+      comment = [];
+      continue;
+    }
+    const split = splitInlineComment(body.slice(eq + 1));
+    out.push({
+      key,
+      value: cleanEnvValue(split.value).slice(0, 4000),
+      comment: [...comment, split.comment].filter(Boolean).join(" ").slice(0, 200),
+    });
+    comment = [];
+  }
+  return out;
+}
+
+/**
+ * The same questions, asked of a release archive instead of a folder.
+ *
+ * This is what makes it possible to set a site up completely before its first
+ * deploy: the code is pulled from GitHub as a release, and package.json and
+ * .env.example are read straight out of the zip — no extracting, nothing
+ * written to the app directory yet.
+ */
+function scanRelease(releaseId) {
+  const rel = store.release(releaseId);
+  if (!rel) return { ok: false, reason: "That release is not on this machine any more." };
+  const file = store.releasePath(rel.id);
+  if (!exists(file)) return { ok: false, reason: "That release's archive is missing." };
+
+  let buf;
+  try {
+    buf = fs.readFileSync(file);
+  } catch (err) {
+    return { ok: false, reason: `Could not read the release archive: ${err.message}` };
+  }
+
+  const text = (name) => {
+    try {
+      const b = readZipFile(buf, name);
+      return b && b.length <= SCAN_MAX_BYTES ? b.toString("utf8") : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const out = {
+    ok: true,
+    from: "release",
+    releaseId: rel.id,
+    releaseVersion: rel.version ?? null,
+    exists: true,
+    packageJson: null,
+    envExample: null,
+    entries: [],
+    envFile: null,
+  };
+
+  const pkgRaw = text("package.json");
+  if (pkgRaw) out.packageJson = parsePackageJson(pkgRaw, (n) => text(n) !== null);
+
+  for (const name of ENV_EXAMPLE_NAMES) {
+    const body = text(name);
+    if (body === null) continue;
+    out.envExample = name;
+    out.entries = parseEnvEntries(body);
+    break;
+  }
+  return out;
+}
+
+/** package.json, reduced to the parts the panel asks about. */
+function parsePackageJson(raw, has = () => false) {
+  let pkg;
+  try {
+    pkg = JSON.parse(raw);
+  } catch {
+    return { error: "package.json is there but is not valid JSON." };
+  }
+  const scripts = {};
+  for (const [k, v] of Object.entries(pkg.scripts || {})) {
+    if (typeof v === "string") scripts[String(k).slice(0, 60)] = v.slice(0, 300);
+  }
+  return {
+    name: typeof pkg.name === "string" ? pkg.name.slice(0, 80) : "",
+    version: typeof pkg.version === "string" ? pkg.version.slice(0, 40) : "",
+    main: typeof pkg.main === "string" ? pkg.main.slice(0, 120) : "",
+    type: pkg.type === "module" ? "module" : "commonjs",
+    scripts,
+    packageManager: has("pnpm-lock.yaml") ? "pnpm" : has("yarn.lock") ? "yarn" : "npm",
+    dependencies: Object.keys({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) }).slice(0, 200),
+  };
+}
+
+/**
+ * Look at an app directory and report what it can tell us about itself:
+ * whether it exists, what package.json can start, and which environment
+ * variables it expects. Only the handful of files named here are ever read.
+ *
+ * A site that runs behind an agent lives on a different machine, so there is
+ * nothing here to look at — that comes back as { ok:false, remote:true } and
+ * the browser falls back to asking.
+ */
+function scanAppDir({ appDir, runner, siteId } = {}) {
+  const site = siteId ? findSite(siteId) : null;
+  const where = runner || site?.runner || "local";
+  const dir = String(appDir || site?.settings?.appDir || "").trim();
+
+  if (where === "agent") {
+    return { ok: false, remote: true, appDir: dir, reason: "That app is on another machine, so this panel cannot look in its folder." };
+  }
+  if (!dir) return { ok: false, appDir: "", reason: "No app directory yet." };
+  if (!path.isAbsolute(dir)) return { ok: false, appDir: dir, reason: "The app directory has to be a full path." };
+
+  const resolved = path.resolve(dir);
+  let stat = null;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    /* handled below */
+  }
+  if (!stat || !stat.isDirectory()) {
+    return { ok: true, appDir: resolved, exists: false, packageJson: null, envExample: null, envFile: null, entries: [] };
+  }
+
+  // ---- package.json
+  const pkgRaw = readSmallFile(path.join(resolved, "package.json"));
+  const packageJson = pkgRaw ? parsePackageJson(pkgRaw, (n) => exists(path.join(resolved, n))) : null;
+
+  // ---- .env.example, and whatever the app already has
+  let envExample = null;
+  let entries = [];
+  for (const name of ENV_EXAMPLE_NAMES) {
+    const text = readSmallFile(path.join(resolved, name));
+    if (text === null) continue;
+    envExample = name;
+    entries = parseEnvEntries(text);
+    break;
+  }
+  const currentRaw = readSmallFile(path.join(resolved, ".env"));
+  const current = currentRaw === null ? null : parseEnvEntries(currentRaw);
+
+  return {
+    ok: true,
+    appDir: resolved,
+    exists: true,
+    packageJson,
+    envExample,
+    entries,
+    envFile: current ? { name: ".env", entries: current } : null,
+  };
+}
+
+/**
+ * The `cloudflared tunnel login` flow, driven from the panel.
+ *
+ * cloudflared tries to open a browser on the machine it runs on, which is no
+ * use when that machine is a container three networks away — so the URL it
+ * prints is captured and handed to whoever is looking at the panel instead.
+ * When they finish, the certificate appears on disk and the credentials in it
+ * become the panel's Cloudflare connection.
+ */
+const cfLogin = {
+  proc: null,
+  url: "",
+  error: "",
+  startedAt: 0,
+  certPath: path.join(config.dataDir, "cloudflared", "cert.pem"),
+
+  async start() {
+    this.cancel();
+    this.url = "";
+    this.error = "";
+    ensureDir(path.dirname(this.certPath));
+    // A certificate from a previous attempt would look like instant success.
+    try {
+      fs.unlinkSync(this.certPath);
+    } catch {
+      /* not there, which is the normal case */
+    }
+
+    const bin = await tunnel.resolveBinary();
+    if (!bin) throw new Error("cloudflared is not installed here yet, and could not be downloaded.");
+
+    const proc = spawn(bin, ["tunnel", "login", "--origincert", this.certPath], {
+      env: { ...process.env, HOME: process.env.HOME || os.homedir() },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    this.proc = proc;
+
+    const onData = (chunk) => {
+      const text = chunk.toString();
+      const m = text.match(/https:\/\/dash\.cloudflare\.com\/argotunnel\S*/);
+      if (m && !this.url) this.url = m[0];
+    };
+    proc.stdout.on("data", onData);
+    proc.stderr.on("data", onData);
+    proc.once("exit", () => {
+      this.proc = null;
+    });
+
+    // The URL is printed immediately; a couple of seconds is plenty.
+    const deadline = Date.now() + 12_000;
+    while (!this.url && Date.now() < deadline && this.proc) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!this.url) {
+      this.cancel();
+      throw new Error("cloudflared did not print a login link. Use an API token instead.");
+    }
+    this.startedAt = Date.now();
+    return { ok: true, url: this.url };
+  },
+
+  /** Has the certificate turned up, and is what is in it any use? */
+  async poll() {
+    const waiting = { running: !!this.proc, url: this.url, done: false, error: this.error };
+    if (!exists(this.certPath)) {
+      if (!this.proc && this.startedAt) {
+        return { ...waiting, error: this.error || "The login was cancelled or timed out." };
+      }
+      return waiting;
+    }
+
+    let creds = null;
+    try {
+      creds = cf.readOriginCert(fs.readFileSync(this.certPath, "utf8"));
+    } catch (err) {
+      this.error = `Could not read the certificate Cloudflare wrote: ${err.message}`;
+    }
+    this.cancel();
+
+    if (!creds) {
+      return {
+        ...waiting,
+        running: false,
+        done: false,
+        error:
+          this.error ||
+          "You are logged in, but that certificate does not carry an API token this panel can use. " +
+            "Create an API token instead — it is the box below.",
+      };
+    }
+
+    // Being logged in is not the same as being allowed to make tunnels.
+    const can = await cf.canManageTunnels(creds.apiToken, creds.accountId);
+    if (!can.ok) {
+      return {
+        ...waiting,
+        running: false,
+        done: false,
+        error: `Logged in, but those credentials cannot manage tunnels — ${can.reason} Create an API token instead.`,
+      };
+    }
+
+    config.cloudflare = {
+      ...(config.cloudflare || {}),
+      apiToken: creds.apiToken,
+      accountId: creds.accountId,
+      accountName: config.cloudflare?.accountName || "",
+      viaLogin: true,
+    };
+    try {
+      const accounts = await cf.listAccounts(creds.apiToken);
+      const mine = accounts.find((a) => a.id === creds.accountId);
+      if (mine) config.cloudflare.accountName = mine.name;
+    } catch {
+      /* the name is a nicety, not a requirement */
+    }
+    saveConfig();
+    return { running: false, url: this.url, done: true, error: "", accountName: config.cloudflare.accountName };
+  },
+
+  cancel() {
+    this.startedAt = 0; // nothing is in flight, so nothing "timed out"
+    if (!this.proc) return;
+    try {
+      this.proc.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    this.proc = null;
+  },
+};
+
 // ------------------------------------------------------------ HTTP routes
 
 async function handleApi(req, res, url) {
@@ -716,6 +1097,50 @@ async function handleApi(req, res, url) {
   }
 
   // ---- site registry ---------------------------------------------------
+
+  // What is actually in that folder? Used by the new-site wizard and by the
+  // settings pane, so neither has to ask you to retype what package.json and
+  // .env.example already say.
+  // The folder a new site is being pointed at usually does not exist yet.
+  // Creating it here means the walkthrough can put a .env in it before the
+  // first deploy, instead of leaving the site half-configured until then.
+  if (url.pathname === "/api/sites/ensureDir" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    const site = body.siteId ? findSite(body.siteId) : null;
+    const where = body.runner || site?.runner || "local";
+    if (where === "agent") {
+      return sendJson(res, 400, { error: "That app is on another machine — its agent creates the folder on the first deploy." });
+    }
+    const dir = String(body.appDir || "").trim();
+    if (!dir || !path.isAbsolute(dir)) return sendJson(res, 400, { error: "The app directory has to be a full path." });
+    const resolved = path.resolve(dir);
+    if (resolved === path.parse(resolved).root) return sendJson(res, 400, { error: "That is the root of the filesystem." });
+    try {
+      const existed = exists(resolved);
+      if (!existed) fs.mkdirSync(resolved, { recursive: true });
+      const st = fs.statSync(resolved);
+      if (!st.isDirectory()) return sendJson(res, 400, { error: `${resolved} exists but is a file, not a folder.` });
+      return sendJson(res, 200, { ok: true, appDir: resolved, created: !existed });
+    } catch (err) {
+      // The two that actually happen are "the panel is not allowed to write
+      // there" and "a parent of that path is not somewhere you can create
+      // folders at all" — both read as gibberish as a bare errno.
+      const why =
+        err.code === "EACCES" || err.code === "EPERM"
+          ? "the panel does not have permission to write there"
+          : err.code === "ENOENT"
+            ? "nothing on this machine can create that path — check the folder above it exists"
+            : err.message;
+      return sendJson(res, 400, { error: `Could not create ${resolved}: ${why}.` });
+    }
+  }
+
+  if (url.pathname === "/api/sites/scan" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    if (body.releaseId) return sendJson(res, 200, scanRelease(body.releaseId));
+    return sendJson(res, 200, scanAppDir(body));
+  }
+
   if (url.pathname === "/api/sites/create" && req.method === "POST") {
     const body = await readJsonBody(req).catch(() => ({}));
     try {
@@ -749,7 +1174,19 @@ async function handleApi(req, res, url) {
     local.sync();
     pushState();
     wakeSite(site.id); // a remote agent picks the change up within a second
-    return sendJson(res, 200, { ok: true, site: publicSite(site) });
+    // Write the managed .env block now rather than at the next deploy: the
+    // variables were just typed into the panel, and an app someone starts by
+    // hand in the meantime should see them. Only the block the panel owns is
+    // touched. A remote site's agent does the same on its next poll.
+    let envFile = null;
+    if (site.runner === "local" && site.settings.appDir) {
+      try {
+        envFile = local.deployer(site.id)?.writeEnvFile(site.settings.appDir) || null;
+      } catch {
+        /* a folder that is not there yet is not an error worth failing a save for */
+      }
+    }
+    return sendJson(res, 200, { ok: true, site: publicSite(site), envFile });
   }
 
   if (url.pathname === "/api/sites/delete" && req.method === "POST") {
@@ -783,8 +1220,10 @@ async function handleApi(req, res, url) {
       portSource: PORT_ENV ? PORT_ENV.source : "config",
       portLocked: !!PORT_ENV,
       host: config.host,
+      appRoot: APP_ROOT,
       keepReleases: config.keepReleases,
       hasGithubToken: !!config.github?.token,
+      githubTokenHint: tokenHint(config.github?.token),
       githubUser: config.github?.username || "",
       tunnel: {
         ...tunnel.status(),
@@ -808,7 +1247,9 @@ async function handleApi(req, res, url) {
     const body = await readJsonBody(req).catch(() => ({}));
     let restartNeeded = false;
 
-    if (typeof body.githubToken === "string") {
+    if (body.clearGithubToken) {
+      config.github = { token: "", username: "" };
+    } else if (typeof body.githubToken === "string") {
       const token = body.githubToken.trim();
       config.github = { token, username: config.github?.username || "" };
       if (token) {
@@ -939,6 +1380,241 @@ async function handleApi(req, res, url) {
     try {
       await tunnel.download();
       return sendJson(res, 200, { ok: true, ...tunnel.status() });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  // ---- Cloudflare account ----------------------------------------------
+
+  // Logging in beats making a token by hand, so it is the way in that the
+  // panel offers first. `cloudflared tunnel login` prints a URL, the browser
+  // approves it, and Cloudflare writes an origin certificate here with the
+  // account and an API token inside it.
+  if (url.pathname === "/api/cloudflare/login" && req.method === "POST") {
+    try {
+      return sendJson(res, 200, await cfLogin.start());
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  if (url.pathname === "/api/cloudflare/login" && req.method === "GET") {
+    return sendJson(res, 200, await cfLogin.poll());
+  }
+
+  if (url.pathname === "/api/cloudflare/login/cancel" && req.method === "POST") {
+    cfLogin.cancel();
+    return sendJson(res, 200, { ok: true });
+  }
+
+  //
+  // With an API token the panel can do for itself what the dashboard would
+  // otherwise make you do by hand: create the connector, take its token, and
+  // point hostnames at the ports running on this machine.
+
+  const cfCreds = () => {
+    const c = config.cloudflare || {};
+    if (!c.apiToken) throw new Error("Connect a Cloudflare API token first.");
+    if (!c.accountId) throw new Error("Pick which Cloudflare account to use first.");
+    return c;
+  };
+
+  if (url.pathname === "/api/cloudflare" && req.method === "GET") {
+    const c = config.cloudflare || {};
+    const out = {
+      hasToken: !!c.apiToken,
+      tokenHint: tokenHint(c.apiToken),
+      accountId: c.accountId || "",
+      accountName: c.accountName || "",
+      viaLogin: !!c.viaLogin,
+      tunnelId: c.tunnelId || "",
+      tunnelName: c.tunnelName || "",
+      accounts: [],
+      zones: [],
+      tunnels: [],
+      routes: [],
+      // What a hostname can usefully be pointed at on this machine.
+      targets: [
+        // 127.0.0.1 rather than localhost: on a dual-stack box localhost can
+        // resolve to ::1 first, and an app bound only to IPv4 then refuses the
+        // connector's connection for reasons that look like nothing at all.
+        { label: "This panel", service: `http://127.0.0.1:${LISTEN_PORT}`, port: LISTEN_PORT },
+        ...config.sites
+          .filter((site) => site.runner === "local" && site.settings.port)
+          .map((site) => ({
+            label: site.name,
+            service: `http://127.0.0.1:${site.settings.port}`,
+            port: site.settings.port,
+          })),
+      ],
+    };
+    if (!c.apiToken) return sendJson(res, 200, out);
+    try {
+      out.accounts = await cf.listAccounts(c.apiToken);
+      if (!out.accountId && out.accounts.length === 1) {
+        // One account is not a choice worth making anyone make.
+        config.cloudflare.accountId = out.accounts[0].id;
+        config.cloudflare.accountName = out.accounts[0].name;
+        saveConfig();
+        out.accountId = out.accounts[0].id;
+        out.accountName = out.accounts[0].name;
+      }
+      if (out.accountId) {
+        const [zones, tunnels] = await Promise.all([
+          cf.listZones(c.apiToken, out.accountId).catch(() => []),
+          cf.listTunnels(c.apiToken, out.accountId).catch(() => []),
+        ]);
+        out.zones = zones;
+        out.tunnels = tunnels;
+        if (out.tunnelId) {
+          const live = tunnels.find((t) => t.id === out.tunnelId);
+          out.tunnel = live || null;
+          if (live) out.routes = await cf.getRoutes(c.apiToken, out.accountId, out.tunnelId).catch(() => []);
+          else out.warning = "The connector this panel was using is no longer in that Cloudflare account.";
+        }
+      }
+      return sendJson(res, 200, out);
+    } catch (err) {
+      return sendJson(res, 200, { ...out, error: err.message });
+    }
+  }
+
+  if (url.pathname === "/api/cloudflare/token" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    const token = String(body.token || "").trim();
+    config.cloudflare = config.cloudflare || {};
+    if (!token) {
+      // Clearing the API token leaves the connector alone: it is still running
+      // on a token of its own and taking it down would be a surprise.
+      config.cloudflare = { apiToken: "", accountId: "", accountName: "", tunnelId: "", tunnelName: "" };
+      saveConfig();
+      return sendJson(res, 200, { ok: true, cleared: true });
+    }
+    try {
+      const who = await cf.verifyToken(token);
+      if (who.status !== "active") throw new Error(`That token is ${who.status}.`);
+      const accounts = await cf.listAccounts(token);
+      config.cloudflare.apiToken = token;
+      if (accounts.length === 1) {
+        config.cloudflare.accountId = accounts[0].id;
+        config.cloudflare.accountName = accounts[0].name;
+      }
+      saveConfig();
+      return sendJson(res, 200, { ok: true, accounts, expiresOn: who.expiresOn });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  if (url.pathname === "/api/cloudflare/account" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    const c = config.cloudflare || {};
+    if (!c.apiToken) return sendJson(res, 400, { error: "Connect a Cloudflare API token first." });
+    try {
+      const accounts = await cf.listAccounts(c.apiToken);
+      const picked = accounts.find((a) => a.id === body.accountId);
+      if (!picked) return sendJson(res, 400, { error: "That account is not one this token can see." });
+      // A connector belongs to one account, so changing account drops it.
+      if (config.cloudflare.accountId !== picked.id) {
+        config.cloudflare.tunnelId = "";
+        config.cloudflare.tunnelName = "";
+      }
+      config.cloudflare.accountId = picked.id;
+      config.cloudflare.accountName = picked.name;
+      saveConfig();
+      return sendJson(res, 200, { ok: true, account: picked });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  // Create a connector (or adopt one that is already there), take its token,
+  // and point this panel's cloudflared at it.
+  if (url.pathname === "/api/cloudflare/tunnel" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    let c;
+    try {
+      c = cfCreds();
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    try {
+      let tun;
+      if (body.tunnelId) {
+        tun = await cf.getTunnel(c.apiToken, c.accountId, body.tunnelId);
+      } else {
+        tun = await cf.createTunnel(c.apiToken, c.accountId, body.name || `fcc-${os.hostname()}`);
+      }
+      const connectorToken = await cf.tunnelToken(c.apiToken, c.accountId, tun.id);
+
+      config.cloudflare.tunnelId = tun.id;
+      config.cloudflare.tunnelName = tun.name;
+      config.tunnel = { ...(config.tunnel || {}), token: connectorToken };
+      saveConfig();
+
+      // Running on the old token would leave it serving the previous
+      // connector's routes, so swap the process over as well.
+      let started = false;
+      let startError = null;
+      if (body.start !== false) {
+        try {
+          await tunnel.stop();
+          await tunnel.start(connectorToken);
+          started = true;
+        } catch (err) {
+          startError = err.message;
+        }
+      }
+      pushState();
+      return sendJson(res, 200, { ok: true, tunnel: tun, started, startError });
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  if (url.pathname === "/api/cloudflare/routes" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    let c;
+    try {
+      c = cfCreds();
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    if (!c.tunnelId) return sendJson(res, 400, { error: "Create or pick a connector first." });
+
+    const hostname = cf.validHostname(body.hostname);
+    if (!hostname) return sendJson(res, 400, { error: "That is not a usable hostname." });
+
+    try {
+      const zones = await cf.listZones(c.apiToken, c.accountId);
+      const zone = cf.zoneForHostname(zones, hostname);
+      if (!zone) {
+        return sendJson(res, 400, {
+          error: `${hostname} is not under a domain this token can edit${zones.length ? ` — it can see ${zones.map((z) => z.name).join(", ")}` : ""}.`,
+        });
+      }
+      const routes = await cf.getRoutes(c.apiToken, c.accountId, c.tunnelId);
+
+      if (body.remove) {
+        const left = routes.filter((r) => !(r.hostname === hostname && (!body.path || r.path === body.path)));
+        if (left.length === routes.length) return sendJson(res, 400, { error: "There is no route for that hostname." });
+        await cf.putRoutes(c.apiToken, c.accountId, c.tunnelId, left);
+        const dns = await cf.unpointHostname(c.apiToken, zone.id, hostname).catch(() => ({ deleted: false }));
+        return sendJson(res, 200, { ok: true, removed: hostname, dnsDeleted: dns.deleted });
+      }
+
+      const service = String(body.service || "").trim();
+      if (!/^https?:\/\/[\w.-]+(:\d+)?$/.test(service) && !/^http_status:\d+$/.test(service)) {
+        return sendJson(res, 400, { error: "The service has to look like http://127.0.0.1:3000." });
+      }
+      const path_ = String(body.path || "").trim();
+      const next = routes.filter((r) => !(r.hostname === hostname && (r.path || "") === path_));
+      next.push({ hostname, path: path_, service });
+      await cf.putRoutes(c.apiToken, c.accountId, c.tunnelId, next);
+      // Ingress without DNS is a rule nothing can reach, so both or neither.
+      const dns = await cf.pointHostnameAtTunnel(c.apiToken, zone.id, hostname, c.tunnelId);
+      return sendJson(res, 200, { ok: true, hostname, service, zone: zone.name, dns });
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
