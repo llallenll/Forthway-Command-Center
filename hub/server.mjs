@@ -71,7 +71,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.6.0";
+const FCC_VERSION = "2.7.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 
@@ -1522,15 +1522,12 @@ async function handleApi(req, res, url) {
       routes: [],
       // What a hostname can usefully be pointed at on this machine.
       targets: [
-        // 127.0.0.1 rather than localhost: on a dual-stack box localhost can
-        // resolve to ::1 first, and an app bound only to IPv4 then refuses the
-        // connector's connection for reasons that look like nothing at all.
-        { label: "This panel", service: `http://127.0.0.1:${LISTEN_PORT}`, port: LISTEN_PORT },
+        { label: "This panel", service: `http://localhost:${LISTEN_PORT}`, port: LISTEN_PORT },
         ...config.sites
           .filter((site) => site.runner === "local" && site.settings.port)
           .map((site) => ({
             label: site.name,
-            service: `http://127.0.0.1:${site.settings.port}`,
+            service: `http://localhost:${site.settings.port}`,
             port: site.settings.port,
           })),
       ],
@@ -1591,6 +1588,58 @@ async function handleApi(req, res, url) {
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
+  }
+
+  /**
+   * Forget everything about Cloudflare.
+   *
+   * Local only, and deliberately so: the connector and its hostnames stay in
+   * the Cloudflare account, because deleting those would take real sites off
+   * the internet. What goes is what this panel is holding — the API token,
+   * the connector token, which account and tunnel it was using, and the
+   * certificate the browser login wrote.
+   */
+  if (url.pathname === "/api/cloudflare/reset" && req.method === "POST") {
+    const removed = [];
+    const remaining = [];
+
+    // Running on a token we are about to forget makes no sense.
+    let wasRunning = false;
+    try {
+      wasRunning = tunnel.status().running;
+      if (wasRunning) await tunnel.stop();
+    } catch {
+      /* stopping is best effort; forgetting is the point */
+    }
+    cfLogin.cancel();
+
+    if (config.cloudflare?.apiToken) removed.push("the Cloudflare API token");
+    if (config.cloudflare?.accountId) removed.push("which account and connector to use");
+    if (config.tunnel?.token) removed.push("the connector token");
+    config.cloudflare = { apiToken: "", accountId: "", accountName: "", tunnelId: "", tunnelName: "", viaLogin: false };
+    config.tunnel = { ...(config.tunnel || {}), token: "" };
+    saveConfig();
+
+    // The certificate this panel's own login wrote is ours to delete. One
+    // sitting in a home directory is not: something else on this machine may
+    // be running on it, so it is reported rather than removed.
+    for (const file of cfLogin.candidateCerts()) {
+      if (!exists(file)) continue;
+      const ours = file.startsWith(config.dataDir);
+      if (!ours) {
+        remaining.push(file);
+        continue;
+      }
+      try {
+        fs.unlinkSync(file);
+        removed.push(`the login certificate at ${file}`);
+      } catch (err) {
+        remaining.push(`${file} (could not be removed: ${err.message})`);
+      }
+    }
+
+    pushState();
+    return sendJson(res, 200, { ok: true, removed, remaining, tunnelStopped: wasRunning });
   }
 
   if (url.pathname === "/api/cloudflare/account" && req.method === "POST") {
@@ -1692,7 +1741,7 @@ async function handleApi(req, res, url) {
 
       const service = String(body.service || "").trim();
       if (!/^https?:\/\/[\w.-]+(:\d+)?$/.test(service) && !/^http_status:\d+$/.test(service)) {
-        return sendJson(res, 400, { error: "The service has to look like http://127.0.0.1:3000." });
+        return sendJson(res, 400, { error: "The service has to look like http://localhost:3000." });
       }
       const path_ = String(body.path || "").trim();
       const next = routes.filter((r) => !(r.hostname === hostname && (r.path || "") === path_));

@@ -263,7 +263,7 @@ accident.
 2. **Host routes.** Type a name, pick the domain from the list of zones your
    account actually owns, and choose what it reaches — this panel, or any local
    site, by name and port. These are Zero Trust public hostnames pointing at
-   `127.0.0.1`, so the app itself never has to listen on anything but localhost.
+   `localhost`, so the app itself never has to be reachable from anywhere else.
    The panel writes both halves: the tunnel's ingress rule *and* the proxied
    CNAME that makes the name resolve. Removing a route removes both again.
 
@@ -278,9 +278,16 @@ Two other ways in, if the login does not suit:
   connector) under "Paste a connector token instead". No account access at all;
   hostnames are then set in the Cloudflare dashboard rather than here.
 
-`127.0.0.1` rather than `localhost`, deliberately: on a dual-stack machine
-`localhost` can resolve to `::1` first, and an app bound only to IPv4 then
-refuses the connector's connection for reasons that look like nothing at all.
+**Start over → Forget everything** drops the API token, the connector token,
+which account was in use, and the certificate the login wrote, and stops the
+tunnel. It is local only: the connector and its hostnames stay in Cloudflare,
+so connecting again picks up exactly where you left off. A certificate in a
+home directory outside `hub/data/` is reported rather than deleted — something
+else on that machine may be running on it.
+
+If a route ever fails to connect on a dual-stack machine, it is worth trying
+`http://127.0.0.1:PORT` in the "Somewhere else" box: `localhost` can resolve to
+`::1` first, and an app listening only on IPv4 will refuse that.
 
 - **cloudflared installs itself.** If it is not already on PATH the panel
   downloads the official build into `hub/data/bin/`, which matters in a
