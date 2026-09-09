@@ -8,13 +8,15 @@
 <title>Set up · Forthway Command Center</title>
 <style>
   :root{
-    /* Forthway Systems palette — forthway.ca */
-    --ground:#0E1116; --surface:#161B22; --surface-hi:#1D242E; --surface-lo:#12171E;
-    --line-bright:#38424F; --paper:#EDEFF2; --fog:#8792A2; --fog-dim:#5B6674;
-    --ink:var(--paper); --ink-2:#A3ADBB; --ink-3:var(--fog);
-    --line:#262E38; --bg:var(--ground); --card:var(--surface);
-    --accent:#FF9E2C; --accent-dk:#B36D1C; --accent-bg:rgba(255,158,44,.14);
-    --bad:#FF6B5E; --bad-bg:rgba(255,107,94,.13);
+    /* Collective OS palette — collectiveos.vercel.app */
+    --ground:#F6F3EC; --surface:#FFFFFF; --surface-hi:#F2F0EA; --surface-lo:#FAFAF8;
+    --line-bright:#DCDAD3; --paper:#2D2D2F; --fog:#6B7280; --fog-dim:#9CA3AF;
+    --night:#141416;
+    --ink:var(--paper); --ink-2:#3A3A3C; --ink-3:var(--fog);
+    --line:#E9E7E1; --bg:var(--ground); --card:var(--surface);
+    --accent:#2D2D2F; --accent-dk:#141416; --accent-bg:rgba(45,45,47,.06);
+    --bad:#B91C1C; --bad-bg:#FEF2F2;
+    --r-pill:999px;
     --line-2:var(--line);
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
@@ -24,7 +26,7 @@
     color:var(--ink);background:var(--bg);display:grid;place-items:center;padding:32px 20px}
   .box{width:100%;max-width:460px}
   .mark{width:48px;height:48px;border-radius:13px;display:grid;place-items:center;margin:0 auto 18px;
-    background:linear-gradient(145deg,var(--accent),var(--accent-dk));color:var(--ground);font-weight:750;font-size:15px;
+    background:var(--night);color:#fff;border-radius:50%;font-weight:750;font-size:15px;
     letter-spacing:.5px}
   h1{font-size:21px;margin:0 0 5px;text-align:center;font-weight:650}
   p.sub{margin:0 0 24px;text-align:center;color:var(--ink-3);font-size:13.5px;line-height:1.5}
@@ -43,9 +45,9 @@
   summary::before{content:'> ';color:var(--ink-3)}
   details[open] summary::before{content:'v ';}
   details .field{margin-top:12px}
-  button{width:100%;margin-top:18px;padding:11px;border:0;border-radius:9px;background:var(--paper);color:var(--ground);
+  button{width:100%;margin-top:18px;padding:11px;border:0;border-radius:999px;background:var(--night);color:#fff;
     font-size:14.5px;font-weight:600;cursor:pointer;font-family:inherit}
-  button:hover{background:#fff}
+  button:hover{background:#000}
   button:disabled{opacity:.5;cursor:not-allowed}
   .err{background:var(--bad-bg);color:var(--bad);padding:9px 11px;border-radius:8px;font-size:13px;margin-top:12px;display:none}
   .err.show{display:block}

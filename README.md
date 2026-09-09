@@ -149,10 +149,10 @@ target machine.
 
 ## The dashboard
 
-The panel wears the Forthway Systems palette from forthway.ca — the same
-ground, surfaces, amber and cyan, read from that site's own custom properties
-so the two stay in step. Every colour lives in one `:root` block at the top of
-`hub/public/index.html`.
+The panel is built in the Collective OS idiom: a warm cream ground, white
+cards with a hairline border and no shadow, near-black as the action colour,
+and a dark capsule header floating over the page. Every colour and radius
+lives in one `:root` block at the top of `hub/public/index.html`.
 
 
 Each site gets a small card: whether it is up, what version is on disk, what
