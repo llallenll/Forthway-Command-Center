@@ -132,7 +132,11 @@
   .card > .head{padding:15px 18px;border-bottom:1px solid var(--line-2);display:flex;align-items:flex-start;gap:10px}
   .card h2{font-size:16px;margin:0 0 3px;font-weight:660;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
     letter-spacing:-.015em}
-  .card .head .sub{font-size:12.5px;color:var(--ink-3)}
+  .card .head .sub{font-size:12.5px;color:var(--ink-3);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  /* The path already has .trunc for use elsewhere; inside this row the row
+     itself does the ellipsising, so the inner cap would only cut it twice. */
+  .card .head .sub .trunc{max-width:none;display:inline}
   .card .body{padding:16px 18px}
   .card .head .tools{margin-left:auto;display:flex;gap:5px;align-items:center}
 
@@ -1310,8 +1314,11 @@ function statusPills(s) {
       : '<span class="pill mute">not started</span>');
   }
   if (s.repo && s.repo.updateAvailable === true) {
-    out.push('<span class="pill accent" title="' +
-      esc((s.repo.latest && s.repo.latest.message) || '') + '">update available</span>');
+    // Short, because it shares a row with the runner and health chips and the
+    // banner underneath says the whole of it anyway.
+    const c = s.repo.latest || {};
+    out.push('<span class="pill accent" title="Update available — ' +
+      esc(c.shortSha || '') + (c.message ? ' ' + esc(c.message) : '') + '">update</span>');
   }
   if (s.restartPending) out.push('<span class="pill warn">restart pending</span>');
   if (s.queuedJobs) out.push('<span class="pill mute">' + s.queuedJobs + ' queued</span>');
@@ -4007,7 +4014,12 @@ function connect() {
 // The panel's own settings are wanted before the first click — the new-site
 // walkthrough needs to know where apps live on this machine.
 api('/api/settings', null, 'GET').then((s) => { SETTINGS = s; }).catch(() => {});
-refresh().then(connect);
+// Loading the page is someone deciding to look, so both update questions get
+// asked again rather than waiting out a cooldown — after the first render, so
+// a slow GitHub never delays the panel appearing.
+refresh()
+  .then(connect)
+  .then(() => api('/api/check', {}).catch(() => {}));
 setInterval(() => { if (!es || es.readyState === 2) refresh(); }, 15000);
 </script>
 </body>

@@ -170,11 +170,12 @@ actually deployed. Either one shows up as a badge — a button in the header for
 the panel itself, a pill and a one-click **Pull & deploy** on the card for a
 site — with the waiting commit named so you can see what it is before taking it.
 
-It asks on refresh, and on a timer so a panel left open still notices. Not
-literally on every refresh, though: GitHub allows 60 requests an hour to an
-anonymous caller, and a dashboard polling every twelve seconds would spend that
-in minutes and then be able to tell you nothing. Each site has a five-minute
-cooldown (twenty after a failure), and pressing **Refresh** on a card skips it.
+Loading the page asks both questions for real, because that is a person
+deciding to look. The twelve-second status poll does not: GitHub allows 60
+requests an hour to an anonymous caller, and polling it that often would spend
+the allowance in minutes and then be able to tell you nothing. Between page
+loads each site has a five-minute cooldown (twenty after a failure), a timer
+covers a panel left open, and pressing **Refresh** on a card skips the wait.
 
 **Click the card** for everything else: uploading a zip, pulling a branch,
 the release list, deploy and rollback, recent jobs and their logs, and a box

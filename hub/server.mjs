@@ -72,7 +72,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.8.0";
+const FCC_VERSION = "2.8.1";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 const REPO_CHECK_EVERY_MS = 5 * 60_000;
@@ -503,6 +503,32 @@ async function sweepRepos({ force = false, siteId = null } = {}) {
 function nudgeRepoSweep() {
   if (config.update?.autoCheck === false) return;
   sweepRepos().catch(() => {});
+}
+
+/**
+ * Ask both questions at once — is there a newer panel, and is any site's repo
+ * ahead of what is deployed.
+ *
+ * Loading the page forces it, because that is a person deciding to look, and
+ * happens orders of magnitude less often than the twelve-second status poll.
+ * The floor is only there so that holding refresh, or half a dozen tabs on a
+ * wall display, cannot multiply into a rate limit.
+ */
+let lastForcedCheck = 0;
+const FORCE_FLOOR_MS = 20_000;
+
+async function checkEverything({ force = false } = {}) {
+  if (force && Date.now() - lastForcedCheck < FORCE_FLOOR_MS) force = false;
+  if (force) lastForcedCheck = Date.now();
+
+  const was = lastUpdateCheck?.updateAvailable;
+  const wasVersion = lastUpdateCheck?.latest?.version;
+  await Promise.allSettled([runUpdateCheck({ force }), sweepRepos({ force })]);
+  // sweepRepos pushes its own changes; this covers the panel's own answer.
+  if (lastUpdateCheck?.updateAvailable !== was || lastUpdateCheck?.latest?.version !== wasVersion) {
+    pushState();
+  }
+  return { update: buildDashboardState().update };
 }
 
 /**
@@ -1099,6 +1125,15 @@ async function handleApi(req, res, url) {
   if (!isAuthed(req, config.sessionSecret)) return sendJson(res, 401, { error: "Not signed in" });
 
   // ---- dashboard state ------------------------------------------------
+  // The page asking, on load, for both answers to be re-fetched now.
+  if (url.pathname === "/api/check" && req.method === "POST") {
+    try {
+      return sendJson(res, 200, { ok: true, ...(await checkEverything({ force: true })) });
+    } catch (err) {
+      return sendJson(res, 200, { ok: false, error: err.message });
+    }
+  }
+
   if (url.pathname === "/api/state") {
     // Each refresh asks whether anything moved; the cooldowns inside decide
     // whether that turns into an actual request to GitHub.
