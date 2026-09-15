@@ -164,6 +164,18 @@ on it for the things you do without thinking —
   ones that run the app itself (`start`, `dev`). So `db:migrate`, `seed` or
   `typecheck` are one click, and the output streams into the console.
 
+**Update available.** The panel keeps asking GitHub two questions: is there a
+newer Command Center, and is any site's repository ahead of the commit that is
+actually deployed. Either one shows up as a badge — a button in the header for
+the panel itself, a pill and a one-click **Pull & deploy** on the card for a
+site — with the waiting commit named so you can see what it is before taking it.
+
+It asks on refresh, and on a timer so a panel left open still notices. Not
+literally on every refresh, though: GitHub allows 60 requests an hour to an
+anonymous caller, and a dashboard polling every twelve seconds would spend that
+in minutes and then be able to tell you nothing. Each site has a five-minute
+cooldown (twenty after a failure), and pressing **Refresh** on a card skips it.
+
 **Click the card** for everything else: uploading a zip, pulling a branch,
 the release list, deploy and rollback, recent jobs and their logs, and a box
 for any command you want to run in the app directory.

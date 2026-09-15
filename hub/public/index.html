@@ -198,6 +198,9 @@
   .empty{color:var(--ink-3);font-size:13px;padding:10px 0}
   .trunc{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;
     vertical-align:middle}
+  /* In a banner there is a whole row to use, so the 200px cap just throws
+     away the half of the commit message worth reading. */
+  .banner .trunc{max-width:100%;display:block}
 
   .cmdrun{display:flex;gap:7px;margin-top:12px}
   .cmdrun input{flex:1;min-width:0;padding:7px 11px;border:1px solid var(--line);border-radius:8px;
@@ -487,6 +490,8 @@
     <span class="conn"><span class="dot off" id="liveDot"></span><span id="liveText">connecting...</span></span>
     <span class="conn" id="tunPill" style="display:none" title="Cloudflare Tunnel">
       <span class="dot off" id="tunDot"></span><span id="tunText">tunnel</span></span>
+    <button class="btn sm accent" id="fccUpdate" style="display:none"
+      title="A newer Command Center is on GitHub">Update available</button>
     <div class="spacer"></div>
     <button class="btn accent" id="btnAdd">+ Add site</button>
     <button class="btn ghost" id="btnSettings">Settings</button>
@@ -1304,6 +1309,10 @@ function statusPills(s) {
       ? '<span class="pill bad">not answering</span>'
       : '<span class="pill mute">not started</span>');
   }
+  if (s.repo && s.repo.updateAvailable === true) {
+    out.push('<span class="pill accent" title="' +
+      esc((s.repo.latest && s.repo.latest.message) || '') + '">update available</span>');
+  }
   if (s.restartPending) out.push('<span class="pill warn">restart pending</span>');
   if (s.queuedJobs) out.push('<span class="pill mute">' + s.queuedJobs + ' queued</span>');
   return out.join(' ');
@@ -1570,6 +1579,13 @@ function cardHtml(s) {
   } else if (s.lastError) {
     h += '<div class="banner bad"><span class="txt trunc" title="' + esc(s.lastError) + '">Last job failed: ' +
          esc(s.lastError) + '</span></div>';
+  } else if (s.repo && s.repo.updateAvailable === true) {
+    const c = s.repo.latest || {};
+    h += '<div class="banner info"><span class="txt trunc" title="' + esc(c.message || '') + '">' +
+         '<b>' + esc(c.shortSha || 'New commit') + '</b> on ' + esc(s.repo.ref) +
+         (c.message ? ' — ' + esc(c.message) : '') + '</span>' +
+         '<button class="btn sm accent" data-act="ghQuick"' + (s.activeJob ? ' disabled' : '') +
+         '>Pull &amp; deploy</button></div>';
   }
 
   h += '<div class="mini">';
@@ -1595,6 +1611,31 @@ function cardHtml(s) {
 }
 
 // ---------------------------------------------------- the rest of a site
+
+/** Where this site stands against its repository, in one line. */
+function repoLine(s) {
+  const r = s.repo;
+  if (!r) return '';
+  if (r.error) {
+    return '<div class="repo muted" style="color:var(--bad)" title="' + esc(r.error) + '">' +
+      'Could not check: ' + esc(r.error) + '</div>';
+  }
+  if (r.updateAvailable === true) {
+    const c = r.latest || {};
+    return '<div class="repo" style="color:var(--accent-tx)" title="' + esc(c.message || '') + '">' +
+      '<b>' + esc(c.shortSha || '') + '</b> is waiting' +
+      (r.deployedSha ? ' · ' + esc(r.deployedSha) + ' is live' : '') +
+      (c.date ? ' · ' + esc(ago(c.date)) : '') + '</div>';
+  }
+  if (r.updateAvailable === false) {
+    return '<div class="repo muted">Up to date with ' + esc(r.ref) +
+      (r.checkedAt ? ' · checked ' + esc(ago(r.checkedAt)) : '') + '</div>';
+  }
+  // Deployed from a zip, or never deployed: there is nothing to compare.
+  return '<div class="repo muted">' +
+    (r.latest ? esc(r.latest.shortSha) + ' is the newest commit — nothing deployed from it yet' : 'Not checked yet') +
+    '</div>';
+}
 
 function siteDetailHtml(s) {
   const rel = s.releases.find((r) => r.id === s.currentReleaseId);
@@ -1623,6 +1664,7 @@ function siteDetailHtml(s) {
   h += '<div class="gh"><b>Pull from GitHub</b>' +
        (s.github.repo
          ? '<div class="repo">' + esc(s.github.repo) + (s.github.ref ? ' @ ' + esc(s.github.ref) : '') + '</div>' +
+           repoLine(s) +
            '<div class="row"><button class="btn sm accent" data-act="ghQuick"' + (s.activeJob ? ' disabled' : '') +
            '>Pull &amp; deploy</button>' +
            '<button class="btn sm" data-act="github">Change...</button></div>'
@@ -3406,10 +3448,27 @@ async function refresh() {
     STATE = await api('/api/state', null, 'GET');
     render();
     paintTunnelPill();
+    paintFccUpdate();
   } catch (err) { /* the SSE stream will catch up */ }
 }
 
 // ------------------------------------------------------------------ tunnel
+
+/** The panel's own update, said out loud rather than left in settings. */
+function paintFccUpdate() {
+  const u = STATE.update || {};
+  const btn = $('fccUpdate');
+  btn.style.display = u.available === true ? '' : 'none';
+  if (u.available !== true) return;
+  btn.textContent = u.version ? 'Update to ' + u.version : 'Update available';
+  btn.title = 'A newer Command Center is on GitHub' +
+    (u.shortSha ? ' (' + u.shortSha + ')' : '') + ' — click to see what changed';
+}
+
+$('fccUpdate').addEventListener('click', () => {
+  $('btnSettings').click();
+  setTimeout(() => showHubTab('updates'), 60);
+});
 
 function paintTunnelPill() {
   const t = STATE.tunnel;
@@ -3888,6 +3947,7 @@ function connect() {
     STATE = JSON.parse(e.data);
     render();
     paintTunnelPill();
+    paintFccUpdate();
     if (openJob) {
       for (const s of STATE.sites) {
         const j = s.jobs.find((x) => x.id === openJob);

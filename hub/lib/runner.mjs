@@ -15,10 +15,13 @@ import fs from "node:fs";
 import { Deployer } from "../../shared/deployer.mjs";
 
 export class LocalRunner {
-  constructor({ store, listSites, onStateChange, broadcast }) {
+  constructor({ store, listSites, onStateChange, onJobFinished, broadcast }) {
     this.store = store;
     this.listSites = listSites;
     this.onStateChange = onStateChange || (() => {});
+    // So the panel can re-answer "is the repo ahead of us?" the instant a
+    // deploy changes which commit is live.
+    this.onJobFinished = onJobFinished || (() => {});
     this.broadcast = broadcast || (() => {});
     this.deployers = new Map(); // siteId -> Deployer
     this.busy = new Set();
@@ -176,6 +179,7 @@ export class LocalRunner {
     if (body.rolledBackTo) state.currentReleaseId = body.rolledBackTo;
 
     this.store.save({ immediate: true });
+    this.onJobFinished(job);
     this.onStateChange();
     this.broadcast("job-finished", { jobId: job.id, siteId: job.siteId, ok: !!body.ok, error: job.error });
   }

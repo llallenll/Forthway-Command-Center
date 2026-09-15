@@ -56,6 +56,7 @@ import {
 } from "./lib/sites.mjs";
 import { normalizeRepo, repoInfo, listRefs, resolveCommit, downloadZipball, checkToken } from "./lib/github.mjs";
 import { Tunnel } from "./lib/tunnel.mjs";
+import { RepoWatch } from "./lib/repowatch.mjs";
 import * as cf from "./lib/cloudflare.mjs";
 import {
   DEFAULT_REPO as UPDATE_REPO,
@@ -71,9 +72,10 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.7.0";
+const FCC_VERSION = "2.8.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
+const REPO_CHECK_EVERY_MS = 5 * 60_000;
 
 // ---------------------------------------------------------------- config
 
@@ -242,6 +244,10 @@ const local = new LocalRunner({
   store,
   listSites: () => config.sites,
   onStateChange: pushState,
+  onJobFinished: (job) => {
+    const site = findSite(job.siteId);
+    if (site) repoWatch.refreshDeployed(job.siteId, deployedShaFor(site));
+  },
   broadcast,
 });
 local.sync();
@@ -288,6 +294,14 @@ function buildDashboardState() {
     hasGithubToken: !!config.github?.token,
     githubUser: config.github?.username || "",
     tunnel: { ...tunnel.status(), hasToken: !!config.tunnel?.token, autoStart: config.tunnel?.autoStart !== false },
+    // Enough for the header to say an update is waiting without opening
+    // settings; the detail is still behind /api/update.
+    update: {
+      available: lastUpdateCheck?.updateAvailable ?? null,
+      version: lastUpdateCheck?.latest?.version || null,
+      shortSha: lastUpdateCheck?.latest?.shortSha || null,
+      checkedAt: lastUpdateCheck?.checkedAt || null,
+    },
     sites: config.sites.map((sc) => {
       const s = store.site(sc.id);
       const isLocal = sc.runner === "local";
@@ -320,6 +334,7 @@ function buildDashboardState() {
           ? { id: running.id, type: running.type, startedAt: running.startedAt, step: running.step || null }
           : null,
         queuedJobs: queued,
+        repo: repoWatch.publicState(sc.id),
         releases: store.releasesForSite(sc.id).map(publicRelease),
         jobs: store.jobsForSite(sc.id).map(publicJob),
       };
@@ -436,6 +451,58 @@ function updateStatus() {
     error: updateJob.error,
     backups: listBackups(config.dataDir).slice(0, 5),
   };
+}
+
+// --------------------------------------------------- is the repo ahead of us?
+
+const repoWatch = new RepoWatch({ resolveCommit, repoInfo });
+
+/** The commit the release currently serving this site was built from. */
+function deployedShaFor(site) {
+  const state = store.site(site.id);
+  const rel = state.currentReleaseId ? store.release(state.currentReleaseId) : null;
+  const src = rel?.source;
+  if (!src || src.type !== "github" || !src.sha) return null;
+  // A sha from a different repository answers a different question.
+  if (src.repo && site.github?.repo && src.repo !== site.github.repo) return null;
+  return src.sha;
+}
+
+/**
+ * Look at every site whose cooldown has elapsed.
+ *
+ * Called on a timer and, opportunistically, whenever the dashboard asks for
+ * state — so the badge keeps up with how the panel is actually used without
+ * a request to GitHub per refresh.
+ */
+async function sweepRepos({ force = false, siteId = null } = {}) {
+  const targets = config.sites.filter((s) => s.github?.repo && (!siteId || s.id === siteId));
+  let changed = false;
+  for (const site of targets) {
+    if (!force && !repoWatch.due(site.id)) continue;
+    const before = JSON.stringify(repoWatch.publicState(site.id));
+    await repoWatch.check(site, {
+      deployedSha: deployedShaFor(site),
+      token: githubTokenFor(site),
+      force,
+    });
+    if (JSON.stringify(repoWatch.publicState(site.id)) !== before) changed = true;
+  }
+  // Sites that lost their repo should lose their badge with it.
+  for (const id of [...repoWatch.byId.keys()]) {
+    if (!config.sites.some((s) => s.id === id && s.github?.repo)) {
+      repoWatch.forget(id);
+      changed = true;
+    }
+  }
+  if (changed) pushState();
+  return changed;
+}
+
+/** Fire-and-forget, so a slow GitHub never holds up a dashboard refresh. */
+function nudgeRepoSweep() {
+  if (config.update?.autoCheck === false) return;
+  sweepRepos().catch(() => {});
 }
 
 /**
@@ -1032,7 +1099,13 @@ async function handleApi(req, res, url) {
   if (!isAuthed(req, config.sessionSecret)) return sendJson(res, 401, { error: "Not signed in" });
 
   // ---- dashboard state ------------------------------------------------
-  if (url.pathname === "/api/state") return sendJson(res, 200, buildDashboardState());
+  if (url.pathname === "/api/state") {
+    // Each refresh asks whether anything moved; the cooldowns inside decide
+    // whether that turns into an actual request to GitHub.
+    nudgeRepoSweep();
+    runUpdateCheck().catch(() => {});
+    return sendJson(res, 200, buildDashboardState());
+  }
 
   if (url.pathname === "/api/events") {
     res.writeHead(200, {
@@ -1147,6 +1220,7 @@ async function handleApi(req, res, url) {
 
       // Remember the repo and ref so the next pull is one click.
       site.github = sanitizeGithub({ ...site.github, repo, ref });
+      repoWatch.invalidate(site.id);
       if (body.saveToken && String(body.token || "").trim()) site.github.token = String(body.token).trim();
       saveConfig();
       pushState();
@@ -1252,6 +1326,7 @@ async function handleApi(req, res, url) {
     if (RUNNERS.includes(body.runner)) site.runner = body.runner;
     if (body.settings) site.settings = sanitizeSettings(body.settings, site.settings);
     if (body.github) {
+      repoWatch.invalidate(site.id);
       const g = sanitizeGithub(body.github);
       // A blank token in the form means "leave it alone", not "clear it".
       site.github = { ...g, token: body.github.clearToken ? "" : g.token || site.github?.token || "" };
@@ -1922,6 +1997,8 @@ async function handleApi(req, res, url) {
     if (url.pathname === "/api/refresh") {
       const site = findSite(body.siteId);
       if (!site) return sendJson(res, 400, { error: "Unknown site" });
+      // Pressing refresh is an explicit ask, so it skips the cooldown.
+      sweepRepos({ force: true, siteId: site.id }).catch(() => {});
       if (site.runner === "local") {
         await local.refreshStatus();
         return sendJson(res, 200, { ok: true, job: null });
@@ -2122,6 +2199,8 @@ async function handleAgent(req, res, url) {
 
     store.save({ immediate: true });
     pushState();
+    const finished = findSite(job.siteId);
+    if (finished) repoWatch.refreshDeployed(job.siteId, deployedShaFor(finished));
     broadcast("job-finished", { jobId: job.id, siteId: job.siteId, ok: !!body.ok, error: job.error });
     return sendJson(res, 200, { ok: true });
   }
@@ -2306,6 +2385,11 @@ server.on("error", (err) => {
 if (config.update?.autoCheck !== false) {
   setTimeout(() => runUpdateCheck().catch(() => {}), 8_000).unref();
   setInterval(() => runUpdateCheck().catch(() => {}), UPDATE_CHECK_EVERY_MS).unref();
+
+  // And the same question for each site's own repository. On a timer as well
+  // as on refresh, so a panel left open on a wall still notices a push.
+  setTimeout(() => sweepRepos().catch(() => {}), 12_000).unref();
+  setInterval(() => sweepRepos().catch(() => {}), REPO_CHECK_EVERY_MS).unref();
 }
 
 // Keep the dashboard honest about which agents are actually there.
