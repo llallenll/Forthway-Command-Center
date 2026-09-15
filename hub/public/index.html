@@ -130,8 +130,12 @@
   @media (max-width:600px){ .grid{grid-template-columns:1fr} .wrap{padding:0 14px} }
   .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);overflow:hidden}
   .card > .head{padding:15px 18px;border-bottom:1px solid var(--line-2);display:flex;align-items:flex-start;gap:10px}
-  .card h2{font-size:16px;margin:0 0 3px;font-weight:660;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-    letter-spacing:-.015em}
+  .card h2{font-size:16px;margin:0 0 3px;font-weight:660;display:flex;align-items:center;gap:8px;
+    flex-wrap:nowrap;letter-spacing:-.015em;min-width:0}
+  /* A long site name must give way rather than push the status chips onto a
+     second row: it is the one part of the line that can be cut and still read. */
+  .card h2 .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}
+  .card h2 .dot,.card h2 .pill{flex:none}
   .card .head .sub{font-size:12.5px;color:var(--ink-3);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
   /* The path already has .trunc for use elsewhere; inside this row the row
@@ -360,6 +364,11 @@
   /* ---- the card is a summary; the detail is a click away */
   .card.compact{cursor:pointer;transition:border-color .12s,box-shadow .12s}
   .card.compact:hover{border-color:var(--line-bright);box-shadow:0 8px 26px rgba(28,25,20,.08)}
+  /* Amber, because green already means healthy and red already means failed:
+     this is a third thing — something is waiting for you. */
+  .card.has-update{border-color:rgba(180,83,9,.38);background:#FFFCF4}
+  .card.has-update:hover{border-color:rgba(180,83,9,.55);box-shadow:0 8px 26px rgba(180,83,9,.10)}
+  .card.has-update .banner.info{background:#FDF3DF;color:#7C4A08}
   .card.compact:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
   .card .head.tight{padding:13px 15px;border-bottom:0}
   .card .body.tight{padding:0 15px 13px}
@@ -1281,6 +1290,9 @@ function render() {
       card.setAttribute('role', 'button');
       wrap.appendChild(card);
     }
+    // The whole card carries "there is something waiting here", rather than
+    // one more chip on a row that is already full.
+    card.classList.toggle('has-update', !!(s.repo && s.repo.updateAvailable === true));
     const html = cardHtml(s);
     if (card.dataset.html !== html) {
       card.dataset.html = html;
@@ -1312,13 +1324,6 @@ function statusPills(s) {
     out.push(s.lastDeployAt || s.serving
       ? '<span class="pill bad">not answering</span>'
       : '<span class="pill mute">not started</span>');
-  }
-  if (s.repo && s.repo.updateAvailable === true) {
-    // Short, because it shares a row with the runner and health chips and the
-    // banner underneath says the whole of it anyway.
-    const c = s.repo.latest || {};
-    out.push('<span class="pill accent" title="Update available — ' +
-      esc(c.shortSha || '') + (c.message ? ' ' + esc(c.message) : '') + '">update</span>');
   }
   if (s.restartPending) out.push('<span class="pill warn">restart pending</span>');
   if (s.queuedJobs) out.push('<span class="pill mute">' + s.queuedJobs + ' queued</span>');
@@ -1560,7 +1565,8 @@ function cardHtml(s) {
 
   let h = '';
   h += '<div class="head tight">';
-  h += '<div style="min-width:0"><h2><span class="dot ' + dotClass + '"></span>' + esc(s.name) + statusPills(s) + '</h2>';
+  h += '<div style="min-width:0"><h2><span class="dot ' + dotClass + '"></span>' +
+       '<span class="nm" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' + statusPills(s) + '</h2>';
   h += '<div class="sub"><span class="mono">' + esc(s.id) + '</span>' +
        (s.settings.appDir ? ' · <span class="mono muted trunc" title="' + esc(s.settings.appDir) + '">' +
          esc(s.settings.appDir) + '</span>' : '') + '</div></div>';

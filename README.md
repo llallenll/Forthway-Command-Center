@@ -166,9 +166,10 @@ on it for the things you do without thinking —
 
 **Update available.** The panel keeps asking GitHub two questions: is there a
 newer Command Center, and is any site's repository ahead of the commit that is
-actually deployed. Either one shows up as a badge — a button in the header for
-the panel itself, a pill and a one-click **Pull & deploy** on the card for a
-site — with the waiting commit named so you can see what it is before taking it.
+actually deployed. Either one shows up on sight — a button in the header for
+the panel itself; for a site, the whole card warms to amber with the waiting
+commit named and a one-click **Pull & deploy**, so you can see what it is
+before taking it.
 
 Loading the page asks both questions for real, because that is a person
 deciding to look. The twelve-second status poll does not: GitHub allows 60
