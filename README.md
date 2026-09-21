@@ -270,10 +270,16 @@ cloudflared is given a home directory of its own under `hub/data/`, so a
 certificate already sitting in yours is neither overwritten nor read by
 accident.
 
-1. **The connector.** Create one, or adopt a tunnel already in the account. It
-   is created remotely-managed, so its routes live in Zero Trust → Networks →
+1. **The connectors.** Create one, or adopt a tunnel already in the account.
+   It is created remotely-managed, so its routes live in Zero Trust → Networks →
    Tunnels and stay editable there as well as here. The panel takes its
    connector token, stores it, and starts running it.
+
+   More than one can run at once — separate accounts, a connector shared with
+   another machine, or a spare kept warm while a hostname moves across. Each
+   has its own start/stop, its own log, and its own "start with the panel";
+   they share only the cloudflared binary. When there are several, the host
+   routes section asks which one a hostname belongs to.
 2. **Host routes.** Type a name, pick the domain from the list of zones your
    account actually owns, and choose what it reaches — this panel, or any local
    site, by name and port. These are Zero Trust public hostnames pointing at

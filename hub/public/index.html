@@ -1102,6 +1102,10 @@
               port here, through the connector, so the app itself never has to listen on anything else. The DNS
               record is written for you, so the name works as soon as it is added.</div>
             <div class="body">
+              <div class="field" id="cfRouteTunnelWrap" style="display:none;margin-bottom:10px">
+                <label for="cfRouteTunnel">On which connector</label>
+                <select id="cfRouteTunnel"></select>
+              </div>
               <table class="routes" id="cfRoutes"></table>
               <div class="two" style="margin-top:12px">
                 <div class="field" style="margin-bottom:8px"><label for="cfSub">Hostname</label>
@@ -1122,28 +1126,27 @@
           </div>
         </div>
 
-        <div class="sub-h" style="margin-top:18px">The connector process</div>
-        <div class="row" style="margin:0 0 12px">
-          <button class="btn sm" id="tunStart">Start</button>
-          <button class="btn sm" id="tunStop">Stop</button>
-          <button class="btn sm ghost" id="tunLog">Show log</button>
-        </div>
-        <label class="chk"><input type="checkbox" id="tunAutoStart" />
-          <span>Start the tunnel with the panel<span class="d">Otherwise it only runs when you start it here.</span></span></label>
+        <div class="sub-h" style="margin-top:18px">Connectors running here <span id="tunCount" class="muted"></span></div>
+        <div id="tunList"></div>
         <div class="sub-h" style="margin-top:20px;color:var(--bad)">Start over</div>
         <div class="row" style="margin-bottom:6px">
           <button class="btn sm danger" id="cfReset">Forget everything</button>
           <span class="hint" style="margin:0;flex:1;min-width:180px">Clears the API token, the connector token
-            and the login certificate from this panel. Your connector and its hostnames stay in Cloudflare.</span>
+            and every connector token from this panel. Your tunnels and their hostnames stay in Cloudflare.</span>
         </div>
 
         <details style="margin-top:12px">
-          <summary class="hint" style="cursor:pointer">Paste a connector token instead</summary>
-          <div class="field" style="margin-top:10px">
-            <input type="password" id="tunToken" autocomplete="off" placeholder="eyJhIjoi…" />
-            <div class="hint" id="tunTokenState">From the Cloudflare dashboard: Zero Trust → Networks → Tunnels →
-              your tunnel → Install connector. Hostnames are then set over there rather than here.</div>
+          <summary class="hint" style="cursor:pointer">Add one from a connector token</summary>
+          <div class="two" style="margin-top:10px">
+            <div class="field"><label for="tunName">Name it</label>
+              <input type="text" id="tunName" placeholder="what this one is for" autocomplete="off" /></div>
+            <div class="field"><label for="tunToken">Connector token</label>
+              <input type="password" id="tunToken" autocomplete="off" placeholder="eyJhIjoi…" /></div>
           </div>
+          <button class="btn sm" id="tunAdd">Add it</button>
+          <div class="hint" id="tunTokenState" style="margin-top:8px">From the Cloudflare dashboard: Zero Trust →
+            Networks → Tunnels → your tunnel → Install connector. Hostnames for a connector added this way are set
+            over there rather than here.</div>
         </details>
       </section>
 
@@ -3192,7 +3195,7 @@ $('btnSettings').addEventListener('click', async () => {
     : 'Changing this restarts the panel, and the address you use to reach it changes with it.';
   $('hubPwOld').value = '';
   $('hubPwNew').value = '';
-  paintTunnelSettings(SETTINGS.tunnel);
+  paintTunnelSettings();
   paintUpdate(SETTINGS.update);
   $('tunToken').value = '';
   showHubTab('updates');
@@ -3242,8 +3245,7 @@ $('hubSave').addEventListener('click', async () => {
     update: { repo: $('updRepo').value, ref: $('updRef').value, autoCheck: $('updAuto').checked },
   };
   if ($('hubGh').value !== '') body.githubToken = $('hubGh').value;
-  if ($('tunToken').value !== '') body.tunnelToken = $('tunToken').value;
-  body.tunnelAutoStart = $('tunAutoStart').checked;
+  // Connectors are added and toggled on their own rows now, not by Save.
   if (!$('hubPort').disabled) body.port = +$('hubPort').value;
   if ($('hubPwNew').value) { body.newPassword = $('hubPwNew').value; body.currentPassword = $('hubPwOld').value; }
   const btn = $('hubSave');
@@ -3264,7 +3266,7 @@ $('hubSave').addEventListener('click', async () => {
     // rather than leaving stale values behind a dialog that stays open.
     SETTINGS = await api('/api/settings', null, 'GET');
     paintGithubToken();
-    paintTunnelSettings(SETTINGS.tunnel);
+    paintTunnelSettings();
     $('hubPwOld').value = '';
     $('hubPwNew').value = '';
     $('tunToken').value = '';
@@ -3484,89 +3486,148 @@ $('fccUpdate').addEventListener('click', () => {
 });
 
 function paintTunnelPill() {
-  const t = STATE.tunnel;
+  const t = STATE.tunnel;                      // the summary across all of them
   const pill = $('tunPill');
-  if (!t || !t.hasToken) { pill.style.display = 'none'; return; }
+  if (!t || !t.count) { pill.style.display = 'none'; return; }
   pill.style.display = '';
   const dot = $('tunDot');
+  const many = t.count > 1;
+  const label = many ? t.connected + '/' + t.count + ' tunnels' : 'tunnel';
   if (t.connected) {
     dot.className = 'dot on';
-    $('tunText').textContent = 'tunnel · ' + t.connections;
-    pill.title = 'Cloudflare Tunnel: ' + t.connections + ' connection' + (t.connections === 1 ? '' : 's');
+    $('tunText').textContent = many ? label : 'tunnel · on';
+    pill.title = t.connected + ' of ' + t.count + ' connector' + (t.count === 1 ? '' : 's') + ' connected';
   } else if (t.running) {
     dot.className = 'dot new';
-    $('tunText').textContent = 'tunnel · connecting';
-    pill.title = 'Cloudflare Tunnel: starting up';
+    $('tunText').textContent = many ? label : 'tunnel · connecting';
+    pill.title = 'Connecting to Cloudflare';
   } else {
-    dot.className = 'dot ' + (t.lastError ? 'bad' : 'off');
-    $('tunText').textContent = 'tunnel · off';
-    pill.title = t.lastError || 'Cloudflare Tunnel is not running';
+    dot.className = 'dot ' + (t.anyError ? 'bad' : 'off');
+    $('tunText').textContent = many ? label : 'tunnel · off';
+    pill.title = t.anyError ? 'A connector reported an error' : 'No connector is running';
   }
 }
 
+/** One connector's state, in a sentence. */
 function tunnelSummary(t) {
   if (!t) return ['info', 'Loading…'];
   if (t.downloading) return ['info', 'Downloading cloudflared…'];
   if (t.connected) {
-    return ['ok', `Connected — ${t.connections} connection${t.connections === 1 ? '' : 's'} to Cloudflare` +
+    return ['ok', `${t.connections} connection${t.connections === 1 ? '' : 's'} to Cloudflare` +
       (t.version ? ' · ' + t.version : '')];
   }
-  if (t.running) return ['warn', 'cloudflared is running but has not registered a connection yet.'];
-  if (t.lastError) return ['bad', 'Not running. Last error: ' + t.lastError];
-  if (!t.hasToken) return ['info', 'No token yet. Paste a connector token below and save.'];
-  if (!t.supported) return ['warn', 'No official cloudflared build for this machine — install it yourself and it will be used.'];
+  if (t.running) return ['warn', 'Running, but no connection registered yet.'];
+  if (t.lastError) return ['bad', 'Stopped. Last error: ' + t.lastError];
+  if (!t.hasToken) return ['info', 'No connector token.'];
+  if (t.supported === false) return ['warn', 'No official cloudflared build for this machine — install it yourself.'];
   return ['info', 'Not running.'];
 }
 
-function paintTunnelSettings(t) {
-  const [kind, text] = tunnelSummary(t);
-  const el = $('tunState');
-  el.className = 'banner ' + kind;
-  el.innerHTML = '<span class="txt">' + esc(text) + '</span>';
-  $('tunTokenState').textContent = t && t.hasToken
-    ? 'A token is stored (' + t.tokenHint + '). Type a new one to replace it, or clear the box and save to remove it.'
-    : 'From Cloudflare: Zero Trust → Networks → Tunnels → your tunnel → Install connector. Copy the long token out of the command.';
-  $('tunAutoStart').checked = !t || t.autoStart !== false;
-  $('tunStart').disabled = !t || !t.hasToken || t.running;
-  $('tunStop').disabled = !t || !t.running;
+let TUNNELS = [];
+
+/**
+ * Every connector this panel runs, each with its own controls. One is the
+ * common case; the list is what makes more than one possible without any of
+ * them being the special one.
+ */
+function paintTunnels(list) {
+  TUNNELS = list || [];
+  $('tunCount').textContent = TUNNELS.length ? '· ' + TUNNELS.length : '';
+
+  if (!TUNNELS.length) {
+    $('tunList').innerHTML = '<div class="hint" style="margin:0 0 4px">None yet. Create one above, or add a ' +
+      'connector token below.</div>';
+  } else {
+    $('tunList').innerHTML = TUNNELS.map((t) => {
+      const [kind, text] = tunnelSummary(t);
+      const dot = t.connected ? 'on' : t.running ? 'new' : t.lastError ? 'bad' : 'off';
+      return '<div class="cfstep" style="padding:11px 13px;margin-bottom:8px">' +
+        '<div class="t" style="margin-bottom:2px"><span class="dot ' + dot + '"></span>' + esc(t.name) +
+          '<span class="pill ' + (kind === 'ok' ? 'ok' : kind === 'bad' ? 'bad' : 'mute') + '" ' +
+          'style="margin-left:auto">' + esc(kind === 'ok' ? 'connected' : t.running ? 'starting' : 'stopped') +
+          '</span></div>' +
+        '<div class="d">' + esc(text) + '</div>' +
+        '<div class="row" style="margin-top:9px">' +
+          '<button class="btn sm" data-tun="start" data-id="' + esc(t.id) + '"' + (t.running ? ' disabled' : '') +
+            '>Start</button>' +
+          '<button class="btn sm" data-tun="stop" data-id="' + esc(t.id) + '"' + (t.running ? '' : ' disabled') +
+            '>Stop</button>' +
+          '<button class="btn sm ghost" data-tun="log" data-id="' + esc(t.id) + '">Log</button>' +
+          '<label class="chk" style="margin:0 0 0 auto;font-size:12.5px">' +
+            '<input type="checkbox" data-tun="auto" data-id="' + esc(t.id) + '"' + (t.autoStart ? ' checked' : '') +
+            ' /><span>start with the panel</span></label>' +
+          '<button class="btn sm ghost danger" data-tun="remove" data-id="' + esc(t.id) + '">Remove</button>' +
+        '</div></div>';
+    }).join('');
+  }
+
+  $('tunList').querySelectorAll('[data-tun]').forEach((el) => {
+    const id = el.dataset.id;
+    const what = el.dataset.tun;
+    if (what === 'auto') {
+      el.addEventListener('change', async () => {
+        try { await api('/api/tunnel/update', { id, autoStart: el.checked }); } catch (err) { toast(err.message, 'bad'); }
+      });
+      return;
+    }
+    el.addEventListener('click', async () => {
+      const t = TUNNELS.find((x) => x.id === id);
+      if (what === 'log') return showTunnelLog(id, t);
+      if (what === 'remove') {
+        return confirmThen('Stop running "' + (t ? t.name : 'this connector') + '" here?',
+          'The panel stops it and forgets its token. The tunnel itself, and every hostname on it, stays in ' +
+          'Cloudflare — this only stops this machine from being one of its connectors.',
+          async () => {
+            try {
+              paintTunnels((await api('/api/tunnel/remove', { id })).tunnels);
+              toast('Removed', 'ok');
+            } catch (err) { toast(err.message, 'bad'); }
+          });
+      }
+      try {
+        paintTunnels((await api('/api/tunnel/' + what, { id })).tunnels);
+        toast(what === 'start' ? 'Starting' : 'Stopped', 'ok');
+        setTimeout(refreshTunnel, 1500);
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+  });
 }
 
 async function refreshTunnel() {
   try {
-    const t = await api('/api/tunnel', null, 'GET');
-    paintTunnelSettings(t);
-    return t;
+    const r = await api('/api/tunnel', null, 'GET');
+    paintTunnels(r.tunnels);
+    return r;
   } catch (err) { toast(err.message, 'bad'); }
 }
 
-$('tunStart').addEventListener('click', async () => {
-  try {
-    await api('/api/tunnel/start', {});
-    toast('Tunnel starting', 'ok');
-    setTimeout(refreshTunnel, 1200);
-  } catch (err) { toast(err.message, 'bad'); }
-});
+/** Kept for the places that still paint from the settings payload. */
+function paintTunnelSettings(t) {
+  paintTunnels((SETTINGS && SETTINGS.tunnels) || []);
+}
 
-$('tunStop').addEventListener('click', async () => {
-  try {
-    await api('/api/tunnel/stop', {});
-    toast('Tunnel stopped', 'ok');
-    refreshTunnel();
-  } catch (err) { toast(err.message, 'bad'); }
-});
-
-$('tunLog').addEventListener('click', async () => {
-  const t = await refreshTunnel();
-  if (!t) return;
+async function showTunnelLog(id, t) {
+  const r = await api('/api/tunnel?id=' + encodeURIComponent(id), null, 'GET').catch(() => null);
   openJob = 'tunnel';
   con.classList.add('open');
-  $('conTitle').textContent = 'Cloudflare Tunnel';
-  $('conSub').textContent = tunnelSummary(t)[1];
-  const text = (t.log || []).join('\n') || '(nothing logged yet)';
+  $('conTitle').textContent = t ? t.name : 'Cloudflare Tunnel';
+  $('conSub').textContent = t ? tunnelSummary(t)[1] : '';
+  const text = ((r && r.log) || []).join('\n') || '(nothing logged yet)';
   logCache.set('tunnel', text);
   paintLog(text);
-});
+}
 
+$('tunAdd').addEventListener('click', async () => {
+  const token = $('tunToken').value.trim();
+  if (!token) return toast('Paste the connector token first.', 'bad');
+  try {
+    const r = await api('/api/tunnel/add', { token, name: $('tunName').value.trim() });
+    $('tunToken').value = '';
+    $('tunName').value = '';
+    paintTunnels(r.tunnels);
+    toast('Connector added', 'ok');
+  } catch (err) { toast(err.message, 'bad'); }
+});
 
 // ---- settings tabs
 
@@ -3631,39 +3692,43 @@ function paintCloudflare() {
   $('cfAccount').innerHTML = accounts.map((a) =>
     '<option value="' + esc(a.id) + '"' + (a.id === c.accountId ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('');
 
-  // step 2 — the connector
-  const hasTunnel = !!(c.tunnelId && c.tunnel);
+  // step 2 — the connectors this panel runs, of which there may be several
+  const mine = (c.running || []).filter((t) => t.cfId);
+  const hasTunnel = mine.length > 0;
   $('cfStep2').classList.toggle('done', hasTunnel);
-  const tunnels = c.tunnels || [];
-  $('cfTunnelPick').innerHTML = tunnels.length
-    ? tunnels.map((t) => '<option value="' + esc(t.id) + '"' + (t.id === c.tunnelId ? ' selected' : '') + '>' +
-        esc(t.name) + ' · ' + esc(t.status || 'unknown') + '</option>').join('')
+  const accountTunnels = c.tunnels || [];
+  $('cfTunnelPick').innerHTML = accountTunnels.length
+    ? accountTunnels.map((t) => '<option value="' + esc(t.id) + '">' + esc(t.name) + ' · ' +
+        esc(t.status || 'unknown') + (mine.some((m) => m.cfId === t.id) ? ' · already here' : '') +
+        '</option>').join('')
     : '<option value="">none in this account</option>';
-  $('cfTunnelPick').disabled = !tunnels.length;
-  $('cfTunnelAdopt').disabled = !tunnels.length;
+  $('cfTunnelPick').disabled = !accountTunnels.length;
+  $('cfTunnelAdopt').disabled = !accountTunnels.length;
   $('cfTunnelGo').disabled = !$('cfTunnelName').value.trim();
   $('cfTunnelDesc').innerHTML = !connected || !c.accountId
     ? 'Connect an account first.'
     : hasTunnel
-      ? 'Running <b>' + esc(c.tunnelName) + '</b> — ' + esc(c.tunnel.status || 'unknown') + ' on ' +
-        c.tunnel.connections + ' connection' + (c.tunnel.connections === 1 ? '' : 's') + '.'
-      : 'One connector serves this whole machine. Pick one that exists, or make a new one.';
+      ? 'Running ' + mine.map((t) => '<b>' + esc(t.name) + '</b>').join(', ') +
+        '. Add another to run more than one at once.'
+      : 'Pick one that exists, or make a new one. More than one can run here at the same time.';
   $('cfTunnelBody').style.display = connected && c.accountId ? '' : 'none';
-  // A step that is done should look done: the way to change it stays folded
-  // away until there is nothing set up, or until you go looking for it.
-  $('cfTunnelSummary').textContent = hasTunnel ? 'Use a different connector' : 'Set the connector up';
-  // Open while there is nothing set up, folded once there is — including
-  // straight after you set one up, which is when it stops being the point.
+  $('cfTunnelSummary').textContent = hasTunnel ? 'Add or change a connector' : 'Set the connector up';
   $('cfTunnelPanel').open = !hasTunnel;
   if (c.warning) $('cfTunnelDesc').innerHTML += '<br><span style="color:var(--bad)">' + esc(c.warning) + '</span>';
 
-  // step 3 — the routes
-  $('cfStep3').classList.toggle('done', hasTunnel && (c.routes || []).length > 0);
+  // step 3 — the routes, which belong to one connector at a time
+  const pick = $('cfRouteTunnel');
+  const keep = pick.value;
+  pick.innerHTML = mine.map((t) =>
+    '<option value="' + esc(t.cfId) + '"' + (t.cfId === keep ? ' selected' : '') + '>' + esc(t.name) + '</option>').join('');
+  // With one connector there is no choice to make, so it is not offered.
+  $('cfRouteTunnelWrap').style.display = mine.length > 1 ? '' : 'none';
+  $('cfStep3').classList.toggle('done', hasTunnel && cfRoutesForSelected().length > 0);
   const targets = c.targets || [];
   $('cfTarget').innerHTML = targets.map((t) =>
     '<option value="' + esc(t.service) + '">' + esc(t.label) + ' · :' + esc(t.port) + '</option>').join('') +
     '<option value="__custom">Somewhere else…</option>';
-  const routes = c.routes || [];
+  const routes = cfRoutesForSelected();
   $('cfRoutes').innerHTML = !hasTunnel
     ? '<tbody><tr><td class="muted" style="font-size:12.5px">Nothing to route yet — set the connector up first.</td></tr></tbody>'
     : routes.length
@@ -3683,7 +3748,7 @@ function paintCloudflare() {
         'The route and its DNS record are both deleted, so that name stops resolving.',
         async () => {
           try {
-            await api('/api/cloudflare/routes', { hostname, remove: true });
+            await api('/api/cloudflare/routes', { hostname, remove: true, cfId: (cfSelectedTunnel() || {}).cfId });
             toast('Removed ' + hostname, 'ok');
             loadCloudflare(true);
           } catch (err) { toast(err.message, 'bad'); }
@@ -3694,6 +3759,22 @@ function paintCloudflare() {
   cfDot($('tabDotCf'), hasTunnel ? 'ok' : connected ? 'warn' : '');
   paintCfZones();
 }
+
+/** Which connector the routes table is showing, and its ingress. */
+function cfSelectedTunnel() {
+  const mine = ((CF && CF.running) || []).filter((t) => t.cfId);
+  if (!mine.length) return null;
+  const picked = $('cfRouteTunnel').value;
+  return mine.find((t) => t.cfId === picked) || mine[0];
+}
+
+function cfRoutesForSelected() {
+  const t = cfSelectedTunnel();
+  if (!t || !CF) return [];
+  return (CF.routesByTunnel || {})[t.cfId] || [];
+}
+
+$('cfRouteTunnel').addEventListener('change', () => paintCloudflare());
 
 /**
  * The domain list is whatever this token can see, so the hostname is a name
@@ -3934,7 +4015,7 @@ $('cfAddRoute').addEventListener('click', async () => {
   btn.disabled = true;
   btn.textContent = 'Adding…';
   try {
-    const r = await api('/api/cloudflare/routes', { hostname, service });
+    const r = await api('/api/cloudflare/routes', { hostname, service, cfId: (cfSelectedTunnel() || {}).cfId });
     toast(hostname + ' → ' + service + (r.dns && r.dns.created ? ' · DNS added' : ''), 'ok');
     $('cfSub').value = '';
     loadCloudflare(true);
