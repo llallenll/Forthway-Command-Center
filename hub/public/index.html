@@ -1025,8 +1025,6 @@
         <h4>Cloudflare Tunnel</h4>
         <p class="lead">This machine dials out to Cloudflare, so the panel and the sites on it are reachable
           by name without opening a port or knowing the box's address.</p>
-        <div class="banner info" id="tunState"><span class="txt">…</span></div>
-
         <div class="steps-v" id="cfSteps">
           <!-- 1 -->
           <div class="cfstep" id="cfStep1">
@@ -3693,9 +3691,13 @@ function paintCloudflare() {
     '<option value="' + esc(a.id) + '"' + (a.id === c.accountId ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('');
 
   // step 2 — the connectors this panel runs, of which there may be several
-  const mine = (c.running || []).filter((t) => t.cfId);
+  // Two different questions: what is this panel running (any connector, however
+  // it was added), and which of those this account can manage (the ones with a
+  // Cloudflare id behind them).
+  const running = c.running || [];
+  const mine = running.filter((t) => t.cfId);
   const hasTunnel = mine.length > 0;
-  $('cfStep2').classList.toggle('done', hasTunnel);
+  $('cfStep2').classList.toggle('done', running.length > 0);
   const accountTunnels = c.tunnels || [];
   $('cfTunnelPick').innerHTML = accountTunnels.length
     ? accountTunnels.map((t) => '<option value="' + esc(t.id) + '">' + esc(t.name) + ' · ' +
@@ -3706,7 +3708,12 @@ function paintCloudflare() {
   $('cfTunnelAdopt').disabled = !accountTunnels.length;
   $('cfTunnelGo').disabled = !$('cfTunnelName').value.trim();
   $('cfTunnelDesc').innerHTML = !connected || !c.accountId
-    ? 'Connect an account first.'
+    ? (running.length
+        // Running something, but with no account there is nothing to manage it
+        // with — saying only "connect an account" would ignore what is up.
+        ? 'Running ' + running.map((t) => '<b>' + esc(t.name) + '</b>').join(', ') +
+          ' from a pasted token. Connect an account above to add hostnames from here.'
+        : 'Connect an account first.')
     : hasTunnel
       ? 'Running ' + mine.map((t) => '<b>' + esc(t.name) + '</b>').join(', ') +
         '. Add another to run more than one at once.'
