@@ -76,14 +76,34 @@ const MUST_CONTAIN = ["hub/server.mjs", "shared/deployer.mjs"];
 export function installedVersion(fallbackVersion) {
   const stamp = readJson(path.join(ROOT, "version.json"), null);
   const git = gitHead();
+
+  /*
+   * version.json is a record of what was downloaded, not proof of what is
+   * running. Those come apart: an install restored from a backup, a container
+   * that re-extracts an older image on boot, a half-finished write. When they
+   * do, the stamp keeps claiming the new commit and the panel reports itself
+   * up to date while running something else entirely — the one lie this file
+   * must never tell, because it hides the update that would fix it.
+   *
+   * The compiled-in constant is the only thing that cannot disagree with the
+   * code around it, so it is the arbiter. If the stamp disagrees, the stamp is
+   * describing code that is not here, and its commit is dropped with it.
+   */
+  const running = fallbackVersion || null;
+  const stale = !!(stamp?.version && running && stamp.version !== running);
+
+  const sha = stale ? git?.sha || null : stamp?.sha || git?.sha || null;
   return {
-    version: stamp?.version || fallbackVersion || null,
-    sha: stamp?.sha || git?.sha || null,
-    shortSha: (stamp?.sha || git?.sha || "").slice(0, 7) || null,
+    version: stale ? running : stamp?.version || running,
+    sha,
+    shortSha: (sha || "").slice(0, 7) || null,
     ref: stamp?.ref || git?.ref || null,
-    installedAt: stamp?.installedAt || null,
+    installedAt: stale ? null : stamp?.installedAt || null,
     // How we know: this decides what the panel can honestly claim.
-    source: stamp?.sha ? "panel" : git?.sha ? "git" : "unknown",
+    source: stale ? "mismatch" : stamp?.sha ? "panel" : git?.sha ? "git" : "unknown",
+    stale,
+    stampVersion: stale ? stamp.version : null,
+    stampInstalledAt: stale ? stamp.installedAt || null : null,
     root: ROOT,
   };
 }
@@ -230,6 +250,24 @@ export async function checkForUpdate({ repo = DEFAULT_REPO, ref = "", token = ""
  * so rather than inventing a badge either way.
  */
 function compare(installed, latest) {
+  /*
+   * A stamp that disagrees with the running code settles it on its own, and
+   * settles it as "yes". The commit comparison below would otherwise say the
+   * install is current — that commit is exactly what did not survive — and
+   * hide the button that puts it back.
+   */
+  if (installed.stale) {
+    return {
+      updateAvailable: true,
+      certainty: "mismatch",
+      reason:
+        `The last update recorded ${installed.stampVersion}, but the running code is ${installed.version}. ` +
+        `It did not survive — something replaced the files afterwards, most often a restart that restores an ` +
+        `older copy. Applying the update again is the fix; if it keeps coming back, whatever starts the panel ` +
+        `is overwriting it.`,
+    };
+  }
+
   if (installed.sha && latest.sha) {
     if (installed.sha === latest.sha) {
       return { updateAvailable: false, certainty: "exact", reason: "Running the same commit as GitHub." };
@@ -374,7 +412,10 @@ export async function applyUpdate({
   );
 
   const stampFile = {
-    version: readPackageVersion(staging) || info.latest.version || currentVersion || null,
+    // Read out of the code being installed, not out of the code doing the
+    // installing: currentVersion is the old one, and recording it would make
+    // every future check compare against the wrong number.
+    version: readServerVersion(staging) || readPackageVersion(staging) || info.latest.version || null,
     sha: info.latest.sha,
     ref: wanted,
     repo: target,
@@ -403,6 +444,16 @@ export async function applyUpdate({
     backupPath: backup,
     dependencyChange,
   };
+}
+
+/** The panel declares its version in one place; read it from the staged copy. */
+function readServerVersion(dir) {
+  try {
+    const src = fs.readFileSync(path.join(dir, "hub", "server.mjs"), "utf8");
+    return /FCC_VERSION\s*=\s*"([^"]+)"/.exec(src)?.[1] || null;
+  } catch {
+    return null;
+  }
 }
 
 function readPackageVersion(dir) {

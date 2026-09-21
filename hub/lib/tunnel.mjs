@@ -294,3 +294,134 @@ function run(cmd, args) {
     });
   });
 }
+
+// ---------------------------------------------------------------- many
+
+/**
+ * More than one connector at a time.
+ *
+ * One tunnel per machine is the common case, but not the only one: separate
+ * Cloudflare accounts, a connector shared with another box, or a spare kept
+ * warm while a hostname is moved across. Each entry is an independent
+ * cloudflared process with its own token and its own log; they share only the
+ * binary, which is downloaded once.
+ */
+export class TunnelPool {
+  constructor({ dataDir, onChange, onLog }) {
+    this.dataDir = dataDir;
+    this.onChange = onChange || (() => {});
+    this.onLog = onLog || (() => {});
+    this.byId = new Map();
+    this.meta = new Map(); // id -> { name, autoStart, cfId }
+    // Downloading and version-checking need a Tunnel but not a token, so one
+    // instance stands in for the toolbox the others share.
+    this.tools = new Tunnel({ dataDir, onChange: () => {}, onLog: () => {} });
+  }
+
+  /** Bring the running set in line with what is configured. */
+  sync(entries = []) {
+    const wanted = new Map(entries.filter((e) => e && e.id).map((e) => [e.id, e]));
+    for (const id of [...this.byId.keys()]) {
+      if (!wanted.has(id)) {
+        this.byId.get(id).stop().catch(() => {});
+        this.byId.delete(id);
+        this.meta.delete(id);
+      }
+    }
+    for (const [id, e] of wanted) {
+      this.meta.set(id, { name: e.name || "Tunnel", autoStart: e.autoStart !== false, cfId: e.cfId || "", token: e.token || "" });
+      if (!this.byId.has(id)) {
+        this.byId.set(
+          id,
+          new Tunnel({
+            dataDir: this.dataDir,
+            onChange: () => this.onChange(id),
+            onLog: (line) => this.onLog(id, line),
+          }),
+        );
+      }
+    }
+  }
+
+  get(id) {
+    return this.byId.get(id) || null;
+  }
+
+  /** Every connector, with the configuration that produced it. */
+  statuses() {
+    return [...this.byId.entries()].map(([id, t]) => {
+      const m = this.meta.get(id) || {};
+      return {
+        id,
+        name: m.name || "Tunnel",
+        cfId: m.cfId || "",
+        autoStart: m.autoStart !== false,
+        hasToken: !!m.token,
+        ...t.status(),
+      };
+    });
+  }
+
+  /** One line for the header pill: are they all up? */
+  summary() {
+    const all = this.statuses();
+    return {
+      count: all.length,
+      running: all.filter((t) => t.running).length,
+      connected: all.filter((t) => t.connected).length,
+      anyError: all.some((t) => t.lastError) || null,
+    };
+  }
+
+  async start(id) {
+    const t = this.byId.get(id);
+    const m = this.meta.get(id);
+    if (!t || !m) throw new Error("No such tunnel.");
+    if (!m.token) throw new Error("That tunnel has no connector token.");
+    return t.start(m.token);
+  }
+
+  async stop(id) {
+    const t = this.byId.get(id);
+    if (t) await t.stop();
+  }
+
+  async restart(id) {
+    await this.stop(id);
+    return this.start(id);
+  }
+
+  async startAutos() {
+    for (const [id, m] of this.meta) {
+      if (m.autoStart === false || !m.token) continue;
+      try {
+        await this.start(id);
+      } catch (err) {
+        this.byId.get(id)?.line(`Could not start: ${err.message}`);
+      }
+    }
+  }
+
+  async stopAll() {
+    await Promise.allSettled([...this.byId.keys()].map((id) => this.stop(id)));
+  }
+
+  recentLog(id, lines = 120) {
+    return this.byId.get(id)?.recentLog(lines) || [];
+  }
+
+  // ---- the shared binary
+  resolveBinary(opts) {
+    return this.tools.resolveBinary(opts);
+  }
+  download() {
+    return this.tools.download();
+  }
+  readVersion() {
+    return this.tools.readVersion();
+  }
+  binaryStatus() {
+    const s = this.tools.status();
+    return { version: s.version, binary: s.binary, supported: s.supported, downloading: s.downloading };
+  }
+}

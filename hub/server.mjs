@@ -55,7 +55,7 @@ import {
   RUNNERS,
 } from "./lib/sites.mjs";
 import { normalizeRepo, repoInfo, listRefs, resolveCommit, downloadZipball, checkToken } from "./lib/github.mjs";
-import { Tunnel } from "./lib/tunnel.mjs";
+import { TunnelPool } from "./lib/tunnel.mjs";
 import { RepoWatch } from "./lib/repowatch.mjs";
 import * as cf from "./lib/cloudflare.mjs";
 import {
@@ -72,7 +72,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.8.2";
+const FCC_VERSION = "2.9.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 const REPO_CHECK_EVERY_MS = 5 * 60_000;
@@ -114,7 +114,10 @@ function defaultConfig() {
     // Cloudflare Tunnel. One connector token for the whole machine; which
     // hostname points at which local port is decided in the Cloudflare
     // dashboard, which is what a connector token is for.
+    // Kept only so an install made before multiple connectors can be migrated;
+    // tunnels[] is what the panel reads.
     tunnel: { token: "", autoStart: true },
+    tunnels: [], // [{ id, name, token, autoStart, cfId }]
     // The API token, and which account and connector it manages. Set from the
     // panel; without it the tunnel still runs from a pasted connector token.
     cloudflare: { apiToken: "", accountId: "", accountName: "", tunnelId: "", tunnelName: "" },
@@ -142,6 +145,28 @@ function loadConfig() {
       dirty = true;
     }
   }
+  /*
+   * One connector became many. An install that had one keeps it, under a name
+   * and an id of its own, and nothing about it stops working.
+   *
+   * The empty-list test rather than a missing-key test is deliberate: the
+   * defaults merge above has already put tunnels:[] there, so "is it missing"
+   * is never true by the time this runs. The legacy token is cleared as it is
+   * moved, so a later decision to remove every connector cannot resurrect it.
+   */
+  if (!Array.isArray(cfg.tunnels)) cfg.tunnels = [];
+  if (!cfg.tunnels.length && cfg.tunnel?.token) {
+    cfg.tunnels.push({
+      id: `tun_${crypto.randomBytes(5).toString("hex")}`,
+      name: cfg.cloudflare?.tunnelName || "Cloudflare Tunnel",
+      token: cfg.tunnel.token,
+      autoStart: cfg.tunnel.autoStart !== false,
+      cfId: cfg.cloudflare?.tunnelId || "",
+    });
+    cfg.tunnel = { ...cfg.tunnel, token: "" };
+    dirty = true;
+  }
+
   if (!cfg.sessionSecret) {
     cfg.sessionSecret = crypto.randomBytes(32).toString("hex");
     dirty = true;
@@ -255,19 +280,26 @@ local.startPolling();
 
 // ------------------------------------------------------------ the tunnel
 
-const tunnel = new Tunnel({
+const tunnels = new TunnelPool({
   dataDir: config.dataDir,
   onChange: () => pushState(),
-  onLog: (line) => broadcast("tunnel-log", { line }),
+  onLog: (id, line) => broadcast("tunnel-log", { id, line }),
 });
 
-tunnel.readVersion();
-
-if (config.tunnel?.token && config.tunnel?.autoStart !== false) {
-  tunnel.start(config.tunnel.token).catch((err) => {
-    console.error(`[fcc] tunnel did not start: ${err.message}`);
-  });
+function syncTunnels() {
+  tunnels.sync(config.tunnels || []);
 }
+
+/** The one a request is talking about — by id, or the only one there is. */
+function tunnelEntry(id) {
+  const list = config.tunnels || [];
+  if (id) return list.find((t) => t.id === id) || null;
+  return list.length === 1 ? list[0] : null;
+}
+
+syncTunnels();
+tunnels.readVersion();
+tunnels.startAutos().catch((err) => console.error(`[fcc] tunnels did not start: ${err.message}`));
 
 /** Agents parked on a long poll, keyed by site id. */
 const pollWaiters = new Map();
@@ -293,7 +325,8 @@ function buildDashboardState() {
     serverTime: new Date().toISOString(),
     hasGithubToken: !!config.github?.token,
     githubUser: config.github?.username || "",
-    tunnel: { ...tunnel.status(), hasToken: !!config.tunnel?.token, autoStart: config.tunnel?.autoStart !== false },
+    tunnels: tunnels.statuses(),
+    tunnel: tunnels.summary(), // what the header pill needs
     // Enough for the header to say an update is waiting without opening
     // settings; the detail is still behind /api/update.
     update: {
@@ -991,7 +1024,7 @@ const cfLogin = {
       /* not there, which is the normal case */
     }
 
-    const bin = await tunnel.resolveBinary();
+    const bin = await tunnels.resolveBinary();
     if (!bin) throw new Error("cloudflared is not installed here yet, and could not be downloaded.");
 
     const proc = spawn(bin, ["tunnel", "login"], {
@@ -1421,8 +1454,9 @@ async function handleApi(req, res, url) {
       hasGithubToken: !!config.github?.token,
       githubTokenHint: tokenHint(config.github?.token),
       githubUser: config.github?.username || "",
+      tunnels: tunnels.statuses(),
       tunnel: {
-        ...tunnel.status(),
+        ...tunnels.summary(),
         hasToken: !!config.tunnel?.token,
         tokenHint: tokenHint(config.tunnel?.token),
         autoStart: config.tunnel?.autoStart !== false,
@@ -1476,17 +1510,8 @@ async function handleApi(req, res, url) {
       lastUpdateCheck = null; // the answer we cached was about a different source
     }
 
-    // ---- Cloudflare Tunnel ------------------------------------------------
-    let tunnelAction = null;
-    if (typeof body.tunnelToken === "string") {
-      const token = body.tunnelToken.trim();
-      config.tunnel = { ...(config.tunnel || {}), token };
-      // A changed token means the running connector is using the old one.
-      tunnelAction = token ? "restart" : "stop";
-    }
-    if (typeof body.tunnelAutoStart === "boolean") {
-      config.tunnel = { ...(config.tunnel || {}), autoStart: body.tunnelAutoStart };
-    }
+    // Connectors are added, toggled and removed on their own endpoints now —
+    // there is more than one of them, so Save has nothing to say about them.
 
     if (Number.isFinite(+body.port) && +body.port !== config.port) {
       if (PORT_ENV) {
@@ -1512,16 +1537,6 @@ async function handleApi(req, res, url) {
 
     saveConfig();
 
-    if (tunnelAction) {
-      await tunnel.stop().catch(() => {});
-      if (tunnelAction === "restart" && config.tunnel.autoStart !== false) {
-        tunnel.start(config.tunnel.token).catch((err) => {
-          tunnel.line(`Could not start: ${err.message}`);
-          pushState();
-        });
-      }
-    }
-
     pushState();
     sendJson(res, 200, {
       ok: true,
@@ -1529,7 +1544,7 @@ async function handleApi(req, res, url) {
       port: config.port,
       hasGithubToken: !!config.github?.token,
       githubUser: config.github?.username || "",
-      tunnel: tunnel.status(),
+      tunnels: tunnels.statuses(),
     });
 
     if (restartNeeded) {
@@ -1546,36 +1561,92 @@ async function handleApi(req, res, url) {
 
   // ---- Cloudflare Tunnel controls --------------------------------------
   if (url.pathname === "/api/tunnel" && req.method === "GET") {
+    const id = url.searchParams.get("id") || "";
+    const entry = tunnelEntry(id);
     return sendJson(res, 200, {
-      ...tunnel.status(),
-      hasToken: !!config.tunnel?.token,
-      tokenHint: tokenHint(config.tunnel?.token),
-      autoStart: config.tunnel?.autoStart !== false,
-      log: tunnel.recentLog(120),
+      ...tunnels.binaryStatus(),
+      tunnels: tunnels.statuses().map((t) => ({ ...t, tokenHint: tokenHint(tunnelEntry(t.id)?.token) })),
+      // The log of the one asked about, so the console has something to show.
+      log: entry ? tunnels.recentLog(entry.id, 120) : [],
+      logFor: entry?.id || null,
     });
   }
 
-  if (url.pathname === "/api/tunnel/start" && req.method === "POST") {
-    if (!config.tunnel?.token) return sendJson(res, 400, { error: "Add a tunnel token first." });
-    try {
-      await tunnel.start(config.tunnel.token);
-      pushState();
-      return sendJson(res, 200, { ok: true, ...tunnel.status() });
-    } catch (err) {
-      return sendJson(res, 400, { error: err.message });
+  // start / stop / restart, each addressed to one connector
+  for (const [route, verb] of [
+    ["/api/tunnel/start", "start"],
+    ["/api/tunnel/stop", "stop"],
+    ["/api/tunnel/restart", "restart"],
+  ]) {
+    if (url.pathname === route && req.method === "POST") {
+      const body = await readJsonBody(req).catch(() => ({}));
+      const entry = tunnelEntry(body.id);
+      if (!entry) return sendJson(res, 400, { error: "Which tunnel? None was named, and there is not exactly one." });
+      try {
+        await tunnels[verb](entry.id);
+        pushState();
+        return sendJson(res, 200, { ok: true, tunnels: tunnels.statuses() });
+      } catch (err) {
+        return sendJson(res, 400, { error: err.message });
+      }
     }
   }
 
-  if (url.pathname === "/api/tunnel/stop" && req.method === "POST") {
-    await tunnel.stop();
+  /**
+   * Add a connector by hand — the paste-a-token path, now that there can be
+   * more than one. A token already in the list is updated rather than doubled.
+   */
+  if (url.pathname === "/api/tunnel/add" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    const token = String(body.token || "").trim();
+    if (!token) return sendJson(res, 400, { error: "Paste the connector token first." });
+    const name = String(body.name || "").trim().slice(0, 60) || "Cloudflare Tunnel";
+    config.tunnels = config.tunnels || [];
+    const existing = config.tunnels.find((t) => t.token === token);
+    const entry = existing || { id: `tun_${crypto.randomBytes(5).toString("hex")}`, cfId: body.cfId || "" };
+    entry.name = name;
+    entry.token = token;
+    // Only when it was actually asked for: updating an existing connector
+    // must not silently flip a setting the caller never mentioned.
+    if (typeof body.autoStart === "boolean") entry.autoStart = body.autoStart;
+    else if (!existing) entry.autoStart = true;
+    if (!existing) config.tunnels.push(entry);
+    saveConfig();
+    syncTunnels();
+    if (entry.autoStart) tunnels.start(entry.id).catch(() => {});
     pushState();
-    return sendJson(res, 200, { ok: true, ...tunnel.status() });
+    return sendJson(res, 200, { ok: true, id: entry.id, tunnels: tunnels.statuses() });
+  }
+
+  if (url.pathname === "/api/tunnel/update" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    const entry = tunnelEntry(body.id);
+    if (!entry) return sendJson(res, 400, { error: "Unknown tunnel." });
+    if (typeof body.name === "string" && body.name.trim()) entry.name = body.name.trim().slice(0, 60);
+    if (typeof body.autoStart === "boolean") entry.autoStart = body.autoStart;
+    saveConfig();
+    syncTunnels();
+    pushState();
+    return sendJson(res, 200, { ok: true, tunnels: tunnels.statuses() });
+  }
+
+  /** Stop running one here. The tunnel itself stays in Cloudflare. */
+  if (url.pathname === "/api/tunnel/remove" && req.method === "POST") {
+    const body = await readJsonBody(req).catch(() => ({}));
+    const entry = tunnelEntry(body.id);
+    if (!entry) return sendJson(res, 400, { error: "Unknown tunnel." });
+    await tunnels.stop(entry.id).catch(() => {});
+    config.tunnels = (config.tunnels || []).filter((t) => t.id !== entry.id);
+    saveConfig();
+    syncTunnels();
+    pushState();
+    return sendJson(res, 200, { ok: true, tunnels: tunnels.statuses() });
   }
 
   if (url.pathname === "/api/tunnel/install" && req.method === "POST") {
     try {
-      await tunnel.download();
-      return sendJson(res, 200, { ok: true, ...tunnel.status() });
+      await tunnels.download();
+      return sendJson(res, 200, { ok: true, ...tunnels.binaryStatus() });
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
@@ -1624,12 +1695,12 @@ async function handleApi(req, res, url) {
       accountId: c.accountId || "",
       accountName: c.accountName || "",
       viaLogin: !!c.viaLogin,
-      tunnelId: c.tunnelId || "",
-      tunnelName: c.tunnelName || "",
       accounts: [],
       zones: [],
       tunnels: [],
-      routes: [],
+      // Which connectors this panel actually runs, and the ingress on each.
+      running: tunnels.statuses(),
+      routesByTunnel: {},
       // What a hostname can usefully be pointed at on this machine.
       targets: [
         { label: "This panel", service: `http://localhost:${LISTEN_PORT}`, port: LISTEN_PORT },
@@ -1654,17 +1725,29 @@ async function handleApi(req, res, url) {
         out.accountName = out.accounts[0].name;
       }
       if (out.accountId) {
-        const [zones, tunnels] = await Promise.all([
+        const [zones, accountTunnels] = await Promise.all([
           cf.listZones(c.apiToken, out.accountId).catch(() => []),
           cf.listTunnels(c.apiToken, out.accountId).catch(() => []),
         ]);
         out.zones = zones;
-        out.tunnels = tunnels;
-        if (out.tunnelId) {
-          const live = tunnels.find((t) => t.id === out.tunnelId);
-          out.tunnel = live || null;
-          if (live) out.routes = await cf.getRoutes(c.apiToken, out.accountId, out.tunnelId).catch(() => []);
-          else out.warning = "The connector this panel was using is no longer in that Cloudflare account.";
+        out.tunnels = accountTunnels;
+        // The ingress of every connector this panel runs, fetched together so
+        // the pane can lay them out side by side.
+        const mine = (config.tunnels || []).filter((t) => t.cfId);
+        const missing = [];
+        await Promise.all(
+          mine.map(async (t) => {
+            if (!accountTunnels.some((x) => x.id === t.cfId)) {
+              missing.push(t.name);
+              return;
+            }
+            out.routesByTunnel[t.cfId] = await cf
+              .getRoutes(c.apiToken, out.accountId, t.cfId)
+              .catch(() => []);
+          }),
+        );
+        if (missing.length) {
+          out.warning = `No longer in this Cloudflare account: ${missing.join(", ")}.`;
         }
       }
       return sendJson(res, 200, out);
@@ -1680,7 +1763,7 @@ async function handleApi(req, res, url) {
     if (!token) {
       // Clearing the API token leaves the connector alone: it is still running
       // on a token of its own and taking it down would be a surprise.
-      config.cloudflare = { apiToken: "", accountId: "", accountName: "", tunnelId: "", tunnelName: "" };
+      config.cloudflare = { apiToken: "", accountId: "", accountName: "", viaLogin: false };
       saveConfig();
       return sendJson(res, 200, { ok: true, cleared: true });
     }
@@ -1716,17 +1799,19 @@ async function handleApi(req, res, url) {
     // Running on a token we are about to forget makes no sense.
     let wasRunning = false;
     try {
-      wasRunning = tunnel.status().running;
-      if (wasRunning) await tunnel.stop();
+      wasRunning = tunnels.statuses().some((t) => t.running);
+      await tunnels.stopAll();
     } catch {
       /* stopping is best effort; forgetting is the point */
     }
     cfLogin.cancel();
 
     if (config.cloudflare?.apiToken) removed.push("the Cloudflare API token");
-    if (config.cloudflare?.accountId) removed.push("which account and connector to use");
-    if (config.tunnel?.token) removed.push("the connector token");
-    config.cloudflare = { apiToken: "", accountId: "", accountName: "", tunnelId: "", tunnelName: "", viaLogin: false };
+    if (config.cloudflare?.accountId) removed.push("which account to use");
+    const hadTunnels = (config.tunnels || []).length;
+    if (hadTunnels) removed.push(`${hadTunnels} connector token${hadTunnels === 1 ? "" : "s"}`);
+    config.cloudflare = { apiToken: "", accountId: "", accountName: "", viaLogin: false };
+    config.tunnels = [];
     config.tunnel = { ...(config.tunnel || {}), token: "" };
     saveConfig();
 
@@ -1748,6 +1833,7 @@ async function handleApi(req, res, url) {
       }
     }
 
+    syncTunnels();
     pushState();
     return sendJson(res, 200, { ok: true, removed, remaining, tunnelStopped: wasRunning });
   }
@@ -1760,11 +1846,9 @@ async function handleApi(req, res, url) {
       const accounts = await cf.listAccounts(c.apiToken);
       const picked = accounts.find((a) => a.id === body.accountId);
       if (!picked) return sendJson(res, 400, { error: "That account is not one this token can see." });
-      // A connector belongs to one account, so changing account drops it.
-      if (config.cloudflare.accountId !== picked.id) {
-        config.cloudflare.tunnelId = "";
-        config.cloudflare.tunnelName = "";
-      }
+      // Connectors belong to an account; the ones already running keep running,
+      // but they are no longer the ones this account can offer to manage.
+
       config.cloudflare.accountId = picked.id;
       config.cloudflare.accountName = picked.name;
       saveConfig();
@@ -1793,26 +1877,30 @@ async function handleApi(req, res, url) {
       }
       const connectorToken = await cf.tunnelToken(c.apiToken, c.accountId, tun.id);
 
-      config.cloudflare.tunnelId = tun.id;
-      config.cloudflare.tunnelName = tun.name;
-      config.tunnel = { ...(config.tunnel || {}), token: connectorToken };
+      // Adding, not replacing: a connector already in the list has its token
+      // refreshed, anything else joins it and runs alongside.
+      config.tunnels = config.tunnels || [];
+      const existing = config.tunnels.find((t) => t.cfId === tun.id);
+      const entry = existing || { id: `tun_${crypto.randomBytes(5).toString("hex")}`, autoStart: true };
+      entry.cfId = tun.id;
+      entry.name = tun.name;
+      entry.token = connectorToken;
+      if (!existing) config.tunnels.push(entry);
       saveConfig();
+      syncTunnels();
 
-      // Running on the old token would leave it serving the previous
-      // connector's routes, so swap the process over as well.
       let started = false;
       let startError = null;
       if (body.start !== false) {
         try {
-          await tunnel.stop();
-          await tunnel.start(connectorToken);
+          await tunnels.restart(entry.id);
           started = true;
         } catch (err) {
           startError = err.message;
         }
       }
       pushState();
-      return sendJson(res, 200, { ok: true, tunnel: tun, started, startError });
+      return sendJson(res, 200, { ok: true, tunnel: tun, id: entry.id, started, startError });
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
@@ -1826,7 +1914,16 @@ async function handleApi(req, res, url) {
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
-    if (!c.tunnelId) return sendJson(res, 400, { error: "Create or pick a connector first." });
+    // Which connector's ingress: the one named, or the only one there is.
+    const onTunnel = tunnelEntry(body.id);
+    const cfId = body.cfId || onTunnel?.cfId || "";
+    if (!cfId) {
+      return sendJson(res, 400, {
+        error: (config.tunnels || []).length
+          ? "Say which connector the hostname belongs to."
+          : "Create or pick a connector first.",
+      });
+    }
 
     const hostname = cf.validHostname(body.hostname);
     if (!hostname) return sendJson(res, 400, { error: "That is not a usable hostname." });
@@ -1839,12 +1936,12 @@ async function handleApi(req, res, url) {
           error: `${hostname} is not under a domain this token can edit${zones.length ? ` — it can see ${zones.map((z) => z.name).join(", ")}` : ""}.`,
         });
       }
-      const routes = await cf.getRoutes(c.apiToken, c.accountId, c.tunnelId);
+      const routes = await cf.getRoutes(c.apiToken, c.accountId, cfId);
 
       if (body.remove) {
         const left = routes.filter((r) => !(r.hostname === hostname && (!body.path || r.path === body.path)));
         if (left.length === routes.length) return sendJson(res, 400, { error: "There is no route for that hostname." });
-        await cf.putRoutes(c.apiToken, c.accountId, c.tunnelId, left);
+        await cf.putRoutes(c.apiToken, c.accountId, cfId, left);
         const dns = await cf.unpointHostname(c.apiToken, zone.id, hostname).catch(() => ({ deleted: false }));
         return sendJson(res, 200, { ok: true, removed: hostname, dnsDeleted: dns.deleted });
       }
@@ -1856,9 +1953,9 @@ async function handleApi(req, res, url) {
       const path_ = String(body.path || "").trim();
       const next = routes.filter((r) => !(r.hostname === hostname && (r.path || "") === path_));
       next.push({ hostname, path: path_, service });
-      await cf.putRoutes(c.apiToken, c.accountId, c.tunnelId, next);
+      await cf.putRoutes(c.apiToken, c.accountId, cfId, next);
       // Ingress without DNS is a rule nothing can reach, so both or neither.
-      const dns = await cf.pointHostnameAtTunnel(c.apiToken, zone.id, hostname, c.tunnelId);
+      const dns = await cf.pointHostnameAtTunnel(c.apiToken, zone.id, hostname, cfId);
       return sendJson(res, 200, { ok: true, hostname, service, zone: zone.name, dns });
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
@@ -2450,7 +2547,7 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, async () => {
     store.save({ immediate: true });
     // Leave no orphaned connector behind when the panel restarts.
-    await tunnel.stop().catch(() => {});
+    await tunnels.stopAll().catch(() => {});
     process.exit(0);
   });
 }
