@@ -42,6 +42,8 @@ import {
   clearCookieHeader,
   LoginThrottle,
   tokenMatches,
+  normalizePin,
+  verifyPin,
 } from "./lib/auth.mjs";
 import {
   createSite,
@@ -72,7 +74,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.9.1";
+const FCC_VERSION = "2.10.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 const REPO_CHECK_EVERY_MS = 5 * 60_000;
@@ -230,8 +232,61 @@ function tokenHint(token) {
   return t.length <= 12 ? "..." : `${t.slice(0, 6)}…${t.slice(-4)} (${t.length} chars)`;
 }
 
+// ------------------------------------------------------------------ PIN
+
+/**
+ * Where the sign-in PIN comes from, when there is one.
+ *
+ * On a Pterodactyl server the egg's autorun.sh writes a fresh code here on
+ * every start of the server and prints the same code in the panel console.
+ * It is read from disk rather than taken from the environment because pm2
+ * freezes an environment at the first start and hands the same one back on
+ * every resurrect, so a per-boot value could never reach a running panel
+ * that way. The file changes; the panel notices; no restart is needed.
+ *
+ * FCC_PIN sets one directly for anything that is not the egg, and
+ * FCC_PIN_FILE points somewhere other than hub/data/pin. With neither, and no
+ * file, the panel is password-protected exactly as before.
+ */
+const PIN_FILE = process.env.FCC_PIN_FILE ? path.resolve(process.env.FCC_PIN_FILE) : path.join(config.dataDir, "pin");
+let pinCache = { mtimeMs: null, pin: null };
+
+function currentPin() {
+  if (process.env.FCC_PIN) return normalizePin(process.env.FCC_PIN) || null;
+  let st;
+  try {
+    st = fs.statSync(PIN_FILE);
+  } catch {
+    pinCache = { mtimeMs: null, pin: null };
+    return null;
+  }
+  if (st.mtimeMs !== pinCache.mtimeMs) {
+    let pin = null;
+    try {
+      pin = normalizePin(fs.readFileSync(PIN_FILE, "utf8").split(/\r?\n/)[0]) || null;
+    } catch {
+      pin = null;
+    }
+    pinCache = { mtimeMs: st.mtimeMs, pin };
+  }
+  return pinCache.pin;
+}
+
+function pinMode() {
+  return currentPin() !== null;
+}
+
+function authMode() {
+  return pinMode() ? "pin" : "password";
+}
+
+function pinSource() {
+  return process.env.FCC_PIN ? "FCC_PIN" : PIN_FILE;
+}
+
+/** A PIN is a credential in its own right, so a panel that has one is set up. */
 function setupComplete() {
-  return !!(config.passwordHash && config.passwordSalt);
+  return pinMode() || !!(config.passwordHash && config.passwordSalt);
 }
 
 function findSite(siteId) {
@@ -604,6 +659,17 @@ function serveStatic(res, relPath, contentType) {
   const file = path.join(HERE, "public", relPath);
   if (!exists(file)) return send(res, 404, "Not found");
   send(res, 200, fs.readFileSync(file), { "Content-Type": contentType });
+}
+
+/**
+ * The sign-in page asks for a PIN or a password, whichever this panel is
+ * protected by. That is decided here, before the page is sent, rather than by
+ * the page asking after it has drawn — so the right prompt is there from the
+ * first paint and nothing flickers.
+ */
+function serveLogin(res) {
+  const html = fs.readFileSync(path.join(HERE, "public", "login.html"), "utf8").replace("{{AUTH_MODE}}", authMode());
+  send(res, 200, html, { "Content-Type": "text/html; charset=utf-8" });
 }
 
 /** Every address this box can be reached on, for the "open this" hint. */
@@ -1444,6 +1510,8 @@ async function handleApi(req, res, url) {
   if (url.pathname === "/api/settings" && req.method === "GET") {
     return sendJson(res, 200, {
       version: FCC_VERSION,
+      authMode: authMode(),
+      pinSource: pinSource(),
       port: LISTEN_PORT,
       configuredPort: config.port,
       portSource: PORT_ENV ? PORT_ENV.source : "config",
@@ -1526,6 +1594,11 @@ async function handleApi(req, res, url) {
     }
 
     if (body.newPassword) {
+      if (pinMode()) {
+        return sendJson(res, 400, {
+          error: "This panel is protected by a PIN the server makes on each start, so there is no password to change.",
+        });
+      }
       if (!verifyPassword(body.currentPassword, config.passwordSalt, config.passwordHash)) {
         return sendJson(res, 401, { error: "Current password is incorrect." });
       }
@@ -2392,7 +2465,13 @@ async function handler(req, res) {
     if (url.pathname === "/install/agent.sh") return serveAgentInstaller(req, res, url);
     if (url.pathname.startsWith("/install/files/")) return serveAgentFile(req, res, url);
     if (url.pathname === "/healthz") {
-      return sendJson(res, 200, { ok: true, version: FCC_VERSION, setup: setupComplete(), port: LISTEN_PORT });
+      return sendJson(res, 200, {
+        ok: true,
+        version: FCC_VERSION,
+        setup: setupComplete(),
+        auth: authMode(),
+        port: LISTEN_PORT,
+      });
     }
 
     // ---- first-run setup ------------------------------------------------
@@ -2441,7 +2520,12 @@ async function handler(req, res) {
         });
       }
       const body = await readJsonBody(req).catch(() => ({}));
-      if (verifyPassword(body.password, config.passwordSalt, config.passwordHash)) {
+      // With a PIN, the password is not a way in — even one set before the
+      // PIN arrived. The console is the credential now.
+      const ok = pinMode()
+        ? verifyPin(body.pin ?? body.password, currentPin())
+        : verifyPassword(body.password, config.passwordSalt, config.passwordHash);
+      if (ok) {
         throttle.succeed(ip);
         const sessionToken = issueSession(config.sessionSecret);
         const secure = !!config.tls || req.headers["x-forwarded-proto"] === "https";
@@ -2452,16 +2536,16 @@ async function handler(req, res) {
         return res.end(JSON.stringify({ ok: true }));
       }
       throttle.fail(ip);
-      return sendJson(res, 401, { error: "Incorrect password." });
+      return sendJson(res, 401, { error: pinMode() ? "Incorrect PIN." : "Incorrect password." });
     }
 
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      if (!isAuthed(req, config.sessionSecret)) return serveStatic(res, "login.html", "text/html; charset=utf-8");
+      if (!isAuthed(req, config.sessionSecret)) return serveLogin(res);
       return serveStatic(res, "index.html", "text/html; charset=utf-8");
     }
-    if (url.pathname === "/login") return serveStatic(res, "login.html", "text/html; charset=utf-8");
+    if (url.pathname === "/login") return serveLogin(res);
     // The settings pane parses environment variables with exactly the same
     // code the server does, rather than a second implementation that drifts.
     if (url.pathname === "/lib/env.mjs") {
@@ -2493,6 +2577,13 @@ server.listen(LISTEN_PORT, config.host, () => {
   for (const u of localUrls()) console.log(`  open  ${u}`);
   if (PORT_ENV) console.log(`  port  ${LISTEN_PORT} (from ${PORT_ENV.source})`);
   console.log(`  data  ${config.dataDir}`);
+  if (pinMode()) {
+    console.log(
+      process.env.FCC_PIN
+        ? `  auth  PIN, set by FCC_PIN`
+        : `  auth  PIN, read from ${PIN_FILE} — the server console shows it at each start`,
+    );
+  }
   if (!setupComplete()) console.log(`\n  Not set up yet — open the address above and choose a password.`);
   else {
     const localCount = config.sites.filter((s) => s.runner === "local").length;

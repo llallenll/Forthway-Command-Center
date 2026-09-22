@@ -17,6 +17,7 @@
     --accent:#2D2D2F; --accent-dk:#141416; --accent-bg:rgba(45,45,47,.06);
     --bad:#B91C1C; --bad-bg:#FEF2F2;
     --r-pill:999px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%}
@@ -33,29 +34,51 @@
   input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14.5px;
     font-family:inherit;background:var(--surface-lo);color:var(--ink)}
   input:focus{outline:none;border-color:var(--accent);background:var(--surface-hi);box-shadow:0 0 0 3px var(--accent-bg)}
+  /* The PIN is six characters read off a console, so it is typed the way it is
+     shown there: big, spaced out, upper case. */
+  input.pin{font-family:var(--mono);font-size:24px;font-weight:600;letter-spacing:.34em;text-align:center;
+    text-transform:uppercase;padding:12px 10px 12px calc(10px + .34em)}
+  input.pin::placeholder{letter-spacing:.34em;color:var(--fog-dim);font-weight:500}
+  .hint{margin:8px 0 0;font-size:12px;color:var(--ink-3);line-height:1.45}
   button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:999px;background:var(--night);color:#fff;
     font-size:14.5px;font-weight:600;cursor:pointer;font-family:inherit}
   button:hover{background:#000}
   button:disabled{opacity:.5;cursor:not-allowed}
   .err{background:var(--bad-bg);color:var(--bad);padding:9px 11px;border-radius:8px;font-size:13px;margin-top:12px;display:none}
   .err.show{display:block}
+  /* Which prompt to show is decided by the server before this page is sent.
+     Anything that is not "pin" — including the raw placeholder, if the file is
+     opened directly — falls back to the password prompt. */
+  body:not([data-auth="pin"]) .only-pin{display:none}
+  body[data-auth="pin"] .only-password{display:none}
 </style>
 </head>
-<body>
+<body data-auth="{{AUTH_MODE}}">
   <div class="box">
     <div class="mark">FCC</div>
     <h1>Forthway Command Center</h1>
-    <p class="sub">Sign in to continue</p>
+    <p class="sub only-password">Sign in to continue</p>
+    <p class="sub only-pin">Enter the PIN shown in the server console</p>
     <form id="f">
-      <label for="pw">Password</label>
-      <input id="pw" type="password" autocomplete="current-password" autofocus />
+      <div class="only-password">
+        <label for="pw">Password</label>
+        <input id="pw" type="password" autocomplete="current-password" />
+      </div>
+      <div class="only-pin">
+        <label for="pin">PIN</label>
+        <input id="pin" class="pin" type="text" inputmode="text" autocomplete="one-time-code"
+          autocapitalize="characters" autocorrect="off" spellcheck="false" placeholder="······" />
+        <p class="hint">Six letters and digits. A new one is made every time the server starts and printed in its console.</p>
+      </div>
       <button id="go" type="submit">Sign in</button>
       <div class="err" id="err"></div>
     </form>
   </div>
 <script>
-  const f = document.getElementById('f'), pw = document.getElementById('pw');
+  const isPin = document.body.dataset.auth === 'pin';
+  const f = document.getElementById('f'), field = document.getElementById(isPin ? 'pin' : 'pw');
   const err = document.getElementById('err'), go = document.getElementById('go');
+  field.focus();
   f.addEventListener('submit', async (e) => {
     e.preventDefault();
     err.classList.remove('show');
@@ -63,13 +86,13 @@
     try {
       const res = await fetch('/api/login', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ password: pw.value }),
+        body: JSON.stringify(isPin ? { pin: field.value } : { password: field.value }),
       });
       if (res.ok) { location.href = '/'; return; }
       const j = await res.json().catch(() => ({}));
       err.textContent = j.error || 'Sign in failed.';
       err.classList.add('show');
-      pw.select();
+      field.select();
     } catch (e2) {
       err.textContent = 'Could not reach the Command Center.';
       err.classList.add('show');

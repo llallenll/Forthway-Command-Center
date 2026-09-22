@@ -58,6 +58,24 @@ history are kept.
 
 </details>
 
+### Signing in with a PIN instead of a password
+
+A file called `pin` in the data directory (`hub/data/pin` by default) turns
+the password off and the PIN on: the sign-in page asks for the code in that
+file, the setup page that asks you to choose a password never appears, and a
+password set earlier is not accepted while the file is there. The file is
+read at each sign-in, so whatever writes it can change it whenever it likes
+without restarting the panel. Remove the file and the password is back.
+
+This is how the Pterodactyl egg works: every start of the server writes a
+fresh six-character code there and prints it in the panel console, in a box,
+so being able to see that console is what signs you in. Case and spacing do
+not matter when typing it, and the login throttle (eight tries per ten
+minutes per address) keeps six characters plenty.
+
+`FCC_PIN` in the environment sets a code directly, and `FCC_PIN_FILE` points
+at a file somewhere else. Neither is needed on the egg.
+
 ### In a Pterodactyl container
 
 The installer notices it is in a container (no root, `/home/container`) and
@@ -368,8 +386,9 @@ password into it and agents send their tokens in a header. Either point nginx
 at it, or set `"tls": { "key": "...", "cert": "..." }` in `hub/config.json`.
 
 **It runs commands you give it, as the user it runs as.** That is the job — but
-it means the password is the only thing between someone and a shell on that
-box. Use a long one.
+it means the password — or the PIN, on a Pterodactyl server — is the only thing
+between someone and a shell on that box. Use a long password; and treat the
+panel console, where the PIN is printed, as the secret it now is.
 
 **`hub/config.json` holds the site tokens and your GitHub token.** The
 installer sets it to mode 600. Back it up somewhere sensible; losing it means

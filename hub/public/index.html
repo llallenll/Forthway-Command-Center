@@ -946,7 +946,7 @@
       <div class="grp">This panel</div>
       <button type="button" class="on" data-tab="updates">Updates<span class="badge" id="tabDotUpd"></span></button>
       <button type="button" data-tab="panel">Panel</button>
-      <button type="button" data-tab="password">Password</button>
+      <button type="button" data-tab="password" id="tabPassword">Password</button>
       <div class="grp">Connections</div>
       <button type="button" data-tab="github">GitHub</button>
       <button type="button" data-tab="cloudflare">Cloudflare<span class="badge" id="tabDotCf"></span></button>
@@ -996,14 +996,26 @@
 
       <!-- password -->
       <section class="pane" data-pane="password">
-        <h4>Password</h4>
-        <p class="lead">One password guards the whole panel — and the panel can run any command on this
-          machine, so it is worth a good one.</p>
-        <div class="field"><label>Current password</label>
-          <input type="password" id="hubPwOld" autocomplete="current-password" /></div>
-        <div class="field"><label>New password</label>
-          <input type="password" id="hubPwNew" autocomplete="new-password" />
-          <div class="hint">Saved as a hash. Other browsers stay signed in until their session expires.</div></div>
+        <div id="hubAuthPassword">
+          <h4>Password</h4>
+          <p class="lead">One password guards the whole panel — and the panel can run any command on this
+            machine, so it is worth a good one.</p>
+          <div class="field"><label>Current password</label>
+            <input type="password" id="hubPwOld" autocomplete="current-password" /></div>
+          <div class="field"><label>New password</label>
+            <input type="password" id="hubPwNew" autocomplete="new-password" />
+            <div class="hint">Saved as a hash. Other browsers stay signed in until their session expires.</div></div>
+        </div>
+        <div id="hubAuthPin" style="display:none">
+          <h4>PIN</h4>
+          <p class="lead">A six-character PIN guards the whole panel. The server makes a new one every time it
+            starts and prints it in its console, so signing in means being able to see that console —
+            there is no password to set or change.</p>
+          <div class="hint" id="hubPinSource"></div>
+          <div class="hint" style="margin-top:10px">Sessions already signed in stay signed in until they expire,
+            the same as with a password. To go back to a password, stop the server from writing the PIN
+            (on a Pterodactyl server, the egg's <span class="mono">PIN LOGIN</span> variable) and restart it.</div>
+        </div>
       </section>
 
       <!-- github -->
@@ -3193,6 +3205,7 @@ $('btnSettings').addEventListener('click', async () => {
     : 'Changing this restarts the panel, and the address you use to reach it changes with it.';
   $('hubPwOld').value = '';
   $('hubPwNew').value = '';
+  paintAuthMode();
   paintTunnelSettings();
   paintUpdate(SETTINGS.update);
   $('tunToken').value = '';
@@ -3206,6 +3219,19 @@ $('btnSettings').addEventListener('click', async () => {
     '<dt>Data</dt><dd>' + esc(SETTINGS.dataDir) + '</dd>';
   $('dlgHub').showModal();
 });
+
+/** PIN or password: the tab and its pane say which one guards this panel. */
+function paintAuthMode() {
+  const pin = SETTINGS.authMode === 'pin';
+  $('tabPassword').textContent = pin ? 'PIN' : 'Password';
+  $('hubAuthPassword').style.display = pin ? 'none' : '';
+  $('hubAuthPin').style.display = pin ? '' : 'none';
+  $('hubPinSource').innerHTML = pin
+    ? (SETTINGS.pinSource === 'FCC_PIN'
+        ? 'Set by <span class="mono">FCC_PIN</span> in this panel\'s environment.'
+        : 'Read from <span class="mono">' + esc(SETTINGS.pinSource) + '</span>, which the server rewrites at each start.')
+    : '';
+}
 
 /** A stored token is invisible by nature, so say plainly that one is there. */
 function paintGithubToken() {

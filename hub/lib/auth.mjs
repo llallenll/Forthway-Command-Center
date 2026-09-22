@@ -132,3 +132,34 @@ export function tokenMatches(given, expected) {
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
+
+// ------------------------------------------------------------------ PIN
+
+/**
+ * PIN sign-in.
+ *
+ * On a Pterodactyl server the egg's autorun.sh makes a fresh six-character
+ * code every time the server starts, prints it in the panel console, and
+ * writes it to a file the hub reads. The code is the credential: whoever can
+ * see the console can sign in, and nobody else can. It is short because it is
+ * typed off a screen, and it is safe at that length because the login
+ * throttle allows eight guesses per ten minutes against 31^6 possibilities.
+ *
+ * The code is shown spaced out for legibility, and people type what they
+ * see, so anything that is not a letter or digit is dropped before comparing
+ * and case is ignored. The console never shows 0/O or 1/I/L, so there is no
+ * ambiguity to resolve here — just tolerance for how it was typed.
+ */
+export function normalizePin(input) {
+  return String(input ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+/** Constant-time compare of a typed PIN against the current one. */
+export function verifyPin(given, expected) {
+  const a = Buffer.from(normalizePin(given));
+  const b = Buffer.from(normalizePin(expected));
+  if (!a.length || !b.length || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
