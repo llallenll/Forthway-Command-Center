@@ -1354,10 +1354,13 @@ function closeMenu() {
   document.removeEventListener('mousedown', onMenuOutside, true);
   document.removeEventListener('keydown', onMenuKey, true);
   window.removeEventListener('resize', closeMenu);
-  window.removeEventListener('scroll', closeMenu, true);
+  window.removeEventListener('scroll', onMenuScroll, true);
 }
 function onMenuOutside(ev) { if (openMenuEl && !openMenuEl.contains(ev.target)) closeMenu(); }
 function onMenuKey(ev) { if (ev.key === 'Escape') { ev.stopPropagation(); closeMenu(); } }
+// Scrolling the page moves the anchor out from under the menu, so close it --
+// but scrolling inside the menu itself (a long script list) must not.
+function onMenuScroll(ev) { if (openMenuEl && !openMenuEl.contains(ev.target)) closeMenu(); }
 
 /**
  * A drop-down anchored to a button.
@@ -1383,7 +1386,7 @@ function openMenu(anchor, items) {
     document.addEventListener('mousedown', onMenuOutside, true);
     document.addEventListener('keydown', onMenuKey, true);
     window.addEventListener('resize', closeMenu);
-    window.addEventListener('scroll', closeMenu, true);
+    window.addEventListener('scroll', onMenuScroll, true);
   }, 0);
   const first = el.querySelector('button:not(:disabled)');
   if (first) first.focus();
