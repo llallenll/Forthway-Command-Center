@@ -74,7 +74,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.10.1";
+const FCC_VERSION = "2.10.2";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 const REPO_CHECK_EVERY_MS = 5 * 60_000;
@@ -2447,7 +2447,7 @@ function serveAgentFile(req, res, url) {
   if (!sc || !tokenMatches(token, sc.token)) return send(res, 401, "unauthorized");
 
   const rel = url.pathname.replace(/^\/install\/files\//, "");
-  const allowed = ["agent/agent.mjs", "shared/deployer.mjs", "shared/zip.mjs", "shared/zipwrite.mjs", "shared/fsx.mjs"];
+  const allowed = ["agent/agent.mjs", "shared/deployer.mjs", "shared/zip.mjs", "shared/zipwrite.mjs", "shared/fsx.mjs", "shared/env.mjs"];
   if (!allowed.includes(rel)) return send(res, 404, "not found");
   const file = path.join(ROOT, rel);
   if (!exists(file)) return send(res, 404, "not found");

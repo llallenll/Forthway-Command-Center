@@ -96,6 +96,7 @@ fetch shared/deployer.mjs  "$DIR/shared/deployer.mjs"
 fetch shared/zip.mjs       "$DIR/shared/zip.mjs"
 fetch shared/zipwrite.mjs  "$DIR/shared/zipwrite.mjs"
 fetch shared/fsx.mjs       "$DIR/shared/fsx.mjs"
+fetch shared/env.mjs       "$DIR/shared/env.mjs"
 ok "agent downloaded to ${DIR}"
 
 cat > "$DIR/agent/agent.config.json" <<JSON
