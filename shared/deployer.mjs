@@ -92,6 +92,10 @@ export class Deployer {
     this.workDirName = workDirName;
     this.child = null;
     this.childWantsRun = false;
+    // Set while a job is being abandoned on purpose, so the step that is
+    // running stops and the ones after it never start.
+    this.aborted = null;
+    this.jobChild = null; // the command a job is running right now
     this.childRestartTimer = null;
     this.childOutput = [];
     this.onChildOutput = null;
@@ -141,6 +145,8 @@ export class Deployer {
    * deploy right there.
    */
   run(cmd, { cwd, log = this.log, env = {}, timeoutMs = 30 * 60_000, allowFail = false } = {}) {
+    // Asked to stop between two commands: do not start another one.
+    if (this.aborted) return Promise.reject(abortError(this.aborted));
     return new Promise((resolve, reject) => {
       log?.line(`$ ${cmd}`);
       const child = spawn(cmd, {
@@ -150,6 +156,7 @@ export class Deployer {
         env: { ...process.env, ...this._appEnv(), ...env },
         stdio: ["ignore", "pipe", "pipe"],
       });
+      this.jobChild = child;
       let out = "";
       const onData = (chunk) => {
         const text = chunk.toString();
@@ -170,12 +177,17 @@ export class Deployer {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        reject(err);
+        if (this.jobChild === child) this.jobChild = null;
+        reject(this.aborted ? abortError(this.aborted) : err);
       });
       const done = (code) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (this.jobChild === child) this.jobChild = null;
+        // A command that died because we killed it did not "fail" — saying so
+        // would bury the reason under an exit code nobody can interpret.
+        if (this.aborted) return reject(abortError(this.aborted));
         if (code === 0 || allowFail) resolve({ code, output: out });
         else reject(new Error(`Command failed (exit ${code}): ${cmd}`));
       };
@@ -1030,7 +1042,29 @@ export class Deployer {
   }
 
   /** Dispatch by job type. Throws on failure; the caller reports it. */
+  /**
+   * Abandon whatever is running.
+   *
+   * The command has its own process group, so the whole tree goes rather than
+   * just the shell that started it — a `npm install` abandoned by killing only
+   * its parent leaves node processes holding the lock file.
+   */
+  abort(reason = "Cancelled.") {
+    this.aborted = reason;
+    const child = this.jobChild;
+    if (child) {
+      this.log?.line(`\n!! ${reason} — killing the running command.`);
+      signalGroup(child, "SIGTERM");
+      // Anything still alive a moment later is not going to exit politely.
+      setTimeout(() => {
+        if (this.jobChild === child) signalGroup(child, "SIGKILL");
+      }, 4000).unref?.();
+    }
+    return !!child;
+  }
+
   async execute(job, log = this.log) {
+    this.aborted = null; // a new job is not born cancelled
     switch (job.type) {
       case "deploy":
         return this.doDeploy(job, log);
@@ -1062,6 +1096,13 @@ export class Deployer {
 }
 
 // ------------------------------------------------------------------ utils
+
+/** Tagged so a caller can tell "you stopped this" from "this broke". */
+export function abortError(reason) {
+  const err = new Error(reason || "Cancelled.");
+  err.aborted = true;
+  return err;
+}
 
 export function signalGroup(proc, signal) {
   try {

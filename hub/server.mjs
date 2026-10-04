@@ -67,6 +67,7 @@ import {
   installedVersion,
   listBackups,
   restoreBackup,
+  compareVersions,
 } from "./lib/updates.mjs";
 import { inspectZip, readZipFile } from "../shared/zip.mjs";
 import { ensureDir, readJson, writeJson, exists, humanBytes } from "../shared/fsx.mjs";
@@ -74,7 +75,7 @@ import { cleanEnvValue, isEnvKey } from "../shared/env.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const FCC_VERSION = "2.10.2";
+const FCC_VERSION = "2.11.0";
 const POLL_TIMEOUT_MS = 25_000;
 const AGENT_OFFLINE_AFTER_MS = 45_000;
 const REPO_CHECK_EVERY_MS = 5 * 60_000;
@@ -2211,15 +2212,60 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, { ok: true, job: publicJob(enqueueJob(site.id, "inspect")) });
     }
 
+    /**
+     * Cancel a job — queued or running.
+     *
+     * A queued one simply never starts. A running one has to be taken apart:
+     * for a local site the engine is in this process and can be told to stop,
+     * and for a remote one the request is recorded and handed to the agent on
+     * its next log post, which is the only channel open while it is busy.
+     */
     if (url.pathname === "/api/cancel") {
       const job = store.job(body.jobId);
       if (!job) return sendJson(res, 404, { error: "Job not found" });
-      if (job.status !== "queued") return sendJson(res, 409, { error: "Only a queued job can be cancelled." });
-      job.status = "cancelled";
-      job.finishedAt = new Date().toISOString();
+
+      if (job.status === "queued") {
+        job.status = "cancelled";
+        job.finishedAt = new Date().toISOString();
+        store.save();
+        pushState();
+        return sendJson(res, 200, { ok: true, stopped: true });
+      }
+
+      if (job.status !== "running") {
+        return sendJson(res, 409, { error: `That job already finished (${job.status}).` });
+      }
+
+      const site = findSite(job.siteId);
+      job.cancelRequested = new Date().toISOString();
       store.save();
+
+      if (site?.runner === "local") {
+        const stopped = local.cancel(job.siteId);
+        pushState();
+        return sendJson(res, 200, {
+          ok: true,
+          stopped,
+          // Between two commands there is nothing to kill; the next step just
+          // never starts, which is a moment away rather than instant.
+          message: stopped ? "Stopping it now." : "It will stop at the end of the current step.",
+        });
+      }
+
       pushState();
-      return sendJson(res, 200, { ok: true });
+      // An agent older than this cannot hear the cancel — it ignores the field
+      // and keeps going. Better to say so than to leave someone waiting for
+      // something that is never going to happen.
+      const agentVersion = store.site(job.siteId).runnerVersion || "";
+      const deaf = agentVersion && compareVersions(agentVersion, "2.1.0") < 0;
+      return sendJson(res, 200, {
+        ok: true,
+        stopped: false,
+        message: deaf
+          ? `That agent is version ${agentVersion} and cannot be cancelled remotely — re-run its installer to update it. ` +
+            `The job will finish on its own.`
+          : "Told the agent to stop. It picks that up within a second or two.",
+      });
     }
 
     if (url.pathname === "/api/release/update") {
@@ -2369,14 +2415,20 @@ async function handleAgent(req, res, url) {
     }
     store.appendLog(job.id, lines);
     if (lines.length) broadcast("log", { jobId: job.id, siteId: job.siteId, lines });
-    return sendJson(res, 200, { ok: true });
+    /*
+     * An agent is blocked inside its job and will not poll again until it
+     * finishes, so there is no second channel to reach it on. It does send its
+     * log every second or so, though, and a reply costs nothing — so the
+     * answer to "here is some output" is where "stop what you are doing" goes.
+     */
+    return sendJson(res, 200, { ok: true, cancel: !!job.cancelRequested });
   }
 
   // ---- job finished ------------------------------------------------------
   if (url.pathname === "/agent/result") {
     const job = store.job(body.jobId);
     if (!job || job.siteId !== siteId) return sendJson(res, 404, { error: "Job not found" });
-    job.status = body.ok ? "success" : "failed";
+    job.status = body.ok ? "success" : body.aborted || job.cancelRequested ? "cancelled" : "failed";
     job.finishedAt = new Date().toISOString();
     job.error = body.error || null;
     job.summary = body.summary || null;
@@ -2385,7 +2437,7 @@ async function handleAgent(req, res, url) {
     for (const key of ["deployed", "serving", "health", "migrations", "appRunning"]) {
       if (body[key] !== undefined) state[key] = body[key];
     }
-    state.lastError = body.ok ? null : body.error || null;
+    state.lastError = job.status === "success" || job.status === "cancelled" ? null : body.error || null;
 
     if (body.ok && (job.type === "deploy" || job.type === "rollback")) {
       if (state.currentReleaseId && state.currentReleaseId !== job.releaseId) {
@@ -2406,7 +2458,7 @@ async function handleAgent(req, res, url) {
     pushState();
     const finished = findSite(job.siteId);
     if (finished) repoWatch.refreshDeployed(job.siteId, deployedShaFor(finished));
-    broadcast("job-finished", { jobId: job.id, siteId: job.siteId, ok: !!body.ok, error: job.error });
+    broadcast("job-finished", { jobId: job.id, siteId: job.siteId, ok: !!body.ok, status: job.status, error: job.error });
     return sendJson(res, 200, { ok: true });
   }
 

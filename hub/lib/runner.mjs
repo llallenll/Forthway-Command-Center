@@ -67,6 +67,21 @@ export class LocalRunner {
     return this.deployers.get(siteId) || null;
   }
 
+  /**
+   * Abandon the job running for this site.
+   *
+   * The deploy rejects out of whatever step it was in, which lands in the
+   * normal failure path and finishes the job as cancelled — so the queue moves
+   * on and the next thing can run.
+   */
+  cancel(siteId, reason = "Cancelled from the panel.") {
+    if (!this.busy.has(siteId)) return false;
+    const d = this.deployers.get(siteId);
+    if (!d) return false;
+    d.abort(reason);
+    return true;
+  }
+
   /** Run whatever is queued for this site, if it is local and idle. */
   async kick(siteId) {
     const d = this.deployers.get(siteId);
@@ -100,10 +115,13 @@ export class LocalRunner {
       await log.flush();
       this._finish(job, { ok: true, ...result });
     } catch (err) {
-      log.line(`\n!! FAILED: ${err.message}`);
+      // Stopping something on purpose is not a failure, and the log should not
+      // shout as though a build broke.
+      log.line(err.aborted ? `\n-- ${err.message}` : `\n!! FAILED: ${err.message}`);
       await log.flush();
       this._finish(job, {
         ok: false,
+        aborted: !!err.aborted,
         error: err.message,
         rolledBackTo: err.rolledBackTo || null,
         deployed: err.deployed ?? d.readDeployedInfo(),
@@ -153,7 +171,7 @@ export class LocalRunner {
 
   _finish(job, body) {
     const state = this.store.site(job.siteId);
-    job.status = body.ok ? "success" : "failed";
+    job.status = body.ok ? "success" : body.aborted ? "cancelled" : "failed";
     job.finishedAt = new Date().toISOString();
     job.error = body.error || null;
     job.summary = body.summary || null;
@@ -162,7 +180,7 @@ export class LocalRunner {
     for (const key of ["deployed", "serving", "health", "migrations", "appRunning"]) {
       if (body[key] !== undefined) state[key] = body[key];
     }
-    state.lastError = body.ok ? null : body.error || null;
+    state.lastError = body.ok || body.aborted ? null : body.error || null;
 
     if (body.ok && (job.type === "deploy" || job.type === "rollback")) {
       if (state.currentReleaseId && state.currentReleaseId !== job.releaseId) {
@@ -181,7 +199,13 @@ export class LocalRunner {
     this.store.save({ immediate: true });
     this.onJobFinished(job);
     this.onStateChange();
-    this.broadcast("job-finished", { jobId: job.id, siteId: job.siteId, ok: !!body.ok, error: job.error });
+    this.broadcast("job-finished", {
+      jobId: job.id,
+      siteId: job.siteId,
+      ok: !!body.ok,
+      status: job.status,
+      error: job.error,
+    });
   }
 
   /** Refresh health and versions for every local site. */

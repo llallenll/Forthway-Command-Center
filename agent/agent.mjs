@@ -26,7 +26,7 @@ import { Deployer } from "../shared/deployer.mjs";
 import { readJson } from "../shared/fsx.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const AGENT_VERSION = "2.0.0";
+const AGENT_VERSION = "2.1.0";
 
 // ------------------------------------------------------------------ config
 
@@ -118,7 +118,13 @@ class JobLogger {
     if (!this.buffer.length && !this.step) return;
     const lines = this.buffer.splice(0, this.buffer.length);
     try {
-      await hubPost("/agent/log", { jobId: this.jobId, lines, step: this.step });
+      const reply = await hubPost("/agent/log", { jobId: this.jobId, lines, step: this.step });
+      // The hub answers every log post, and that answer is how a cancel
+      // reaches an agent that is too busy running the job to poll for one.
+      if (reply?.cancel && !deployer.aborted) {
+        console.log(`[agent] the Command Center cancelled job ${this.jobId}`);
+        deployer.abort("Cancelled from the Command Center.");
+      }
     } catch {
       // Losing a log line must never fail a deploy. Put them back so the next
       // flush retries once.
@@ -139,11 +145,12 @@ async function runJob(job) {
     await log.close();
     await hubPost("/agent/result", { jobId: job.id, ok: true, ...result });
   } catch (err) {
-    log.line(`\n!! FAILED: ${err.message}`);
+    log.line(err.aborted ? `\n-- ${err.message}` : `\n!! FAILED: ${err.message}`);
     await log.close();
     await hubPost("/agent/result", {
       jobId: job.id,
       ok: false,
+      aborted: !!err.aborted,
       error: err.message,
       rolledBackTo: err.rolledBackTo || null,
       deployed: err.deployed ?? deployer.readDeployedInfo(),

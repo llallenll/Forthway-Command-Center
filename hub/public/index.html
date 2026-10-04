@@ -1631,6 +1631,7 @@ function cardHtml(s) {
   h += '<button class="btn sm" data-act="scripts"' + (s.configured ? '' : ' disabled') + '>Run <span class="caret">&#9660;</span></button>';
   if (s.activeJob) {
     h += '<button class="btn sm ghost" data-act="watch">Watch</button>';
+    h += '<button class="btn sm ghost danger" data-act="cancel" data-job="' + esc(s.activeJob.id) + '">Stop</button>';
   }
   h += '<span class="more">Open &rarr;</span>';
   h += '</div>';
@@ -1673,7 +1674,8 @@ function siteDetailHtml(s) {
   if (s.activeJob) {
     h += '<div class="banner info"><span class="txt"><b>' + esc(s.activeJob.type) + '</b>' +
          (s.activeJob.step ? ' — ' + esc(s.activeJob.step) : '') + ' is running.</span>' +
-         '<button class="btn sm" data-act="watch">Watch console</button></div>';
+         '<button class="btn sm" data-act="watch">Watch console</button>' +
+         '<button class="btn sm danger" data-act="cancel" data-job="' + esc(s.activeJob.id) + '">Stop it</button></div>';
   }
 
   h += '<div class="versions">';
@@ -1769,7 +1771,10 @@ function siteDetailHtml(s) {
            (j.error ? '<div class="muted" style="font-size:12px">' + esc(j.error) + '</div>' : '') + '</td>';
       h += '<td class="muted nowrap">' + esc(shortTime(j.createdAt)) + '</td>';
       h += '<td class="nowrap" style="text-align:right"><button class="btn sm ghost" data-act="log" data-job="' + esc(j.id) + '">Log</button>' +
-           (j.status === 'queued' ? ' <button class="btn sm ghost" data-act="cancel" data-job="' + esc(j.id) + '">Cancel</button>' : '') +
+           (j.status === 'queued' || j.status === 'running'
+             ? ' <button class="btn sm ghost danger" data-act="cancel" data-job="' + esc(j.id) + '">' +
+               (j.status === 'running' ? 'Stop' : 'Cancel') + '</button>'
+             : '') +
            '</td></tr>';
     }
     h += '</tbody></table>';
@@ -1860,7 +1865,23 @@ function wireSite(root, s) {
       if (act === 'delrel') return confirmThen('Delete this release?', 'The archive is removed from this machine.',
         () => act0('/api/release/delete', { releaseId: rel }, 'Deleted'));
       if (act === 'log') return openConsole(job);
-      if (act === 'cancel') return act0('/api/cancel', { jobId: job }, 'Cancelled');
+      if (act === 'cancel') {
+        const running = (cur.jobs || []).find((j) => j.id === job)?.status === 'running' ||
+          cur.activeJob?.id === job;
+        if (!running) return act0('/api/cancel', { jobId: job }, 'Cancelled');
+        // Killing a deploy part-way can leave the app mid-swap, which is worth
+        // one sentence before it happens rather than afterwards.
+        return confirmThen('Stop the ' + esc(cur.activeJob?.type || 'running') + ' job?',
+          'The command running right now is killed. A deploy stopped part-way can leave the app ' +
+          'between versions — check it, and redeploy or roll back if it did.',
+          async () => {
+            try {
+              const r = await api('/api/cancel', { jobId: job });
+              toast(r.message || 'Stopping', 'ok');
+              refresh();
+            } catch (err) { toast(err.message, 'bad'); }
+          });
+      }
       if (act === 'watch') return openConsole((site(id) || s).activeJob?.id);
     });
   });
@@ -4117,6 +4138,9 @@ function connect() {
     const s = site(d.siteId);
     const name = s ? s.name : d.siteId;
     if (d.ok) toast(name + ': done', 'ok');
+    // Something you asked to stop is not an alarm, and you already saw a toast
+    // saying it was stopping — a red one here reads as though it went wrong.
+    else if (d.status === 'cancelled') toast(name + ': stopped');
     else toast(name + ': ' + (d.error || 'failed'), 'bad');
     if (openJob === d.jobId) {
       fetch('/api/log/' + encodeURIComponent(d.jobId)).then((r) => r.text()).then((t) => {
