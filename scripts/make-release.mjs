@@ -97,4 +97,4 @@ fs.writeFileSync(outFile, buffer);
 
 console.log(`${files.length} files · ${humanBytes(buffer.length)} · ${Math.round((Date.now() - t0) / 1000)}s`);
 console.log(`\n  ${outFile}\n`);
-console.log("Upload that file on the Update Hub.");
+console.log("Upload it on the website's Deployments tab in the Command Center.");

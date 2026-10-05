@@ -27,7 +27,9 @@ import { ensureDir, rmrf, exists, readJson, writeJson, mirror, copyDir, hardlink
 import { mergeEnvFile, shadowedKeys, lintEnv } from "./env.mjs";
 
 export const ENGINE_VERSION = "2.0.0";
-export const RESTART_MODES = ["pm2", "systemd", "command", "child"];
+// "none": there is no app process to manage (static / php sites served by
+// nginx + php-fpm). Stop/start/restart are no-ops; deploy is unpack + swap.
+export const RESTART_MODES = ["pm2", "systemd", "command", "child", "none"];
 
 export function defaultSettings() {
   return {
@@ -46,6 +48,8 @@ export function defaultSettings() {
 
     healthUrl: "",
     versionUrl: "",
+    healthCheck: true, // false: never probe a health URL (no derived default either)
+    versionCheck: true, // false: never probe a version URL
     healthTimeoutMs: 180000,
     stopGraceMs: 10000,
 
@@ -66,6 +70,8 @@ export function defaultSettings() {
     // app but not the tools that read a .env file for themselves — prisma
     // generate, prisma migrate, next build. So they are written there too.
     writeEnvFile: true,
+    // Create appDir when it does not exist yet (a brand new site on a server).
+    createAppDir: false,
   };
 }
 
@@ -129,6 +135,10 @@ export class Deployer {
   _require(log) {
     if (!this.S.appDir) {
       throw new Error("No app directory is set for this site. Open its settings and fill that in first.");
+    }
+    if (!exists(this.S.appDir) && this.S.createAppDir) {
+      ensureDir(this.S.appDir);
+      log?.line?.(`Created the app directory ${this.S.appDir}.`);
     }
     if (!exists(this.S.appDir)) {
       throw new Error(`The app directory ${this.S.appDir} does not exist on this machine.`);
@@ -341,6 +351,8 @@ export class Deployer {
 
   async stopApp(log = this.log) {
     switch (this.S.restart.mode) {
+      case "none":
+        return;
       case "child":
         return this.stopChild(log);
       case "pm2":
@@ -354,6 +366,8 @@ export class Deployer {
 
   async startApp(log = this.log) {
     switch (this.S.restart.mode) {
+      case "none":
+        return;
       case "child":
         this.startChild(log);
         return;
@@ -386,6 +400,7 @@ export class Deployer {
   }
 
   async restartApp(log = this.log) {
+    if (this.S.restart.mode === "none") return;
     if (this.S.restart.mode === "pm2" && (await this._pm2Known(log))) {
       return this.run(`pm2 restart ${this._pm2Name()} --update-env`, { log, timeoutMs: 120_000 });
     }
@@ -439,11 +454,13 @@ export class Deployer {
 
   /** An explicit URL wins; otherwise derive one from the site's port. */
   healthUrl() {
+    if (this.S.healthCheck === false) return "";
     if (this.S.healthUrl) return this.S.healthUrl;
     return this.S.port ? `http://127.0.0.1:${this.S.port}/api/health` : "";
   }
 
   versionUrl() {
+    if (this.S.versionCheck === false || this.S.healthCheck === false) return "";
     if (this.S.versionUrl) return this.S.versionUrl;
     return this.S.port ? `http://127.0.0.1:${this.S.port}/api/version` : "";
   }
@@ -451,7 +468,11 @@ export class Deployer {
   async waitForHealthy(log = this.log, timeoutMs = this.S.healthTimeoutMs) {
     const url = this.healthUrl();
     if (!url) {
-      log?.line("No health URL and no port configured — skipping the health check.");
+      log?.line(
+        this.S.healthCheck === false
+          ? "Health check is off for this site — skipping it."
+          : "No health URL and no port configured — skipping the health check.",
+      );
       return { ok: null };
     }
     const deadline = Date.now() + timeoutMs;
@@ -498,6 +519,8 @@ export class Deployer {
           timeoutMs: 45_000,
           allowFail: true,
         });
+      } else if (mode === "none") {
+        log.line("(no app process for this site type — check the web server's error log)");
       } else if (mode === "child") {
         const tail = this.childOutput.slice(-lines).join("");
         log.line(tail.trim() || "(the supervised process produced no output)");

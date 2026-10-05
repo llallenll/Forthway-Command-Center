@@ -1,0 +1,366 @@
+// Settings: General · Admins · Servers & load balancing · Backups · GitHub · Account.
+// Routed as #/settings/<section>. Every user-supplied string goes through html``.
+import { html, raw, mount, $, on, ago, initials, plural, toast, toastError, confirmDialog, formDialog, openMenu, emptyState, errorState, skeletonRows, debounce } from "../util.js";
+import { icon } from "../icons.js";
+import { get, post, patch, del } from "../api.js";
+import { pageHead, openJobLog, serverKind, METHOD_LABEL } from "../components.js";
+import { scheduleForm } from "./backups.js";
+
+const SECTIONS = [
+  { id: "general", label: "General", icon: "settings", render: general },
+  { id: "admins", label: "Admins", icon: "users", render: admins },
+  { id: "servers", label: "Servers & load balancing", icon: "balance", render: serversLb },
+  { id: "backups", label: "Backups", icon: "archive", render: backups },
+  { id: "github", label: "GitHub", icon: "github", render: github },
+  { id: "account", label: "Account", icon: "user", render: account },
+];
+const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account" };
+
+export default async function settings(ctx) {
+  const { root, params } = ctx;
+  const id = ALIASES[params.tab] || params.tab || "general";
+  const sec = SECTIONS.find((s) => s.id === id) || SECTIONS[0];
+  ctx.crumbs([{ label: "Settings", href: "#/settings" }, { label: sec.label }]);
+  mount(root, html`${pageHead("Settings", "Panel-wide configuration, the people who can sign in, and where backups go.")}
+    <div class="settings">
+      <nav class="settings-nav" aria-label="Settings sections">${SECTIONS.map((s) => html`<a href="#/settings/${s.id}" class="${s.id === sec.id ? "active" : ""}" ${s.id === sec.id ? raw('aria-current="page"') : ""}>${icon(s.icon, "sm")}<span>${s.label}</span></a>`)}</nav>
+      <div class="stack" data-sec style="min-width:0">${skeletonRows(3, 120)}</div>
+    </div>`);
+  const box = $("[data-sec]", root);
+  try {
+    await sec.render(box, ctx);
+  } catch (e) {
+    if (!ctx.alive()) return;
+    console.error(e);
+    mount(box, errorState(e));
+    $("[data-retry]", box)?.addEventListener("click", () => ctx.reload());
+  }
+}
+
+/* ───────── helpers ───────── */
+
+function setBusy(btn, busy) { btn.classList.toggle("loading", busy); btn.disabled = busy; }
+function showErr(el, msg) { el.hidden = !msg; mount(el, msg ? html`${icon("alert")}<div>${msg}</div>` : html``); }
+function announce(name, patchObj, target) {
+  Object.assign(target, patchObj);
+  window.dispatchEvent(new Event(name));
+}
+const field = (label, control, hint) => html`<div class="field"><label>${label}</label>${control}${hint ? html`<div class="hint">${hint}</div>` : ""}</div>`;
+
+/* ───────── General ───────── */
+
+async function general(box, ctx) {
+  const s = await get("/api/settings");
+  if (!ctx.alive()) return;
+  mount(box, html`
+    <form class="card" data-form novalidate>
+      <div class="card-head"><div><h3>Panel</h3><div class="sub">How this panel names itself and the address agents use to reach it.</div></div></div>
+      <div class="card-body"><div class="form-stack">
+        ${field("Panel name", html`<input class="input" name="panelName" maxlength="60" value="${s.panelName || ""}" placeholder="Forthway Command Center" autocomplete="off"/>`, "Shown in the sidebar, the browser tab and the sign-in page.")}
+        ${field("Panel URL", html`<input class="input mono" name="panelUrl" value="${s.panelUrl || ""}" placeholder="${s.panelUrlEffective || "https://panel.example.com"}" autocomplete="off" spellcheck="false"/>`,
+          html`Put into agent install commands and release download links. Leave blank to use ${s.panelUrlEffective ? html`<span class="mono">${s.panelUrlEffective}</span>` : "the address you opened the panel with"}.`)}
+        <div class="error-box" data-err hidden></div>
+      </div></div>
+      <div class="card-foot"><span class="muted small" data-state></span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save changes</button></div>
+    </form>
+    <div class="card"><div class="card-head"><h3>About this panel</h3>${s.dryRun ? html`<div class="right"><span class="badge warn">${icon("alert")}Dry run</span></div>` : ""}</div>
+      <div class="card-body"><dl class="kv">
+        <dt>Version</dt><dd>v${s.version || "—"}</dd>
+        <dt>Hostname</dt><dd class="mono">${s.hostname || "—"}</dd>
+        <dt>Address in use</dt><dd class="mono">${s.panelUrlEffective || "—"}</dd>
+        ${s.dryRun ? html`<dt>Mode</dt><dd>Dry run — system commands are simulated, nothing on this machine is changed.</dd>` : ""}
+      </dl></div></div>`);
+  const form = $("[data-form]", box), err = $("[data-err]", box), btn = $("[data-save]", box);
+  let saved = { panelName: s.panelName || "", panelUrl: s.panelUrl || "" };
+  const dirty = () => form.elements.panelName.value.trim() !== saved.panelName || form.elements.panelUrl.value.trim() !== saved.panelUrl;
+  const paintState = () => ($("[data-state]", box).textContent = dirty() ? "Unsaved changes" : "");
+  form.addEventListener("input", paintState);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    showErr(err, "");
+    const body = { panelName: form.elements.panelName.value.trim(), panelUrl: form.elements.panelUrl.value.trim() };
+    setBusy(btn, true);
+    try {
+      const r = await patch("/api/settings", body);
+      saved = { panelName: r.panelName || "", panelUrl: r.panelUrl || "" };
+      form.elements.panelName.value = saved.panelName;
+      form.elements.panelUrl.value = saved.panelUrl;
+      announce("fcc:settings", r, (ctx.state.settings ||= {}));
+      toast("Settings saved", "ok");
+      paintState();
+    } catch (ex) { showErr(err, ex.message); }
+    finally { setBusy(btn, false); }
+  });
+}
+
+/* ───────── Admins ───────── */
+
+async function admins(box, ctx) {
+  let items = [];
+  const me = () => ctx.state.me || {};
+  const load = async () => {
+    items = (await get("/api/admins")).items || [];
+    if (ctx.alive()) paint();
+  };
+  const paint = () => {
+    const iAmOwner = me().role === "owner";
+    mount(box, html`<div class="card">
+      <div class="card-head"><div><h3>Admins</h3><div class="sub">${plural(items.length, "person", "people")} can sign in to this panel. Every admin has full access.</div></div>
+        <div class="right"><button class="btn btn-primary btn-sm" data-add>${icon("plus")}Add admin</button></div></div>
+      ${items.length ? html`<div class="list">${items.map((a) => {
+        const self = a.id === me().id;
+        return html`<div class="list-item" data-admin="${a.id}">
+          <span class="avatar" style="width:34px;height:34px;border-radius:10px">${initials(a.name || a.email)}</span>
+          <div class="li-main"><div class="li-title">${a.name || a.email}${self ? html` <span class="dim" style="font-weight:500">(you)</span>` : ""}</div>
+            <div class="li-sub">${a.email} · ${a.lastLoginAt ? html`last signed in ${ago(a.lastLoginAt)}` : "never signed in"}</div></div>
+          <div class="li-right">${a.role === "owner" ? html`<span class="badge blue" title="The owner can't be removed and is the only one who can edit the owner or hand ownership over.">${icon("shield")}Owner</span>` : html`<span class="badge">Admin</span>`}
+            <button class="icon-btn ghost sm" data-amenu="${a.id}" aria-label="Actions for ${a.name || a.email}">${icon("more", "sm")}</button></div></div>`;
+      })}</div>` : emptyState({ ico: "users", title: "No admins", sm: true })}
+      <div class="card-foot"><span class="muted small">${iAmOwner ? "You're the owner. To step down, make another admin the owner." : "Only the owner can edit the owner or transfer ownership."} Forgotten passwords are reset here by another admin.</span></div>
+    </div>`);
+  };
+  await load();
+
+  const adminFields = (a) => [
+    { name: "name", label: "Name", value: a?.name || "", required: true, attrs: 'maxlength="80"' },
+    { name: "email", label: "Email", type: "email", value: a?.email || "", required: true, autocomplete: "off" },
+  ];
+  const pwFields = (required) => [
+    { name: "password", label: required ? "Password" : "New password", type: "password", required, autocomplete: "new-password", hint: required ? "At least 8 characters. Share it with them privately." : "Leave blank to keep their current password." },
+    { name: "confirm", label: "Confirm password", type: "password", required, autocomplete: "new-password" },
+  ];
+  const checkPw = (v) => { if ((v.password || v.confirm) && v.password !== v.confirm) throw new Error("The two passwords don't match."); };
+
+  on(box, "click", "[data-add]", async () => {
+    const r = await formDialog({
+      title: "Add an admin", sub: "They can sign in right away with this email and password.", ico: "users",
+      fields: [...adminFields(), ...pwFields(true)], submitText: "Add admin",
+      onSubmit: async (v) => { checkPw(v); return post("/api/admins", { name: v.name, email: v.email, password: v.password }); },
+    });
+    if (r) { toast(`${r.name || r.email} can now sign in`, "ok"); load(); }
+  });
+
+  on(box, "click", "[data-amenu]", (e, b) => {
+    const a = items.find((x) => x.id === b.dataset.amenu);
+    if (!a) return;
+    const self = a.id === me().id, iAmOwner = me().role === "owner";
+    const canEdit = a.role !== "owner" || self || iAmOwner;
+    openMenu(b, [
+      self ? { label: "Edit your account", icon: "user", onClick: () => (location.hash = "#/settings/account") }
+        : { label: a.role === "owner" ? "Edit owner" : "Edit or reset password", icon: "edit", disabled: !canEdit, onClick: () => editAdmin(a) },
+      iAmOwner && !self && { label: "Make owner", icon: "shield", onClick: () => makeOwner(a) },
+      !self && a.role !== "owner" && { sep: true },
+      !self && a.role !== "owner" && { label: "Remove admin", icon: "trash", danger: true, onClick: () => removeAdmin(a) },
+    ]);
+  });
+
+  async function editAdmin(a) {
+    const r = await formDialog({
+      title: `Edit ${a.name || a.email}`, ico: "edit",
+      fields: [...adminFields(a), ...pwFields(false)],
+      onSubmit: async (v) => {
+        checkPw(v);
+        const body = { name: v.name, email: v.email };
+        if (v.password) body.password = v.password;
+        return patch(`/api/admins/${a.id}`, body);
+      },
+    });
+    if (r) { toast("Admin updated", "ok"); load(); }
+  }
+  async function makeOwner(a) {
+    const ok = await confirmDialog({
+      title: `Make ${a.name || a.email} the owner?`, ico: "shield",
+      message: "There is only ever one owner. You'll become a regular admin and can't undo this yourself — only the new owner can hand it back.",
+      confirmText: "Transfer ownership", typed: a.email,
+    });
+    if (!ok) return;
+    try {
+      await patch(`/api/admins/${a.id}`, { role: "owner" });
+      toast(`${a.name || a.email} is now the owner`, "ok");
+      const fresh = await get("/api/me").catch(() => null);
+      if (fresh) announce("fcc:me", fresh, (ctx.state.me ||= {}));
+      load();
+    } catch (ex) { toastError(ex, "Couldn't transfer ownership"); }
+  }
+  async function removeAdmin(a) {
+    const ok = await confirmDialog({ title: `Remove ${a.name || a.email}?`, message: "They're signed out everywhere and can no longer sign in. Their past activity stays in the log.", danger: true, confirmText: "Remove admin" });
+    if (!ok) return;
+    try { await del(`/api/admins/${a.id}`); toast(`${a.name || a.email} removed`, "ok"); load(); }
+    catch (ex) { toastError(ex, "Couldn't remove admin"); }
+  }
+}
+
+/* ───────── Servers & load balancing ───────── */
+
+async function serversLb(box, ctx) {
+  let lb = null, servers = [];
+  const load = async () => {
+    const [l, s] = await Promise.all([get("/api/loadbalancer"), get("/api/servers").catch(() => ({ items: [] }))]);
+    lb = l; servers = s.items || [];
+    if (ctx.alive()) paint();
+  };
+  const paint = () => {
+    const sim = !lb.installed && lb.dryRun;
+    const good = (lb.installed || sim) && lb.configOk !== false;
+    const tone = lb.configOk === false ? "err" : sim ? "off" : !lb.installed ? "err" : lb.lastError ? "warn" : "ok";
+    const lbSites = (lb.sites || []).filter((x) => x.loadBalanced);
+    const online = servers.filter((x) => x.online).length;
+    mount(box, html`
+      <div class="card">
+        <div class="card-head" style="flex-wrap:wrap">
+          <div class="row" style="flex:1 1 240px;min-width:0;gap:12px"><span style="width:38px;height:38px;border-radius:11px;display:grid;place-items:center;flex:none;background:${good ? "rgba(61,220,151,.12)" : "rgba(255,93,122,.12)"};color:${good ? "var(--ok)" : "var(--err)"}">${icon("balance")}</span>
+          <div style="min-width:0"><h3>Front door · nginx${lb.version ? html` <span class="muted" style="font-weight:500">v${lb.version}</span>` : ""}</h3>
+            <div class="sub">${sim ? html`Dry run — config files are written but nginx is not touched${lb.lastAppliedAt ? html` · applied ${ago(lb.lastAppliedAt)}` : ""}` : !lb.installed ? "nginx is not installed on the main server" : lb.configOk === false ? "The last config test failed — websites keep the previous config" : lb.lastAppliedAt ? html`Config OK · applied ${ago(lb.lastAppliedAt)}` : "Config not applied yet since the panel started"}</div></div></div>
+          <div class="right"><button class="btn" data-apply ${lb.installed || lb.dryRun ? "" : raw("disabled")}>${icon("refresh")}Re-apply load balancer</button></div>
+        </div>
+        ${lb.lastError ? html`<div class="card-body" style="padding-bottom:0"><div class="error-box">${icon("alert")}<div class="mono small">${lb.lastError}</div></div></div>` : ""}
+        <div class="card-body"><dl class="kv">
+          <dt>Status</dt><dd><span class="status"><span class="dot ${tone}"></span>${sim ? "Simulated (dry run)" : !lb.installed ? "Not installed" : lb.live ? "Running" : "Not running"}</span></dd>
+          <dt>Config test</dt><dd>${lb.configOk === false ? html`<span class="badge err">Failed</span>` : lb.configOk ? html`<span class="badge ok">Passed</span>` : html`<span class="muted">Not run yet</span>`}</dd>
+          <dt>Certificates</dt><dd>${lb.certbot ? "certbot available — request SSL from a website's Domains & SSL tab" : html`<span class="muted">certbot not installed</span>`}</dd>
+          <dt>Config folder</dt><dd class="mono">${lb.confDir || "—"}</dd>
+        </dl>
+        <p class="hint mt-16">Re-applying rewrites every website's nginx file from the panel's records, tests it with <span class="mono">nginx -t</span> and reloads only if the test passes. Use it after editing nginx by hand or if a site's routing looks wrong.</p></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div><h3>Load-balanced websites</h3><div class="sub">${lbSites.length ? `${plural(lbSites.length, "website")} spread across several servers` : "None yet"}</div></div></div>
+        ${lbSites.length ? html`<div class="list">${lbSites.map((x) => html`<a class="list-item" href="#/sites/${x.id}">
+            <span class="li-ico">${icon("globe", "sm")}</span>
+            <div class="li-main"><div class="li-title">${x.name}</div><div class="li-sub">${(x.domains || [])[0] || "no domain"} · ${METHOD_LABEL[x.method] || x.method || ""}</div></div>
+            <div class="li-right">${(x.upstreams || []).map((u) => html`<span class="row tiny" style="gap:5px" title="${u.name}: ${u.down ? "taken out of rotation" : !u.online ? "offline" : u.healthy === false ? "unhealthy" : u.healthy ? "healthy" : "not checked yet"}"><span class="dot ${u.down || u.healthy === false ? "err" : !u.online ? "off" : u.healthy ? "ok" : "off"}"></span><span class="hide-sm">${u.name}</span></span>`)}</div></a>`)}</div>`
+          : html`<div class="card-body"><p class="muted small">Turn on load balancing when creating a website, or later from its Settings tab. You need at least two servers marked “Available for load balancing”.</p></div>`}
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div><h3>Servers</h3><div class="sub">${servers.length ? `${online} of ${servers.length} online · ${servers.filter((x) => x.lbEligible !== false).length} available for load balancing` : "Loading…"}</div></div>
+          <div class="right"><a class="btn btn-sm" href="#/servers">${icon("server")}Manage servers</a></div></div>
+        ${servers.length ? html`<div class="list">${servers.map((x) => html`<a class="list-item" href="#/servers">
+            <span class="li-ico">${icon("server", "sm")}</span>
+            <div class="li-main"><div class="li-title">${x.name}</div><div class="li-sub">${serverKind(x)}${x.host ? html` · <span class="mono">${x.host}</span>` : ""} · ${plural(x.siteCount || 0, "site")}</div></div>
+            <div class="li-right">${x.lbEligible !== false ? html`<span class="badge badge-lb hide-sm">${icon("balance")}LB pool</span>` : ""}${x.enabled === false ? html`<span class="badge warn">Disabled</span>` : ""}
+              <span class="status"><span class="dot ${x.online ? "ok" : "off"}"></span>${x.online ? "Online" : x.lastSeenAt ? `Seen ${ago(x.lastSeenAt)}` : "Offline"}</span></div></a>`)}</div>`
+          : html`<div class="card-body"><p class="muted small">Add agent servers, rotate tokens and choose which servers join load-balanced pools on the Servers page.</p></div>`}
+      </div>`);
+  };
+  await load();
+  on(box, "click", "[data-apply]", async (e, b) => {
+    setBusy(b, true);
+    try { const job = await post("/api/loadbalancer/apply"); if (job?.id) openJobLog(job.id); else toast("Load balancer re-applied", "ok"); }
+    catch (ex) { toastError(ex, "Couldn't re-apply the load balancer"); }
+    finally { setBusy(b, false); }
+  });
+  ctx.on(["lb", "server", "site"], debounce(() => load().catch(() => {}), 600));
+}
+
+/* ───────── Backups ───────── */
+
+async function backups(box, ctx) {
+  mount(box, html`<div class="note">${icon("info")}<div>Schedules and storage for automatic backups. To create, download or restore a backup, go to <a href="#/backups" style="color:var(--text);font-weight:600">Backups</a>.</div></div><div data-sched></div>`);
+  await scheduleForm($("[data-sched]", box), ctx);
+}
+
+/* ───────── GitHub ───────── */
+
+async function github(box, ctx) {
+  let s = await get("/api/settings");
+  if (!ctx.alive()) return;
+  const paint = () => {
+    mount(box, html`<form class="card" data-form novalidate>
+      <div class="card-head"><div><h3>GitHub access token</h3><div class="sub">Used to list branches and download releases from private repositories.</div></div>
+        <div class="right">${s.githubTokenSet ? html`<span class="badge ok">${icon("check")}Saved</span>` : html`<span class="badge">Not set</span>`}</div></div>
+      <div class="card-body"><div class="form-stack">
+        ${s.githubTokenSet ? html`<div class="row" style="gap:10px"><span class="li-ico" style="width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:rgba(148,166,255,.07)">${icon("key", "sm")}</span>
+          <div><div class="strong small">Panel-wide token</div><div class="muted small mono">${s.githubTokenHint || "••••"}</div></div></div>` : ""}
+        ${field(s.githubTokenSet ? "Replace token" : "Token", html`<div class="pw-wrap"><input class="input mono" type="password" name="token" placeholder="github_pat_… or ghp_…" autocomplete="off" spellcheck="false"/><button type="button" class="icon-btn" data-toggle-pw aria-label="Show token">${icon("eye")}</button></div>`,
+          html`A fine-grained token with <b>Contents: Read-only</b> on the repositories you deploy is enough. A website can also have its own token in its Settings tab, which wins over this one. The token is never shown again after saving.`)}
+        <div class="error-box" data-err hidden></div>
+      </div></div>
+      <div class="card-foot">${s.githubTokenSet ? html`<button class="btn btn-danger" type="button" data-clear>${icon("trash")}Remove token</button>` : ""}<span class="spacer"></span>
+        <button class="btn btn-primary" type="submit" data-save>${icon("check")}${s.githubTokenSet ? "Replace token" : "Save token"}</button></div>
+    </form>
+    <div class="note">${icon("info")}<div>Public repositories work without a token. Without one, GitHub limits the panel to 60 API requests an hour.</div></div>`);
+  };
+  paint();
+  on(box, "click", "[data-toggle-pw]", (e, b) => {
+    const inp = b.parentElement.querySelector("input");
+    inp.type = inp.type === "password" ? "text" : "password";
+    mount(b, html`${icon(inp.type === "password" ? "eye" : "eyeOff")}`);
+  });
+  on(box, "submit", "[data-form]", async (e, form) => {
+    e.preventDefault();
+    const err = $("[data-err]", box), btn = $("[data-save]", box);
+    const token = form.elements.token.value.trim();
+    if (!token) { showErr(err, "Paste a token first."); form.elements.token.focus(); return; }
+    showErr(err, ""); setBusy(btn, true);
+    try { s = await patch("/api/settings", { githubToken: token }); announce("fcc:settings", s, (ctx.state.settings ||= {})); toast("GitHub token saved", "ok"); paint(); }
+    catch (ex) { showErr(err, ex.message); setBusy(btn, false); }
+  });
+  on(box, "click", "[data-clear]", async (e, b) => {
+    const ok = await confirmDialog({ title: "Remove the GitHub token?", message: "Private repositories that don't have their own token stop deploying from GitHub until you add one again.", danger: true, confirmText: "Remove token" });
+    if (!ok) return;
+    setBusy(b, true);
+    try { s = await patch("/api/settings", { githubToken: "" }); announce("fcc:settings", s, (ctx.state.settings ||= {})); toast("GitHub token removed", "ok"); paint(); }
+    catch (ex) { toastError(ex, "Couldn't remove the token"); setBusy(b, false); }
+  });
+}
+
+/* ───────── Account ───────── */
+
+async function account(box, ctx) {
+  const me = await get("/api/me");
+  if (!ctx.alive()) return;
+  announce("fcc:me", me, (ctx.state.me ||= {}));
+  mount(box, html`
+    <form class="card" data-profile novalidate>
+      <div class="card-head"><span class="avatar lg" data-av>${initials(me.name || me.email)}</span><div><h3>Your profile</h3><div class="sub">${me.role === "owner" ? "Owner" : "Admin"}${me.lastLoginAt ? html` · signed in ${ago(me.lastLoginAt)}` : ""}</div></div></div>
+      <div class="card-body"><div class="form-grid">
+        ${field("Name", html`<input class="input" name="name" maxlength="80" value="${me.name || ""}" autocomplete="name"/>`)}
+        ${field("Email", html`<input class="input" type="email" name="email" value="${me.email || ""}" autocomplete="username"/>`, "You sign in with this.")}
+        <div class="error-box span-2" data-err hidden></div>
+      </div></div>
+      <div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save profile</button></div>
+    </form>
+    <form class="card" data-pw novalidate>
+      <div class="card-head"><div><h3>Password</h3><div class="sub">Changing it signs you out on every other device.</div></div></div>
+      <div class="card-body"><div class="form-stack" style="max-width:420px">
+        <input type="text" name="username" value="${me.email || ""}" autocomplete="username" hidden/>
+        ${field("Current password", html`<input class="input" type="password" name="current" autocomplete="current-password"/>`)}
+        ${field("New password", html`<input class="input" type="password" name="next" autocomplete="new-password"/>`, "At least 8 characters. A long passphrase is best.")}
+        ${field("Confirm new password", html`<input class="input" type="password" name="confirm" autocomplete="new-password"/>`)}
+        <div class="error-box" data-err hidden></div>
+      </div></div>
+      <div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("lock")}Change password</button></div>
+    </form>`);
+
+  const prof = $("[data-profile]", box);
+  prof.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("[data-err]", prof), btn = $("[data-save]", prof);
+    const body = { name: prof.elements.name.value.trim(), email: prof.elements.email.value.trim() };
+    if (!body.name || !body.email) { showErr(err, "Name and email are both required."); return; }
+    showErr(err, ""); setBusy(btn, true);
+    try {
+      const r = await patch("/api/me", body);
+      announce("fcc:me", r, (ctx.state.me ||= {}));
+      $("[data-av]", prof).textContent = initials(r.name || r.email);
+      toast("Profile saved", "ok");
+    } catch (ex) { showErr(err, ex.message); }
+    finally { setBusy(btn, false); }
+  });
+
+  const pw = $("[data-pw]", box);
+  pw.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("[data-err]", pw), btn = $("[data-save]", pw), f = pw.elements;
+    if (!f.current.value || !f.next.value) { showErr(err, "Enter your current password and a new one."); return; }
+    if (f.next.value !== f.confirm.value) { showErr(err, "The new passwords don't match."); f.confirm.focus(); return; }
+    showErr(err, ""); setBusy(btn, true);
+    try {
+      await post("/api/me/password", { current: f.current.value, next: f.next.value });
+      pw.reset();
+      toast("Password changed", "ok", { msg: "Other sessions have been signed out." });
+    } catch (ex) { showErr(err, ex.message); }
+    finally { setBusy(btn, false); }
+  });
+}

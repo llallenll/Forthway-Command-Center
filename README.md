@@ -1,395 +1,402 @@
 # Forthway Command Center
 
-A password-protected control panel for the sites you run on Linux.
+A self-hosted control panel for the websites you run, on a VPS you own.
 
-Add a site, point it at its folder, and from then on you either drop a zip on
-its card or pull a branch from GitHub. The Command Center unpacks it, installs,
-builds, swaps it into place, restarts the app, checks that the version actually
-serving traffic is the new one — and puts the old build back if it is not.
+Install it on one server and that server becomes the whole operation: the
+panel, the nginx front door every website is served through, the MySQL server
+their databases live in, and the backups of all of it. Add more machines when
+you need them — to give a site a server of its own, or to load balance one
+across several — and they join by running a single command.
 
 ```
-                    ┌────────────────────────────────┐
-   you  ───────────▶│     Command Center (web)       │  ← one password
-   zip / GitHub     │     sites · releases · logs    │
-                    └───────────┬────────────────────┘
-                                │
-          ┌─────────────────────┴─────────────────────┐
-          ▼                                           ▼
-  sites on THIS machine                     sites on other machines
-  (no agent — it just does it)              (an agent there dials out to here)
+                         ┌──────────────────────────────────────────┐
+   you ── browser ──────▶│  MAIN SERVER                             │
+                         │   Command Center panel   (fcc.service)   │
+   visitors ── 80/443 ──▶│   nginx  — front door / load balancer    │
+                         │   MySQL  — every project's databases     │
+                         │   backups — databases, servers, schedule │
+                         │   websites (pm2, or nginx for static/php)│
+                         └───────┬───────────────────────┬──────────┘
+                     proxies to  │                       │  agents dial out to
+                    site ports   ▼                       ▼  the panel (HTTPS)
+                         ┌──────────────┐        ┌──────────────┐
+                         │ Agent server │  ...   │ Agent server │
+                         │  node agent  │        │  node agent  │
+                         │  websites    │        │  websites    │
+                         └──────────────┘        └──────────────┘
 ```
 
-Most of the time every site is on the same box as the panel, so there is
-nothing to install beyond the panel itself. Agents exist for the sites that are
-somewhere else; they only ever make outbound connections, so nothing needs to
-be opened up on those machines.
+There is no npm install and no build step. Node 18+ is the only requirement —
+deliberately, because this is the tool you reach for when a build has gone
+wrong, and it must not need a build of its own.
 
-No npm dependencies anywhere. Node 18+ is the only requirement — deliberately,
-because this is the tool you reach for when a build has gone wrong, and it must
-not need a build of its own.
+There is also **no terminal and no "run a command" box**, anywhere. Every
+operation is a named action — deploy, restart, back up, restore, rotate a
+password — so what the panel can do to your servers is exactly the list of
+buttons it shows you.
 
 ---
 
 ## Install
 
+On a fresh **Ubuntu 22.04 / 24.04** or **Debian 12** VPS, as root:
+
 ```bash
-bash install.sh
+curl -fsSL https://raw.githubusercontent.com/llallenll/Forthway-Command-Center/standalone/install.sh | sudo bash
 ```
 
-That is the whole thing. It installs Node and pm2 if they are missing, puts the
-files in place, starts the panel under pm2, and prints the address to open.
-There is nothing to edit afterwards: **the first page you open asks you to
-choose a password**, and everything else is done from the dashboard.
+or, from a copy of this repository on the server, `sudo bash install.sh`.
 
-Run it again later to update in place — your password, sites and release
-history are kept.
+It installs and configures everything the main server needs:
 
-<details>
-<summary>Options</summary>
+- **Node.js 20** (from NodeSource) if Node is missing or older than 18, and
+  **pm2**, which keeps Node websites running and brings them back after a reboot.
+- **nginx**, with the stock welcome page replaced by a catch-all that drops
+  any request for a hostname no website claims. Point a stray domain at the
+  server and it gets nothing, rather than whichever site happens to load first.
+- **MySQL** (MariaDB on Debian 12, which has no MySQL package, or anywhere
+  with `FCC_DB=mariadb`). Locked to `127.0.0.1`, no remote root, no anonymous
+  users, no test database. Root keeps socket authentication, which is how the
+  panel talks to it — no database root password is stored anywhere.
+- **certbot** with the nginx plugin, for Let's Encrypt certificates.
+- The panel itself in `/opt/fcc`, its data in `/var/lib/fcc` (root only), and
+  websites under `/srv/fcc/sites`, running as the systemd service **`fcc`**.
+
+At the end it prints the address to open. **The first page asks you to create
+the first admin account** — do that straight away, because until an admin
+exists, whoever opens the page first gets to.
+
+Run the same command again to update. Code is replaced; admins, projects,
+websites, databases and backups are not touched. The installer remembers the
+options you gave it (in `/etc/fcc/installer.env`), so a plain re-run keeps
+your port, domain and database choice.
+
+### Options
+
+Environment variables. Note `sudo` drops your environment, so put them after it:
+`curl … | sudo FCC_PANEL_DOMAIN=panel.example.com FCC_EMAIL=you@example.com bash`.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `FCC_DIR` | `/opt/forthway`, or `./forthway` in a container | Where to install |
-| `FCC_PORT` | `4000` | Port, when the environment does not set one |
-| `FCC_HOST` | `0.0.0.0` | Address to bind |
-| `FCC_NAME` | `forthway` | pm2 process name |
-| `FCC_REPO` | — | `owner/repo` to fetch the source from, instead of the current folder |
-| `FCC_NO_START` | — | Install the files but start nothing |
-
-</details>
-
-### Signing in with a PIN instead of a password
-
-A file called `pin` in the data directory (`hub/data/pin` by default) turns
-the password off and the PIN on: the sign-in page asks for the code in that
-file, the setup page that asks you to choose a password never appears, and a
-password set earlier is not accepted while the file is there. The file is
-read at each sign-in, so whatever writes it can change it whenever it likes
-without restarting the panel. Remove the file and the password is back.
-
-This is how the Pterodactyl egg works: every start of the server writes a
-fresh six-character code there and prints it in the panel console, in a box,
-so being able to see that console is what signs you in. Case and spacing do
-not matter when typing it, and the login throttle (eight tries per ten
-minutes per address) keeps six characters plenty.
-
-`FCC_PIN` in the environment sets a code directly, and `FCC_PIN_FILE` points
-at a file somewhere else. Neither is needed on the egg.
-
-### In a Pterodactyl container
-
-The installer notices it is in a container (no root, `/home/container`) and
-adapts: it installs into the current directory and uses the panel's allocated
-port. Set the server's **startup command** to:
-
-```
-cd /home/container/forthway && pm2-runtime start hub/server.mjs --name forthway
-```
-
-The port comes from the panel's `SERVER_PORT` variable automatically — that is
-the first thing the panel reads, ahead of anything in `config.json`. The port
-field in Settings shows as locked in that case, with a note saying where to
-change it.
+| `FCC_PANEL_DOMAIN` | — | Serve the panel at this name through nginx, with a Let's Encrypt certificate. Recommended. |
+| `FCC_EMAIL` | — | Email for Let's Encrypt expiry notices. |
+| `FCC_PORT` | `4000` | Port the panel listens on. |
+| `FCC_HOST` | `0.0.0.0` | Address it binds. `127.0.0.1` makes it reachable only through the domain. |
+| `FCC_DB` | `mysql` | `mariadb` to use MariaDB instead. An already installed server is always kept. |
+| `FCC_MYSQL_REMOTE` | `0` | `1` lets MySQL listen on all interfaces, for websites on agent servers that use a database. Sticky until you set `0`. |
+| `FCC_FIREWALL` | `0` | `1` turns on ufw allowing SSH, 80, 443 and the panel port. If ufw is already active those ports are opened regardless. |
+| `FCC_PHP` | `0` | `1` installs php-fpm, for PHP websites. |
+| `FCC_DIR` / `FCC_DATA_DIR` / `FCC_SITES_DIR` | `/opt/fcc` · `/var/lib/fcc` · `/srv/fcc/sites` | Where code, panel data and websites go. |
+| `FCC_REPO` / `FCC_REF` | `llallenll/Forthway-Command-Center` · `standalone` | Where to fetch the code from. `FCC_GITHUB_TOKEN` for a private fork. |
+| `FCC_NO_START` | — | Install everything but do not start the panel. |
 
 ### Day to day
 
 ```bash
-pm2 status
-pm2 logs forthway
-pm2 restart forthway
+systemctl status fcc          # is it up
+journalctl -u fcc -f          # its log
+systemctl restart fcc         # restart the panel — websites keep running
 ```
 
----
+Restarting the panel never takes a website down: sites run under pm2 (or
+nginx), not inside the panel process, and the service is set to stop only the
+panel itself.
 
-## Adding a site
+Extra environment for the service goes in `/etc/fcc/fcc.env`, which the
+installer creates once and never overwrites.
 
-**+ Add site** opens a walkthrough that asks one thing at a time and works out
-the rest for itself:
-
-1. **Name** it, and say whether it runs on this machine or another one.
-2. **Folder and port** — apps live under `/home/container`, so this only asks
-   for the folder name and fills it in from the site name. (Set `appRoot` in
-   `hub/config.json`, or `FCC_APP_ROOT`, for a machine laid out differently;
-   there is still a box for a path somewhere else entirely.) If the folder is
-   not there yet it is created now, so the `.env` written two steps later has
-   somewhere to go. The port is required — it is what the health and version
-   checks after a deploy are pointed at.
-3. **Code** — pull the repository from GitHub now. It is downloaded here and
-   kept as a release, and the two steps after this one read the app's own
-   `package.json` and `.env.example` straight out of it, so they can offer real
-   answers instead of asking you to remember them. You can skip this and upload
-   a zip later.
-4. **Start** — pm2 by default, named after the site. The first start command is
-   a list of what `package.json` actually declares, each shown with the command
-   it runs; `npm start` is the default.
-5. **Environment** — a row per variable the app expects, taken from its
-   `.env.example`, prefilled from any `.env` already on disk, with room to add
-   your own. A variable left blank is not written. Saving writes the app's
-   `.env` there and then, inside a marked block that leaves the rest of the file
-   alone.
-6. **Done** — settings saved and, if you pulled a release, deployed.
-
-Health checks, the build pipeline, which files survive a deploy and the GitHub
-repo all live behind **Show advanced options** in the site's settings; the
-defaults suit a Next.js app.
-
-**On this machine** — the normal case. There is no agent, no token and nothing
-to install; the panel runs the commands itself.
-
-**On another machine** — you get a one-line installer with the site's id and
-token already in it:
+### Uninstall
 
 ```bash
-curl -fsSL "http://your-panel:4000/install/agent.sh?site=...&token=..." | sudo bash
+sudo bash /opt/fcc/install.sh --uninstall           # remove the service and code, keep data
+sudo bash /opt/fcc/install.sh --uninstall --purge   # also delete /var/lib/fcc and FCC nginx configs
 ```
 
-Run that on the other box. It installs Node and pm2 if needed, starts the agent
-under pm2 and checks in. Everything else about the site is still configured
-here, in the browser.
-
-### What you configure per site
-
-| | |
-|---|---|
-| **App directory** | The folder the app lives in. The agent keeps its staging build, rollback snapshot and file manifest in `.forthway/` inside it, and deploys never touch that. |
-| **Port** | Required. What the app listens on. It fills in the health and version checks, and is passed to the app as `PORT`. |
-| **Restart mode** | **pm2** (name the process), **systemd** (name the unit), **command** (your own stop and start), or **supervised** (the panel runs the app itself and so knows for certain when it has stopped). |
-| **Environment** | A row per variable, or a plain `KEY=value` block behind **Edit as text**. **Load from .env.example** re-reads the app's own list at any time. Written to the app's `.env` as soon as you save. |
-| **Health / version URL** | Advanced. Left blank they default to `http://127.0.0.1:PORT/api/health` and `/api/version`. |
-| **Build pipeline** | Advanced. Install, an optional prepare step, and build — each one a command, each one skippable. Defaults suit a Next.js app; blank them out for anything that does not need building. A Prisma schema is detected and generated for you. |
-| **Files** | Advanced. Which generated directories get swapped whole (`node_modules`, `.next`), and which paths a deploy must never touch (`.env`, uploads, logs). |
-
-Everything is editable at any time. For a remote site the change reaches the
-agent on its next poll, a second or two later — you never edit a file on the
-target machine.
+Neither touches website files, running sites, databases or installed
+packages. `--purge` deletes local backups, so copy anything you want first.
 
 ---
 
-## The dashboard
+## First login and admins
 
-The panel is built in the Collective OS idiom: a warm cream ground, white
-cards with a hairline border and no shadow, near-black as the action colour,
-and a dark capsule header floating over the page. Every colour and radius
-lives in one `:root` block at the top of `hub/public/index.html`.
+The setup page creates the **owner** account: name, email, password. After
+that you sign in with email and password, and can add more admins under
+**Settings → Admins**. Every admin can do everything; the owner just cannot be
+deleted, and nobody can delete themselves, so there is always a way back in.
 
-
-Each site gets a small card: whether it is up, what version is on disk, what
-version is actually serving, and anything that needs attention. Two menus sit
-on it for the things you do without thinking —
-
-- **Actions** — restart, stop, start, refresh, roll back, pull & deploy.
-- **Run** — the app's own npm scripts, read from its `package.json`, minus the
-  ones that run the app itself (`start`, `dev`). So `db:migrate`, `seed` or
-  `typecheck` are one click, and the output streams into the console.
-
-**Update available.** The panel keeps asking GitHub two questions: is there a
-newer Command Center, and is any site's repository ahead of the commit that is
-actually deployed. Either one shows up on sight — a button in the header for
-the panel itself; for a site, the whole card warms to amber with the waiting
-commit named and a one-click **Pull & deploy**, so you can see what it is
-before taking it.
-
-Loading the page asks both questions for real, because that is a person
-deciding to look. The twelve-second status poll does not: GitHub allows 60
-requests an hour to an anonymous caller, and polling it that often would spend
-the allowance in minutes and then be able to tell you nothing. Between page
-loads each site has a five-minute cooldown (twenty after a failure), a timer
-covers a panel left open, and pressing **Refresh** on a card skips the wait.
-
-**Click the card** for everything else: uploading a zip, pulling a branch,
-the release list, deploy and rollback, recent jobs and their logs, and a box
-for any command you want to run in the app directory.
+Sign-in attempts are throttled per address. Every change anyone makes — a
+deploy, a restore, a revealed database password — goes into the **Activity**
+log with who did it.
 
 ---
 
-## Deploying
+## Projects
 
-**Upload a zip** — drop it in the site's view (click its card). It reads the
-version out of `package.json` and shows you `1.4.2 → 1.5.0` before you commit.
+A project is a folder for one piece of work: its websites, its databases and
+their backups, and an activity feed of just that project. Projects have a
+name, a description and a colour, and that is all — they exist so a server
+running twenty sites for six clients stays readable.
 
-**Pull from GitHub** — give it `owner/name` and a branch or tag. The archive is
-downloaded here and kept as a release, so rolling back is a file operation
-rather than a bet on git history still looking the way it did. The target
-machines never need git or any GitHub credentials.
+A project with websites or databases still in it cannot be deleted. Remove
+those first; it is deliberate that nothing disappears as a side effect.
 
-*Private repositories*: put a personal access token in **Settings** for
-panel-wide use, or set one per site under its GitHub section. Either one is
-enough; the per-site token wins where both exist.
+---
 
-Once a repo is set, the card grows a **Pull & deploy** button — one click from
-"pushed to main" to "live".
+## Websites
 
-### What happens during a deploy
+A website is a **Node app** (run under pm2), a **static site**, or a **PHP
+site** (served by nginx and php-fpm). It has one or more domains, and it is
+deployed from a zip you upload or straight from a GitHub branch or tag.
 
-1. The archive is unpacked into a staging directory, never over the live app.
-2. `node_modules` is hardlinked across from the running build, so an install is
-   usually seconds rather than minutes. If `package.json` and the lockfile are
-   unchanged, the install is skipped entirely.
-3. Install → prepare → build, all in staging. **A failed build never reaches
-   the live app**: nothing has moved yet, so there is nothing to undo.
-4. The app stops, the current build is snapshotted, and only the files that
-   actually changed are replaced. Files the previous release installed and this
-   one drops are removed. Files a deploy never owned — `.env`, uploads — are
-   left alone.
-5. The app starts, and the panel waits for the health check.
-6. **Then it checks the version**, which is the part that matters. A stop
-   command that silently did nothing leaves the *old* process answering health
-   checks perfectly while your new code never loads. That specific failure is
-   caught and named.
-7. If either check fails, the previous build is restored and restarted.
+### Where it runs: one server, or load balanced
 
-The full output of every step streams into the console at the bottom of the
-page as it happens — the same for a site on this machine and one on an agent.
+When you create a website you choose:
 
-### The two routes worth adding
+- **Single server** — the site runs on one machine. You pick it from a list
+  of your servers, each showing its RAM and disk usage, so you can see which
+  one has room. The main server is in that list; so is every agent server.
+- **Load balanced** — the site runs on several servers at once, and nginx on
+  the main server spreads visitors across them. You choose which servers (only
+  those marked *Available for load balancing* are offered) and how traffic is
+  shared: round robin, least connections, or by visitor IP (the same visitor
+  keeps landing on the same server).
+
+Either can be changed later. Add a server to a load balanced site and the
+current release is deployed to it before it starts receiving traffic. Every
+website shows whether it is load balanced, and its overview lists each server
+it runs on with that copy's status.
+
+### How the load balancing works
+
+Every website — load balanced or not — gets its own nginx config on the main
+server: an `upstream` listing the servers and ports the site runs on, and a
+`server` block for its domains that proxies to it. A single-server site is
+simply an upstream of one. That keeps the front door uniform: visitors always
+arrive at the main server, and nginx always forwards them to *address:port*.
+
+- **Health checks.** Each copy has a health path (default `/api/health`). The
+  panel checks every copy and shows the result; nginx additionally takes a
+  server out of rotation for ten seconds after three failed requests, so a
+  copy that falls over stops getting traffic within moments, without anyone
+  touching anything.
+- **Rolling deploys.** A deploy to a load balanced site goes one server at a
+  time: deploy, wait for it to come back healthy and serving the new version,
+  then the next. At any moment the others are answering, so a release goes out
+  without downtime — and a release that fails its checks on the first server
+  stops there, rolled back, with the rest still on the old version.
+- **Each site's config is tested before nginx is reloaded.** A bad change is
+  refused and reported, never left half-applied.
+
+> **Shared state.** When a site runs on several servers, each copy has its own
+> disk and its own memory. Anything a visitor's next request might need must
+> live somewhere all copies can see: **sessions in the database** (or a signed
+> cookie), **uploads in object storage** (S3 or similar) or the database — never
+> in the app's own folder or memory. Otherwise a visitor logs in on one server
+> and is logged out on the next. Choosing *by visitor IP* hides this but does
+> not fix it: when a server drops out, its visitors move. If an app cannot work
+> that way yet, keep it on a single server.
+
+### Deploying
+
+**Upload a zip** or **pull from GitHub** — a branch or tag of `owner/name`.
+Either way the archive is kept on the main server as a *release*, so rolling
+back is a file operation rather than a bet on git history still looking the
+way it did, and agent servers never need git or GitHub credentials. Private
+repositories need a token in **Settings → GitHub**, or one set on the site.
+
+For a Node site, a deploy:
+
+1. unpacks into a staging directory, never over the live app;
+2. installs and builds there — **a failed build never reaches the live app**;
+3. stops the app, snapshots the current build, and swaps in only the files
+   that changed (your `.env` and uploads are never touched);
+4. starts it and waits for the health check;
+5. **checks the version actually serving**, which is the part that matters: a
+   restart that silently did nothing leaves the old process answering health
+   checks perfectly while the new code never loads;
+6. puts the previous build back if either check fails.
 
 `patches/api-health-route.ts` and `patches/api-version-route.ts` are drop-in
-Next.js routes. The version one is what makes the "serving now" number honest:
-it reports what the *running process* loaded, not what is sitting on disk.
-Without it the panel still works, it just cannot prove a restart took effect.
+Next.js routes for those two checks. Without the version route the panel still
+works; it just cannot prove a restart took effect.
+
+Every deploy, restart and rollback is a **job** with a live log you can watch,
+and a history you can come back to.
+
+`scripts/make-release.mjs` packages a folder into a release zip, for the times
+you want to ship exactly what is on your disk.
+
+### Environment
+
+Each site has its own environment variables, written to the app's `.env`
+inside a marked block that leaves the rest of the file alone. Linked database
+variables appear alongside them, read-only (see below).
 
 ---
 
-## The rest of the panel
+## Databases
 
-**Restart · Stop · Start** — with the command output streaming, so you can see
-what actually happened rather than guessing.
+Each project can have any number of MySQL databases. Creating one creates the
+database and a user that can reach only that database, with a generated
+password shown **once**. After that the password is stored encrypted with the
+panel's key; you can reveal it (that is logged in Activity) or rotate it.
 
-**Run a command** — a box on every card that runs a one-off command in the app
-directory and streams it back. `pm2 logs --lines 50`, `git status`, `df -h`.
+**Link a database to a website** and the site gets its connection details as
+environment variables — `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
+`DB_PASSWORD` and `DATABASE_URL` — with no copy-pasting. On the main server
+`DB_HOST` is `127.0.0.1`; on an agent server it is the main server's address.
+Rotate the password and every linked site's environment is rewritten.
 
-**Roll back** — one click for the build before this one, or pick any archive in
-the release list. The previous build is kept as a snapshot on disk, so undoing
-the last deploy is a rename rather than a rebuild.
-
-**Migrations** — `runmigNN.cjs` scripts found in the app directory can be run on
-demand, or ticked to run as part of a deploy. They are not undone by a
-rollback, and the panel says so before you commit.
-
-**Releases** — every archive is kept, up to a limit you set. Pin one to keep it
-forever. The live release and the one before it are never pruned.
+You can import a `.sql` or `.sql.gz` dump into a database from its page.
 
 ---
 
-## Reaching it from outside: Cloudflare Tunnel
+## Backups
 
-**Settings → Cloudflare.** This machine dials out to Cloudflare, so the panel
-and the sites on it are reachable by name without port-forwarding anything or
-having a public address.
+**Database backups** are a `mysqldump`, gzipped. **Server backups** are a
+`tar.gz` of the things that make a server what it is — panel data, website
+files, nginx configs, and optionally a full dump of every database — for the
+main server or any agent server (the agent uploads its archive to the panel).
 
-**Log in with Cloudflare** and the panel does the rest itself. If that machine
-has already been through a `cloudflared tunnel login` at some point, its
-certificate is read and you are connected without a browser at all. Otherwise
-it runs the login, opens the approval page for you (and shows the link, for
-when the panel is somewhere a browser is not), and takes the credentials out of
-the certificate Cloudflare writes back.
+Both can be taken by hand or on a **schedule** — hourly, daily or weekly at a
+time you choose — and each kind keeps the last *N* (the **retention**).
+**Pinned** backups are never pruned, and can carry a note: "before the 2.0
+migration".
 
-cloudflared is given a home directory of its own under `hub/data/`, so a
-certificate already sitting in yours is neither overwritten nor read by
-accident.
+Backups are stored in `/var/lib/fcc/backups` by default. Set an **S3**
+destination (AWS, or anything S3-compatible: Backblaze B2, Cloudflare R2,
+MinIO, Wasabi…) under **Settings → Backups** and they go off the machine too —
+which they should, because a backup on the server it is backing up does not
+survive losing that server.
 
-1. **The connectors.** Create one, or adopt a tunnel already in the account.
-   It is created remotely-managed, so its routes live in Zero Trust → Networks →
-   Tunnels and stay editable there as well as here. The panel takes its
-   connector token, stores it, and starts running it.
-
-   More than one can run at once — separate accounts, a connector shared with
-   another machine, or a spare kept warm while a hostname moves across. Each
-   has its own start/stop, its own log, and its own "start with the panel";
-   they share only the cloudflared binary. When there are several, the host
-   routes section asks which one a hostname belongs to.
-2. **Host routes.** Type a name, pick the domain from the list of zones your
-   account actually owns, and choose what it reaches — this panel, or any local
-   site, by name and port. These are Zero Trust public hostnames pointing at
-   `localhost`, so the app itself never has to be reachable from anywhere else.
-   The panel writes both halves: the tunnel's ingress rule *and* the proxied
-   CNAME that makes the name resolve. Removing a route removes both again.
-
-It only ever touches DNS records it created (a CNAME to `*.cfargotunnel.com`);
-anything else in the zone is left alone and reported rather than overwritten.
-
-Two other ways in, if the login does not suit:
-
-- **An API token** — Account · Cloudflare Tunnel · Edit, Zone · DNS · Edit,
-  Zone · Zone · Read — under "Use an API token instead". Identical from there on.
-- **A connector token** (Zero Trust → Networks → Tunnels → your tunnel → Install
-  connector) under "Paste a connector token instead". No account access at all;
-  hostnames are then set in the Cloudflare dashboard rather than here.
-
-**Start over → Forget everything** drops the API token, the connector token,
-which account was in use, and the certificate the login wrote, and stops the
-tunnel. It is local only: the connector and its hostnames stay in Cloudflare,
-so connecting again picks up exactly where you left off. A certificate in a
-home directory outside `hub/data/` is reported rather than deleted — something
-else on that machine may be running on it.
-
-If a route ever fails to connect on a dual-stack machine, it is worth trying
-`http://127.0.0.1:PORT` in the "Somewhere else" box: `localhost` can resolve to
-`::1` first, and an app listening only on IPv4 will refuse that.
-
-- **cloudflared installs itself.** If it is not already on PATH the panel
-  downloads the official build into `hub/data/bin/`, which matters in a
-  container with no root. There is also an explicit install button.
-- **The token never reaches the process list.** It is passed as `TUNNEL_TOKEN`
-  in the environment, not as an argument, so it does not show up in `ps`.
-  Stored in `hub/config.json`, and the UI only ever shows you a masked hint.
-- **A bad token stops rather than spins.** cloudflared exits immediately on an
-  invalid token; the panel notices, says so, and does not retry. A connection
-  that drops for any other reason is retried with a growing backoff.
-- The header shows a tunnel indicator with the live connection count, and
-  **Show log** puts cloudflared's own output in the console at the bottom of
-  the page.
+**Restore** a database backup into its database, or a server backup onto the
+main server (site files and nginx config). Panel data is not overwritten
+while the panel is running from it.
 
 ---
 
-## Starting a new site
+## Agent servers
 
-`template/` is a Next.js + TypeScript starter, ready to deploy from here. Push
-it to its own GitHub repository once; after that a new test site is: fork the
-repo, add a site in the panel, point it at the fork, **Pull & deploy**.
+Any other Linux server can join as an **agent server**. Agent servers have
+two uses, and one can do both:
 
-It already has the `/api/health` and `/api/version` routes, so the version
-confirmation and automatic rollback work from the very first deploy — and a
-`CLAUDE.md` explaining the project to Claude. See `template/README.md`.
+- **Hosting websites of their own.** A single-server site can be placed on
+  any agent server — the way to give a heavy site its own machine, or to put
+  a site somewhere the main server is not.
+- **Load balancing.** An agent server marked **Available for load balancing**
+  can be one of the servers a load balanced site runs on.
+
+**Settings → Servers → Add server**, give it a name and its address, and the
+panel gives you a one-line installer with that server's token already in it:
+
+```bash
+curl -fsSL "https://panel.example.com/install/node.sh?server=...&token=..." | sudo bash
+```
+
+Run that on the new server. It installs Node and pm2 and starts a small agent
+that dials **out** to the panel and checks in. The panel never connects to the
+agent, so nothing on the agent server needs opening up *for the panel*. The
+token is shown once; rotate it from the server's page if it leaks.
+
+Two things do need to be reachable, and are worth knowing about if you run a
+firewall:
+
+- **Main → agent, on each website's port.** nginx on the main server proxies
+  visitors to `agent-address:port`. Allow those ports **from the main
+  server's address only** — or use a private network between your servers and
+  set the agent's private address in the panel, so that traffic never touches
+  the public interface.
+- **Agent → main, on MySQL (3306)**, if a site on that agent uses a database.
+  Install the main server with `FCC_MYSQL_REMOTE=1`, and allow 3306 from each
+  agent server only (`ufw allow from <agent-ip> to any port 3306 proto tcp`).
+  The panel grants database users to the agent servers' addresses
+  specifically — never to `%` — and updates those grants when servers change.
+
+Each server shows CPU, memory, disk and load, and how many websites it hosts.
+A server that still hosts websites cannot be deleted; move them first.
+
+---
+
+## SSL
+
+With `FCC_PANEL_DOMAIN` set, the installer gives the panel its own HTTPS vhost
+and certificate. Point the name's DNS at the server *before* installing (or
+re-run the installer once it is).
+
+For websites, add the domains, point their DNS at the **main server** (it is
+the front door even for sites that run elsewhere), and press **Issue
+certificate** under the site's *Domains & SSL*. certbot does the rest, and its
+systemd timer renews certificates on its own.
+
+---
+
+## Security notes
+
+**The panel runs as root.** It has to: it writes nginx configs, manages MySQL,
+runs certbot and takes server backups. That makes the admin password the key
+to the machine. Use long, unique passwords, keep the admin list short, and
+remove admins who no longer need access.
+
+**Put it behind HTTPS.** You type a password into it and agents send their
+tokens to it. Install with `FCC_PANEL_DOMAIN` (and then, if you like,
+`FCC_HOST=127.0.0.1` so the plain-HTTP port is not exposed at all). Without a
+domain, reach it over an SSH tunnel rather than over the open internet.
+
+**There is no command runner, by design.** The previous version had a "run a
+command" box; this one does not. A stolen session can still do damage —
+it can deploy, delete and restore — but it cannot open a shell, read arbitrary
+files or install software, because no button does those things.
+
+**Secrets are encrypted at rest** with a key in `/var/lib/fcc`, which is mode
+700. That directory *is* the panel: back it up (a server backup with *panel*
+ticked does), and treat a copy of it as you would the root password.
+
+---
+
+## Development
+
+On a Mac or any machine without nginx or MySQL:
+
+```bash
+FCC_DRY_RUN=1 FCC_DATA_DIR=./.devdata node panel/server.mjs
+```
+
+and open `http://localhost:4000`. In dry-run mode every system call (nginx,
+mysql, certbot, pm2, tar) is logged instead of run, so the whole UI can be
+clicked through safely. Modules report missing programs as "not installed"
+rather than failing. `.devdata/` is git-ignored; delete it to start over.
 
 ---
 
 ## Layout
 
 ```
-Forthway Command Center/
-  install.sh          one-command installer
-  template/           Next.js starter for new sites — push it as its own repo
-  hub/                the panel — runs on ONE machine
-    server.mjs
-    lib/              sites, storage, auth, GitHub, the local runner, the tunnel
-    public/           setup · login · dashboard
-    templates/        the agent installer, with tokens filled in per site
-    config.json       created on first run; holds sites and the password hash
-    data/             release archives, job logs, state, cloudflared
-  agent/              only for sites on OTHER machines
-    agent.mjs
-  shared/
-    deployer.mjs      the deploy engine — used by the panel and the agent alike
-    zip.mjs fsx.mjs   archive and filesystem helpers
-  scripts/
-    make-release.mjs  package a folder into a release zip, if you prefer that
-  patches/            the two Next.js routes to add to each site
+install.sh                  installer for the main server (also: --uninstall)
+panel/                      the panel — runs on the MAIN server only
+  server.mjs                boot, HTTP, static files, live events
+  lib/                      auth, store, jobs, sites, cluster, load balancer,
+                            mysql, backups, github, s3 — one module each
+  public/                   the dashboard (vanilla JS, no build step)
+  templates/node-install.sh the agent server installer, filled in per server
+node/
+  node-agent.mjs            the agent that runs on agent servers
+shared/
+  deployer.mjs              the deploy engine
+  tasks.mjs                 site/server tasks — run by agents, and in-process on main
+  env.mjs fsx.mjs zip.mjs zipwrite.mjs
+scripts/
+  make-release.mjs          package a folder into a release zip
+patches/                    health and version routes to add to Next.js sites
+docs/STANDALONE.md          architecture and module contract
 ```
 
----
+On a server:
 
-## Notes on running it safely
-
-**Put it behind HTTPS if it is reachable from the internet.** You type a
-password into it and agents send their tokens in a header. Either point nginx
-at it, or set `"tls": { "key": "...", "cert": "..." }` in `hub/config.json`.
-
-**It runs commands you give it, as the user it runs as.** That is the job — but
-it means the password — or the PIN, on a Pterodactyl server — is the only thing
-between someone and a shell on that box. Use a long password; and treat the
-panel console, where the PIN is printed, as the secret it now is.
-
-**`hub/config.json` holds the site tokens and your GitHub token.** The
-installer sets it to mode 600. Back it up somewhere sensible; losing it means
-re-running the agent installers.
+```
+/opt/fcc                    code (replaced on update)
+/var/lib/fcc                panel data, job logs, releases, backups  (700)
+/srv/fcc/sites/<project>/<site>   website files
+/etc/nginx/conf.d/fcc-*.conf      one front-door config per website
+/etc/fcc/                   installer choices, extra service environment
+/etc/systemd/system/fcc.service
+```

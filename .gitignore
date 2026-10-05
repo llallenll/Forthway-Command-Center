@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Local development data (FCC_DATA_DIR=./.devdata)
+.devdata/
+
+# Installer staging / editor leftovers
+.staging.*
+*.log
+node_modules/
