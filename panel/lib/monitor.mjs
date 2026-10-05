@@ -737,11 +737,18 @@ function createMonitor(ctx) {
     };
   }
 
-  function bars24h(siteId, now = Date.now()) {
-    return minuteBuckets(siteId, now - DAY, now, HOUR).map((b) => {
+  /**
+   * 24 hourly cells aligned to clock hours (UTC — the same as local hours in
+   * whole-hour time zones): 23 closed hours plus the current hour so far, so a
+   * cell never moves between reloads and the newest one includes the latest check.
+   */
+  function strip24h(siteId, now = Date.now()) {
+    const start = floorTo(now, HOUR) - 23 * HOUR;
+    const bars24h = minuteBuckets(siteId, start, start + DAY, HOUR).map((b) => {
       const r = ratio(b);
-      return r == null ? (b.p ? -1 : null) : Math.round(r * 1000) / 1000;
+      return r == null ? (b.p ? -1 : null) : Math.round(r * 100000) / 100000; // same precision as the uptime %
     });
+    return { bars24h, bars24hStart: iso(start) };
   }
 
   // ------------------------------------------------------------- views
@@ -781,11 +788,12 @@ function createMonitor(ctx) {
 
   function summary(site) {
     const now = Date.now();
-    return { ...lightSummary(site), ...uptimeStats(site.id, now), bars24h: bars24h(site.id, now) };
+    return { ...lightSummary(site), ...uptimeStats(site.id, now), ...strip24h(site.id, now) };
   }
 
   const RANGES = {
-    "24h": { span: DAY, step: 10 * MINUTE },
+    "1h": { span: HOUR, step: MINUTE },
+    "24h": { span: DAY, step: 5 * MINUTE },
     "7d": { span: 7 * DAY, step: HOUR },
     "30d": { span: 30 * DAY, step: 6 * HOUR },
     "90d": { span: 90 * DAY, step: DAY },
@@ -794,7 +802,10 @@ function createMonitor(ctx) {
   function series(siteId, range) {
     const R = RANGES[range] || RANGES["24h"];
     const now = Date.now();
-    const list = R.step < HOUR ? minuteBuckets(siteId, now - R.span, now, R.step) : hourBuckets(siteId, now - R.span, now, R.step);
+    // Buckets on fixed step boundaries (stable across reloads); the last one is the current, still-open step.
+    const to = floorTo(now, R.step) + R.step;
+    const from = to - R.span;
+    const list = R.step < HOUR ? minuteBuckets(siteId, from, to, R.step) : hourBuckets(siteId, from, to, R.step);
     return {
       range: RANGES[range] ? range : "24h",
       step: R.step,
@@ -1121,6 +1132,7 @@ function createMonitor(ctx) {
       if (!site) continue;
       const sum = lightSummary(site);
       sum.uptime = { h24: uptimeStats(id).uptime.h24 };
+      Object.assign(sum, strip24h(id)); // rows' mini strips stay live too
       items.push(sum);
     }
     changed.clear();

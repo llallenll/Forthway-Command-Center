@@ -37,11 +37,12 @@ export function uptimeStrip(values, { labels = [], cls = "" } = {}) {
   return html`<div class="up-strip ${cls}" role="img" aria-label="Uptime history">${values.map((v, i) => html`<i class="up-b ${toneOf(v)}" title="${labels[i] || ""}${labels[i] ? " · " : ""}${v == null ? "no data" : v < 0 ? "paused" : fmtUptime(v * 100)}"></i>`)}</div>`;
 }
 
-function hourLabels(n = 24) {
-  const now = Date.now();
+/** Labels for the 24 clock-hour cells of `bars24h` (the server sends where they start; the last cell is the current hour). */
+function hourLabels(start, n = 24) {
+  const s = Date.parse(start) || Math.floor(Date.now() / 3600e3) * 3600e3 - (n - 1) * 3600e3;
   return Array.from({ length: n }, (_, i) => {
-    const t = now - (n - i) * 3600e3;
-    return `${fmtTime(t)}–${fmtTime(t + 3600e3)}`;
+    const t = s + i * 3600e3;
+    return i === n - 1 ? `${fmtTime(t)}–now` : `${fmtTime(t)}–${fmtTime(t + 3600e3)}`;
   });
 }
 
@@ -101,7 +102,7 @@ export function bindUptime(root, ctx) {
     }
     mount(el, html`<div class="up-slot" title="${title}">
       <span class="up-inline"><span class="dot ${st.tone}"></span>${m.state === "up" || m.state === "down" ? html`<b>${fmtUptime(h24)}</b><span class="dim">24h</span>` : st.text}</span>
-      ${Array.isArray(m.bars24h) && m.state !== "pending" ? uptimeStrip(m.bars24h, { cls: "mini", labels: hourLabels(24) }) : ""}</div>`);
+      ${Array.isArray(m.bars24h) && m.state !== "pending" ? uptimeStrip(m.bars24h, { cls: "mini", labels: hourLabels(m.bars24hStart, m.bars24h.length) }) : ""}</div>`);
   };
   const paintAll = () => $$("[data-uptime]", root).forEach(paintSlot);
   const load = async () => {
@@ -191,7 +192,7 @@ export async function uptimeTab(box, ctx, S) {
     <div class="card mt-20"><div class="card-head"><div><h3>Last 90 days</h3><div class="sub" data-up-90sub></div></div></div>
       <div class="card-body" data-up-90></div></div>
     <div class="card mt-20 chart-card"><div class="chart-toolbar"><div><h3 style="margin:0">Response time</h3><div class="sub muted small" data-up-csub></div></div>
-      <div class="seg" data-range>${["24h", "7d", "30d", "90d"].map((r) => html`<button class="${r === range ? "active" : ""}" data-r="${r}">${r}</button>`)}</div></div>
+      <div class="seg" data-range>${["1h", "24h", "7d", "30d", "90d"].map((r) => html`<button class="${r === range ? "active" : ""}" data-r="${r}">${r}</button>`)}</div></div>
       <div class="chart" data-up-chart style="height:240px"></div></div>
     <div class="card mt-20"><div class="card-head"><div><h3>Incidents</h3><div class="sub">Outages and every text message sent about them</div></div></div><div class="list" data-up-inc></div></div>
     <div class="grid-2 mt-20 up-forms" data-up-forms></div>`);
@@ -214,7 +215,7 @@ export async function uptimeTab(box, ctx, S) {
           <div class="sub">${D.effective.url ? html`<span class="mono">GET ${D.effective.url}</span>` : "No address to check"} · every ${intervalLabel(D.settings.intervalSec)} · expects ${D.settings.expectMin}–${D.settings.expectMax}</div></div>
         <div class="right btn-row">${m.paused ? html`<button class="btn btn-sm" data-resume>${icon("play")}Resume</button>` : html`<button class="btn btn-sm" data-check ${m.state === "pending" ? raw("disabled") : ""}>${icon("refresh")}Check now</button><button class="btn btn-sm" data-pause>${icon("stop")}Pause</button>`}</div></div>
         <div class="card-body"><dl class="kv">
-          <dt>Last 24 hours</dt><dd>${uptimeStrip(m.bars24h || [], { labels: hourLabels(24) })}</dd>
+          <dt>Last 24 hours</dt><dd>${uptimeStrip(m.bars24h || [], { labels: hourLabels(m.bars24hStart, (m.bars24h || []).length) })}</dd>
           ${servers.length ? html`<dt>${servers.length > 1 ? "Servers" : "Server"}</dt><dd class="row wrap" style="gap:12px">${servers.map((x) => html`<span class="status" title="${x.error || ""}"><span class="dot ${x.down || x.healthy === false ? "err" : !x.online ? "off" : x.healthy ? "ok" : "off"}"></span>${x.name}<span class="muted small">${x.down || x.healthy === false ? " unhealthy" : !x.online ? " offline" : x.healthy ? " healthy" : " not checked"}</span></span>`)}</dd>` : ""}
           <dt>Text alerts</dt><dd>${!D.notifications.enabled ? html`<span class="muted">Off for the whole panel — </span><a href="#/settings/notifications" style="color:var(--blue-3)">Settings → Notifications</a>` : D.settings.smsEnabled ? html`On · ${plural(D.recipients.length, "number")}${D.notifications.dryRun ? html` <span class="badge">dry run: simulated</span>` : !D.notifications.configured ? html` <span class="badge warn">Bird not set up</span>` : ""}` : html`<span class="muted">Off for this website</span>`}</dd>
         </dl></div></div>`);
