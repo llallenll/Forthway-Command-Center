@@ -87,7 +87,8 @@ export function lineChart(el, opts) {
   };
   const fmtTipX = (t) => {
     const d = new Date(t);
-    if (state.range === "7d" || state.range === "30d") return d.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+    if (state.range === "30d") return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }); // daily points
+    if (state.range === "7d") return d.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
     return fmtTime(d);
   };
 

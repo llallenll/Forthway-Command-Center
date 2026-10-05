@@ -304,6 +304,13 @@ async function boot() {
     if (j.status === "failed") toast(`${j.title || j.type} failed`, "err", { msg: j.error || "", action: { label: "View log →", fn: () => import("./components.js").then((c) => c.openJobLog(j.id)) } });
     else if (j.status === "succeeded") toast(`${j.title || j.type}`, "ok", { msg: "Finished successfully." });
   });
+  onEvent("monitor", (d) => {
+    // MONITOR: a website went down / came back (uptime checks).
+    if (!d || (d.kind !== "down" && d.kind !== "up") || Date.now() - new Date(d.at) > 15000) return;
+    const open = { label: "View uptime →", fn: () => (location.hash = `#/sites/${d.siteId}/uptime`) };
+    if (d.kind === "down") toast(`${d.siteName} is down`, "err", { msg: d.cause || "", action: open });
+    else toast(`${d.siteName} is back up`, "ok", { msg: d.durationMs ? `Down for ${Math.max(1, Math.round(d.durationMs / 60000))} min.` : "", action: open });
+  });
 
   window.addEventListener("hashchange", route);
   window.addEventListener("fcc:me", () => paintTop());

@@ -335,6 +335,24 @@ R("GET", "/api/dashboard", (p, b, q) => {
     health: { nginx: { ...db.lb, running: true }, mysql: clone(db.mysql) },
   };
 });
+R("GET", "/api/analytics", (p, b, q) => { // ANALYTICS (panel/lib/analytics.mjs)
+  const range = ["1h", "24h", "7d", "30d"].includes(q.range) ? q.range : "24h";
+  const [n, step] = { "1h": [60, MIN], "24h": [24, HOUR], "7d": [168, HOUR], "30d": [30, 24 * HOUR] }[range];
+  const scale = (q.siteId ? 0.3 : 1) * (step / HOUR);
+  const to = Math.floor(Date.now() / step) * step, from = to - (n - 1) * step;
+  const row = (t, k = 1) => { const h = new Date(t).getUTCHours(), d = 0.55 + 0.45 * Math.sin(((h - 8) / 24) * Math.PI * 2) + Math.sin(t / 7e6) * 0.1; const u = Math.round(140 * scale * k * Math.max(0.1, d)); return { t, uniques: u, pageViews: Math.round(u * 2.6), requests: Math.round(u * 31) }; };
+  const series = Array.from({ length: n }, (_, i) => row(from + i * step));
+  const previousSeries = series.map((s) => ({ ...row(s.t - n * step, 0.9), t: s.t }));
+  const sum = (a, k) => a.reduce((x, y) => x + y[k], 0);
+  const tot = (a) => ({ requests: sum(a, "requests"), pageViews: sum(a, "pageViews"), uniques: Math.round(sum(a, "uniques") * (range === "7d" || range === "30d" ? 1 : 0.7)) });
+  const totals = tot(series), previous = tot(previousSeries);
+  const change = Object.fromEntries(Object.keys(totals).map((k) => [k, Math.round(((totals[k] - previous[k]) / previous[k]) * 1000) / 10]));
+  return { range, step, from, to, now: Date.now(), siteId: q.siteId || null, since: iso(Date.now() - 40 * 864e5), visitorsSince: iso(Date.now() - 40 * 864e5), uniquesMethod: range === "7d" || range === "30d" ? "daily-sum" : "exact",
+    series, previousSeries, totals, previous, change,
+    ...(q.siteId ? { topPages: ["/", "/pricing", "/blog", "/blog/launch-week", "/docs", "/about", "/contact"].map((path, i) => ({ path, views: Math.round(totals.pageViews / (i + 2.2)) })),
+      topReferrers: ["www.google.com", "news.ycombinator.com", "github.com", "t.co", "duckduckgo.com"].map((host, i) => ({ host, visits: Math.round(totals.uniques / (i + 3)) })) }
+      : { topSites: db.sites.slice(0, 5).map((s, i) => ({ siteId: s.id, name: s.name, uniques: Math.round(totals.uniques / (i + 1.5)), pageViews: Math.round(totals.pageViews / (i + 1.5)), requests: Math.round(totals.requests / (i + 1.5)) })) }) };
+});
 R("GET", "/api/settings", () => clone(db.settings));
 R("PATCH", "/api/settings", (p, b) => {
   if ("githubToken" in b) { db.settings.githubTokenSet = !!b.githubToken; db.settings.githubTokenHint = b.githubToken ? b.githubToken.slice(0, 4) + "••••" + b.githubToken.slice(-4) : null; }

@@ -51,13 +51,13 @@ export function jobStatusBadge(status) {
   const [cls, t] = map[status] || ["", status];
   return html`<span class="badge ${cls}">${status === "running" ? html`<span class="dot run" style="width:6px;height:6px"></span>` : ""}${t}</span>`;
 }
-const JOB_ICON = { "site.deploy": "rocket", "site.restart": "restart", "site.stop": "stop", "site.start": "play", "site.rollback": "rollback", "site.ssl": "lock", "release.github": "github",
+const JOB_ICON = { "site.deploy": "rocket", "site.restart": "restart", "site.stop": "stop", "site.start": "play", "site.rollback": "rollback", "site.ssl": "lock", "release.github": "github", "site.script": "zap",
   "backup.database": "archive", "backup.server": "hardDrive", "backup.restore": "history", "database.import": "upload", "lb.apply": "balance" };
 
 export function jobItem(j) {
   const dur = j.finishedAt && j.startedAt ? fmtDuration(new Date(j.finishedAt) - new Date(j.startedAt)) : null;
   const ico = j.status === "running" || j.status === "queued" ? "refresh" : j.status === "failed" ? "x" : j.status === "cancelled" ? "stop" : JOB_ICON[j.type] || "check";
-  return html`<div class="list-item clickable" data-job="${j.id}">
+  return html`<div class="list-item clickable" data-job="${j.id}" role="button" tabindex="0">
     <span class="job-ico ${j.status}">${icon(ico, "sm")}</span>
     <div class="li-main"><div class="li-title">${j.title || j.type}</div>
       <div class="li-sub">${j.status === "failed" && j.error ? j.error : html`${ago(j.startedAt)}${dur ? html` · ${dur}` : ""}`}</div></div>
@@ -66,7 +66,7 @@ export function jobItem(j) {
 
 const ACT_VERB = {
   "site.deploy": "deployed", "site.update": "updated", "site.create": "created website", "site.delete": "deleted website", "site.restart": "restarted", "site.stop": "stopped",
-  "site.start": "started", "site.rollback": "rolled back", "site.ssl": "requested a certificate for", "site.env": "edited environment of", "release.upload": "uploaded a release to",
+  "site.start": "started", "site.rollback": "rolled back", "site.script": "ran a package.json script on", "site.ssl": "requested a certificate for", "site.env": "edited environment of", "release.upload": "uploaded a release to",
   "database.create": "created database", "database.delete": "deleted database", "database.credentials": "revealed credentials for", "database.password": "rotated the password of",
   "database.import": "imported into", "backup.create": "backed up", "backup.restore": "restored", "backup.settings": "changed", "server.add": "added server", "server.update": "updated server",
   "server.remove": "removed server", "server.token": "rotated the token of", "lb.apply": "re-applied", "project.create": "created project", "project.update": "updated project",
@@ -106,7 +106,13 @@ export function activityItem(a, { compact = false } = {}) {
 /* ───────── job log viewer (SSE streamed, read-only) ───────── */
 
 export function bindJobClicks(root) {
-  return on(root, "click", "[data-job]", (e, el) => openJobLog(el.dataset.job));
+  const offClick = on(root, "click", "[data-job]", (e, el) => openJobLog(el.dataset.job));
+  // job rows are focusable divs (role=button): Enter / Space open the log like a click
+  const offKey = on(root, "keydown", "div[data-job]", (e, el) => {
+    if (e.target !== el || (e.key !== "Enter" && e.key !== " ")) return;
+    e.preventDefault(); openJobLog(el.dataset.job);
+  });
+  return () => { offClick(); offKey(); };
 }
 
 function logLineHTML(l) {
@@ -201,9 +207,10 @@ export function jobStarted(job, title) {
 
 /* ───────── usage bars + server picker ───────── */
 
-export function ubar(label, used, total) {
-  const p = pct(used, total);
-  return html`<div class="ubar"><span class="u-l">${label}</span><div class="u-track"><div class="u-fill ${total ? toneFor(p) : ""}" style="width:${p.toFixed(1)}%"></div></div><span class="u-t">${total ? fmtUsage(used, total) : "—"}</span></div>`;
+/** Label · thin bar · value. Inside .ubars the rows share one grid so bars and values line up. `text` overrides the value (e.g. "42%"). */
+export function ubar(label, used, total, text) {
+  const p = pct(used, total), has = total && used != null;
+  return html`<div class="ubar" title="${label}: ${has ? (text ?? fmtUsage(used, total)) + (text ? "" : ` (${Math.round(p)}%)`) : "no data"}"><span class="u-l">${label}</span><div class="u-track"><div class="u-fill ${has ? toneFor(p) : ""}" style="width:${has ? p.toFixed(1) : 0}%"></div></div><span class="u-t">${has ? (text ?? fmtUsage(used, total)) : "—"}</span></div>`;
 }
 
 /**
@@ -232,7 +239,7 @@ export function serverPicker(container, { servers, mode = "single", selected = [
           ${s.online ? "" : html`<span class="badge warn" style="height:20px;font-size:11px">offline</span>`}
           <span class="sp-host">${s.host || ""}</span></div>
         <div class="sp-sub">${icon("globe", "xs")}${plural(s.siteCount || 0, "site")}${m.cpu != null ? html` · CPU ${Math.round(m.cpu)}%` : ""}</div>
-        <div class="sp-bars">${ubar("RAM", m.mem, m.memTotal || s.info?.memTotal)}${ubar("Disk", m.disk, m.diskTotal || s.info?.diskTotal)}</div>
+        <div class="sp-bars ubars">${ubar("RAM", m.mem, m.memTotal || s.info?.memTotal)}${ubar("Disk", m.disk, m.diskTotal || s.info?.diskTotal)}</div>
       </label>`;
     })}</div>
     ${mode === "multi" && sel.size < 2 ? html`<div class="note mt-12">${icon("info")}<div>Pick at least <b>2 servers</b> — traffic is spread across every server you select.</div></div>` : ""}
@@ -534,7 +541,7 @@ export function backupsTable(items, { serversById = {}, dbsById = {}, kind } = {
           <div class="t-sub mono ellipsis" style="max-width:340px">${b.filename || String(b.file || "").split("/").pop()}${inc.length ? html` · <span style="font-family:var(--font)">${inc.join(", ")}</span>` : ""}</div>${b.note ? html`<div class="t-sub">“${b.note}”</div>` : ""}</div></div></td>
         <td>${b.status === "ok" && b.available === false ? html`<span class="badge warn" title="The archive is no longer on disk">${icon("alert")}File missing</span>` : b.status === "ok" ? html`<span class="badge ok">${icon("check")}OK</span>` : b.status === "running" ? html`<span class="badge blue"><span class="dot run" style="width:6px;height:6px"></span>Running</span>` : html`<span class="badge err" title="${b.error || ""}">${icon("alert")}Failed</span>`}</td>
         <td class="num">${b.status === "ok" ? fmtBytes(b.size) : html`<span class="dim">—</span>`}</td>
-        <td class="hide-sm"><span class="muted small">${b.trigger === "schedule" ? "Scheduled" : b.trigger === "safety" ? "Safety copy" : "Manual"}</span>${b.remote?.type === "s3" && !b.remote.error ? html`<div class="t-sub row" style="gap:5px">${icon("cloud", "xs")}Off-site</div>` : b.remote?.error ? html`<div class="t-sub" style="color:#ffc46b" title="${b.remote.error}">Upload failed</div>` : ""}</td>
+        <td class="hide-sm"><span class="muted small">${b.trigger === "schedule" ? "Scheduled" : b.trigger === "safety" ? "Safety copy" : "Manual"}</span>${b.remote?.type && !b.remote.error && b.remote.key ? html`<div class="t-sub row" style="gap:5px;white-space:nowrap" title="${b.remote.location || ""}${b.remote.uploadedAt ? ` · uploaded ${fmtDate(b.remote.uploadedAt)}` : ""}${b.remote.dryRun ? " (dry run)" : ""}">${icon(b.remote.type === "smb" ? "folder" : "cloud", "xs")}${b.remote.type === "smb" ? "SMB copy" : "Off-site"}</div>` : b.remote?.error ? html`<div class="t-sub" style="color:#ffc46b" title="${b.remote.error}">Upload failed</div>` : ""}</td>
         <td class="hide-sm"><div class="small">${fmtDate(b.createdAt)}</div><div class="t-sub">${ago(b.createdAt)}</div></td>
         <td class="actions"><div class="btn-row">
           <button class="icon-btn sm hide-sm" data-bk-dl="${b.id}" title="Download" ${b.status !== "ok" || b.available === false ? raw("disabled") : ""}>${icon("download")}</button>
@@ -569,12 +576,13 @@ export function bindBackupActions(root, getItems, { dbsById = () => ({}), server
     const b = byId(el.dataset.bkMenu); if (!b) return;
     openMenu(el, [
       { label: "Download", icon: "download", disabled: b.status !== "ok", onClick: () => download(dlUrl(b)) },
+      ...(b.status === "ok" && b.available === false && b.remote?.fetchable ? [{ label: "Fetch from SMB share", icon: "download", onClick: async () => { try { jobStarted(await post(`/api/backups/${b.id}/fetch`), "Fetching from the SMB share"); } catch (e) { toastError(e, "Couldn't fetch"); } } }] : []),
       { label: "Restore…", icon: "history", disabled: b.status !== "ok" || (b.kind === "server" && b.serverId !== "main"), onClick: () => restore(b) },
       { label: b.pinned ? "Unpin" : "Pin (keep forever)", icon: "pin", onClick: async () => { try { await patch(`/api/backups/${b.id}`, { pinned: !b.pinned }); toast(b.pinned ? "Unpinned" : "Pinned — retention will keep it", "ok"); refresh?.(); } catch (e) { toastError(e); } } },
       { label: "Edit note", icon: "edit", onClick: () => editNote(b) },
       { sep: true },
       { label: "Delete", icon: "trash", danger: true, onClick: async () => {
-        if (!(await confirmDialog({ title: "Delete this backup?", message: `${b.filename || b.file} is removed permanently${b.remote?.type === "s3" ? ", including its off-site copy" : ""}.`, danger: true, confirmText: "Delete backup" }))) return;
+        if (!(await confirmDialog({ title: "Delete this backup?", message: `${b.filename || b.file} is removed permanently${b.remote?.key && !b.remote.error ? `, including its ${b.remote.type === "smb" ? "copy on the SMB share" : "off-site copy"}` : ""}.`, danger: true, confirmText: "Delete backup" }))) return;
         try { await del(`/api/backups/${b.id}`); toast("Backup deleted", "ok"); refresh?.(); } catch (e) { toastError(e); }
       } },
     ]);

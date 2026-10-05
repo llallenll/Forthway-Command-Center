@@ -32,13 +32,18 @@ import path from "node:path";
 import { httpError } from "./http.mjs";
 import * as sys from "./sys.mjs";
 import { applyNginxFile, reloadNginx, nginxIsLive } from "../../shared/tasks.mjs";
+import { cloudflareRanges, refreshCloudflareRanges, renderRealIpConf, renderRealIpDisabled, REFRESH_MS as CF_REFRESH_MS } from "./cfips.mjs";
 
 const HEALTH_INTERVAL_MS = 30_000;
 const HEALTH_TIMEOUT_MS = 5_000;
 const FAILS_TO_DOWN = 2;
 const OKS_TO_UP = 2;
 const COMMON_FILE = "fcc-00-common.conf";
-const LOG_FORMAT = "fcc_main";
+const REALIP_FILE = "fcc-00-realip.conf"; // real client IP behind Cloudflare (panel/lib/cfips.mjs)
+// fcc_v2 starts like fcc_main (CLUSTER's request counter reads both) and adds what
+// panel/lib/analytics.mjs needs. fcc_main stays defined for files not yet regenerated.
+const LOG_FORMAT = "fcc_v2";
+const LEGACY_LOG_FORMAT = "fcc_main";
 const UPGRADE_MAP = "$fcc_connection_upgrade";
 const LE_LIVE = "/etc/letsencrypt/live";
 
@@ -64,6 +69,8 @@ function createLb(ctx) {
   const timers = [];
   let chain = Promise.resolve();
   let nginxVersion = null;
+  let nginxRealIpModule = null; // from `nginx -V` (null = unknown / not live)
+  let realIpError = null; // set when nginx rejected fcc-00-realip.conf — it then stays disabled until restart
   const state = { lastAppliedAt: null, lastError: null, configOk: null };
 
   const serial = (fn) => {
@@ -187,7 +194,8 @@ function createLb(ctx) {
   function renderCommon() {
     return [
       "# Managed by Forthway Command Center — shared by every fcc-<siteId>.conf. Do not edit.",
-      `log_format ${LOG_FORMAT} '$msec $status $request_time "$upstream_addr" "$host" "$request" $body_bytes_sent "$http_user_agent"';`,
+      `log_format ${LEGACY_LOG_FORMAT} '$msec $status $request_time "$upstream_addr" "$host" "$request" $body_bytes_sent "$http_user_agent"';`,
+      `log_format ${LOG_FORMAT}${logEscapeJson() ? " escape=json" : ""} '$msec $status $request_time "$upstream_addr" "$host" "$request_method" "$request_uri" $body_bytes_sent "$http_user_agent" "$remote_addr" "$sent_http_content_type" "$http_referer" "$http_sec_fetch_dest" "$http_sec_purpose$http_purpose" fcc2';`,
       `map $http_upgrade ${UPGRADE_MAP} {`,
       "    default upgrade;",
       "    ''      '';",
@@ -195,6 +203,44 @@ function createLb(ctx) {
       "",
     ].join("\n");
   }
+
+  // log_format escape= needs nginx ≥ 1.11.8 (unknown version → assume a current one).
+  function logEscapeJson() {
+    if (!nginxVersion) return true;
+    const v = nginxVersion.split(".").map(Number);
+    return v[0] > 1 || (v[0] === 1 && (v[1] > 11 || (v[1] === 11 && v[2] >= 8)));
+  }
+
+  /** Why fcc-00-realip.conf must stay a comment, or null when it can be live. */
+  function realIpBlocker() {
+    if (realIpError) return `nginx rejected it (${realIpError})`;
+    if (!nginxIsLive()) return null; // dev preview: show the real thing
+    if (nginxRealIpModule === false) return "this nginx was built without ngx_http_realip_module";
+    // real_ip_header twice in the http block fails `nginx -t`: leave an existing setup alone.
+    const files = ["/etc/nginx/nginx.conf"];
+    for (const d of ["/etc/nginx/conf.d", "/etc/nginx/sites-enabled"]) {
+      try {
+        for (const f of fs.readdirSync(d)) if (f !== REALIP_FILE) files.push(path.join(d, f));
+      } catch {
+        /* no such dir */
+      }
+    }
+    for (const f of files) {
+      try {
+        if (/^\s*real_ip_header\s/m.test(fs.readFileSync(f, "utf8"))) return `real_ip_header is already set in ${f}`;
+      } catch {
+        /* unreadable — ignore */
+      }
+    }
+    return null;
+  }
+
+  function renderRealIp() {
+    const why = realIpBlocker();
+    return why ? renderRealIpDisabled(why) : renderRealIpConf(cloudflareRanges(ctx.dataDir));
+  }
+  const realIpFile = () => path.join(confDir(), REALIP_FILE);
+  const realIpFailed = (err) => String(err?.message || "").includes(REALIP_FILE);
 
   function proxyLocation(site, up) {
     return [
@@ -344,7 +390,16 @@ function createLb(ctx) {
   }
 
   async function ensureCommon(log) {
-    return applyNginxFile(path.join(confDir(), COMMON_FILE), renderCommon(), { log });
+    const r = await applyNginxFile(path.join(confDir(), COMMON_FILE), renderCommon(), { log });
+    try {
+      await applyNginxFile(realIpFile(), renderRealIp(), { log });
+    } catch (err) {
+      // applyNginxFile already put the previous file back; keep real_ip off rather than block site changes.
+      realIpError = String(err.message).split("\n").filter((l) => l.includes(REALIP_FILE))[0]?.trim().slice(0, 300) || "nginx -t failed";
+      console.warn(`[lb] ${REALIP_FILE} rejected by nginx — real client IP stays off: ${realIpError}`);
+      await applyNginxFile(realIpFile(), renderRealIp(), { log }).catch(() => {});
+    }
+    return r;
   }
 
   function syncSite(site, { log = () => {} } = {}) {
@@ -383,9 +438,26 @@ function createLb(ctx) {
   /** Regenerate every site file (one test + one reload); drop files of deleted sites. */
   function applyAll({ log = () => {} } = {}) {
     return serial(async () => {
+      try {
+        return await applyAllOnce(log);
+      } catch (err) {
+        if (!realIpFailed(err) || realIpError) throw err;
+        // Everything was rolled back. Retry once with fcc-00-realip.conf as a comment.
+        realIpError = String(err.message).split("\n").filter((l) => l.includes(REALIP_FILE))[0]?.trim().slice(0, 300) || "nginx -t failed";
+        log(`nginx rejected ${REALIP_FILE} — retrying with the real client IP setting turned off.`);
+        return applyAllOnce(log);
+      }
+    });
+  }
+
+  async function applyAllOnce(log) {
+    {
       const dir = confDir();
       const sites = allSites();
-      const want = new Map([[path.join(dir, COMMON_FILE), renderCommon()]]);
+      const want = new Map([
+        [path.join(dir, COMMON_FILE), renderCommon()],
+        [path.join(dir, REALIP_FILE), renderRealIp()],
+      ]);
       for (const s of sites) want.set(siteFile(s), render(s));
       const ownedRe = /^fcc-[A-Za-z0-9_-]+\.conf$/;
       for (const f of fs.readdirSync(dir)) {
@@ -434,7 +506,7 @@ function createLb(ctx) {
         fail(err);
         throw err;
       }
-    });
+    }
   }
 
   function status() {
@@ -449,6 +521,11 @@ function createLb(ctx) {
       dryRun: sys.DRY_RUN,
       confDir: confDir(),
       certbot: !!sys.which("certbot"),
+      realIp: (() => {
+        const cf = cloudflareRanges(ctx.dataDir);
+        const blocked = realIpBlocker();
+        return { enabled: !blocked, reason: blocked, header: "CF-Connecting-IP", ranges: cf.source, fetchedAt: cf.fetchedAt, file: path.join(confDir(), REALIP_FILE) };
+      })(),
     };
   }
 
@@ -632,9 +709,27 @@ function createLb(ctx) {
 
   async function _start() {
     if (sys.which("nginx") && !sys.DRY_RUN) {
-      const r = await sys.run("nginx", ["-v"], { allowFail: true, timeoutMs: 10_000 }).catch(() => null);
-      nginxVersion = /nginx\/([\d.]+)/.exec(`${r?.stderr || ""}${r?.stdout || ""}`)?.[1] || null;
+      const r = await sys.run("nginx", ["-V"], { allowFail: true, timeoutMs: 10_000 }).catch(() => null);
+      const out = `${r?.stderr || ""}${r?.stdout || ""}`;
+      nginxVersion = /nginx\/([\d.]+)/.exec(out)?.[1] || null;
+      nginxRealIpModule = /configure arguments:/.test(out) ? /--with-http_realip_module\b/.test(out) : null;
     }
+    // Cloudflare's IP ranges for real_ip: refreshed daily (never fetched in dry-run unless FCC_CF_IPS_FETCH=1).
+    const refreshCf = async () => {
+      if (sys.DRY_RUN && process.env.FCC_CF_IPS_FETCH !== "1") return;
+      const r = await refreshCloudflareRanges(ctx.dataDir);
+      if (r.error) console.warn(`[lb] Cloudflare IP ranges not refreshed (${r.error}); using the ${r.ranges.source === "cloudflare" ? "cached" : "built-in"} list.`);
+      if (r.changed) {
+        console.log("[lb] Cloudflare IP ranges changed — updating fcc-00-realip.conf");
+        await applyAll().catch((err) => console.warn("[lb] apply after Cloudflare IP update failed:", err.message));
+      }
+    };
+    const cfFirst = setTimeout(() => refreshCf().catch(() => {}), 20_000);
+    cfFirst.unref?.();
+    timers.push(cfFirst);
+    const cfEvery = setInterval(() => refreshCf().catch(() => {}), Math.min(CF_REFRESH_MS, 6 * 3_600_000));
+    cfEvery.unref?.();
+    timers.push(cfEvery);
     ctx.cluster?.on?.("servers-changed", (e) => {
       if (e?.reason === "hello") return; // an agent reconnecting changes nothing in nginx
       scheduleApplyAll();

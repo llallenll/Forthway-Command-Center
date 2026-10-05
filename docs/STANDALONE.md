@@ -172,6 +172,8 @@ Task types handled by `shared/tasks.mjs` (payload → result):
 | `site.env` | `{ spec, env }` | writes app `.env` block |
 | `site.remove` | `{ spec, deleteFiles }` | |
 | `site.logs` | `{ spec, lines }` | `{ text }` (read-only app logs) |
+| `site.scripts` | `{ spec }` | `{ scripts: { name: command } \| null, packageName, version, hasNodeModules, appDir, hostname, error? }` (deployed package.json on that server) |
+| `site.script` | `{ spec, script }` | `{ script, code: 0, durationMs }`; `npm run <script>` in appDir, only if the deployed package.json defines it; non-zero exit = failure with the output tail |
 | `server.metrics` | `{}` | `{ cpu, mem, memTotal, disk, diskTotal, load, uptime, hostname, os }` |
 | `server.backup` | `{ include, upload: { url, token } }` | `{ file, size, sha256 }` (worker uploads archive to panel) |
 
@@ -254,7 +256,7 @@ from 3001 upward, unique across all sites; backups in `dataDir/backups/`.
 
 `config.json` (dataDir): `{ panelName, panelUrl, port, host, sessionSecret, secretKey, github: { token },
 backups: { database: { enabled, every: "daily"|"hourly"|"weekly", at: "03:00", keep: 14 },
-server: { enabled, every, at, keep, include }, destination: { type: "local"|"s3", ... } },
+server: { enabled, every, at, keep, include }, destination: { type: "local"|"s3"|"smb", ..., smb?: {...} } },
 mysql: { socket, rootUser: "root", rootPasswordEnc?, host: "127.0.0.1", port: 3306 }, tls? }`.
 
 ---
@@ -304,6 +306,8 @@ POST   /api/sites/:id/deploy        { releaseId? }        → job (fan-out to ev
 POST   /api/sites/:id/restart|stop|start|rollback          → job
 GET    /api/sites/:id/status                     { [serverId]: { running, healthy, version, checkedAt } }  (refreshes)
 GET    /api/sites/:id/logs?serverId&lines        { text }
+GET    /api/sites/:id/scripts?serverId           { scripts: [{ name, command, kind, risky, runnable }], source: "deployed"|"release"|null, serverId, servers, note }
+POST   /api/sites/:id/scripts/run { script, serverId? | allServers? }  → job (type site.script, locked per site)
 GET    /api/sites/:id/env         PUT /api/sites/:id/env { env }   (linked DB vars shown read-only)
 GET    /api/sites/:id/releases
 POST   /api/sites/:id/releases/upload?filename=  raw zip body (≤ 500 MB) → release
@@ -569,6 +573,36 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     never the bundled DB dump. Database restore: checksum check → safety backup → drop/recreate schema (grants survive) → load.
   - Agent server backups: `cluster.runTask(id, "server.backup", { include: { panel: false, sites, nginx }, appDirs, file })`,
     then the archive CLUSTER stored at `result.file` is moved to `backups/server/<id>/` and its sha256 checked.
+  - **SMB destination** (`panel/lib/smb.mjs`, DATA): `destination.type: "smb"` with `config.backups.destination.smb =
+    { server, share, path (optional subfolder), username, passwordEnc, domain (optional), minProtocol: "SMB2"|"SMB3"|"NT1"
+    (default SMB2 → `client min protocol=SMB2_02`; max is always SMB3), port (default 445) }`. S3 fields are kept alongside, so
+    switching types loses nothing. PUT `/api/backups/settings` takes `destination.smb.password` (write-only, encrypted with
+    `ctx.secrets`) or `destination.smb.clearPassword: true`; GET returns `destination.smb` with `passwordSet` (never the
+    password) plus `smbclient: { installed, canInstall, dryRun }`. Server = host name or IPv4 (no IPv6 yet); user name without
+    `\` (domain goes in its own field); use `guest` + empty password for guest shares.
+  - Uses the `smbclient` CLI — no mounts. One short session per operation: `smbclient //server/share -A <dataDir/tmp/smb-auth-*>
+    -p <port> -m SMB3 --option="client min protocol=…" -t 60 -c "<cmd>"`. The auth file (`username/password/domain`, mode 0600,
+    created `wx`) is removed in `finally` (and swept at boot); the password is never in argv/env/logs, and smbclient output is
+    scrubbed of it. Names are validated (no `; " * ? : < > | \`, control characters, `..`, leading/trailing space) and quoted;
+    remote paths are joined with `\`. Upload = `mkdir` per path level (collisions ignored) then `put` (a partial file is
+    deleted on failure; session timeout 10 min + 1 s/MB); deleting a backup `del`s its SMB copy when the destination still
+    points at the same server+share.
+  - Backup record `remote: { type: "smb", key: "<subfolder>/db/<slug>/<file>", server, share, uploadedAt, dryRun? } |
+    { type: "smb", error }`. Public view `remote` gains `location` (`//server/share/key` or `s3://bucket/key`), `dryRun`,
+    `fetchable` (SMB copy on the current destination). `available` now resolves `file` against the backups folder (it used to
+    be tested against cwd and was always false).
+  - Missing local file + SMB copy: restore jobs fetch it first (`get` → `.part` → sha256 check → rename); new
+    `POST /api/backups/:id/fetch` → job (`backup.fetch`) to pull it back for download (download returns 410 with a hint
+    until then). S3 has no fetch-back yet.
+  - New routes: `POST /api/backups/destination/test { type: "smb", smb: {…} }` (mkdir subfolder → put → ls → del a tiny file;
+    400 `{ error, log, notInstalled }`); `GET /api/backups/destination/remote?path=` → `{ path, location, items: [{ name, dir,
+    size, modifiedAt }] }` (browses the saved SMB destination); `POST /api/backups/destination/smb/install` → job
+    (`apt-get install smbclient`, retried after `apt-get update`; 400 when there is no apt-get). Audit: `backup.fetch`,
+    `backup.smbclient.install`.
+  - Install: `FCC_SMB=1 install.sh` apt-installs smbclient (remembered in installer.env). Without smbclient, uploads fail with
+    "smbclient is not installed … `apt install smbclient`" and Settings → Backups shows an Install smbclient button.
+  - `FCC_DRY_RUN=1`: smbclient commands are logged (with the auth-file path, never the password), uploads/deletes/fetches
+    succeed; fetched files are placeholders and skip the checksum.
 - **UPDATES — panel self-update (`panel/lib/updates.mjs`, port of v2 hub/lib/updates.mjs).**
   - Channel: `version.json` in the install dir (`repo`, `ref`, `commit`, written by install.sh) → `config.updates.{repo,ref}` →
     `llallenll/Forthway-Command-Center@standalone`. Installed commit: version.json `commit`, else `.git` HEAD (dev checkout).
@@ -730,3 +764,131 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     `dataDir/cloudflare-fake.json` — no network.
   - CLUSTER, please: `lb.issueCertificate()` requests every `site.domains` entry; consider skipping tunnel hostnames
     (`ctx.cloudflare?.isTunnelHostname(d)`) — they don't need a certificate (validation would still go through the tunnel).
+- **SITES — package.json scripts (named actions, still no terminal).** "Run `db:push`" and friends:
+  - **Tasks** (shared/tasks.mjs, both main and agents): `site.scripts { spec }` reads `<appDir>/package.json` on that
+    server; `site.script { spec, script }` runs `npm run <script>` — spawned without a shell, the name passed as its own
+    argument after a strict check (`/^[A-Za-z0-9_][A-Za-z0-9:._+-]{0,99}$/`, no `..`), and refused unless it is a key of
+    the deployed package.json's `scripts`. cwd = appDir; env = the app's own (process env minus `npm_*`, site env + linked
+    DB vars, `PORT`, `NODE_ENV=production` unless the site sets it); the managed `.env` block is refreshed first (prisma &
+    co. read it); npm puts `node_modules/.bin` on PATH. Output streams to the job log. Killed (whole process group) after
+    15 min (`SCRIPT_TIMEOUT_MS`; cluster timeout 17 min) or on cancel. Holds the per-site task lock on that server.
+    `FCC_DRY_RUN=1`: logs what would run. Agents pick the new task up via the existing stale-files self-update.
+  - **Routes**: `GET /api/sites/:id/scripts?serverId` — deployed package.json via `site.scripts` on that server (default:
+    first target), falling back to the release record's `scripts` when the server is offline/old (`source: "release"`,
+    `note` says why). Each script gets `kind`: `"task"` (default list), `"hook"` (npm lifecycle + pre/post hooks of other
+    scripts; under "Show all", runnable) or `"app"` (`start`, `dev`, `serve`, `preview`, `watch` and their pre/post —
+    shown, never run: they'd fight pm2 for the port), and `risky` (name/command matches push, migrate, reset, drop, seed,
+    truncate, wipe, purge, destroy, fresh, rollback, `--force-reset`, `--accept-data-loss`, `--force` → the UI asks with
+    a danger confirm). `POST /api/sites/:id/scripts/run { script, serverId? }` → job `site.script` titled
+    "npm run db:push on VPS 200"; 409 while another site job runs (deploy, restart…), 409 if not deployed / server offline,
+    400 for invalid names, app scripts, or names the deployed release's package.json lacks. Load-balanced sites run on
+    ONE server (picked, default first target) — DB changes must run once; `allServers: true` runs on every target one at
+    a time (stops at the first failure). Audit action `site.script` `{ script, servers }`.
+  - **After-deploy scripts (opt-in)**: website setting `settings.afterDeployScripts: string[]` (≤ 5 names, validated; app
+    scripts refused; default `[]`). On `POST /api/sites/:id/deploy` and GitHub pull-and-deploy (not on rollbacks), they run
+    once, on the first target only, right after it serves the new release and before any other server is deployed. A
+    failure fails the deploy there (other servers keep the old release; the first server keeps the new one).
+  - **UI**: website tab **Scripts** (`#/sites/:id/scripts`, code in `views/site-scripts.js`; site.js only adds the tab,
+    a "Run a script…" item in the header ⋯ menu and the "After deploy, run" field in Settings → Build & run): list with
+    command text, Run buttons, server picker + "run on every server" checkbox for LB sites, confirm (danger for risky),
+    output in the standard job log modal, "Recent script runs" (`/api/jobs?siteId&type=site.script`). components.js:
+    `site.script` job icon + activity verb. (views/sites.js has no row menu, so nothing was added there.)
+- **MONITOR — uptime monitoring + SMS alerts via Bird (`panel/lib/monitor.mjs`, module `monitor`, new).**
+  - **Checks** from the main server (default every 60 s, timeout 10 s; `node:http(s)`, no redirects followed, response time = time to
+    headers). Target: per-site custom `url` → first domain (`https` when `ssl.status === "active"` or the domain is a Cloudflare tunnel
+    hostname) → no domain: first upstream `address:port` from `ctx.lb.upstreams(site)` (main = 127.0.0.1). Path: per-site `path` →
+    `site.healthPath` → `/`. Pass = status inside `expectMin..expectMax` (default 200–399); network error / timeout / TLS error / other
+    status = fail. DOWN after `failThreshold` (3) fails in a row, UP after `recoverThreshold` (2) good checks. Never-deployed sites are
+    `pending` (not checked) unless they have a custom URL. LB per-server health is folded in: an up site with an unhealthy/`down`
+    upstream is `degraded` (`unhealthyServers`). Real requests also under DRY_RUN (unresolvable dev domains simply fail).
+  - **Storage** (db.json stays small): `dataDir/monitor/state.json` (runtime per site, SMS rate-limit map, heartbeat `savedAt` every 15 s,
+    `gaps`), `dataDir/monitor/sites/<siteId>/<UTC-day>.json` = `{ v, day, s: 1440 chars, r: [1440 ms] }` per-minute buckets
+    (`.` no data · `u` up · `f` failed check before DOWN · `d` down · `p` paused; worst result in a minute wins; when DOWN is confirmed
+    the streak's `f` minutes become `d`), 90 days kept. Collections: `monitors` (`{ id: siteId, …settings }`), `incidents`
+    (`{ id, siteId, projectId, siteName, domain, target, startedAt (first failed check), confirmedAt, endedAt, durationMs, endedBy:
+    "recovered"|"paused", cause, lastCause, lastStatus, servers, failedChecks, notify: { [phone]: { lastAt, ok, name } }, alerts: [{ at, kind:
+    "down"|"reminder"|"up", to, name, ok, simulated, skipped, error, messageId, api, text }], gaps, lastAlertAt }`; ≤ 300 per site, closed ones
+    pruned after 90 days). Uptime % = (u+f)/(u+f+d) over minutes with data (paused and no-data minutes excluded); 24 h from minute buckets,
+    7/30/90 d from cached hourly aggregates. Panel offline (heartbeat older than 90 s at boot) → `{ from, to, reason: "panel offline" }` gap on
+    the monitor and on every open incident; minutes in it stay "no data". State and open incidents (incl. `notify.lastAt`) survive restarts.
+    Deleting a website (SSE `site` with `deleted`) drops its files, settings and incidents.
+  - **SMS** (`config.json` → `notifications: { enabled, provider: "bird", bird: { accessKeyEnc, workspaceId, channelId, from }, defaults:
+    [{ name, phone }], repeatMinutes: 60, notifyRecovery: true }`; key encrypted with `ctx.secrets`, never returned or logged). Bird API is
+    picked from the key: `bk_<region>_…` → platform API `POST https://<region>.platform.bird.com/v1/sms/messages`, `Authorization: Bearer`,
+    `{ to, from, text, category: "transactional" }` (needs a sender); any other key → Channels API `POST https://api.bird.com/workspaces/
+    <workspaceId>/channels/<channelId>/messages`, `Authorization: AccessKey <key>`, `{ receiver: { contacts: [{ identifierValue }] }, body:
+    { type: "text", text: { text } } }`. Recipients = site `recipients` + `defaults` (if `includeDefaults`, default on), deduplicated by E.164
+    number. On DOWN: one text each; while down: again every `repeatMinutes` (site override → panel default 60); on recovery: one "back up after
+    X" text to everyone who was texted successfully (`notifyRecovery`). Never more than one non-recovery text per number per site per 10 min
+    (`FCC_MONITOR_SMS_MIN_GAP_SEC` overrides, for testing); a first text blocked by that limit is logged as `skipped` and sent when allowed;
+    a failed send is retried after the same window. Texts are ≤ 160 GSM-7 chars. Every attempt → incident `alerts` + activity `monitor.sms`
+    (failures also to the console, number masked). Sending runs beside the check loop and never throws into it. **DRY_RUN never calls Bird**:
+    `[monitor] [dry-run] would text +1… : message` in the log, recorded as `simulated`.
+  - **Routes**: `GET /api/monitor` → `{ items: summary[], counts: { total, up, down, paused, pending, unknown, degraded }, notifications }`;
+    summary = `{ siteId, name, projectId, domain, state: "up"|"down"|"unknown"|"paused"|"pending", since, degraded, unhealthyServers, servers,
+    lastCheck: { at, ok, status, ms, error, url }, failing, incidentId, paused, pauseUntil, intervalSec, sms: { enabled, recipients }, target,
+    uptime: { h24, d7, d30, d90 } (%, null = no data), downMinutes, avgMs24h, bars24h: [24 × ratio|null|-1 paused] }` ·
+    `GET /api/sites/:id/monitor?range=24h|7d|30d|90d` → `{ summary, settings, effective: { url, how, path, healthPath }, recipients,
+    notifications, series: { range, step, points: [{ t, ms, uptime, up, down, paused }] }, days: [90 × { day, uptime, downMinutes,
+    pausedMinutes, avgMs }], incidents (25), gaps }` · `PUT /api/sites/:id/monitor { intervalSec (10–3600; 2 under DRY_RUN), timeoutSec,
+    path, url, expect: "200-399" | expectMin/expectMax, failThreshold, recoverThreshold, smsEnabled, recipients: [{ name, phone }],
+    includeDefaults, repeatMinutes|null }` · `POST /api/sites/:id/monitor/pause { minutes?, reason? }` (closes an open incident with
+    `endedBy: "paused"`, no text; auto-resumes at `pauseUntil`) · `POST /api/sites/:id/monitor/resume` · `POST /api/sites/:id/monitor/check`
+    (check now) · `GET /api/incidents?siteId&status=open|closed&limit` · `GET|PUT /api/notifications/settings` (`accessKey` write-only,
+    `clearAccessKey: true`; view has `accessKeySet, accessKeyHint, api, configured, problem, defaults, repeatMinutes, notifyRecovery,
+    minGapMinutes, dryRun`) · `POST /api/notifications/test { to }` → `{ ok, simulated, error, api, messageId, to, text }` (5 s cooldown).
+    Phone numbers must be E.164 (spaces, dashes, brackets and a leading 00 are normalised). Audit: `monitor.down|up|sms|pause|resume|
+    settings.update`, `notifications.settings.update|test`.
+  - **SSE `monitor`** (added to events.js TYPES): `{ kind: "down", siteId, siteName, projectId, incidentId, cause, since, at }`,
+    `{ kind: "up", …, durationMs }`, `{ kind: "update", items: [light summaries with uptime.h24] }` (coalesced, ≤ every 5 s),
+    `{ kind: "sms", siteId, incidentId, ok, simulated }`, `{ kind: "settings", siteId }`, `{ kind: "notifications" }`.
+    `ctx.monitor = { summary(siteId), list(), downCount(), incidents(filter), checkNow(siteId), sendSms(to, text) }`.
+  - **UI** (`views/monitor.js`): website tab **Uptime** (`#/sites/:id/uptime`: status, uptime 24h/7d/30d/90d, 24 h + 90-day bar strips,
+    response-time chart, incidents with their SMS log, check + text-alert settings, Check now / Pause / Resume); Settings → **Notifications**
+    (`#/settings/notifications`); Websites list + project page rows get a `[data-uptime]` slot (dot, 24 h %, mini 24 h strip) filled by
+    `bindUptime()` — no `.site-row` grid changes; dashboard "N websites down" card (`downBanner`); global toast on down/up (app.js).
+    Small hooks in site.js, sites.js, project.js, settings.js, dashboard.js, app.js, events.js, icons.js (`bell`), app.css (`.up-*`, `.inc*`, `.rcp-*`).
+- **ANALYTICS — unique visitors, page views, requests (new module `panel/lib/analytics.mjs`, in MODULES after `monitor`).**
+  - **Input**: CLUSTER's access-log tailer hands each batch of new lines to `ctx.analytics.ingest(site, lines)` (one hook in
+    `cluster.mjs tailAccessLogs`). Nothing is added to the websites: no script, no cookie.
+  - **Log format (CLUSTER, loadbalancer.mjs)**: site files now use `log_format fcc_v2 escape=json '$msec $status $request_time
+    "$upstream_addr" "$host" "$request_method" "$request_uri" $body_bytes_sent "$http_user_agent" "$remote_addr"
+    "$sent_http_content_type" "$http_referer" "$http_sec_fetch_dest" "$http_sec_purpose$http_purpose" fcc2'` (no `escape=` on
+    nginx < 1.11.8). It starts like `fcc_main`, so CLUSTER's request/error/per-server counter is unchanged; `fcc_main` stays
+    defined in `fcc-00-common.conf` for files not yet regenerated. Old `fcc_main` / `combined` lines count as requests only.
+  - **Real client IP (CLUSTER)**: new `conf.d/fcc-00-realip.conf` (http level, owned by loadbalancer.mjs, part of `applyAll`
+    and `syncSite`): `set_real_ip_from` 127.0.0.1, ::1 (Cloudflare Tunnel) and Cloudflare's ranges, `real_ip_header
+    CF-Connecting-IP`. Ranges come from cloudflare.com/ips-v4 + ips-v6 (`panel/lib/cfips.mjs`), refreshed daily, cached in
+    `dataDir/cloudflare-ips.json`, built-in fallback list; a change triggers `applyAll` (nginx -t + rollback). Not fetched under
+    `FCC_DRY_RUN=1` unless `FCC_CF_IPS_FETCH=1`. The file is written as a comment ("Disabled: …") when nginx lacks
+    `--with-http_realip_module`, when `real_ip_header` is already set in nginx.conf / conf.d / sites-enabled, or when nginx
+    rejected it (applyAll then retries once without it, so site changes never get blocked). `proxyLocation()` is unchanged:
+    after real_ip, `X-Real-IP $remote_addr` is the visitor and `X-Forwarded-For` ends with the visitor (Cloudflare's own XFF
+    entry may precede it). `GET /api/loadbalancer` gains `realIp: { enabled, reason, header, ranges, fetchedAt, file }`.
+  - **Definitions**: *requests* = every line. *Page views* = GET, 2xx (not 204/206) or 304, `text/html` (or no Content-Type
+    logged and a non-asset path), Sec-Fetch-Dest `document` when sent, not prefetch/prerender, not `/api/ /_next/ /static/
+    /assets/ …`, asset extensions, favicon/robots, `/api/health`, `/api/version`, `/healthz`…, `site.healthPath`, `?_rsc=`;
+    and not a bot. *Bots* = empty UA, UA without `Mozilla/`/`Opera`, or a token from `BOT_UA_TOKENS` (bot, crawl, spider,
+    curl, python, go-http, headless, uptime, monitor, preview, `fcc-`, `forthway` …). *Unique visitors* = distinct
+    `HMAC-SHA256(daily salt, IP + "\n" + UA)` (first 32 bits) among page views. The salt is random per UTC day, kept in
+    `dataDir/analytics/salt.json` (0600) and deleted 10 min after the day ends; raw IPs are never stored.
+  - **Uniques method**: exact id sets per minute (kept 2 h), hour (49 h) and UTC day (2 d), switching to a HyperLogLog sketch
+    (p=12, 4 KiB, ≈1.6 % error) above 1024 ids. 1h / 24h headline = union of the minute / hour sets (a visitor on both sides of
+    midnight UTC counts twice in 24h); **7d / 30d = sum of daily unique visitors** (ids rotate daily — labelled "per day" in
+    the UI). Chart points are unique visitors per bucket. "Previous period" = the same length immediately before, ending at
+    the same point in time (partial buckets weighted).
+  - **Storage**: `dataDir/analytics/{all,site-<id>}.json` (atomic, every minute when dirty + on stop): minute buckets 26 h,
+    hour buckets 32 d, day buckets 400 d (`[t, requests, pageViews, uniques]`), live id sets, top paths / referrer hosts per
+    hour (26 h) and per day (31 d), capped. Deleted sites' files are removed on the next save. Restarts mid-day keep counting
+    each visitor once (sets + salt persisted); lines written while the panel is down are not counted (the tailer starts at EOF).
+  - **Route** (admin): `GET /api/analytics?range=1h|24h|7d|30d[&siteId=]` → `{ range, step, from, to, now, siteId, since,
+    visitorsSince, uniquesMethod: "exact"|"estimate"|"daily-sum", series: [{ t, requests, pageViews, uniques }],
+    previousSeries (t shifted onto the current period), totals, previous, change: { requests, pageViews, uniques } (% or null),
+    topPages: [{ path, views }], topReferrers: [{ host, visits }] (site only; path without query, referrer host only, own
+    domains excluded) | topSites: [{ siteId, name, uniques, pageViews, requests }] (all sites) }`. Steps: 1h = minute,
+    24h / 7d = hour, 30d = UTC day.
+  - **UI**: `public/assets/traffic.js` (`trafficCard`, `topList`): dashboard "Traffic overview" = tabs Visitors (default; visitors
+    + page views lines) / Page views / Requests / CPU load, ranges 1h / 24h / 7d / 30d, headline Unique visitors / Page views /
+    Requests with % vs the previous period, Compare overlays the previous period, "Collecting since …" note; website **Traffic**
+    tab (`views/site-traffic.js`; hooks in site.js) with the same card + Top pages + Top referrers. Styles `.tr-*` in app.css;
+    `charts.js` shows date-only tooltips for 30d; mock route in mock.js. `/api/dashboard` is unchanged (CPU is still kept 24 h).

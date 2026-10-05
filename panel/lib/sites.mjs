@@ -13,6 +13,8 @@
  * file path as well, so it never has to download from itself.
  *
  * There is deliberately no "run a command" feature here. Logs are read-only.
+ * The one exception is named: `npm run <script>` for a script that the deployed
+ * package.json defines (POST /api/sites/:id/scripts/run → task site.script).
  */
 
 import fs from "node:fs";
@@ -32,6 +34,7 @@ import {
 import { inspectZip, readZipFile } from "../../shared/zip.mjs";
 import { isEnvKey, cleanEnvValue, parseEnvText } from "../../shared/env.mjs";
 import { ensureDir, humanBytes } from "../../shared/fsx.mjs";
+import { validScriptName } from "../../shared/tasks.mjs";
 
 export const SITE_TYPES = ["node", "static", "php"];
 export const LB_METHODS = ["round_robin", "least_conn", "ip_hash"];
@@ -125,6 +128,7 @@ export function defaultSiteSettings(type) {
     autoPrepare: node,
     writeEnvFile: true,
     keepReleases: DEFAULT_KEEP_RELEASES,
+    afterDeployScripts: [],
   };
 }
 
@@ -154,6 +158,15 @@ export function sanitizeSettings(input, base) {
   }
   if (Array.isArray(s.swapDirs)) out.swapDirs = cleanList(s.swapDirs, 20);
   if (Array.isArray(s.preserve)) out.preserve = cleanList(s.preserve, 60);
+  if (Array.isArray(s.afterDeployScripts)) {
+    const names = [...new Set(s.afterDeployScripts.map((x) => String(x ?? "").trim()).filter(Boolean))];
+    const bad = names.find((n) => !validScriptName(n));
+    if (bad) throw httpError(400, `"${bad.slice(0, 60)}" is not a valid package.json script name.`);
+    const app = names.find((n) => scriptKind(n) === "app");
+    if (app) throw httpError(400, `"${app}" runs the app itself and can't run after a deploy.`);
+    if (names.length > 5) throw httpError(400, "At most 5 after-deploy scripts.");
+    out.afterDeployScripts = names;
+  }
   for (const f of ["smartInstall", "autoRollback", "autoPrepare", "writeEnvFile"]) {
     if (typeof s[f] === "boolean") out[f] = s[f];
   }
@@ -254,6 +267,36 @@ function parsePackageJson(raw) {
   } catch {
     return { error: "package.json is there but is not valid JSON." };
   }
+}
+
+/** Scripts that run or serve the app: never run as a one-off (it would fight pm2 for the port). */
+const APP_SCRIPTS = new Set(["start", "dev", "serve", "preview", "watch"]);
+const LIFECYCLE_SCRIPTS = /^(pre|post)?(install|prepare|prepublish|prepublishOnly|publish|pack|version|uninstall)$/;
+/** Names/commands that change data — the UI asks before running these. */
+const RISKY_SCRIPT_RE = /(^|[^a-z])(push|migrat\w*|reset|drop|seed\w*|truncate|wipe|purge|destroy|fresh|rollback)([^a-z]|$)|--force-reset|--accept-data-loss|--force\b/i;
+
+/** "app" (runs the app — refused), "hook" (npm lifecycle / pre- & post- hooks) or "task". */
+export function scriptKind(name, all = {}) {
+  const m = /^(pre|post)(.+)$/.exec(name);
+  if (APP_SCRIPTS.has(name) || (m && APP_SCRIPTS.has(m[2]))) return "app";
+  if (LIFECYCLE_SCRIPTS.test(name) || (m && Object.prototype.hasOwnProperty.call(all, m[2]))) return "hook";
+  return "task";
+}
+
+export function describeScripts(map) {
+  if (!map || typeof map !== "object") return [];
+  return Object.entries(map)
+    .filter(([, v]) => typeof v === "string")
+    .map(([name, command]) => {
+      const kind = scriptKind(name, map);
+      return {
+        name,
+        command: command.slice(0, 500),
+        kind,
+        risky: RISKY_SCRIPT_RE.test(name) || RISKY_SCRIPT_RE.test(command),
+        runnable: kind !== "app" && validScriptName(name),
+      };
+    });
 }
 
 function maskEnv(vars) {
@@ -788,7 +831,7 @@ export function register(router, ctx) {
    * Deploy one release to `serverIds`, one server at a time. Stops on the
    * first failure and reports where every server stands.
    */
-  async function deployTo(siteId, release, serverIds, { log, signal, base, multi }) {
+  async function deployTo(siteId, release, serverIds, { log, signal, base, multi, afterFirst = null }) {
     const done = [];
     for (let i = 0; i < serverIds.length; i++) {
       const sid = serverIds[i];
@@ -820,8 +863,36 @@ export function register(router, ctx) {
         e.cause = err;
         throw e;
       }
+      if (i === 0 && afterFirst) {
+        try {
+          await afterFirst(sid);
+        } catch (err) {
+          if (err.aborted || signal?.aborted) throw err;
+          const pending = serverIds.slice(1);
+          throw new Error(`${err.message}${pending.length ? ` Not deployed yet: ${pending.map(serverName).join(", ")}.` : ""}`);
+        }
+      }
     }
     return done;
+  }
+
+  /**
+   * Website setting `afterDeployScripts`: run once per deploy, on the first
+   * target only, right after it is serving the new release and before any
+   * other server is touched. A failure stops the deploy there.
+   */
+  async function runAfterDeployScripts(siteId, sid, names, { log, signal, multi }) {
+    for (const name of names) {
+      if (signal?.aborted) throw new Error("Cancelled.");
+      log(`── After deploy: npm run ${name} on ${serverName(sid)}${multi ? " (once — before the other servers are deployed)" : ""}`);
+      const spec = await specForAsync(getSite(siteId), sid);
+      try {
+        await runTask(sid, "site.script", { spec, script: name }, { log: prefixed(log, sid, multi), signal });
+      } catch (err) {
+        if (err.aborted || signal?.aborted) throw err;
+        throw new Error(`After-deploy script "${name}" failed on ${serverName(sid)}: ${err.message}`);
+      }
+    }
   }
 
   async function syncLb(siteId, log) {
@@ -854,7 +925,7 @@ export function register(router, ctx) {
   }
 
   /** Full deploy of `release` to every target, then the front door. */
-  async function deployRelease(siteId, release, { log, signal, base }) {
+  async function deployRelease(siteId, release, { log, signal, base, afterDeploy = false }) {
     const site = getSite(siteId);
     if (!fs.existsSync(releaseFile(release.id))) throw new Error(`The archive for release ${release.id} is missing.`);
     const ids = targets(site);
@@ -862,7 +933,9 @@ export function register(router, ctx) {
       `Deploying ${releaseLabel(release.id)} of ${site.name} to ${ids.length} server${ids.length === 1 ? "" : "s"}` +
         (site.loadBalanced ? " — rolling, one server at a time." : "."),
     );
-    await deployTo(siteId, release, ids, { log, signal, base, multi: ids.length > 1 });
+    const scripts = afterDeploy ? (site.settings?.afterDeployScripts || []).filter(validScriptName) : [];
+    const afterFirst = scripts.length ? (sid) => runAfterDeployScripts(siteId, sid, scripts, { log, signal, multi: ids.length > 1 }) : null;
+    await deployTo(siteId, release, ids, { log, signal, base, multi: ids.length > 1, afterFirst });
     markCurrent(siteId, release.id);
     await syncLb(siteId, log);
     pruneReleases(siteId);
@@ -1478,7 +1551,7 @@ export function register(router, ctx) {
     if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
     const base = panelBase(req);
     const job = siteJob(site, admin, { type: "site.deploy", title: `Deploy ${site.name} ${release.version ? `v${release.version}` : release.id}` }, ({ log, signal }) =>
-      deployRelease(site.id, release, { log, signal, base }),
+      deployRelease(site.id, release, { log, signal, base, afterDeploy: true }),
     );
     audit(admin, "site.deploy", site, { releaseId: release.id, version: release.version });
     return job;
@@ -1564,6 +1637,112 @@ export function register(router, ctx) {
     } finally {
       t.done();
     }
+  });
+
+  // ---- package.json scripts (named actions, never a free-form command)
+
+  const isDeployed = (site) => !!site.currentReleaseId || Object.values(site.state || {}).some((x) => x?.releaseId);
+  /** The release most likely on `sid`: its own, else the site's current, else any deployed one. */
+  function releaseOn(site, sid) {
+    const ids = [site.state?.[sid]?.releaseId, site.currentReleaseId, ...Object.values(site.state || {}).map((x) => x?.releaseId)];
+    for (const id of ids) {
+      const r = id && db.get("releases", id);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  async function scriptsView(site, sid) {
+    const ids = targets(site);
+    const rel = releaseOn(site, sid);
+    let deployed = null;
+    let note = null;
+    if (!isDeployed(site)) {
+      note = "This website has not been deployed yet.";
+    } else if (!isOnline(sid)) {
+      note = `${serverName(sid)} is offline.`;
+    } else {
+      const t = withTimeout(null, STATUS_TIMEOUT_MS);
+      try {
+        const spec = await specForAsync(site, sid);
+        const r = await runTask(sid, "site.scripts", { spec }, { log: () => {}, signal: t.signal });
+        if (r?.scripts) deployed = r;
+        else note = r?.error || null;
+      } catch (err) {
+        note = t.signal.aborted ? `Reading package.json on ${serverName(sid)} timed out.` : err.message;
+      } finally {
+        t.done();
+      }
+    }
+    const map = deployed?.scripts || rel?.scripts || null;
+    return {
+      serverId: sid,
+      servers: ids.map((id) => ({ id, name: serverName(id), online: isOnline(id) })),
+      loadBalanced: !!site.loadBalanced,
+      deployed: isDeployed(site),
+      source: deployed ? "deployed" : map ? "release" : null,
+      releaseId: rel?.id || null,
+      version: deployed?.version || rel?.version || null,
+      hasNodeModules: deployed ? !!deployed.hasNodeModules : null,
+      note: deployed ? null : note,
+      scripts: describeScripts(map),
+    };
+  }
+
+  router.get("/api/sites/:id/scripts", async (req, res, { params, query }) => {
+    const site = mustSite(params.id);
+    const ids = targets(site);
+    const sid = query.serverId || ids[0];
+    if (!ids.includes(sid)) throw httpError(400, "That server does not run this website.");
+    return scriptsView(site, sid);
+  });
+
+  router.post("/api/sites/:id/scripts/run", async (req, res, { params, body, admin }) => {
+    const site = mustSite(params.id);
+    const name = typeof body.script === "string" ? body.script.trim() : "";
+    if (!validScriptName(name)) throw httpError(400, "That is not a valid script name.");
+    if (scriptKind(name, {}) === "app") throw httpError(400, `"${name}" runs the app itself — use Start or Restart instead.`);
+    if (!isDeployed(site)) throw httpError(409, "Deploy this website first — scripts run in the deployed app folder.");
+    const ids = targets(site);
+    let run;
+    if (body.allServers) {
+      run = ids;
+    } else {
+      const sid = body.serverId || ids[0];
+      if (!ids.includes(sid)) throw httpError(400, "That server does not run this website.");
+      run = [sid];
+    }
+    const rel = releaseOn(site, run[0]);
+    if (rel?.scripts && name.length <= 60 && !Object.prototype.hasOwnProperty.call(rel.scripts, name)) {
+      throw httpError(400, `The deployed release's package.json has no "${name}" script.`);
+    }
+    const offline = run.filter((id) => !isOnline(id));
+    if (offline.length) throw httpError(409, `${offline.map(serverName).join(", ")} ${offline.length === 1 ? "is" : "are"} offline.`);
+
+    const multi = run.length > 1;
+    const where = multi ? `all ${run.length} servers` : serverName(run[0]);
+    const job = siteJob(site, admin, { type: "site.script", title: `npm run ${name} on ${where}`, serverId: multi ? null : run[0] }, async ({ log, signal }) => {
+      if (multi) log(`Running npm run ${name} on ${run.map(serverName).join(", ")} — one server at a time.`);
+      const results = [];
+      for (const sid of run) {
+        if (signal?.aborted) throw new Error("Cancelled.");
+        if (multi) log(`── ${serverName(sid)}`);
+        try {
+          assertOnline(sid);
+          const spec = await specForAsync(getSite(site.id) || site, sid);
+          const r = await runTask(sid, "site.script", { spec, script: name }, { log: prefixed(log, sid, multi), signal });
+          results.push({ serverId: sid, code: r?.code ?? 0, durationMs: r?.durationMs ?? null });
+        } catch (err) {
+          if (!multi || err.aborted) throw err;
+          const e = new Error(`${serverName(sid)}: ${err.message}${results.length ? `\nAlready ran on: ${results.map((x) => serverName(x.serverId)).join(", ")}.` : ""}`);
+          e.cause = err;
+          throw e;
+        }
+      }
+      return { script: name, servers: results };
+    });
+    audit(admin, "site.script", site, { script: name, servers: run });
+    return job;
   });
 
   // ---- environment
@@ -1663,7 +1842,7 @@ export function register(router, ctx) {
         log(`Release ${rec.id} created (${rec.version ? `v${rec.version}` : "unversioned"}).`);
         for (const w of rec.warnings) log(`note: ${w}`);
         if (!deploy) return { releaseId: rec.id, version: rec.version };
-        const out = await deployRelease(site.id, rec, { log, signal, base });
+        const out = await deployRelease(site.id, rec, { log, signal, base, afterDeploy: true });
         return { ...out, releaseId: rec.id };
       },
       { lock: deploy },

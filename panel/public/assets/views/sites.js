@@ -2,6 +2,7 @@ import { html, mount, $, on, colorOf, ago, emptyState, errorState, skeletonRows,
 import { icon } from "../icons.js";
 import { get } from "../api.js";
 import { pageHead, lbBadge, healthChip, typeIco, TYPE_LABEL } from "../components.js";
+import { bindUptime } from "./monitor.js"; // MONITOR: fills the [data-uptime] slots below
 
 /** Public URL of a site: https only once its certificate is active. */
 export function siteUrl(s, domain) {
@@ -20,8 +21,8 @@ export function siteRow(s, { serversById = {}, projectsById = {}, showProject = 
       <div style="min-width:0"><div class="site-name">${s.name}</div>
         <div class="site-dom">${(s.domains || [])[0] || html`<span class="dim">No domain</span>`}${(s.domains || []).length > 1 ? html` <span class="dim">+${s.domains.length - 1}</span>` : ""}</div></div></div>
     <div class="site-meta">${lbBadge(s, serversById)}
-      <span class="tiny muted row" style="gap:8px">${showProject && p ? html`<span class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(p.color)}"></span>${p.name}</span><span class="dim">·</span>` : ""}${TYPE_LABEL[s.type] || s.type}${ver ? html`<span class="dim">·</span><span class="mono">v${ver}</span>` : ""}<span class="site-health-inline row" style="gap:8px"><span class="dim">·</span>${healthChip(s)}</span></span></div>
-    <div class="site-health">${healthChip(s)}${s.ssl?.status === "active" ? html`<div class="tiny muted row mt-8" style="gap:6px">${icon("lock", "xs")}HTTPS</div>` : ""}</div>
+      <span class="tiny muted row" style="gap:8px">${showProject && p ? html`<span class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(p.color)}"></span>${p.name}</span><span class="dim">·</span>` : ""}${TYPE_LABEL[s.type] || s.type}${ver ? html`<span class="dim">·</span><span class="mono">v${ver}</span>` : ""}<span class="site-health-inline row" style="gap:8px"><span class="dim">·</span>${healthChip(s)}<span data-uptime="${s.id}" data-compact></span></span></span></div>
+    <div class="site-health">${healthChip(s)}<div data-uptime="${s.id}"></div>${s.ssl?.status === "active" ? html`<div class="tiny muted row mt-8" style="gap:6px">${icon("lock", "xs")}HTTPS</div>` : ""}</div>
     <div class="site-actions btn-row" style="flex-wrap:nowrap">
       ${href ? html`<a class="icon-btn sm ghost" href="${href}" target="_blank" rel="noopener noreferrer" title="Open ${s.domains[0]}" data-stop>${icon("external")}</a>` : ""}
       <span class="icon-btn sm ghost" aria-hidden="true">${icon("chevronRight")}</span></div>
@@ -30,7 +31,8 @@ export function siteRow(s, { serversById = {}, projectsById = {}, showProject = 
 
 export function bindSiteRows(root) {
   on(root, "click", ".site-row", (e, el) => { if (e.target.closest("[data-stop]")) return; location.hash = el.dataset.href; });
-  on(root, "keydown", ".site-row", (e, el) => { if (e.key === "Enter") location.hash = el.dataset.href; });
+  // only when the row itself has focus — Enter on a nested button/link must not also open the row
+  on(root, "keydown", ".site-row", (e, el) => { if (e.key === "Enter" && e.target === el) location.hash = el.dataset.href; });
 }
 
 export default async function sites(ctx) {
@@ -41,6 +43,7 @@ export default async function sites(ctx) {
     <div class="toolbar"><div class="pills" data-filters></div><span class="grow"></span><div class="search">${icon("search")}<input placeholder="Search name or domain" data-q/></div></div>
     <div data-list>${skeletonRows(5, 68)}</div>`);
   const list = $("[data-list]", root);
+  bindUptime(list, ctx); // MONITOR: uptime dot + 24h % per row
   let items = [], serversById = {}, projectsById = {};
   const paint = () => {
     const counts = { all: items.length, lb: items.filter((s) => s.loadBalanced).length, single: items.filter((s) => !s.loadBalanced).length };

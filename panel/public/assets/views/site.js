@@ -4,13 +4,19 @@ import { get, post, patch, put, del, upload, MOCK } from "../api.js";
 import { tabsBar, lbBadge, healthChip, siteHealth, typeIco, TYPE_LABEL, METHOD_LABEL, serverKind, jobItem, bindJobClicks, jobStarted, openJobLog, serverPicker, envEditor, dropzone } from "../components.js";
 import { lbMethodSelect, methodHint } from "./wizard.js";
 import { siteUrl } from "./sites.js";
+import { scriptsTab } from "./site-scripts.js";
+import { uptimeTab } from "./monitor.js"; // Uptime tab (monitoring + SMS alerts)
+import { trafficTab } from "./site-traffic.js"; // Traffic tab (visitors, page views — panel/lib/analytics.mjs)
 import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
 const TABS = [
   { id: "overview", label: "Overview", icon: "dashboard" },
+  { id: "traffic", label: "Traffic", icon: "users" },
+  { id: "uptime", label: "Uptime", icon: "activity" },
   { id: "deployments", label: "Deployments", icon: "rocket" },
   { id: "environment", label: "Environment", icon: "key" },
+  { id: "scripts", label: "Scripts", icon: "zap" },
   { id: "domains", label: "Domains & SSL", icon: "lock" },
   { id: "settings", label: "Settings", icon: "settings" },
   { id: "logs", label: "Logs", icon: "fileText" },
@@ -83,6 +89,7 @@ export default async function site(ctx) {
     { label: "Stop", icon: "stop", onClick: () => runAction("stop") },
     { label: "Roll back", icon: "rollback", disabled: !S.previousReleaseId, onClick: () => runAction("rollback") },
     { sep: true },
+    { label: "Run a script…", icon: "zap", onClick: () => (location.hash = `${base}/scripts`) },
     { label: "Open nginx config", icon: "code", onClick: () => (location.hash = `${base}/domains`) },
     { label: "Website settings", icon: "settings", onClick: () => (location.hash = `${base}/settings`) },
   ]));
@@ -413,6 +420,7 @@ export default async function site(ctx) {
         <div class="field"><label>Must exist after build <span class="dim">(optional)</span></label><input class="input mono" data-bs="artifact" value="${b.artifact || ""}" placeholder=".next/BUILD_ID"/></div>` : ""}
         ${S.type === "node" ? html`<div class="field"><label>Start</label><input class="input mono" data-ps="start" value="${st.start || rs.start || ""}" placeholder="npm start"/><div class="hint">Run under pm2. The app must listen on <span class="mono">$PORT</span>.</div></div>` : html`<div class="field"><label>Web root</label><input class="input mono" data-ps="publicDir" value="${st.publicDir || ""}" placeholder="."/></div>`}
         <div class="field"><label>Health timeout (seconds)</label><input class="input mono" type="number" min="10" data-ht value="${Math.round((st.healthTimeoutMs || 180000) / 1000)}"/></div>
+        ${S.type !== "php" ? html`<div class="field"><label>After deploy, run <span class="dim">(optional)</span></label><input class="input mono" data-ads value="${(st.afterDeployScripts || []).join(", ")}" placeholder="e.g. db:migrate" spellcheck="false"/><div class="hint">package.json scripts, run once per deploy on the first server only, before the other servers get the release. A failure stops the deploy. <a href="${base}/scripts" style="color:var(--blue-3)">Scripts →</a></div></div>` : ""}
         <div class="field span-2"><div class="row wrap" style="gap:22px">
           <label class="switch"><input type="checkbox" data-sw="autoRollback" ${st.autoRollback !== false ? raw("checked") : ""}/><span class="track"></span>Roll back automatically if the health check fails</label>
           <label class="switch"><input type="checkbox" data-sw="smartInstall" ${st.smartInstall !== false ? raw("checked") : ""}/><span class="track"></span>Skip install when the lockfile is unchanged</label></div></div>
@@ -470,6 +478,8 @@ export default async function site(ctx) {
       $$("[data-ps]", box).forEach((i) => (settings[i.dataset.ps] = i.value.trim()));
       $$("[data-sw]", box).forEach((i) => (settings[i.dataset.sw] = i.checked));
       settings.healthTimeoutMs = Math.max(10, Number($("[data-ht]", box).value) || 180) * 1000;
+      const ads = $("[data-ads]", box);
+      if (ads) settings.afterDeployScripts = ads.value.split(/[\s,]+/).filter(Boolean);
       save(btn, { settings }, "Build settings saved");
     });
     on(box, "click", "[data-delete]", async () => {
@@ -480,6 +490,11 @@ export default async function site(ctx) {
       try { await del(`/api/sites/${S.id}${r.deleteFiles ? "?deleteFiles=1" : ""}`); toast(`${S.name} deleted`, "ok"); location.hash = project ? `#/projects/${project.id}` : "#/sites"; } catch (ex) { toastError(ex, "Couldn't delete"); }
     });
   }
+
+  /* ── scripts (views/site-scripts.js) ── */
+  if (tab === "scripts") await scriptsTab(ctx, box, S);
+  if (tab === "uptime") await uptimeTab(box, ctx, S);
+  if (tab === "traffic") await trafficTab(ctx, box, S);
 
   /* ── logs ── */
   if (tab === "logs") {

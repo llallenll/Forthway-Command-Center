@@ -1,8 +1,10 @@
 import { html, mount, $, on, fmtNum, fmtBytes, fmtCompact, plural, debounce, emptyState, errorState } from "../util.js";
 import { icon } from "../icons.js";
 import { get } from "../api.js";
-import { sparkline, lineChart } from "../charts.js";
+import { sparkline } from "../charts.js";
+import { trafficCard } from "../traffic.js";
 import { jobItem, activityItem, bindJobClicks } from "../components.js";
+import { downBanner } from "./monitor.js"; // MONITOR: "N websites down" card
 
 function greeting() {
   const h = new Date().getHours();
@@ -21,7 +23,7 @@ export default async function dashboard(ctx) {
   ctx.crumbs([{ label: "Dashboard" }]);
   mount(root, skeleton(state.me?.name));
 
-  let range = "24h", metric = "requests", compare = false;
+  const range = "24h";
   let data, dbs = [], backups = [];
   try {
     [data, dbs, backups] = await Promise.all([
@@ -46,7 +48,6 @@ export default async function dashboard(ctx) {
     return backups.filter((b) => { const t = +new Date(b.createdAt); return t >= +d0 && t < d1; }).length;
   });
   const dbSizes = dbs.map((d) => d.sizeBytes || 0).sort((a, b) => a - b);
-  const totalReq = reqVals.reduce((a, b) => a + b, 0);
   const running = (data.recentJobs || []).filter((j) => j.status === "running" || j.status === "queued").length;
   const h = data.health || {};
   const nginxOk = h.nginx && (h.nginx.installed !== false || h.nginx.dryRun) && h.nginx.configOk !== false;
@@ -72,7 +73,7 @@ export default async function dashboard(ctx) {
         <div class="hero-center">
           <div class="hello">${greeting()}</div>
           <div class="name">${name}</div>
-          <div class="tagline">${allOk ? "All systems operational" : "Some services need attention"} · ${plural(c.projects || 0, "project")} · ${running ? `${running} job${running > 1 ? "s" : ""} running` : "no jobs running"}</div>
+          <div class="tagline"><span data-sys>${allOk ? "All systems operational" : "Some services need attention"}</span> · ${plural(c.projects || 0, "project")} · ${running ? `${running} job${running > 1 ? "s" : ""} running` : "no jobs running"}</div>
         </div>
       </section>
       <div class="stat-row">
@@ -83,27 +84,13 @@ export default async function dashboard(ctx) {
       </div>
     </div>
 
+    <section class="section" data-down hidden></section>
+
     <section class="section">
       <div class="section-head">
-        <div><h2>Traffic overview</h2><p>Requests through the front door and average CPU across your servers.</p></div>
+        <div><h2>Traffic overview</h2><p>Unique visitors, page views and requests through the front door, across all your websites.</p></div>
       </div>
-      <div class="card chart-card">
-        <div class="chart-toolbar">
-          <div class="pills" data-metric>
-            <button class="pill active" data-m="requests">${icon("globe", "sm")}Requests</button>
-            <button class="pill" data-m="cpu">${icon("cpu", "sm")}CPU load</button>
-          </div>
-          <div class="row wrap">
-            <div class="seg" data-range>${["1h", "24h"].map((r) => html`<button class="${r === range ? "active" : ""}" data-r="${r}">${r}</button>`)}</div>
-            <button class="btn btn-sm" data-compare>${icon("compare")}Compare</button>
-          </div>
-        </div>
-        <div class="row" style="justify-content:space-between;align-items:flex-end;margin:6px 0 4px;flex-wrap:wrap;gap:10px">
-          <div><div class="muted small" data-kpi-l>Requests · last 24h</div><div style="font-size:26px;font-weight:750;letter-spacing:-.03em" data-kpi>${fmtCompact(totalReq)}</div></div>
-          <div class="chart-legend" data-legend></div>
-        </div>
-        <div class="chart" data-chart></div>
-      </div>
+      <div data-traffic></div>
     </section>
 
     <section class="section grid-2">
@@ -117,6 +104,19 @@ export default async function dashboard(ctx) {
       </div>
     </section>`);
 
+  downBanner($("[data-down]", root), ctx); // MONITOR: shown only while a website is down
+  // Hero status line: live website states (GET /api/monitor + SSE `monitor`), then panel services.
+  const sysEl = $("[data-sys]", root);
+  const paintSys = (m) => {
+    const n = m?.counts || {};
+    const down = n.down || 0, degraded = n.degraded || 0;
+    if (down || degraded) {
+      mount(sysEl, html`${down ? html`<span style="color:#ff9fb2;font-weight:650">${plural(down, "website")} down</span>` : ""}${down && degraded ? " · " : ""}${degraded ? html`<span style="color:#ffd08a;font-weight:650">${fmtNum(degraded)} degraded</span>` : ""}`);
+    } else sysEl.textContent = allOk ? "All systems operational" : "Some services need attention";
+  };
+  const loadSys = async () => { try { const m = await get("/api/monitor"); if (ctx.alive()) paintSys(m); } catch { /* monitor not installed: keep the services line */ } };
+  ctx.on("monitor", debounce((d) => { if (d?.kind !== "sms") loadSys(); }, 500));
+  loadSys();
   const jobsEl = $("[data-jobs]", root), actEl = $("[data-activity]", root);
   let jobs = data.recentJobs || [], acts = data.recentActivity || [];
   const paintJobs = () => mount(jobsEl, jobs.length ? html`${jobs.slice(0, 7).map(jobItem)}` : emptyState({ ico: "rocket", title: "No jobs yet", text: "Deploys, backups and certificate requests show up here.", sm: true }));
@@ -124,44 +124,10 @@ export default async function dashboard(ctx) {
   paintJobs(); paintActs();
   bindJobClicks(jobsEl);
 
-  // chart
-  const chartEl = $("[data-chart]", root);
-  const COLORS = { requests: ["#c6f36b", "#6d8dff", "#9d7dff"], cpu: ["#33d4c1", "#6d8dff", "#9d7dff"] };
-  const build = () => {
-    const req = (data.series?.requests || []).map((p) => ({ t: p.t, v: p.count }));
-    const cpu = (data.series?.cpu || []).map((p) => ({ t: p.t, v: p.value }));
-    const main = metric === "requests"
-      ? { name: "Requests", color: "#8aa4ff", gradient: COLORS.requests, areaColor: "#5a7dff", points: req, fmt: (v) => fmtNum(Math.round(v)) }
-      : { name: "CPU", color: "#33d4c1", gradient: COLORS.cpu, areaColor: "#33d4c1", points: cpu, fmt: (v) => `${(+v).toFixed(1)}%` };
-    const other = metric === "requests"
-      ? { name: "CPU", color: "#ffb547", points: cpu, dashed: true, ownScale: true, fmt: (v) => `${(+v).toFixed(1)}%` }
-      : { name: "Requests", color: "#ffb547", points: req, dashed: true, ownScale: true, fmt: (v) => fmtNum(Math.round(v)) };
-    const series = compare ? [main, other] : [main];
-    const total = metric === "requests" ? req.reduce((a, b) => a + b.v, 0) : cpu.length ? cpu.reduce((a, b) => a + b.v, 0) / cpu.length : 0;
-    $("[data-kpi]", root).textContent = metric === "requests" ? fmtCompact(total) : `${total.toFixed(1)}%`;
-    $("[data-kpi-l]", root).textContent = `${metric === "requests" ? "Requests" : "Average CPU"} · last ${range}`;
-    mount($("[data-legend]", root), html`<span><i style="background:linear-gradient(90deg,${main.gradient[0]},${main.gradient[2]})"></i>${main.name}</span>${compare ? html`<span style="color:${other.color}"><i class="dashed"></i><span style="color:var(--muted)">${other.name} (own scale)</span></span>` : ""}`);
-    return { series, range, fmt: metric === "requests" ? fmtCompact : (v) => `${Math.round(v)}%`, yMax: metric === "cpu" ? 100 : undefined, empty: "No traffic recorded yet", aria: `${main.name} over the last ${range}` };
-  };
-  const chart = lineChart(chartEl, build());
-  ctx.cleanup(() => chart.destroy());
-
-  on(root, "click", "[data-m]", (e, b) => {
-    metric = b.dataset.m;
-    root.querySelectorAll("[data-m]").forEach((x) => x.classList.toggle("active", x === b));
-    chart.update(build());
-  });
-  on(root, "click", "[data-r]", async (e, b) => {
-    range = b.dataset.r;
-    root.querySelectorAll("[data-r]").forEach((x) => x.classList.toggle("active", x === b));
-    chartEl.style.opacity = ".5";
-    try { data = { ...data, series: (await get(`/api/dashboard?range=${range}`)).series }; chart.update(build()); } catch {}
-    chartEl.style.opacity = "";
-  });
-  on(root, "click", "[data-compare]", (e, b) => {
-    compare = !compare;
-    b.classList.toggle("btn-primary", compare);
-    chart.update(build());
+  // traffic (visitors · page views · requests from /api/analytics; CPU from /api/dashboard, kept 24h)
+  trafficCard($("[data-traffic]", root), {
+    ctx,
+    cpu: async (r) => (r === range ? data.series?.cpu : (await get(`/api/dashboard?range=${r}`)).series?.cpu) || [],
   });
 
   // live

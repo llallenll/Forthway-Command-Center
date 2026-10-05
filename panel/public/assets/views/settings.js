@@ -7,6 +7,7 @@ import { pageHead, openJobLog, serverKind, METHOD_LABEL } from "../components.js
 import { scheduleForm } from "./backups.js";
 import { cloudflareSettings } from "./cloudflare.js"; // Cloudflare section (lives in its own file)
 import { mysqlSettings, phpMyAdminSettings } from "./settings-databases.js"; // Databases + phpMyAdmin sections
+import { notificationsSettings } from "./monitor.js"; // Notifications section (uptime SMS alerts via Bird)
 import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliased: avoids clashing with the shared import line)
 
 const SECTIONS = [
@@ -18,10 +19,11 @@ const SECTIONS = [
   { id: "phpmyadmin", label: "phpMyAdmin", icon: "layers", render: phpMyAdminSettings },
   { id: "github", label: "GitHub", icon: "github", render: github },
   { id: "cloudflare", label: "Cloudflare", icon: "cloud", render: cloudflareSettings },
+  { id: "notifications", label: "Notifications", icon: "bell", render: notificationsSettings },
   { id: "updates", label: "Updates", icon: "refresh", render: updates },
   { id: "account", label: "Account", icon: "user", render: account },
 ];
-const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", tunnel: "cloudflare", zerotrust: "cloudflare" };
+const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications" };
 
 export default async function settings(ctx) {
   const { root, params } = ctx;

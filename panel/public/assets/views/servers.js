@@ -1,8 +1,8 @@
-import { html, raw, mount, frag, $, $$, on, ago, fmtUsage, pct, plural, emptyState, errorState, skeletonRows, debounce, toast, toastError, confirmDialog, openModal, openMenu, secretBox } from "../util.js";
+import { html, raw, mount, frag, $, $$, on, ago, plural, emptyState, errorState, skeletonRows, debounce, toast, toastError, confirmDialog, openModal, openMenu, secretBox } from "../util.js";
 import { icon } from "../icons.js";
 import { get, post, patch, del } from "../api.js";
-import { sparkline, meter } from "../charts.js";
-import { pageHead, serverKind, jobStarted, METHOD_LABEL } from "../components.js";
+import { sparkline } from "../charts.js";
+import { pageHead, serverKind, jobStarted, METHOD_LABEL, ubar } from "../components.js";
 import { serverBackupDialog } from "./backups.js";
 
 function installBlock(cmd, warning) {
@@ -81,10 +81,10 @@ function serverCard(s) {
       ${s.enabled === false ? html`<span class="badge warn">Disabled</span>` : ""}
       ${s.lbEligible !== false ? html`<span class="badge badge-lb">${icon("balance")}LB pool</span>` : ""}
     </div>
-    <div class="srv-meters">
-      ${meter("CPU", m.cpu, m.cpu != null ? `${Math.round(m.cpu)}%` : "—")}
-      ${meter("RAM", pct(m.mem, memT), memT ? fmtUsage(m.mem, memT) : "—")}
-      ${meter("Disk", pct(m.disk, diskT), diskT ? fmtUsage(m.disk, diskT) : "—")}
+    <div class="srv-meters ubars">
+      ${ubar("CPU", m.cpu, m.cpu != null ? 100 : 0, m.cpu != null ? `${Math.round(m.cpu)}%` : undefined)}
+      ${ubar("RAM", m.mem, memT)}
+      ${ubar("Disk", m.disk, diskT)}
     </div>
     <div class="srv-spark" data-spark="${s.id}"><div class="skel" style="height:100%"></div></div>
     <div class="ecard-foot" style="justify-content:space-between;padding-top:12px;border-top:1px solid var(--line)">

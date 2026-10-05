@@ -55,6 +55,7 @@ export async function scheduleForm(box, ctx) {
   try { [s, servers] = await Promise.all([get("/api/backups/settings"), get("/api/servers").then((r) => r.items || []).catch(() => [])]); } catch (e) { mount(box, errorState(e)); return; }
   if (ctx && !ctx.alive()) return;
   const dbS = s.database || {}, srvS = s.server || {}, dest = s.destination || { type: "local" };
+  const smb = dest.smb || {}, smbTool = s.smbclient || { installed: true };
   const srvIds = srvS.serverIds || ["main"];
   const runInfo = (k) => {
     const n = s.nextRun?.[k], l = s.lastRun?.[k];
@@ -84,9 +85,10 @@ export async function scheduleForm(box, ctx) {
         </div><p class="hint mt-12">Panel data and the database dump only apply to the main server.</p>${runInfo("server")}</div></div>
     </div>
     <div class="card"><div class="card-head"><h3>Destination</h3><span class="sub">Where archives are stored</span></div><div class="card-body">
-      <div class="mode-switch">
-        <label class="choice ${dest.type !== "s3" ? "selected" : ""}"><input type="radio" name="dest" value="local" ${dest.type !== "s3" ? raw("checked") : ""}/><span class="c-mark"></span><span class="c-title"><span class="c-ico">${icon("hardDrive")}</span>Main server disk</span><span class="c-desc" style="overflow-wrap:anywhere">${s.localPath || "/var/lib/fcc/backups"} — fast, but lost if the server is.</span></label>
+      <div class="mode-switch" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,200px),1fr))">
+        <label class="choice ${!["s3", "smb"].includes(dest.type) ? "selected" : ""}"><input type="radio" name="dest" value="local" ${!["s3", "smb"].includes(dest.type) ? raw("checked") : ""}/><span class="c-mark"></span><span class="c-title"><span class="c-ico">${icon("hardDrive")}</span>Main server disk</span><span class="c-desc" style="overflow-wrap:anywhere">${s.localPath || "/var/lib/fcc/backups"} — fast, but lost if the server is.</span></label>
         <label class="choice ${dest.type === "s3" ? "selected" : ""}"><input type="radio" name="dest" value="s3" ${dest.type === "s3" ? raw("checked") : ""}/><span class="c-mark"></span><span class="c-title"><span class="c-ico">${icon("cloud")}</span>S3-compatible storage</span><span class="c-desc">AWS S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO… A local copy is kept too.</span></label>
+        <label class="choice ${dest.type === "smb" ? "selected" : ""}"><input type="radio" name="dest" value="smb" ${dest.type === "smb" ? raw("checked") : ""}/><span class="c-mark"></span><span class="c-title"><span class="c-ico">${icon("folder")}</span>SMB share</span><span class="c-desc">A Windows or Samba file share — NAS, file server. A local copy is kept too.</span></label>
       </div>
       <div class="form-grid mt-20" data-s3 ${dest.type === "s3" ? "" : raw("hidden")}>
         <div class="field"><label>Endpoint</label><input class="input mono" data-d="endpoint" value="${dest.endpoint || ""}" placeholder="https://s3.eu-central-1.amazonaws.com"/></div>
@@ -97,6 +99,21 @@ export async function scheduleForm(box, ctx) {
         <div class="field"><label>Secret key</label><input class="input mono" type="password" data-secret placeholder="${dest.secretKeySet ? "•••••••• saved — leave blank to keep" : ""}" autocomplete="new-password"/></div>
         <div class="field span-2"><label class="check"><input type="checkbox" data-pathstyle ${dest.pathStyle !== false ? raw("checked") : ""}/>Path-style URLs (needed for MinIO and most non-AWS providers)</label></div>
         <div class="field span-2"><div class="row wrap"><button class="btn btn-sm" data-test type="button">${icon("zap")}Test connection</button><span class="small" data-test-res></span></div></div>
+      </div>
+      <div class="mt-20" data-smb ${dest.type === "smb" ? "" : raw("hidden")}>
+        ${smbTool.installed ? "" : html`<div class="note warn" style="margin-bottom:16px">${icon("alert")}<div><b>smbclient is not installed on this server.</b> SMB copies need it. ${smbTool.canInstall ? html`Install it here, or run <span class="mono">apt install smbclient</span>.` : html`Install the <span class="mono">smbclient</span> package with your package manager.`}${smbTool.canInstall ? html`<div class="mt-12"><button class="btn btn-sm" type="button" data-smb-install>${icon("download")}Install smbclient</button></div>` : ""}</div></div>`}
+        <div class="form-grid">
+          <div class="field"><label>Server</label><input class="input mono" data-smb-f="server" value="${smb.server || ""}" placeholder="nas.local or 192.168.1.20" autocomplete="off"/></div>
+          <div class="field"><label>Share</label><input class="input mono" data-smb-f="share" value="${smb.share || ""}" placeholder="Backups"/></div>
+          <div class="field"><label>Subfolder <span class="dim">(optional)</span></label><input class="input mono" data-smb-f="path" value="${smb.path || ""}" placeholder="fcc/panel-1"/></div>
+          <div class="field"><label>Domain / workgroup <span class="dim">(optional)</span></label><input class="input mono" data-smb-f="domain" value="${smb.domain || ""}" placeholder="WORKGROUP"/></div>
+          <div class="field"><label>User name</label><input class="input mono" data-smb-f="username" value="${smb.username || ""}" autocomplete="off"/></div>
+          <div class="field"><label>Password</label><input class="input mono" type="password" data-smb-pass placeholder="${smb.passwordSet ? "•••••••• saved — leave blank to keep" : ""}" autocomplete="new-password"/></div>
+          <div class="field"><label>Minimum protocol</label><select class="select" data-smb-f="minProtocol">${[["SMB2", "SMB2+ (recommended)"], ["SMB3", "SMB3 only"], ["NT1", "SMB1 — legacy, insecure"]].map(([k, l]) => html`<option value="${k}" ${(smb.minProtocol || "SMB2") === k ? raw("selected") : ""}>${l}</option>`)}</select></div>
+          <div class="field"><label>Port</label><input class="input mono" type="number" min="1" max="65535" data-smb-f="port" value="${smb.port || 445}"/></div>
+          <div class="field span-2"><p class="hint">Files go to <span class="mono" data-smb-preview></span>. The account needs permission to create folders and write and delete files. Deleting a backup here also deletes its copy on the share; a missing local copy can be fetched back for download or restore.</p></div>
+          <div class="field span-2"><div class="row wrap"><button class="btn btn-sm" data-smb-test type="button">${icon("zap")}Test connection</button><button class="btn btn-sm btn-ghost" data-smb-browse type="button" ${dest.type === "smb" && smb.server ? "" : raw("disabled")} title="Lists the saved share">${icon("folder")}Browse share</button><span class="small" data-smb-test-res></span></div></div>
+        </div>
       </div>
     </div><div class="card-foot"><span class="muted small">Changes apply from the next scheduled slot.</span><span class="spacer"></span><button class="btn btn-primary" data-savesched>${icon("check")}Save schedule</button></div></div>
   </div>`);
@@ -110,7 +127,15 @@ export async function scheduleForm(box, ctx) {
   on(box, "change", "input[name=dest]", (e) => {
     $$("input[name=dest]", box).forEach((r) => r.closest(".choice").classList.toggle("selected", r.checked));
     $("[data-s3]", box).hidden = e.target.value !== "s3";
+    $("[data-smb]", box).hidden = e.target.value !== "smb";
   });
+  const smbPreview = () => {
+    const v = (k) => $(`[data-smb-f="${k}"]`, box).value.trim();
+    const sub = v("path").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    $("[data-smb-preview]", box).textContent = `\\\\${v("server") || "server"}\\${v("share") || "share"}${sub ? `\\${sub.replace(/\//g, "\\")}` : ""}\\db|server\\…`;
+  };
+  smbPreview();
+  on(box, "input", "[data-smb-f]", smbPreview);
   const destBody = () => {
     const type = $("input[name=dest]:checked", box).value;
     const d = { type };
@@ -118,6 +143,12 @@ export async function scheduleForm(box, ctx) {
       $$("[data-d]", box).forEach((i) => (d[i.dataset.d] = i.value.trim()));
       d.pathStyle = $("[data-pathstyle]", box).checked;
       const sk = $("[data-secret]", box).value; if (sk) d.secretKey = sk;
+    }
+    if (type === "smb") {
+      d.smb = {};
+      $$("[data-smb-f]", box).forEach((i) => (d.smb[i.dataset.smbF] = i.value.trim()));
+      d.smb.port = Number(d.smb.port) || 445;
+      const pw = $("[data-smb-pass]", box).value; if (pw) d.smb.password = pw;
     }
     return d;
   };
@@ -128,10 +159,23 @@ export async function scheduleForm(box, ctx) {
     catch (ex) { mount(res, html`<span class="status" style="color:#ff8ea3"><span class="dot err"></span>${ex.message}</span>`); }
     finally { b.classList.remove("loading"); }
   });
+  on(box, "click", "[data-smb-test]", async (e, b) => {
+    const res = $("[data-smb-test-res]", box);
+    b.classList.add("loading"); res.textContent = "";
+    try { const r = await post("/api/backups/destination/test", destBody()); mount(res, html`<span class="status" style="color:#63e6ad"><span class="dot ok"></span>${r.dryRun ? "Dry run — commands logged, nothing sent." : `Connected — wrote, listed and deleted a test file in ${r.location}.`}</span>`); }
+    catch (ex) { mount(res, html`<span class="status" style="color:#ff8ea3;overflow-wrap:anywhere"><span class="dot err"></span>${ex.message}</span>`); }
+    finally { b.classList.remove("loading"); }
+  });
+  on(box, "click", "[data-smb-install]", async (e, b) => {
+    b.classList.add("loading");
+    try { jobStarted(await post("/api/backups/destination/smb/install"), "Installing smbclient"); } catch (ex) { toastError(ex, "Couldn't start the install"); } finally { b.classList.remove("loading"); }
+  });
+  on(box, "click", "[data-smb-browse]", () => smbBrowser());
   on(box, "click", "[data-savesched]", async (e, b) => {
     const val = (k) => { const el = $(`[data-f="${k}"]`, box); return el.type === "checkbox" ? el.checked : el.type === "number" ? Number(el.value) : el.value; };
     const destination = destBody();
     if (destination.type === "s3" && !destination.bucket) { toast("Enter a bucket name", "warn"); return; }
+    if (destination.type === "smb" && (!destination.smb.server || !destination.smb.share || !destination.smb.username)) { toast("Enter the SMB server, share and user name", "warn"); return; }
     const include = {}; $$("[data-inc]", box).forEach((i) => (include[i.dataset.inc] = i.checked));
     const serverIds = $$("[data-srvsel]", box).filter((i) => i.checked).map((i) => i.dataset.srvsel);
     const sched = (k) => ({ enabled: val(`${k}.enabled`), every: val(`${k}.every`), at: val(`${k}.at`), day: Number(val(`${k}.day`)), keep: val(`${k}.keep`) });
@@ -139,6 +183,25 @@ export async function scheduleForm(box, ctx) {
     b.classList.add("loading");
     try { await put("/api/backups/settings", body); toast("Backup schedule saved", "ok"); } catch (ex) { toastError(ex, "Couldn't save"); } finally { b.classList.remove("loading"); }
   });
+}
+function smbBrowser() {
+  openModal({ title: "SMB share", sub: "The saved destination — save first to browse new settings.", ico: "folder", size: "lg",
+    body: html`<div data-smb-list>${skeletonRows(4, 40)}</div>`, foot: html`<button class="btn btn-ghost" data-close>Close</button>`,
+    onMount(el) {
+      const load = async (sub) => {
+        const box = $("[data-smb-list]", el);
+        mount(box, skeletonRows(4, 40));
+        try {
+          const r = await get(`/api/backups/destination/remote?path=${encodeURIComponent(sub)}`);
+          const parts = sub ? sub.split("/") : [];
+          const items = (r.items || []).sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+          mount(box, html`<div class="row wrap small" style="gap:6px;margin-bottom:12px"><a href="#" data-go="">${r.location.split("/").slice(0, 4).join("/") || "share"}</a>${parts.map((p, i) => html`<span class="dim">/</span><a href="#" data-go="${parts.slice(0, i + 1).join("/")}">${p}</a>`)}</div>
+            ${r.dryRun ? html`<div class="note">${icon("info")}<div>Dry run — smbclient isn't called, so the share looks empty.</div></div>` : items.length ? html`<div class="list">${items.map((x) => html`<div class="list-item">${icon(x.dir ? "folder" : "file", "sm")}${x.dir ? html`<a href="#" class="mono" data-go="${[...parts, x.name].join("/")}">${x.name}</a>` : html`<span class="mono">${x.name}</span>`}<span class="spacer"></span><span class="muted small">${x.dir ? "" : fmtBytes(x.size)}${x.modifiedAt ? ` · ${ago(x.modifiedAt)}` : ""}</span></div>`)}</div>` : html`<p class="muted small">This folder is empty.</p>`}`);
+        } catch (e) { mount(box, errorState(e)); }
+      };
+      on(el, "click", "[data-go]", (e, a) => { e.preventDefault(); load(a.dataset.go); });
+      load("");
+    } });
 }
 function fmtDateShort(t) { return new Date(t).toLocaleString("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }); }
 

@@ -1,6 +1,7 @@
 /**
  * DATA — database and server backups: manual + scheduled, retention,
- * download, restore, optional S3-compatible off-site copy.
+ * download, restore, optional off-site copy to S3-compatible storage or an
+ * SMB (Windows/Samba) share via smbclient (panel/lib/smb.mjs).
  *
  * Layout under dataDir/backups/ (records store the path relative to it):
  *   db/<projectSlug>/<db>-<stamp>.sql.gz          mysqldump | gzip
@@ -25,9 +26,10 @@ import zlib from "node:zlib";
 import { pipeline } from "node:stream/promises";
 
 import { httpError } from "./http.mjs";
-import { run, which, DRY_RUN } from "./sys.mjs";
+import { run, which, forgetWhich, DRY_RUN } from "./sys.mjs";
 import { projectPrefix } from "./mysql.mjs";
 import { createS3 } from "./s3.mjs";
+import { createSmb, smbInstalled, validServer, validShare, validFolder, validUsername, validPassword, validDomain, validPort, validMinProtocol } from "./smb.mjs";
 
 const MAIN_ID = "main";
 const FORBIDDEN_ROOTS = ["/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run", "/var", "/root", "/home", "/srv", "/opt", "/tmp"];
@@ -204,6 +206,14 @@ export function register(router, ctx) {
     return abs;
   }
 
+  function existsRel(rel) {
+    try {
+      return fs.existsSync(absOf(rel));
+    } catch {
+      return false;
+    }
+  }
+
   function readState() {
     try {
       return JSON.parse(fs.readFileSync(stateFile(), "utf8"));
@@ -244,13 +254,24 @@ export function register(router, ctx) {
       status: b.status,
       // A finished backup whose archive has been removed from disk can no
       // longer be downloaded or restored; say so instead of listing it as ok.
-      available: b.status === "ok" ? !!(b.file && fs.existsSync(b.file)) : false,
+      // (b.file is relative to the backups folder — resolve it, don't test it against cwd.)
+      available: b.status === "ok" ? !!(b.file && existsRel(b.file)) : false,
       trigger: b.trigger,
       pinned: !!b.pinned,
       note: b.note || "",
       error: b.error || null,
       jobId: b.jobId || null,
-      remote: b.remote ? { type: b.remote.type, key: b.remote.key || null, uploadedAt: b.remote.uploadedAt || null, error: b.remote.error || null } : null,
+      remote: b.remote
+        ? {
+            type: b.remote.type,
+            key: b.remote.key || null,
+            location: remoteLocation(b.remote),
+            uploadedAt: b.remote.uploadedAt || null,
+            error: b.remote.error || null,
+            dryRun: !!b.remote.dryRun,
+            fetchable: canFetch(b),
+          }
+        : null,
       downloadUrl: b.status === "ok" ? `/api/backups/${b.id}/download` : null,
       createdAt: b.createdAt,
       finishedAt: b.finishedAt || null,
@@ -287,8 +308,47 @@ export function register(router, ctx) {
     return createS3({ endpoint: d.endpoint, bucket: d.bucket, region: d.region, accessKey: d.accessKey, secretKey, prefix: d.prefix, pathStyle: d.pathStyle !== false });
   }
 
+  // SMB: settings live in destination.smb (password as passwordEnc).
+  function smbClient(d = cfg().destination) {
+    const s = d.smb || {};
+    let password = "";
+    try {
+      password = s.passwordEnc ? ctx.secrets.decrypt(s.passwordEnc) : "";
+    } catch {}
+    return createSmb({ ...s, password }, { tmpDir: tmpRoot() });
+  }
+  const sameSmb = (d, r) =>
+    d.type === "smb" && !!d.smb && String(d.smb.server || "").toLowerCase() === String(r.server || "").toLowerCase() && String(d.smb.share || "").toLowerCase() === String(r.share || "").toLowerCase();
+
+  function remoteLocation(r) {
+    if (!r?.key) return null;
+    if (r.type === "smb") return `//${r.server}/${r.share}/${r.key}`;
+    if (r.type === "s3") return `s3://${r.bucket}/${r.key}`;
+    return null;
+  }
+
+  /** Can a missing local file be pulled back from the off-site copy? (SMB only.) */
+  function canFetch(b) {
+    return b.status === "ok" && b.remote?.type === "smb" && !!b.remote.key && !b.remote.error && sameSmb(cfg().destination, b.remote);
+  }
+
+  async function uploadSmb(b, abs, log) {
+    try {
+      const smb = smbClient();
+      const key = smb.keyFor(b.file);
+      log?.(`Uploading to ${smb.location(key)}…`);
+      await smb.putFile(b.file, abs, { log });
+      update(b.id, { remote: { type: "smb", key, server: smb.server, share: smb.share, uploadedAt: new Date().toISOString(), ...(DRY_RUN ? { dryRun: true } : {}) } });
+      log?.(DRY_RUN ? "[dry-run] Off-site copy simulated." : "Off-site copy uploaded.");
+    } catch (e) {
+      log?.(`Off-site upload failed (the local copy is fine): ${e.message}`);
+      update(b.id, { remote: { type: "smb", error: e.message } });
+    }
+  }
+
   async function uploadRemote(b, abs, log) {
     const d = cfg().destination;
+    if (d.type === "smb") return uploadSmb(b, abs, log);
     if (d.type !== "s3") return;
     if (DRY_RUN) {
       log?.(`[dry-run] upload to s3://${d.bucket}/${d.prefix ? `${d.prefix}/` : ""}${b.file}`);
@@ -308,8 +368,18 @@ export function register(router, ctx) {
   }
 
   async function removeRemote(b) {
-    if (!b.remote?.key || DRY_RUN) return;
+    if (!b.remote?.key) return;
     const d = cfg().destination;
+    if (b.remote.type === "smb") {
+      if (!sameSmb(d, b.remote)) return; // destination changed; leave the old file alone
+      try {
+        await smbClient(d).deleteFile(b.remote.key, { log: DRY_RUN ? (l) => console.log(`[fcc] backups: ${l}`) : null });
+      } catch (e) {
+        console.error(`[fcc] could not delete off-site copy ${remoteLocation(b.remote)}: ${e.message}`);
+      }
+      return;
+    }
+    if (DRY_RUN) return;
     if (d.type !== "s3" || d.bucket !== b.remote.bucket) return; // destination changed; leave the old object alone
     try {
       await destinationClient().deleteObject(b.remote.key);
@@ -685,9 +755,48 @@ export function register(router, ctx) {
 
   // ------------------------------------------------------------ restore
 
-  async function verifyFile(b, log) {
+  /** Download a backup's SMB copy back into dataDir/backups (checksum-verified). */
+  async function fetchRemote(b, { log, signal } = {}) {
     const abs = absOf(b.file);
+    const key = `fetch:${b.id}`;
+    if (!lock(key, "fetch")) throw new Error("This backup is already being downloaded from the SMB share.");
+    const part = `${abs}.part`;
+    try {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.rmSync(part, { force: true });
+      log?.(`Downloading ${remoteLocation(b.remote)}…`);
+      await smbClient().getFile(b.remote.key, part, { log, signal, size: b.size });
+      if (DRY_RUN) {
+        if (!fs.existsSync(part)) {
+          if (b.kind === "server") writePlaceholderTar(part, "DRY-RUN.txt", `FCC dry-run placeholder (fetched ${b.id} from SMB)\n`);
+          else fs.writeFileSync(part, zlib.gzipSync(`-- FCC dry-run placeholder (fetched ${b.id} from SMB)\n`), { mode: 0o600 });
+        }
+        log?.("[dry-run] Simulated download — checksum not verified.");
+      } else {
+        if (!fs.existsSync(part)) throw new Error("smbclient finished but no file arrived.");
+        if (b.sha256 && (await sha256File(part)) !== b.sha256) throw new Error("The SMB copy's checksum doesn't match this backup — refusing to use it.");
+      }
+      fs.chmodSync(part, 0o600);
+      fs.renameSync(part, abs);
+      log?.("Local copy restored from the SMB share.");
+      broadcast("backup", { action: "updated", backup: publicView(ctx.db.get("backups", b.id)) });
+      return abs;
+    } finally {
+      fs.rmSync(part, { force: true });
+      active.delete(key);
+    }
+  }
+
+  async function verifyFile(b, log, signal) {
+    const abs = absOf(b.file);
+    let fetched = false;
+    if (!fs.existsSync(abs) && canFetch(b)) {
+      log?.("The local copy is missing — fetching it from the SMB share first.");
+      await fetchRemote(b, { log, signal });
+      fetched = true;
+    }
     if (!fs.existsSync(abs)) throw new Error("The backup file is missing from disk.");
+    if (fetched && DRY_RUN) return abs;
     if (b.sha256) {
       const got = await sha256File(abs);
       if (got !== b.sha256) throw new Error("Backup file checksum does not match — refusing to restore a corrupted or altered file.");
@@ -706,7 +815,7 @@ export function register(router, ctx) {
         { type: "backup.restore", title: `Restore ${dbRec.name} from ${path.basename(b.file)}`, projectId: dbRec.projectId, databaseId: dbRec.id, adminId: admin?.id || null },
         async ({ log, signal, job }) => {
           try {
-            const abs = await verifyFile(b, log);
+            const abs = await verifyFile(b, log, signal);
             log("Taking a safety backup of the current data first…");
             const safety = await runDatabaseBackup(dbRec, {
               trigger: "safety",
@@ -757,7 +866,7 @@ export function register(router, ctx) {
         { type: "backup.restore", title: `Restore main server from ${path.basename(b.file)}`, serverId: MAIN_ID, adminId: admin?.id || null },
         async ({ log, signal }) => {
           try {
-            const abs = await verifyFile(b, log);
+            const abs = await verifyFile(b, log, signal);
             const manifest = await readManifest(abs);
             if (!manifest && !DRY_RUN) throw new Error("This archive has no FCC manifest; extract it by hand.");
             const panelRel = manifest?.dataDir ? relFromRoot(manifest.dataDir) : relFromRoot(ctx.dataDir);
@@ -808,7 +917,7 @@ export function register(router, ctx) {
       database: { ...c.database },
       server: { ...c.server, include: { ...c.server.include } },
       destination: {
-        type: d.type === "s3" ? "s3" : "local",
+        type: ["s3", "smb"].includes(d.type) ? d.type : "local",
         endpoint: d.endpoint || "",
         bucket: d.bucket || "",
         region: d.region || "",
@@ -816,7 +925,18 @@ export function register(router, ctx) {
         prefix: d.prefix || "",
         pathStyle: d.pathStyle !== false,
         secretKeySet: !!d.secretKeyEnc,
+        smb: {
+          server: d.smb?.server || "",
+          share: d.smb?.share || "",
+          path: d.smb?.path || "",
+          username: d.smb?.username || "",
+          domain: d.smb?.domain || "",
+          minProtocol: d.smb?.minProtocol || "SMB2",
+          port: d.smb?.port || 445,
+          passwordSet: !!d.smb?.passwordEnc,
+        },
       },
+      smbclient: { installed: smbInstalled(), canInstall: DRY_RUN || !!which("apt-get"), dryRun: DRY_RUN },
       nextRun: {
         database: c.database.enabled ? nextSlot(c.database).toISOString() : null,
         server: c.server.enabled ? nextSlot(c.server).toISOString() : null,
@@ -832,8 +952,15 @@ export function register(router, ctx) {
     const out = { ...current };
     if (!input || typeof input !== "object") return out;
     if ("type" in input) {
-      if (!["local", "s3"].includes(input.type)) throw httpError(400, "Destination type must be local or s3.");
+      if (!["local", "s3", "smb"].includes(input.type)) throw httpError(400, "Destination type must be local, s3 or smb.");
       out.type = input.type;
+    }
+    if (input.smb && typeof input.smb === "object") {
+      try {
+        out.smb = validSmb(input.smb, out.smb || {});
+      } catch (e) {
+        throw e.validation ? httpError(400, e.message) : e;
+      }
     }
     if ("endpoint" in input) {
       const e = String(input.endpoint || "").trim();
@@ -877,6 +1004,24 @@ export function register(router, ctx) {
     delete out.secretKey;
     if (out.type === "s3" && (!out.endpoint || !out.bucket || !out.accessKey || !out.secretKeyEnc))
       throw httpError(400, "An S3 destination needs endpoint, bucket, access key and secret key.");
+    if (out.type === "smb" && (!out.smb?.server || !out.smb?.share || !out.smb?.username))
+      throw httpError(400, "An SMB destination needs server, share and user name.");
+    return out;
+  }
+
+  /** destination.smb: { server, share, path, username, passwordEnc, domain, minProtocol, port }. */
+  function validSmb(input, current) {
+    const out = { minProtocol: "SMB2", port: 445, ...current };
+    if ("server" in input) out.server = String(input.server || "").trim() ? validServer(input.server) : "";
+    if ("share" in input) out.share = String(input.share || "").trim() ? validShare(input.share) : "";
+    if ("path" in input) out.path = validFolder(input.path).join("/");
+    if ("username" in input) out.username = String(input.username || "").trim() ? validUsername(input.username) : "";
+    if ("domain" in input) out.domain = validDomain(input.domain);
+    if ("minProtocol" in input) out.minProtocol = validMinProtocol(input.minProtocol);
+    if ("port" in input) out.port = validPort(input.port);
+    if (typeof input.password === "string" && input.password) out.passwordEnc = ctx.secrets.encrypt(validPassword(input.password));
+    if (input.clearPassword) delete out.passwordEnc;
+    delete out.password;
     return out;
   }
 
@@ -923,6 +1068,16 @@ export function register(router, ctx) {
   });
 
   router.post("/api/backups/destination/test", async (req, res, { body }) => {
+    if (body?.type === "smb") {
+      const merged = validDestination({ ...body, type: "smb" }, cfg().destination);
+      const lines = [];
+      try {
+        const r = await smbClient(merged).test({ log: (l) => lines.push(l) });
+        return { ...r, dryRun: DRY_RUN, log: lines.slice(-40) };
+      } catch (e) {
+        throw httpError(400, e.message, { log: lines.slice(-20), notInstalled: !!e.notInstalled });
+      }
+    }
     const merged = validDestination({ type: "s3", ...(body || {}) }, cfg().destination);
     if (DRY_RUN) return { ok: true, dryRun: true };
     let secretKey = "";
@@ -935,6 +1090,36 @@ export function register(router, ctx) {
     } catch (e) {
       throw httpError(400, e.message);
     }
+  });
+
+  // SMB extras: browse the share, install smbclient (apt, Debian/Ubuntu).
+  router.get("/api/backups/destination/remote", async (req, res, { query }) => {
+    const d = cfg().destination;
+    if (d.type !== "smb") throw httpError(409, "Browsing is only available for an SMB destination.");
+    try {
+      return await smbClient(d).list(String(query.path || ""), { timeoutSec: 60 });
+    } catch (e) {
+      throw httpError(e.validation ? 400 : 502, e.message, { notInstalled: !!e.notInstalled });
+    }
+  });
+
+  router.post("/api/backups/destination/smb/install", async (req, res, { admin }) => {
+    if (!DRY_RUN && !which("apt-get")) throw httpError(400, "This system has no apt-get. Install smbclient with your package manager (it's the `smbclient` / `samba-client` package), then reload.");
+    return ctx.jobs.start({ type: "backup.smbclient", title: "Install smbclient", lock: "apt", adminId: admin?.id || null }, async ({ log, signal }) => {
+      const env = { DEBIAN_FRONTEND: "noninteractive" };
+      const args = ["install", "-y", "--no-install-recommends", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "smbclient"];
+      const first = await run("apt-get", args, { env, log, signal, allowFail: true, timeoutMs: 20 * 60_000 });
+      if (first.code !== 0) {
+        log("apt-get install failed — refreshing package lists and retrying…");
+        await run("apt-get", ["update"], { env, log, signal, timeoutMs: 10 * 60_000 });
+        await run("apt-get", args, { env, log, signal, timeoutMs: 20 * 60_000 });
+      }
+      forgetWhich("smbclient");
+      if (!smbInstalled()) throw new Error("apt-get finished but smbclient is still not on PATH.");
+      audit(admin, "backup.smbclient.install", { type: "settings", id: "backups", name: "Backups" }, {});
+      broadcast("backup", { action: "settings" });
+      return { installed: true };
+    });
   });
 
   router.get("/api/backups", async (req, res, { query }) => {
@@ -964,11 +1149,26 @@ export function register(router, ctx) {
 
   router.get("/api/backups/:id", async (req, res, { params }) => publicView(getBackup(params.id)));
 
+  router.post("/api/backups/:id/fetch", async (req, res, { params, admin }) => {
+    const b = getBackup(params.id);
+    if (!canFetch(b)) throw httpError(409, "This backup has no SMB copy on the current destination.");
+    if (fs.existsSync(absOf(b.file))) throw httpError(409, "The local copy is already on disk.");
+    audit(admin, "backup.fetch", { type: "backup", id: b.id, name: path.basename(b.file || "") }, { from: remoteLocation(b.remote) });
+    return ctx.jobs.start(
+      { type: "backup.fetch", title: `Fetch ${path.basename(b.file)} from SMB`, lock: `backup:${b.id}`, adminId: admin?.id || null },
+      async ({ log, signal }) => {
+        await fetchRemote(b, { log, signal });
+        return { backupId: b.id, file: path.basename(b.file) };
+      },
+    );
+  });
+
   router.get("/api/backups/:id/download", async (req, res, { params, admin }) => {
     const b = getBackup(params.id);
     if (b.status !== "ok") throw httpError(409, "This backup is not complete.");
     const abs = absOf(b.file);
-    if (!fs.existsSync(abs)) throw httpError(410, "The backup file is no longer on disk.");
+    if (!fs.existsSync(abs))
+      throw httpError(410, canFetch(b) ? "The local copy is gone — use “Fetch from SMB share” first, then download." : "The backup file is no longer on disk.");
     const size = fs.statSync(abs).size;
     const name = path.basename(abs).replace(/[^A-Za-z0-9._-]/g, "_");
     audit(admin, "backup.download", { type: "backup", id: b.id, name }, { size });
@@ -1021,7 +1221,7 @@ export async function start(ctx) {
   // Leftover staging dirs and partial files.
   try {
     for (const f of fs.readdirSync(path.join(ctx.dataDir, "tmp"))) {
-      if (f.startsWith("backup-")) fs.rmSync(path.join(ctx.dataDir, "tmp", f), { recursive: true, force: true });
+      if (f.startsWith("backup-") || f.startsWith("smb-auth-") || f.startsWith("smb-test-")) fs.rmSync(path.join(ctx.dataDir, "tmp", f), { recursive: true, force: true });
     }
   } catch {}
   const sweep = (dir) => {

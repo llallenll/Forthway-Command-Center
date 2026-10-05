@@ -709,6 +709,21 @@ export class Deployer {
         log.line("No existing node_modules — this will be a full install.");
       }
       depsUnchanged = seeded && !!liveLock && liveLock === newLock && livePkg === newPkg;
+      if (depsUnchanged && !/--omit[= ]dev|--production|--only[= ]prod/.test(this.S.build.install)) {
+        // A node_modules installed without devDependencies (an older engine,
+        // NODE_ENV=production) must not be reused as-is: the build needs them.
+        let missing = [];
+        try {
+          const dev = JSON.parse(fs.readFileSync(path.join(p.staging, "package.json"), "utf8")).devDependencies || {};
+          missing = Object.keys(dev).filter((name) => !exists(path.join(p.staging, "node_modules", name, "package.json")));
+        } catch {
+          /* unreadable package.json: leave the decision to the lockfile check */
+        }
+        if (missing.length) {
+          log.line(`node_modules lacks development dependencies (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? "…" : ""}) — installing again.`);
+          depsUnchanged = false;
+        }
+      }
       if (depsUnchanged && this.S.smartInstall) {
         log.line("package.json and the lockfile are unchanged — skipping the install step.");
       } else {
@@ -719,8 +734,10 @@ export class Deployer {
         await this.run(this.S.build.install, {
           cwd: p.staging,
           log,
-          env: { NPM_CONFIG_INCLUDE: "dev", NPM_CONFIG_PRODUCTION: "false" },
-          unsetEnv: ["NODE_ENV", "npm_config_production", "npm_config_omit", "NPM_CONFIG_OMIT"],
+          // (Not NPM_CONFIG_PRODUCTION=false: npm 8+ ignores it apart from
+          // printing a misleading "Use `--omit=dev` instead" warning.)
+          env: { NPM_CONFIG_INCLUDE: "dev" },
+          unsetEnv: ["NODE_ENV", "npm_config_production", "NPM_CONFIG_PRODUCTION", "npm_config_omit", "NPM_CONFIG_OMIT"],
           timeoutMs: 20 * 60_000,
         });
       }

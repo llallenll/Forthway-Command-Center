@@ -74,6 +74,7 @@ const P = {
   arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   dot: '<circle cx="12" cy="12" r="3.5"/>',
   wand: '<path d="m14.5 4.5 5 5L8 21l-5-5z"/><path d="m12 7 5 5"/>',
+  bell: '<path d="M6 16.5V11a6 6 0 1 1 12 0v5.5l1.5 2H4.5z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>', // MONITOR: text alerts
 };
 
 export function icon(name, cls = "") {

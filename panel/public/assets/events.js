@@ -12,7 +12,7 @@
 //         "polling" (fallback working) | "offline" (both failing, retrying)
 import { MOCK, mock } from "./api.js";
 
-const TYPES = ["job", "job.log", "site", "server", "database", "backup", "project", "lb", "activity", "settings", "updates", "cloudflare"];
+const TYPES = ["job", "job.log", "site", "server", "database", "backup", "project", "lb", "activity", "settings", "updates", "cloudflare", "monitor"];
 const OPEN_TIMEOUT = 8000; // SSE must deliver its hello within this
 const STALL_TIMEOUT = 45000; // server pings every 15s; silence this long = stalled
 const PROBE_EVERY = 120000; // while polling, retry SSE this often

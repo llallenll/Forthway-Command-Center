@@ -3,6 +3,7 @@ import { icon } from "../icons.js";
 import { get, del } from "../api.js";
 import { tabsBar, databasesTable, dbMenu, revealCredentials, createDatabase, backupsTable, bindBackupActions, activityItem, openPhpMyAdmin } from "../components.js";
 import { siteRow, bindSiteRows } from "./sites.js";
+import { bindUptime } from "./monitor.js"; // MONITOR: uptime in website rows
 import { projectDialog } from "./projects.js";
 
 export default async function project(ctx) {
@@ -68,6 +69,7 @@ export default async function project(ctx) {
       } catch (e) { mount(box, errorState(e)); }
     };
     mount(box, skeletonRows(3, 68));
+    bindUptime(box, ctx);
     await load(); bindSiteRows(box);
     ctx.on("site", debounce(load, 400));
   }

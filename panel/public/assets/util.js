@@ -301,11 +301,11 @@ export function closeMenu() { openMenuEl?.remove(); openMenuEl = null; }
 export function openMenu(anchor, items, { align = "right", head } = {}) {
   closeMenu();
   const el = frag(html`<div class="menu" role="menu">${head || ""}${items.filter(Boolean).map((it, i) =>
-    it.sep ? html`<hr/>` : html`<button role="menuitem" data-i="${i}" class="${it.danger ? "danger" : ""}" ${it.disabled ? raw("disabled style='opacity:.4;pointer-events:none'") : ""}>${it.icon ? icon(it.icon, "sm") : ""}<span>${it.label}</span></button>`)}</div>`);
+    it.sep ? html`<hr/>` : html`<button role="menuitem" data-i="${i}" class="${it.danger ? "danger" : ""}" ${it.disabled ? raw("disabled") : ""}>${it.icon ? icon(it.icon, "sm") : ""}<span>${it.label}</span></button>`)}</div>`);
   const list = items.filter(Boolean);
   el.addEventListener("click", (e) => {
     const b = e.target.closest("button[data-i]");
-    if (!b) return;
+    if (!b || b.disabled) return;
     closeMenu();
     list[Number(b.dataset.i)].onClick?.();
   });
@@ -325,6 +325,7 @@ export function openMenu(anchor, items, { align = "right", head } = {}) {
   return el;
 }
 window.addEventListener("resize", closeMenu);
+window.addEventListener("hashchange", closeMenu); // a menu never outlives the page that opened it
 window.addEventListener("scroll", closeMenu, true);
 
 /* ── shared bits of markup ── */

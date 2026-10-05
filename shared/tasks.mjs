@@ -9,7 +9,8 @@
  *   executeTask(type, payload, { log, signal, dataDir, isMain, uploadFile, authToken, panelUrl })
  *
  * Task types and their payload/result shapes are listed in docs/STANDALONE.md
- * (section 3, "ctx.cluster"). There is deliberately no "run a command" task.
+ * (section 3, "ctx.cluster"). There is deliberately no "run a command" task:
+ * site.script runs only `npm run <name>` for a script the deployed package.json defines.
  *
  * Everything that shells out goes through panel/lib/sys.mjs, so FCC_DRY_RUN=1
  * logs what would run instead of running it. The deploy engine spawns its own
@@ -22,7 +23,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 
 import { Deployer } from "./deployer.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
@@ -40,9 +41,14 @@ export const TASK_TYPES = [
   "site.env",
   "site.remove",
   "site.logs",
+  "site.scripts",
+  "site.script",
   "server.metrics",
   "server.backup",
 ];
+
+/** A package.json script (site.script) is stopped after this long. */
+export const SCRIPT_TIMEOUT_MS = 15 * 60_000;
 
 /** Generous upper bounds, used by the panel to give up on a silent task. */
 export const TASK_TIMEOUTS_MS = {
@@ -55,6 +61,8 @@ export const TASK_TIMEOUTS_MS = {
   "site.env": 60_000,
   "site.remove": 10 * 60_000,
   "site.logs": 60_000,
+  "site.scripts": 60_000,
+  "site.script": SCRIPT_TIMEOUT_MS + 2 * 60_000, // the task kills the script itself at SCRIPT_TIMEOUT_MS
   "server.metrics": 30_000,
   "server.backup": 6 * 60 * 60_000,
 };
@@ -84,6 +92,10 @@ export async function executeTask(type, payload = {}, opts = {}) {
       return siteStatus(payload, o);
     case "site.logs":
       return siteLogs(payload, o);
+    case "site.scripts":
+      return siteScripts(payload, o);
+    case "site.script":
+      return withSiteLock(siteIdOf(payload), () => siteScript(payload, o));
     case "site.deploy":
     case "site.rollback":
     case "site.start":
@@ -484,6 +496,171 @@ async function siteLogs(payload, o) {
     text += `==> ${label} (${file}) <==\n${body ?? "(no log file yet)\n"}\n`;
   }
   return { text };
+}
+
+// ------------------------------------------------------- package.json scripts
+//
+// Not a terminal: the only thing that can run is `npm run <name>`, where <name>
+// is a key of "scripts" in the package.json that is deployed on THIS server,
+// checked against a strict pattern, and passed to npm as its own argument
+// (no shell on our side). npm puts node_modules/.bin on PATH, so devDependency
+// tools (prisma, drizzle-kit, knex…) work as they do on a laptop.
+
+/** Letters, digits and : . _ + - ; must not start with "-" or "." (no flags, no paths). */
+export const SCRIPT_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9:._+-]{0,99}$/;
+
+export function validScriptName(name) {
+  return typeof name === "string" && SCRIPT_NAME_RE.test(name) && !name.includes("..");
+}
+
+/** The deployed package.json's scripts, or { error }. */
+export function readPackageScripts(appDir) {
+  const file = path.join(appDir, "package.json");
+  if (!exists(file)) return { error: `There is no package.json in ${appDir} on ${os.hostname()} — deploy the website first.` };
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return { error: `${file} is not valid JSON.` };
+  }
+  const scripts = {};
+  if (pkg && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts)) {
+    for (const [k, v] of Object.entries(pkg.scripts)) if (typeof v === "string") scripts[k] = v;
+  }
+  return {
+    scripts,
+    packageName: typeof pkg?.name === "string" ? pkg.name : null,
+    version: typeof pkg?.version === "string" ? pkg.version : null,
+    hasNodeModules: exists(path.join(appDir, "node_modules")),
+  };
+}
+
+async function siteScripts(payload, o) {
+  const spec = checkSpec(payload.spec);
+  const r = readPackageScripts(spec.appDir);
+  return { ...r, scripts: r.scripts || null, appDir: spec.appDir, hostname: os.hostname(), ...(sys.DRY_RUN ? { dryRun: true } : {}) };
+}
+
+/** The environment the app itself runs with (see Deployer._appEnv / pm2 start). */
+function scriptEnv(spec) {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) if (!/^npm_/i.test(k)) env[k] = v; // not the panel's own npm context
+  Object.assign(env, spec.settings?.restart?.env || {}, spec.env || {});
+  env.PORT = String(spec.port);
+  if (!env.NODE_ENV && spec.type === "node") env.NODE_ENV = "production";
+  return env;
+}
+
+async function siteScript(payload, o) {
+  const spec = checkSpec(payload.spec);
+  const { log, signal } = o;
+  const name = payload.script;
+  if (!validScriptName(name)) throw new Error(`"${String(name).slice(0, 60)}" is not a valid script name.`);
+  const pkg = readPackageScripts(spec.appDir);
+  if (pkg.error && !sys.DRY_RUN) throw new Error(pkg.error);
+  if (pkg.scripts && !Object.prototype.hasOwnProperty.call(pkg.scripts, name)) {
+    throw new Error(`The package.json deployed on ${os.hostname()} has no "${name}" script.`);
+  }
+  const started = Date.now();
+  const body = pkg.scripts?.[name];
+  log(`$ npm run ${name}${body ? `   # ${body}` : ""}`);
+  log(`in ${spec.appDir} on ${os.hostname()}`);
+  if (sys.DRY_RUN) {
+    log(`[dry-run] would run npm run ${name} with the website's environment (${Object.keys(spec.env || {}).length} variable(s) + PORT)`);
+    return { script: name, code: 0, durationMs: Date.now() - started, dryRun: true };
+  }
+  if (!pkg.hasNodeModules) log("Note: there is no node_modules folder here, so tools from devDependencies may be missing.");
+
+  // Scripts like `prisma db push` read .env for themselves: make sure the
+  // managed block holds the current variables (no write when unchanged).
+  if (spec.type !== "static") {
+    try {
+      const d = deployerFor(spec, o);
+      d.writeEnvFile(spec.appDir, engineLog(log));
+    } catch (err) {
+      log(`Could not refresh .env: ${err.message}`);
+    }
+  }
+
+  const npm = sys.which("npm") || "npm";
+  const timeoutMs = SCRIPT_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const child = spawn(npm, ["run", name], {
+      cwd: spec.appDir,
+      env: scriptEnv(spec),
+      detached: true, // own process group: cancel/timeout stop everything it started
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const tail = [];
+    let partial = { out: "", err: "" };
+    const sink = (key) => (chunk) => {
+      partial[key] += chunk.toString("utf8").replace(/\r(?!\n)/g, "\n");
+      let i;
+      while ((i = partial[key].indexOf("\n")) !== -1) {
+        const line = partial[key].slice(0, i).replace(/\r$/, "");
+        partial[key] = partial[key].slice(i + 1);
+        log(line);
+        tail.push(line);
+        if (tail.length > 40) tail.shift();
+      }
+    };
+    child.stdout.on("data", sink("out"));
+    child.stderr.on("data", sink("err"));
+
+    let stopReason = null;
+    let killTimer = null;
+    const stop = (reason) => {
+      if (stopReason) return;
+      stopReason = reason;
+      log(`!! ${reason} — stopping npm run ${name}`);
+      killGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => killGroup(child, "SIGKILL"), 5000);
+    };
+    const onAbort = () => stop("Cancelled from the panel");
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => stop(`Timed out after ${Math.round(timeoutMs / 60000)} min`), timeoutMs);
+
+    let settled = false;
+    const done = (err, code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", onAbort);
+      for (const key of ["out", "err"]) if (partial[key]) (log(partial[key]), tail.push(partial[key]));
+      partial = { out: "", err: "" };
+      const durationMs = Date.now() - started;
+      if (err) return reject(err.code === "ENOENT" ? new Error(`npm is not installed on ${os.hostname()}.`) : err);
+      if (stopReason) {
+        const e = new Error(`${stopReason}.`);
+        if (signal?.aborted) e.aborted = true;
+        return reject(e);
+      }
+      if (code === 0) {
+        log(`✓ npm run ${name} finished in ${(durationMs / 1000).toFixed(1)}s`);
+        return resolve({ script: name, code, durationMs });
+      }
+      const last = tail.filter((l) => l.trim()).slice(-12).join("\n");
+      const e = new Error(`npm run ${name} exited with code ${code}.${last ? `\n${last}` : ""}`);
+      e.code = code;
+      e.durationMs = durationMs;
+      reject(e);
+    };
+    child.on("error", (err) => done(err));
+    child.on("close", (code, sig) => done(null, code ?? (sig ? 128 : 1)));
+  });
+}
+
+function killGroup(child, sig) {
+  try {
+    process.kill(-child.pid, sig);
+  } catch {
+    try {
+      child.kill(sig);
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
 /** Last `n` lines of a file without reading all of it. */

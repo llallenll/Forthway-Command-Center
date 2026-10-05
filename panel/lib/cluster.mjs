@@ -586,7 +586,13 @@ function createCluster(ctx) {
         if (err) c.errors++;
         counts.set(k, c);
       };
-      for (const line of buf.subarray(0, lastNl).toString("utf8").split("\n")) {
+      const lines = buf.subarray(0, lastNl).toString("utf8").split("\n");
+      try {
+        ctx.analytics?.ingest?.(site, lines); // visitors / page views (panel/lib/analytics.mjs)
+      } catch (err) {
+        console.warn("[cluster] analytics ingest:", err.message);
+      }
+      for (const line of lines) {
         const r = parseLogLine(line);
         if (!r) continue;
         const t = floorMinute(r.t);
@@ -1023,24 +1029,34 @@ function createCluster(ctx) {
       // Out of date and idle: have it reconnect (which updates it) before it
       // takes any work. Newer agents understand `rehello`; older ones only
       // reconnect after a 401, which they wait 60s on — once.
-      if (!running.size && agentIsStale(s.id)) {
+      const staleReply = () => {
+        if (running.size || !agentIsStale(s.id)) return null;
         console.log(`[cluster] ${s.name} (${s.id}) is running older agent files — asking it to reconnect and update`);
         if (query.v) return { tasks: [], cancel: [], rehello: true };
         throw httpError(401, "This agent is out of date — reconnect to fetch the panel's newer files.");
-      }
+      };
+      const stale = staleReply();
+      if (stale) return stale;
       const first = takeWork(s.id);
       if (first.tasks.length || first.cancel.length) return first;
       const wait = Math.max(0, Math.min(POLL_WAIT_MS, Number(query.wait) * 1000 || POLL_WAIT_MS));
       // Only one parked poll per server; a newer one replaces it.
       parked.get(s.id)?.finish(true);
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         let settled = false;
         const finish = (empty = false) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           if (parked.get(s.id)?.finish === finish) parked.delete(s.id);
-          resolve(empty ? { tasks: [], cancel: [] } : takeWork(s.id));
+          if (empty) return resolve({ tasks: [], cancel: [] });
+          // The panel's files can change while this poll is parked: check
+          // again, so work that arrives now still waits for the update.
+          try {
+            resolve(staleReply() || takeWork(s.id));
+          } catch (err) {
+            reject(err);
+          }
         };
         const timer = setTimeout(() => finish(true), wait);
         parked.set(s.id, { finish });
