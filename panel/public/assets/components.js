@@ -51,7 +51,7 @@ export function jobStatusBadge(status) {
   const [cls, t] = map[status] || ["", status];
   return html`<span class="badge ${cls}">${status === "running" ? html`<span class="dot run" style="width:6px;height:6px"></span>` : ""}${t}</span>`;
 }
-const JOB_ICON = { "site.deploy": "rocket", "site.restart": "restart", "site.stop": "stop", "site.start": "play", "site.rollback": "rollback", "site.ssl": "lock", "release.github": "github", "site.script": "zap",
+const JOB_ICON = { "site.deploy": "rocket", "site.restart": "restart", "site.stop": "stop", "site.start": "play", "site.rollback": "rollback", "site.ssl": "lock", "site.ssl.delete": "trash", "release.github": "github", "site.script": "zap",
   "backup.database": "archive", "backup.server": "hardDrive", "backup.restore": "history", "database.import": "upload", "lb.apply": "balance" };
 
 export function jobItem(j) {
@@ -66,7 +66,7 @@ export function jobItem(j) {
 
 const ACT_VERB = {
   "site.deploy": "deployed", "site.update": "updated", "site.create": "created website", "site.delete": "deleted website", "site.restart": "restarted", "site.stop": "stopped",
-  "site.start": "started", "site.rollback": "rolled back", "site.script": "ran a package.json script on", "site.ssl": "requested a certificate for", "site.env": "edited environment of", "release.upload": "uploaded a release to",
+  "site.start": "started", "site.rollback": "rolled back", "site.script": "ran a package.json script on", "site.ssl": "requested a certificate for", "site.ssl.delete": "deleted the certificate of", "site.env": "edited environment of", "release.upload": "uploaded a release to",
   "database.create": "created database", "database.delete": "deleted database", "database.credentials": "revealed credentials for", "database.password": "rotated the password of",
   "database.import": "imported into", "backup.create": "backed up", "backup.restore": "restored", "backup.settings": "changed", "server.add": "added server", "server.update": "updated server",
   "server.remove": "removed server", "server.token": "rotated the token of", "lb.apply": "re-applied", "project.create": "created project", "project.update": "updated project",

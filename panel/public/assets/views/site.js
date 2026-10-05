@@ -330,7 +330,7 @@ export default async function site(ctx) {
               <div class="muted small mt-8">${ssl.status === "active" ? html`Issued ${fmtDate(ssl.issuedAt, false)}${ssl.expiresAt ? html` · expires ${fmtDate(ssl.expiresAt, false)} (auto-renews)` : ""}` : ssl.status === "failed" ? ssl.error || "certbot reported an error." : "Issue a free certificate once every direct domain resolves to this server."}</div>
               ${mixed ? html`<div class="muted small mt-8 cf-sub">${icon("cloud", "xs")} Tunnel domains get HTTPS from Cloudflare; the certificate is for the Direct domains.</div>` : ""}</div>
           </div>
-          <div class="btn-row mt-20"><button class="btn ${ssl.status === "active" ? "" : "btn-primary"}" data-ssl>${icon("shield")}${ssl.status === "active" ? "Re-issue certificate" : "Issue certificate"}</button></div>
+          <div class="btn-row mt-20"><button class="btn ${ssl.status === "active" ? "" : "btn-primary"}" data-ssl>${icon("shield")}${ssl.status === "active" ? "Re-issue certificate" : "Issue certificate"}</button>${ssl.enabled || ssl.status === "failed" ? html`<button class="btn btn-danger" data-ssldel>${icon("trash")}Delete certificate</button>` : ""}</div>
         </div>`); };
     paintSsl();
     ctx.on(["site", "lb"], (d) => { if ((d?.id === S.id || d?.siteId === S.id) && d?.ssl) { S.ssl = d.ssl; paintSsl(); if (d.id) loadConf(); } });
@@ -390,6 +390,14 @@ export default async function site(ctx) {
     on(box, "click", "[data-ssl]", async (e, b) => {
       b.classList.add("loading");
       try { const job = await post(`/api/sites/${S.id}/ssl`); jobStarted(job, "Requesting certificate"); if (job?.id) openJobLog(job.id); } catch (ex) { toastError(ex, "Couldn't request a certificate"); } finally { b.classList.remove("loading"); }
+    });
+    on(box, "click", "[data-ssldel]", async (e, b) => {
+      if (!(await confirmDialog({
+        title: "Delete the HTTPS certificate?", danger: true, confirmText: "Delete certificate", ico: "trash",
+        message: "nginx switches this website back to plain HTTP and the certificate is removed from the server. Visitors using https:// will see an error until a new certificate is issued. Domains on a Cloudflare Tunnel keep HTTPS from Cloudflare.",
+      }))) return;
+      b.classList.add("loading");
+      try { const job = await del(`/api/sites/${S.id}/ssl`); jobStarted(job, "Deleting certificate"); if (job?.id) openJobLog(job.id); } catch (ex) { toastError(ex, "Couldn't delete the certificate"); } finally { b.classList.remove("loading"); }
     });
     on(box, "click", "[data-copyconf]", () => copyText($("[data-conf]", box).textContent));
     loadConf();

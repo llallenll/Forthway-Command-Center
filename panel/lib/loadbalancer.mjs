@@ -446,6 +446,10 @@ function createLb(ctx) {
       try {
         const r = await applyNginxFile(path.join(confDir(), `fcc-${safeId(id)}.conf`), null, { log });
         ok();
+        // A deleted website's certificate goes with it (the vhost referencing it is gone now).
+        if (typeof site === "object" && (site.ssl?.enabled || site.ssl?.status === "failed")) {
+          await removeCertFiles(`fcc-${safeId(id)}`, { log }).catch((err) => log(`Could not delete the certificate: ${err.message}`));
+        }
         return { removed: r.changed };
       } catch (err) {
         fail(err);
@@ -600,6 +604,47 @@ function createLb(ctx) {
     }
   }
 
+  /**
+   * Remove a website's certificate. nginx is regenerated without HTTPS first,
+   * so nothing references the certificate files when certbot deletes them
+   * (the other order would leave nginx unable to reload).
+   */
+  async function deleteCertificate(site, { log = () => {}, signal } = {}) {
+    const s = typeof site === "string" ? getSite(site) : site;
+    if (!s) throw new Error("Site not found");
+    const certName = `fcc-${safeId(s.id)}`;
+    const before = s.ssl || {};
+    const next = { enabled: false, status: "none", issuedAt: null, error: null, domains: [], email: before.email || null };
+    db.update("sites", s.id, { ssl: next });
+    s.ssl = next;
+    broadcast({ siteId: s.id, ssl: next });
+    log("Switching nginx back to plain HTTP for this website…");
+    try {
+      await syncSite(s, { log });
+    } catch (err) {
+      // Could not drop HTTPS from nginx — put the certificate state back and stop.
+      db.update("sites", s.id, { ssl: before });
+      s.ssl = before;
+      broadcast({ siteId: s.id, ssl: before });
+      throw err;
+    }
+    await removeCertFiles(certName, { log, signal });
+    log("Certificate deleted. The website is served over HTTP until a new certificate is issued.");
+    return { ok: true, certName };
+  }
+
+  async function removeCertFiles(certName, { log = () => {}, signal } = {}) {
+    if (!sys.DRY_RUN && !sys.which("certbot")) {
+      log("certbot is not installed here — nothing to delete.");
+      return;
+    }
+    log(`Deleting certificate ${certName} from Let's Encrypt's store…`);
+    const r = await sys.run("certbot", ["delete", "--cert-name", certName, "--non-interactive"], { log, signal, allowFail: true, timeoutMs: 2 * 60_000 });
+    if (r.code !== 0 && !/No certificate found|not found/i.test(`${r.stdout}${r.stderr}`)) {
+      throw new Error(`certbot could not delete ${certName}: ${(r.stderr || r.stdout).trim().split("\n").slice(-2).join(" ")}`);
+    }
+  }
+
   // ------------------------------------------------------- health checks
 
   async function probe(url, strict) {
@@ -712,6 +757,17 @@ function createLb(ctx) {
       ctx.activity?.(admin, "site.ssl", { type: "site", id: s.id, name: s.name }, { domains: domainsOf(s) });
       return job;
     });
+
+    router.delete("/api/sites/:id/ssl", (req, res, { params, admin }) => {
+      const s = requireSite(params.id);
+      if (!s.ssl?.enabled && !["failed", "pending"].includes(s.ssl?.status)) throw httpError(409, "This website has no certificate to delete.");
+      const job = ctx.jobs.start(
+        { type: "site.ssl.delete", title: `Delete SSL certificate for ${domainsOf(s)[0] || s.name}`, siteId: s.id, projectId: s.projectId, adminId: admin?.id },
+        ({ log, signal }) => deleteCertificate(s.id, { log, signal }),
+      );
+      ctx.activity?.(admin, "site.ssl.delete", { type: "site", id: s.id, name: s.name }, { domains: s.ssl?.domains || domainsOf(s) });
+      return job;
+    });
   }
 
   // ---------------------------------------------------------- lifecycle
@@ -777,6 +833,7 @@ function createLb(ctx) {
     preview: (site) => render(typeof site === "string" ? requireSite(site) : site),
     upstreams: (site) => upstreams(typeof site === "string" ? getSite(site) : site),
     issueCertificate,
+    deleteCertificate,
     healthCheckNow: healthPass,
     _routes: routes,
     _start,
