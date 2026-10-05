@@ -37,6 +37,8 @@ const VERB = {
   "admin.delete": "removed admin",
   "admin.password": "changed their password",
   "admin.transfer-owner": "made the owner:",
+  "admin.promote": "made an owner:",
+  "admin.demote": "made a regular admin:",
   "settings.update": "updated",
   "project.create": "created project",
   "project.update": "updated project",

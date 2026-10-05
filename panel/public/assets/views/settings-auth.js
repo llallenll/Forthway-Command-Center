@@ -52,10 +52,10 @@ export async function admins(box, ctx) {
           <div class="li-main"><div class="li-title">${a.name || (a.github ? `@${a.github.login}` : a.email)}${self ? html` <span class="dim" style="font-weight:500">(you)</span>` : ""}</div>
             <div class="li-sub">${a.github ? html`<span class="gh-login">@${a.github.login}</span>` : html`<span>${a.email || "no email"}</span>`} · ${a.lastLoginAt ? html`last signed in ${ago(a.lastLoginAt)}` : "never signed in"}</div></div>
           <div class="li-right">${!a.github ? html`<span class="badge warn" title="${ghOnly ? "Can't sign in until a GitHub account is set." : "Still signs in with a password. Set their GitHub account before switching to GitHub-only."}">${icon("alert")}No GitHub</span>` : ""}
-            ${a.role === "owner" ? html`<span class="badge blue" title="The owner can't be removed and is the only one who can edit the owner or hand ownership over.">${icon("shield")}Owner</span>` : html`<span class="badge">Admin</span>`}
+            ${a.role === "owner" ? html`<span class="badge blue" title="Owners can change roles, edit and remove other owners. There's always at least one.">${icon("shield")}Owner</span>` : html`<span class="badge">Admin</span>`}
             <button class="icon-btn ghost sm" data-amenu="${a.id}" aria-label="Actions for ${who(a)}">${icon("more", "sm")}</button></div></div>`;
       })}</div>` : emptyState({ ico: "users", title: "No admins", sm: true })}
-      <div class="card-foot"><span class="muted small">${iAmOwner ? "You're the owner. To step down, make another admin the owner." : "Only the owner can edit the owner or transfer ownership."}
+      <div class="card-foot"><span class="muted small">${iAmOwner ? "You're an owner: you can make other admins owners, or step an owner (yourself included) back to admin — there's always at least one owner." : "Only owners can change roles or edit owners."}
         ${!ghOnly && unlinked ? html` ${plural(unlinked, "admin")} still ${unlinked === 1 ? "signs" : "sign"} in with a password — see <a href="#/settings/security" style="color:var(--text);font-weight:600">Security</a>.` : ""}</span></div>
     </div>`);
   };
@@ -79,14 +79,17 @@ export async function admins(box, ctx) {
     if (!a) return;
     const self = a.id === me().id, iAmOwner = me().role === "owner";
     const canEdit = a.role !== "owner" || self || iAmOwner;
+    const owners = items.filter((x) => x.role === "owner").length;
+    const lastOwner = a.role === "owner" && owners <= 1;
     openMenu(b, [
       self ? { label: "Edit your account", icon: "user", onClick: () => (location.hash = "#/settings/account") }
         : { label: a.role === "owner" ? "Edit owner" : "Edit name", icon: "edit", disabled: !canEdit, onClick: () => editAdmin(a) },
       !self && { label: a.github ? "Change GitHub account" : "Set GitHub account", icon: "github", disabled: !canEdit, onClick: () => setGithub(a) },
       !self && !ghOnly && a.hasPassword && { label: "Reset password", icon: "lock", disabled: !canEdit, onClick: () => resetPassword(a) },
-      iAmOwner && !self && { label: "Make owner", icon: "shield", onClick: () => makeOwner(a) },
-      !self && a.role !== "owner" && { sep: true },
-      !self && a.role !== "owner" && { label: "Remove admin", icon: "trash", danger: true, onClick: () => removeAdmin(a) },
+      iAmOwner && a.role !== "owner" && { label: "Make owner", icon: "shield", onClick: () => makeOwner(a) },
+      iAmOwner && a.role === "owner" && { label: self ? "Step down to admin" : "Make regular admin", icon: "shield", disabled: lastOwner, onClick: () => demoteOwner(a, self) },
+      !self && (a.role !== "owner" || iAmOwner) && { sep: true },
+      !self && (a.role !== "owner" || iAmOwner) && { label: "Remove admin", icon: "trash", danger: true, disabled: lastOwner, onClick: () => removeAdmin(a) },
     ]);
   });
 
@@ -123,18 +126,33 @@ export async function admins(box, ctx) {
   }
   async function makeOwner(a) {
     const ok = await confirmDialog({
-      title: `Make ${who(a)} the owner?`, ico: "shield",
-      message: "There is only ever one owner. You'll become a regular admin and can't undo this yourself — only the new owner can hand it back.",
-      confirmText: "Transfer ownership", typed: a.github?.login || a.email,
+      title: `Make ${who(a)} an owner?`, ico: "shield",
+      message: "Owners can make other admins owners, step owners back to admin and remove them. You stay an owner too.",
+      confirmText: "Make owner",
     });
     if (!ok) return;
     try {
       await patch(`/api/admins/${a.id}`, { role: "owner" });
-      toast(`${who(a)} is now the owner`, "ok");
-      const fresh = await get("/api/me").catch(() => null);
-      if (fresh) announce("fcc:me", fresh, (ctx.state.me ||= {}));
+      toast(`${who(a)} is now an owner`, "ok");
       load();
-    } catch (ex) { toastError(ex, "Couldn't transfer ownership"); }
+    } catch (ex) { toastError(ex, "Couldn't make them an owner"); }
+  }
+  async function demoteOwner(a, self) {
+    const ok = await confirmDialog({
+      title: self ? "Step down to admin?" : `Make ${who(a)} a regular admin?`, ico: "shield", danger: self,
+      message: self ? "You keep full access to the panel, but can no longer change roles or edit owners. Another owner can make you an owner again." : "They keep full access to the panel, but can no longer change roles or edit owners.",
+      confirmText: self ? "Step down" : "Make admin",
+    });
+    if (!ok) return;
+    try {
+      await patch(`/api/admins/${a.id}`, { role: "admin" });
+      toast(self ? "You're now an admin" : `${who(a)} is now an admin`, "ok");
+      if (self) {
+        const fresh = await get("/api/me").catch(() => null);
+        if (fresh) announce("fcc:me", fresh, (ctx.state.me ||= {}));
+      }
+      load();
+    } catch (ex) { toastError(ex, "Couldn't change their role"); }
   }
   async function removeAdmin(a) {
     const ok = await confirmDialog({ title: `Remove ${who(a)}?`, message: "They're signed out everywhere and can no longer sign in. Their past activity stays in the log.", danger: true, confirmText: "Remove admin" });
@@ -161,21 +179,22 @@ export async function security(box, ctx) {
 
   const paint = () => {
     const meRow = s.admins.find((a) => a.id === me().id) || {};
-    const owner = s.admins.find((a) => a.role === "owner") || {};
+    const otherOwners = s.admins.filter((a) => a.role === "owner" && a.id !== me().id);
+    const ownersLinked = otherOwners.every((a) => a.github);
     const step = (done, n, t, d, action = "") => html`<div class="sec-step ${done ? "done" : ""}"><span class="n">${done ? icon("check", "sm") : n}</span><div><div class="t">${t}</div><div class="d">${d}</div></div>${action}</div>`;
     mount(box, html`
       ${s.githubOnly
         ? html`<div class="card"><div class="card-head"><div class="row" style="gap:12px"><span style="width:38px;height:38px;border-radius:11px;display:grid;place-items:center;flex:none;background:rgba(61,220,151,.12);color:var(--ok)">${icon("shield")}</span>
             <div><h3>Sign in with GitHub only</h3><div class="sub">Password sign-in is off${s.switchedAt ? html` since ${ago(s.switchedAt)}` : ""}. Admins are matched by GitHub account id.</div></div></div>
             <div class="right"><span class="badge ok">${icon("check")}On</span></div></div>
-          <div class="card-body"><p class="hint">Locked out (say the OAuth App was deleted)? On the server, <span class="mono">${RECOVER_CMD}</span> prints a one-time sign-in link for the owner, valid for 15 minutes.</p></div></div>`
+          <div class="card-body"><p class="hint">Locked out (say the OAuth App was deleted)? On the server, <span class="mono">${RECOVER_CMD}</span> prints a one-time sign-in link for an owner, valid for 15 minutes.</p></div></div>`
         : html`<div class="card"><div class="card-head"><div><h3>Switch to Sign in with GitHub</h3><div class="sub">Password sign-in is being retired. Finish these steps, then turn passwords off for everyone.</div></div></div>
           <div class="card-body"><div class="sec-steps">
             ${step(s.githubConfigured, 1, "Create a GitHub OAuth App and save it below", "Its Client ID and Client secret let the panel ask GitHub who you are.")}
             ${step(!!meRow.github, 2, "Link your GitHub account", meRow.github ? html`Linked to <span class="gh-login">@${meRow.github.login}</span>.` : "A quick round trip to GitHub to confirm which account is yours.",
               !meRow.github ? html`<button class="btn btn-sm btn-primary" type="button" data-link ${s.githubConfigured ? "" : raw("disabled")}>${icon("github")}Link GitHub</button>` : "")}
-            ${owner.id && owner.id !== me().id ? step(!!owner.github, 3, `The owner (${owner.name || owner.email}) links theirs`, owner.github ? html`Linked to <span class="gh-login">@${owner.github.login}</span>.` : "They do step 2 for themselves when they next sign in.") : ""}
-            ${step(false, owner.id && owner.id !== me().id ? 4 : 3, "Turn password sign-in off", s.unlinked.length ? html`Admins without GitHub can't sign in afterwards: ${s.unlinked.join(", ")}. Set their GitHub account under <a href="#/settings/admins" style="color:var(--text);font-weight:600">Admins</a> first.` : "Everyone signs in with GitHub from then on, and stored password hashes are deleted.",
+            ${otherOwners.length ? step(ownersLinked, 3, `${otherOwners.length === 1 ? "The other owner links theirs" : "The other owners link theirs"}`, ownersLinked ? html`${otherOwners.map((a, i) => html`${i ? ", " : ""}<span class="gh-login">@${a.github.login}</span>`)} linked.` : html`Still to link: ${otherOwners.filter((a) => !a.github).map((a) => a.name || a.email).join(", ")} — they do step 2 when they next sign in, or set their GitHub account under <a href="#/settings/admins" style="color:var(--text);font-weight:600">Admins</a>.`) : ""}
+            ${step(false, otherOwners.length ? 4 : 3, "Turn password sign-in off", s.unlinked.length ? html`Admins without GitHub can't sign in afterwards: ${s.unlinked.join(", ")}. Set their GitHub account under <a href="#/settings/admins" style="color:var(--text);font-weight:600">Admins</a> first.` : "Everyone signs in with GitHub from then on, and stored password hashes are deleted.",
               html`<button class="btn btn-sm ${s.canSwitch ? "btn-primary" : ""}" type="button" data-switch ${s.canSwitch ? "" : raw(`disabled title="${s.blockers[0] || ""}"`)}>Switch to GitHub-only</button>`)}
           </div>${!s.canSwitch && s.blockers.length ? html`<p class="hint mt-16">${s.blockers[0]}</p>` : ""}</div></div>`}
 
@@ -230,7 +249,7 @@ export async function security(box, ctx) {
     const ok = await confirmDialog({
       title: "Switch to GitHub-only sign-in?", ico: "shield", danger: true, confirmText: "Switch to GitHub-only",
       message: html`Password sign-in stops working for everyone and every stored password hash is deleted — this can't be undone from the panel.
-        ${s.unlinked.length ? html`<b>${s.unlinked.join(", ")}</b> won't be able to sign in until you set their GitHub account. ` : ""}If GitHub sign-in ever breaks, <span class="mono">${RECOVER_CMD}</span> on the server still gets the owner in.`,
+        ${s.unlinked.length ? html`<b>${s.unlinked.join(", ")}</b> won't be able to sign in until you set their GitHub account. ` : ""}If GitHub sign-in ever breaks, <span class="mono">${RECOVER_CMD}</span> on the server still gets an owner in.`,
     });
     if (!ok) return;
     setBusy(b, true);

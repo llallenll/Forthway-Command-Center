@@ -275,9 +275,12 @@ export function register(router, ctx) {
   // ------------------------------------------------------------ admins
   //
   // Rules: any admin can add admins and remove non-owner admins (but never
-  // themselves). Only the owner can edit the owner, change roles, or hand
-  // ownership to someone else (which makes the old owner a plain admin), so
-  // there is always exactly one owner.
+  // themselves). There can be any number of owners. Only an owner can edit
+  // another owner, change roles (make someone an owner, or step an owner —
+  // themselves included — back down to admin) or remove an owner, and there
+  // is always at least one owner left.
+
+  const ownerCount = () => db.list("admins").filter((a) => a.role === "owner").length;
 
   router.get("/api/admins", () => ({
     items: db
@@ -322,7 +325,7 @@ export function register(router, ctx) {
     const target = getAdmin(params.id);
     const self = target.id === admin.id;
     const callerIsOwner = admin.role === "owner";
-    if (target.role === "owner" && !self && !callerIsOwner) throw httpError(403, "Only the owner can edit the owner.");
+    if (target.role === "owner" && !self && !callerIsOwner) throw httpError(403, "Only an owner can edit an owner.");
 
     const patch = {};
     if (body.name !== undefined) patch.name = readName(body.name);
@@ -354,25 +357,25 @@ export function register(router, ctx) {
       if (patch.github !== undefined) endSessions = true;
     }
     if (endSessions) patch.sessionVersion = (target.sessionVersion || 0) + 1;
-    let transferred = false;
+    let roleAction = null;
     if (body.role !== undefined && body.role !== target.role) {
-      if (!callerIsOwner) throw httpError(403, "Only the owner can change roles.");
+      if (!callerIsOwner) throw httpError(403, "Only an owner can change roles.");
       if (body.role === "owner") {
-        if (self) throw httpError(400, "You are already the owner.");
-        transferred = true;
         patch.role = "owner";
+        roleAction = "admin.promote";
       } else if (body.role === "admin") {
-        throw httpError(400, "To step down as owner, make another admin the owner.");
+        if (ownerCount() <= 1) throw httpError(400, "There has to be at least one owner. Make someone else an owner first.");
+        patch.role = "admin";
+        roleAction = "admin.demote";
       } else {
         throw httpError(400, "Role must be owner or admin.");
       }
     }
 
     const updated = db.update("admins", target.id, patch);
-    if (transferred) db.update("admins", admin.id, { role: "admin" });
     db.save({ immediate: true });
     const fields = Object.keys(patch).filter((k) => k !== "passwordSalt" && k !== "sessionVersion");
-    ctx.activity(admin, transferred ? "admin.transfer-owner" : "admin.update", { type: "admin", id: target.id, name: updated.name }, {
+    ctx.activity(admin, roleAction || "admin.update", { type: "admin", id: target.id, name: updated.name }, {
       fields: fields.map((f) => (f === "passwordHash" ? "password" : f)),
     });
     return publicAdmin(updated);
@@ -381,7 +384,10 @@ export function register(router, ctx) {
   router.delete("/api/admins/:id", (req, res, { admin, params }) => {
     const target = getAdmin(params.id);
     if (target.id === admin.id) throw httpError(400, "You cannot delete yourself.");
-    if (target.role === "owner") throw httpError(400, "The owner cannot be deleted. Transfer ownership first.");
+    if (target.role === "owner") {
+      if (admin.role !== "owner") throw httpError(403, "Only an owner can remove an owner.");
+      if (ownerCount() <= 1) throw httpError(400, "The last owner cannot be removed. Make someone else an owner first.");
+    }
     db.remove("admins", target.id);
     db.save({ immediate: true });
     ctx.activity(admin, "admin.delete", { type: "admin", id: target.id, name: target.name }, { email: target.email });

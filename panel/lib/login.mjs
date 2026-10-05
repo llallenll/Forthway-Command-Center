@@ -560,12 +560,16 @@ export function registerLogin(router, ctx, { needsSetup, panelToken }) {
     const m = auth.mode();
     const g = ghConf();
     const admins = db.list("admins").sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
-    const o = owner();
     const self = db.get("admins", me.id);
     const blockers = [];
     if (!githubReady()) blockers.push("Save the Client ID and Client Secret of your GitHub OAuth App.");
     if (!self?.github) blockers.push("Link your own GitHub account.");
-    if (o && o.id !== self?.id && !o.github) blockers.push(`The owner (${o.name || o.email}) has to link their GitHub account first (the owner can do it in Settings → Security).`);
+    // Every owner must be able to sign in once passwords are gone.
+    const unlinkedOwners = admins.filter((a) => a.role === "owner" && a.id !== self?.id && !a.github);
+    if (unlinkedOwners.length) {
+      const names = unlinkedOwners.map((a) => a.name || a.email).join(", ");
+      blockers.push(`${unlinkedOwners.length === 1 ? `The owner ${names} has` : `The owners ${names} have`} to link GitHub first (in Settings → Security, or set their GitHub username under Admins).`);
+    }
     return {
       githubOnly: m.githubOnly,
       githubConfigured: githubReady(),
