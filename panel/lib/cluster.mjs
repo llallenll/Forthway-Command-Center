@@ -11,7 +11,8 @@
  *   POST /agent/tasks/:id/log         { lines } → { ok, cancel }
  *   POST /agent/tasks/:id/result      { ok, result, error, aborted }
  *   POST /agent/metrics               latest server.metrics sample
- *   POST /agent/upload/:taskId        raw body: a server.backup archive
+ *   POST /agent/upload/:taskId        raw body: a server.backup archive, or the
+ *                                     packaged build of a site.deploy (build once, ship everywhere)
  *
  * All agent routes authenticate with `Authorization: Bearer <server token>`;
  * only sha256(token) is stored. There is no endpoint that runs arbitrary
@@ -350,7 +351,10 @@ function createCluster(ctx) {
 
     return new Promise((resolve, reject) => {
       const id = db.newId("tsk");
-      const p = type === "server.backup" ? { ...payload, upload: { url: `/agent/upload/${id}` } } : payload;
+      // server.backup and a site.deploy that packages its build (build once,
+      // ship everywhere) send a file back through /agent/upload/:taskId.
+      const uploads = type === "server.backup" || (type === "site.deploy" && payload?.package);
+      const p = uploads ? { ...payload, upload: { url: `/agent/upload/${id}` } } : payload;
       const task = {
         id,
         serverId,
@@ -1119,19 +1123,32 @@ function createCluster(ctx) {
     router.post("/agent/upload/:taskId", { agent: true, raw: true }, async (req, res, { params }) => {
       const s = node(req);
       const t = tasks.get(params.taskId);
-      if (!t || t.serverId !== s.id || t.type !== "server.backup" || t.status !== "sent") {
-        throw httpError(404, "No backup task is waiting for this upload.");
+      // A packaged build (site.deploy with payload.package) lands where the
+      // panel asked for it — releases/<releaseId>-built.zip — never at a path
+      // the agent chooses. Only once per task.
+      const isBuild = t?.type === "site.deploy" && !!t.payload?.package && !t.uploaded;
+      if (!t || t.serverId !== s.id || !(t.type === "server.backup" || isBuild) || t.status !== "sent") {
+        throw httpError(404, "No task is waiting for this upload.");
       }
       const max = Number(ctx.config?.cluster?.maxUploadBytes) || DEFAULT_MAX_UPLOAD;
       const declared = Number(req.headers["content-length"]);
       if (declared && declared > max) throw httpError(413, `The archive is larger than the ${Math.round(max / 1024 ** 3)} GB limit.`);
 
-      const dir = path.join(ctx.dataDir, "backups");
+      let dir;
+      let name;
+      if (isBuild) {
+        const rid = String(t.payload.package.releaseId || "");
+        if (!/^[\w-]{1,80}$/.test(rid)) throw httpError(400, "The task does not name a valid release for the packaged build.");
+        dir = path.join(ctx.dataDir, "releases");
+        name = `${rid}.zip`;
+      } else {
+        dir = path.join(ctx.dataDir, "backups");
+        const wanted = t.payload.file ? path.basename(String(t.payload.file)) : "";
+        name = /^[\w.-]+\.tar\.gz$/.test(wanted)
+          ? wanted
+          : `server-${s.id}-${new Date().toISOString().replace(/[:.]/g, "-").replace("Z", "")}.tar.gz`;
+      }
       fs.mkdirSync(dir, { recursive: true });
-      const wanted = t.payload.file ? path.basename(String(t.payload.file)) : "";
-      const name = /^[\w.-]+\.tar\.gz$/.test(wanted)
-        ? wanted
-        : `server-${s.id}-${new Date().toISOString().replace(/[:.]/g, "-").replace("Z", "")}.tar.gz`;
       const final = path.join(dir, name);
       const part = path.join(dir, `.upload-${t.id}.part`);
       const hash = crypto.createHash("sha256");

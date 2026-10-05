@@ -43,6 +43,8 @@ const PORT_FIRST = 3001;
 const PORT_LAST = 60999;
 const DEFAULT_KEEP_RELEASES = 10;
 const RESERVED_ENV = new Set(["PORT"]);
+/** Generated per node site, kept by the panel, identical on every server (see managedEnv). */
+const ACTIONS_KEY = "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY";
 const STATUS_EVERY_MS = 120_000;
 const STATUS_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TOKEN_TTL_MS = 6 * 60 * 60_000;
@@ -319,6 +321,11 @@ export function register(router, ctx) {
   const MAIN = () => ctx.cluster?.MAIN_ID || "main";
   const releasesDir = () => ensureDir(path.join(ctx.dataDir, "releases"));
   const releaseFile = (id) => path.join(releasesDir(), `${id}.zip`);
+  // Build once, ship everywhere: the build a load-balanced site's first server
+  // made of a release, kept next to the release as <id>-built.zip and recorded
+  // on the release itself (release.built). Never a release of its own.
+  const BUILT_SUFFIX = "-built";
+  const builtId = (releaseId) => `${releaseId}${BUILT_SUFFIX}`;
   const newId = (prefix) => (db.newId ? db.newId(prefix) : `${prefix}_${crypto.randomBytes(5).toString("hex")}`);
 
   // ---------------------------------------------------------- servers
@@ -424,6 +431,10 @@ export function register(router, ctx) {
       currentReleaseId: site.currentReleaseId || null,
       previousReleaseId: site.previousReleaseId || null,
       currentVersion: rel?.version || null,
+      ...(() => {
+        const spread = releaseSpread(site);
+        return { releasesInLine: spread.length <= 1, releaseSpread: spread.length > 1 ? spread : [] };
+      })(),
       state: Object.fromEntries(t.map((id) => [id, { ...(site.state?.[id] || {}), serverName: serverName(id), online: isOnline(id) }])),
       busyJobId: busyJob(site.id),
       deleting: !!site.deleting,
@@ -452,6 +463,17 @@ export function register(router, ctx) {
       packageName: r.packageName || null,
       fileCount: r.fileCount || 0,
       prebuilt: !!r.prebuilt,
+      built: r.built
+        ? {
+            builtOn: r.built.builtOn,
+            builtOnName: serverName(r.built.builtOn),
+            builtAt: r.built.builtAt,
+            size: r.built.size,
+            sizeHuman: humanBytes(r.built.size || 0),
+            fileCount: r.built.fileCount || null,
+            available: fs.existsSync(releaseFile(builtId(r.id))),
+          }
+        : null,
       warnings: r.warnings || [],
       envExample: r.envExample || null,
       pinned: !!r.pinned,
@@ -714,8 +736,33 @@ export function register(router, ctx) {
     return c.replace(/^(\s*npm\s+(?:ci|install|i))(?=\s|$)/, "$1 --include=dev");
   }
 
+  /**
+   * Variables the panel adds by itself (shown read-only in the Environment tab).
+   *
+   * NEXT_SERVER_ACTIONS_ENCRYPTION_KEY: Next.js encrypts the variables a
+   * Server Action closes over with a key it otherwise makes up at every build.
+   * A fixed key per site keeps them decryptable on every server of a
+   * load-balanced site and across redeploys. The site's own value wins.
+   */
+  function managedEnv(site) {
+    if (site?.type !== "node" || !site.actionsKeyEnc) return {};
+    if (site.env && ACTIONS_KEY in site.env) return {};
+    const v = decrypt(site.actionsKeyEnc);
+    return v ? { [ACTIONS_KEY]: v } : {};
+  }
+
+  /** Create the site's Server Actions key on its first deploy (node sites). */
+  function ensureActionsKey(siteId, log) {
+    const site = getSite(siteId);
+    if (!site || site.type !== "node" || site.actionsKeyEnc) return site;
+    if (site.env && ACTIONS_KEY in site.env) return site;
+    db.update("sites", siteId, { actionsKeyEnc: encrypt(crypto.randomBytes(32).toString("base64")) });
+    log?.(`Generated ${ACTIONS_KEY} for this website — kept by the panel and the same on every server and every deploy, so Next.js Server Actions keep working across servers.`);
+    return getSite(siteId);
+  }
+
   function buildSpec(site, serverId, linkedVars) {
-    const env = { ...(site.env || {}), ...linkedVars };
+    const env = { ...managedEnv(site), ...(site.env || {}), ...linkedVars };
     const settings = deployerSettings(site, env);
     if (settings?.build?.install) settings.build = { ...settings.build, install: withDevDeps(settings.build.install) };
     return {
@@ -807,6 +854,8 @@ export function register(router, ctx) {
       size: release.size,
       filename: release.filename,
       version: release.version || null,
+      // A build made once on another server: the engine must not rebuild it.
+      ...(release.kind === "built" ? { prebuilt: true, builtOn: release.builtOn || null } : {}),
       ...(serverId === MAIN() ? { file: releaseFile(release.id) } : {}),
     };
   }
@@ -828,26 +877,175 @@ export function register(router, ctx) {
   };
 
   /**
+   * Which release each of the site's servers is on, grouped. More than one
+   * group means a rolling deploy stopped part-way (or a server was added and
+   * not deployed): the servers serve different code behind one front door.
+   */
+  function releaseSpread(site) {
+    const groups = new Map();
+    for (const sid of targets(site)) {
+      const rid = site.state?.[sid]?.releaseId || null;
+      if (!groups.has(rid)) groups.set(rid, []);
+      groups.get(rid).push(sid);
+    }
+    return [...groups].map(([releaseId, servers]) => ({
+      releaseId,
+      version: releaseId ? db.get("releases", releaseId)?.version || null : null,
+      servers: servers.map((id) => ({ id, name: serverName(id) })),
+    }));
+  }
+
+  function spreadText(site) {
+    return releaseSpread(site)
+      .map((g) => `${g.servers.map((x) => x.name).join(", ")} on ${releaseLabel(g.releaseId)}`)
+      .join("; ");
+  }
+
+  // ------------------------------------------- build once, ship everywhere
+  //
+  // Next.js (and most bundlers) give every build its own chunk hashes, build
+  // ID and Server Action IDs. Built separately on each server of a load-
+  // balanced site, server A's HTML asks for chunks only A has, and a Server
+  // Action posted to B is "not found". So a multi-server site with a build
+  // step builds on its first server only; that server zips the result and the
+  // others deploy that zip as a prebuilt archive (install + prepare, no build).
+
+  /** Does this release need building on a server at all? */
+  function needsBuild(site, release) {
+    if (release?.prebuilt) return false; // the uploaded zip already holds a build; every server uses it as-is
+    return !!deployerSettings(site, {}).build?.build;
+  }
+
+  /** Multi-server and something to build: the case build-once exists for. */
+  function buildsOnce(site, release) {
+    return !!site?.loadBalanced && targets(site).length > 1 && needsBuild(site, release);
+  }
+
+  /**
+   * What a build depends on besides the archive: the site's variables
+   * (NEXT_PUBLIC_* are inlined at build time) and its build settings. A stored
+   * build made under different ones is not reused.
+   */
+  function buildFingerprint(site) {
+    const env = { ...managedEnv(site), ...(site.env || {}) };
+    const st = deployerSettings(site, {});
+    const body = JSON.stringify({
+      type: site.type,
+      build: st.build,
+      root: st.root || "",
+      env: Object.keys(env).sort().map((k) => [k, env[k]]),
+    });
+    return crypto.createHash("sha256").update(body).digest("hex").slice(0, 32);
+  }
+
+  /** The stored build of `release`, shaped like a release for releasePayload. */
+  function builtArtifact(release) {
+    const b = release?.built;
+    if (!b || !fs.existsSync(releaseFile(builtId(release.id)))) return null;
+    return {
+      kind: "built",
+      id: builtId(release.id),
+      sourceId: release.id,
+      sha256: b.sha256,
+      size: b.size,
+      filename: `${String(release.filename || release.id).replace(/\.zip$/i, "")}-built.zip`,
+      version: release.version || null,
+      builtOn: serverName(b.builtOn),
+      builtAt: b.builtAt,
+      fingerprint: b.fingerprint,
+    };
+  }
+
+  /** A stored build that still matches the site's settings, or null. */
+  function usableBuilt(site, release) {
+    const art = builtArtifact(release);
+    return art && art.fingerprint === buildFingerprint(site) ? art : null;
+  }
+
+  function hashFile(file) {
+    return new Promise((resolve, reject) => {
+      const h = crypto.createHash("sha256");
+      let size = 0;
+      fs.createReadStream(file)
+        .on("data", (d) => {
+          size += d.length;
+          h.update(d);
+        })
+        .on("error", reject)
+        .on("end", () => resolve({ size, sha256: h.digest("hex") }));
+    });
+  }
+
+  /** Record the build the first server packaged; returns it as an artifact, or null. */
+  async function registerBuilt(release, sid, packaged, fingerprint, log) {
+    const file = releaseFile(builtId(release.id));
+    const fail = (why) => {
+      fs.rmSync(file, { force: true });
+      log(
+        `!! ${serverName(sid)} did not hand back its build (${why}). The other servers will build for themselves, ` +
+          `which can leave them with different chunk files and Server Action IDs.`,
+      );
+      return null;
+    };
+    if (!packaged) return fail("its agent is probably too old to package builds — update it from the Servers page");
+    if (packaged.error) return fail(packaged.error);
+    if (!fs.existsSync(file)) return fail("the packaged build never reached the panel");
+    const { size, sha256 } = await hashFile(file);
+    if (packaged.sha256 && packaged.sha256 !== sha256) return fail("the packaged build failed its checksum");
+    db.update("releases", release.id, {
+      built: { sha256, size, fileCount: packaged.fileCount || null, builtOn: sid, builtAt: now(), fingerprint },
+    });
+    log(
+      `Packaged the build from ${serverName(sid)} (${humanBytes(size)}${packaged.fileCount ? `, ${packaged.fileCount} files` : ""}). ` +
+        `The other servers deploy exactly these files — no second build.`,
+    );
+    return builtArtifact(db.get("releases", release.id));
+  }
+
+  /**
    * Deploy one release to `serverIds`, one server at a time. Stops on the
    * first failure and reports where every server stands.
+   *
+   * `ship` (build once, ship everywhere — load-balanced sites):
+   *   { artifact }                   every server gets this stored build, nothing is rebuilt
+   *   { packageFirst, fingerprint }  the first server builds and packages its build;
+   *                                  the rest get that package
    */
-  async function deployTo(siteId, release, serverIds, { log, signal, base, multi, afterFirst = null }) {
+  async function deployTo(siteId, release, serverIds, { log, signal, base, multi, afterFirst = null, ship = null }) {
     const done = [];
     for (let i = 0; i < serverIds.length; i++) {
       const sid = serverIds[i];
       if (signal?.aborted) throw new Error("Cancelled.");
       const site = getSite(siteId);
       if (!site) throw new Error("The website was deleted.");
-      log(`── ${serverName(sid)} (${i + 1}/${serverIds.length}): deploying ${releaseLabel(release.id)}`);
+      const art = ship?.artifact || null;
+      const packaging = i === 0 && !art && !!ship?.packageFirst;
+      log(
+        `── ${serverName(sid)} (${i + 1}/${serverIds.length}): deploying ${releaseLabel(release.id)}` +
+          (art ? ` — the build made on ${art.builtOn}, not rebuilt` : packaging ? " — building it here, then packaging the build for the other servers" : ""),
+      );
       setServerState(siteId, sid, { deploying: release.id });
+      let res;
       try {
         assertOnline(sid);
         const spec = await specForAsync(site, sid);
-        const res = await runTask(sid, "site.deploy", { spec, release: releasePayload(release, sid, base) }, { log: prefixed(log, sid, multi), signal });
-        setServerState(siteId, sid, { ...stateFromResult(site, res), releaseId: release.id, deploying: null, deployedAt: now() });
+        const payload = { spec, release: releasePayload(art || release, sid, base) };
+        if (packaging) {
+          fs.rmSync(releaseFile(builtId(release.id)), { force: true });
+          payload.package = { releaseId: builtId(release.id), ...(sid === MAIN() ? { file: releaseFile(builtId(release.id)) } : {}) };
+        }
+        res = await runTask(sid, "site.deploy", payload, { log: prefixed(log, sid, multi), signal });
+        setServerState(siteId, sid, {
+          ...stateFromResult(site, res),
+          releaseId: release.id,
+          build: art ? `shipped from ${art.builtOn}` : res?.summary?.buildMode || null,
+          deploying: null,
+          deployedAt: now(),
+        });
         done.push(sid);
         log(`✓ ${serverName(sid)} is serving ${releaseLabel(release.id)}`);
       } catch (err) {
+        if (packaging) fs.rmSync(releaseFile(builtId(release.id)), { force: true });
         const rolledBack = err?.rolledBackTo !== undefined;
         setServerState(siteId, sid, { deploying: null, error: err.message, healthy: rolledBack ? err.health?.ok ?? null : false });
         const pending = serverIds.slice(i + 1);
@@ -855,13 +1053,24 @@ export function register(router, ctx) {
         const after = getSite(siteId);
         log("Where every server stands now:");
         for (const t of targets(after)) log(`   ${serverName(t)}: ${releaseLabel(after.state?.[t]?.releaseId)}`);
+        const mixed = releaseSpread(after).length > 1;
+        if (mixed) log("!! Servers are on different releases — redeploy to bring them in line.");
         const e = new Error(
-          serverIds.length > 1
-            ? `Deploy failed on ${serverName(sid)}: ${err.message} Updated: ${done.map(serverName).join(", ") || "none"}. Not attempted: ${pending.map(serverName).join(", ") || "none"}.`
+          serverIds.length > 1 || mixed
+            ? `Deploy failed on ${serverName(sid)}: ${err.message} Updated: ${done.map(serverName).join(", ") || "none"}. Not attempted: ${pending.map(serverName).join(", ") || "none"}.` +
+              (mixed ? ` Servers are on different releases (${spreadText(after)}) — redeploy to bring them in line.` : "")
             : `Deploy failed on ${serverName(sid)}: ${err.message}`,
         );
         e.cause = err;
         throw e;
+      }
+      if (packaging) {
+        try {
+          ship.artifact = await registerBuilt(release, sid, res?.packaged, ship.fingerprint, log);
+        } catch (err) {
+          fs.rmSync(releaseFile(builtId(release.id)), { force: true });
+          log(`!! Could not record the packaged build (${err.message}) — the other servers will build for themselves.`);
+        }
       }
       if (i === 0 && afterFirst) {
         try {
@@ -926,21 +1135,41 @@ export function register(router, ctx) {
 
   /** Full deploy of `release` to every target, then the front door. */
   async function deployRelease(siteId, release, { log, signal, base, afterDeploy = false }) {
-    const site = getSite(siteId);
     if (!fs.existsSync(releaseFile(release.id))) throw new Error(`The archive for release ${release.id} is missing.`);
+    const site = ensureActionsKey(siteId, log);
+    release = db.get("releases", release.id) || release; // fresh: release.built may have changed
     const ids = targets(site);
     log(
       `Deploying ${releaseLabel(release.id)} of ${site.name} to ${ids.length} server${ids.length === 1 ? "" : "s"}` +
         (site.loadBalanced ? " — rolling, one server at a time." : "."),
     );
+    // Build once, ship everywhere (multi-server sites with a build step).
+    let ship = null;
+    if (buildsOnce(site, release)) {
+      const art = usableBuilt(site, release);
+      if (art) {
+        log(`Reusing the build of this release made on ${art.builtOn} at ${art.builtAt} — every server gets exactly the same files, nothing is rebuilt.`);
+        ship = { artifact: art };
+      } else {
+        if (release.built) {
+          log(`The stored build of this release was made with different variables or build settings — building it again.`);
+          db.update("releases", release.id, { built: null });
+        }
+        log(
+          `Build once, ship everywhere: ${serverName(ids[0])} builds the release, packages the build, and ` +
+            `${ids.slice(1).map(serverName).join(", ")} ${ids.length > 2 ? "deploy" : "deploys"} that package — so every server has the same chunk files and Server Action IDs.`,
+        );
+        ship = { packageFirst: true, fingerprint: buildFingerprint(site) };
+      }
+    }
     const scripts = afterDeploy ? (site.settings?.afterDeployScripts || []).filter(validScriptName) : [];
     const afterFirst = scripts.length ? (sid) => runAfterDeployScripts(siteId, sid, scripts, { log, signal, multi: ids.length > 1 }) : null;
-    await deployTo(siteId, release, ids, { log, signal, base, multi: ids.length > 1, afterFirst });
+    await deployTo(siteId, release, ids, { log, signal, base, multi: ids.length > 1, afterFirst, ship });
     markCurrent(siteId, release.id);
     await syncLb(siteId, log);
     pruneReleases(siteId);
-    log(`Done. ${site.name} is on ${releaseLabel(release.id)} everywhere.`);
-    return { releaseId: release.id, version: release.version || null, servers: ids };
+    log(`Done. ${site.name} is on ${releaseLabel(release.id)} everywhere${ship?.artifact ? ` — all ${ids.length} servers run the build made on ${ship.artifact.builtOn}` : ""}.`);
+    return { releaseId: release.id, version: release.version || null, servers: ids, builtOn: ship?.artifact?.builtOn || null };
   }
 
   /** restart / stop / start fan-out (sequential = rolling for LB sites). */
@@ -1057,6 +1286,7 @@ export function register(router, ctx) {
 
   function deleteReleaseRecord(r) {
     fs.rmSync(releaseFile(r.id), { force: true });
+    fs.rmSync(releaseFile(builtId(r.id)), { force: true });
     db.remove("releases", r.id);
   }
 
@@ -1448,8 +1678,16 @@ export function register(router, ctx) {
           if (!rel || !fs.existsSync(releaseFile(rel.id))) {
             throw new Error("The current release archive is missing, so it cannot be put on the new server(s). Deploy a release first.");
           }
-          log(`Putting ${releaseLabel(rel.id)} on ${deployToIds.map(serverName).join(", ")}…`);
-          await deployTo(site.id, rel, deployToIds, { log, signal, base, multi: deployToIds.length > 1 });
+          const art = buildsOnce(cur, rel) ? usableBuilt(cur, rel) : null;
+          if (buildsOnce(cur, rel) && !art) {
+            // No stored build to hand the new server(s): build once on the
+            // first server and ship that to every server, so all of them match.
+            log(`There is no stored build of ${releaseLabel(rel.id)} for the current settings — redeploying it to every server, built once.`);
+            await deployRelease(site.id, rel, { log, signal, base });
+          } else {
+            log(`Putting ${releaseLabel(rel.id)} on ${deployToIds.map(serverName).join(", ")}${art ? ` — the build made on ${art.builtOn}, not rebuilt` : ""}…`);
+            await deployTo(site.id, rel, deployToIds, { log, signal, base, multi: deployToIds.length > 1, ship: art ? { artifact: art } : null });
+          }
         } else if (envChanged) {
           log("Environment changed — writing it to every server and restarting.");
           for (const sid of targets(cur)) {
@@ -1587,6 +1825,14 @@ export function register(router, ctx) {
     const job = siteJob(site, admin, { type: "site.rollback", title: `Roll back ${site.name}` }, async ({ log, signal }) => {
       const cur = getSite(site.id);
       const prev = db.get("releases", prevId);
+      // Load-balanced with a build step: each server's own snapshot could hold
+      // a build of its own. Redeploy the previous release instead — from its
+      // stored build when there is one (else built once and shipped) — so all
+      // servers end up serving identical files again.
+      if (prev && buildsOnce(cur, prev) && fs.existsSync(releaseFile(prevId))) {
+        log(`Rolling back to ${releaseLabel(prevId)} by redeploying it to every server, so they all serve the same build.`);
+        return deployRelease(site.id, prev, { log, signal, base });
+      }
       const ids = targets(cur);
       const multi = ids.length > 1;
       log(`Rolling back to ${releaseLabel(prevId)} on ${ids.map(serverName).join(", ")}${multi ? " — one server at a time" : ""}.`);
@@ -1749,8 +1995,20 @@ export function register(router, ctx) {
 
   async function envView(site) {
     const linked = await linkedEnvAsync(site, targets(site)[0]);
+    const managed = [];
+    if (site.type === "node" && !(site.env && ACTIONS_KEY in site.env)) {
+      managed.push({
+        key: ACTIONS_KEY,
+        value: site.actionsKeyEnc ? "••••••••" : "",
+        pending: !site.actionsKeyEnc,
+        note: site.actionsKeyEnc
+          ? "Generated by the panel and identical on every server, so Next.js Server Actions work whichever server answers and keep working across redeploys. Set your own value above to replace it."
+          : "Generated on the first deploy and then identical on every server, so Next.js Server Actions work whichever server answers.",
+      });
+    }
     return {
       env: site.env || {},
+      managed,
       linked: linked.sources.map((s) => ({ ...s, vars: maskEnv(s.vars), keys: Object.keys(s.vars) })),
       reserved: [...RESERVED_ENV],
     };
@@ -1897,8 +2155,10 @@ export function register(router, ctx) {
   router.get("/agent/releases/:id", { agent: true }, async (req, res, { params, query }) => {
     const id = params.id;
     if (!/^[\w-]{1,80}$/.test(id)) throw httpError(404, "Release not found.");
-    const rel = db.get("releases", id);
-    if (!rel) throw httpError(404, "Release not found.");
+    // <releaseId>-built: the build a load-balanced site's first server made of it.
+    const isBuilt = id.endsWith(BUILT_SUFFIX);
+    const rel = db.get("releases", isBuilt ? id.slice(0, -BUILT_SUFFIX.length) : id);
+    if (!rel || (isBuilt && !rel.built)) throw httpError(404, "Release not found.");
     const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "")?.[1]?.trim();
     let allowed = verifyDownloadToken(id, query.token) || verifyDownloadToken(id, bearer);
     if (!allowed) {
@@ -1920,7 +2180,7 @@ export function register(router, ctx) {
       "Content-Length": st.size,
       "Content-Disposition": `attachment; filename="${id}.zip"`,
       "Cache-Control": "no-store",
-      "X-Release-Sha256": rel.sha256 || "",
+      "X-Release-Sha256": (isBuilt ? rel.built.sha256 : rel.sha256) || "",
     });
     if (req.method === "HEAD") return void res.end();
     await pipeline(fs.createReadStream(file), res);

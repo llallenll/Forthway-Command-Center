@@ -129,7 +129,11 @@ export default async function site(ctx) {
       const h = siteHealth(S);
       const ups = S.upstreams || [];
       const sById = serversById();
+      const spread = S.releasesInLine === false ? S.releaseSpread || [] : [];
       mount($("[data-ov]", box), html`
+        ${spread.length ? html`<div class="note warn" style="margin-bottom:16px">${icon("alert")}<div><strong>Servers are on different releases — redeploy to bring them in line.</strong>
+          <div class="small" style="margin-top:4px">${spread.map((g) => `${g.servers.map((x) => x.name).join(", ")}: ${g.releaseId ? (g.version ? "v" + g.version : g.releaseId) : "nothing deployed"}`).join(" · ")}</div>
+          <div class="row" style="gap:8px;margin-top:10px;flex-wrap:wrap"><button class="btn btn-sm" data-qa="deploy">${icon("rocket")}Deploy the latest release everywhere</button><a class="btn btn-sm btn-ghost" href="${base}/deployments">Pick a release ${icon("arrowRight", "sm")}</a></div></div></div>` : ""}
         <div class="mini-stats">
           <div class="mini-stat"><div class="ms-l">${icon("rocket", "xs")}Current release</div><div class="ms-v mono">${rel ? "v" + rel.version : "—"}</div><div class="ms-s">${rel ? html`${rel.source === "github" ? "GitHub" : "Upload"}${rel.createdAt ? html` · ${ago(rel.createdAt)}` : ""}` : "Nothing deployed yet"}</div></div>
           <div class="mini-stat"><div class="ms-l">${icon("activity", "xs")}Status</div><div class="ms-v row" style="gap:9px"><span class="dot ${h.tone}"></span>${h.text}</div><div class="ms-s">Checked ${ago(Object.values(S.state || {}).map((x) => x?.checkedAt).filter(Boolean).sort().pop())}</div></div>
@@ -210,7 +214,7 @@ export default async function site(ctx) {
       mount($("[data-rel]", box), rels.length ? html`<div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Release</th><th>Source</th><th class="hide-sm">Size</th><th class="hide-sm">Created</th><th></th></tr></thead><tbody>
         ${rels.map((r) => {
           const live = r.id === S.currentReleaseId, prev = r.id === S.previousReleaseId;
-          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}</div>
+          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}</div>
             <div class="t-sub mono ellipsis" style="max-width:300px">${r.filename}</div></td>
             <td>${r.source === "github" ? html`<span class="row small" style="gap:7px">${icon("github", "sm")}<span class="mono">${r.commit || "—"}</span></span>` : html`<span class="row small" style="gap:7px">${icon("upload", "sm")}Upload</span>`}</td>
             <td class="hide-sm num">${fmtBytes(r.size)}</td>
@@ -248,6 +252,9 @@ export default async function site(ctx) {
         <div class="card-body"><div data-suggest></div><div data-env></div>
         <div class="note mt-16">${icon("info")}<div>Saved to the app's <span class="mono">.env</span> on ${S.loadBalanced ? `all ${S.serverIds.length} servers` : "its server"} and passed to the process. The app restarts to pick up changes.</div></div></div></div>
       <div class="stack">
+        ${(envData.managed || []).length ? html`<div class="card"><div class="card-head"><h3>Managed by the panel</h3><span class="sub">read-only</span></div>
+          <div class="card-body"><div class="env-table">${envData.managed.map((m) => html`<div class="env-row ro" style="grid-template-columns:minmax(0,1.2fr) minmax(0,.9fr)"><input class="input mono" value="${m.key}" readonly/><input class="input" value="${m.pending ? "(created on first deploy)" : m.value}" readonly/></div>`)}</div>
+          ${envData.managed.map((m) => html`<div class="note mt-16">${icon("info")}<div>${m.note}</div></div>`)}</div></div>` : ""}
         <div class="card"><div class="card-head"><h3>From linked databases</h3><span class="sub">read-only</span></div>
           <div class="card-body">${linked.length ? html`<div class="stack" style="gap:16px">${linked.map((l) => html`<div><div class="row small strong" style="gap:8px;margin-bottom:8px">${icon("database", "sm")}<span class="mono">${l.name}</span>${l.prefix ? html`<span class="badge mono">${l.prefix}*</span>` : ""}</div>
             ${l.error ? html`<div class="error-box">${icon("alert")}<div>${l.error}</div></div>` : html`<div class="env-table">${Object.entries(l.vars || {}).map(([k, v]) => html`<div class="env-row ro" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.2fr)"><input class="input" value="${k}" readonly/><input class="input" value="${v}" readonly/></div>`)}</div>`}</div>`)}</div>`

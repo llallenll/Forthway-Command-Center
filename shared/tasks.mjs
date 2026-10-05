@@ -26,6 +26,7 @@ import zlib from "node:zlib";
 import { execFile, spawn } from "node:child_process";
 
 import { Deployer } from "./deployer.mjs";
+import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
@@ -290,25 +291,37 @@ async function siteAction(type, payload, o) {
       case "site.deploy": {
         const release = payload.release || {};
         d.getArtifact = () => downloadRelease(release, o);
-        const r = await d.execute(
-          {
-            type: "deploy",
-            releaseId: release.id || "release",
-            releaseFilename: release.filename || `${release.id || "release"}.zip`,
-            releaseVersion: release.version || null,
-            releaseSha256: null, // verified in downloadRelease
-          },
-          L,
-        );
+        const pkg = packageTarget(payload, spec, o);
+        let r;
+        try {
+          r = await d.execute(
+            {
+              type: "deploy",
+              releaseId: release.id || "release",
+              releaseFilename: release.filename || `${release.id || "release"}.zip`,
+              releaseVersion: release.version || null,
+              releaseSha256: null, // verified in downloadRelease
+              // A build made once on another server of this site: never rebuild it.
+              prebuilt: !!release.prebuilt,
+              builtOn: release.builtOn || null,
+              packageTo: pkg?.file || null,
+            },
+            L,
+          );
+        } catch (err) {
+          if (pkg && !pkg.direct) rmrf(pkg.file);
+          throw err;
+        }
+        const packaged = pkg ? await deliverPackage(pkg, r.packaged, o) : undefined;
         if (spec.type !== "node") {
           await writeSiteVhost(spec, o); // root may have changed (dist/, public/)
           if (spec.type === "php") await reloadPhpFpm(log);
           const st = await staticStatus(spec, d, o);
           log(`Serving ${siteRoot(spec)} on port ${spec.port} — ${st.healthy === null ? "not checked (nginx is not live here)" : st.healthy ? "responding" : "NOT responding yet"}.`);
-          return { ...r, ...st };
+          return { ...r, ...st, packaged };
         }
         if (spec.settings?.restart?.mode !== "systemd") await pm2Save(log);
-        return normalize(spec, r);
+        return { ...normalize(spec, r), packaged };
       }
       case "site.rollback": {
         const r = await d.execute({ type: "rollback" }, L);
@@ -384,6 +397,40 @@ async function siteAction(type, payload, o) {
   } finally {
     signal?.removeEventListener("abort", onAbort);
     d.cleanup();
+  }
+}
+
+/**
+ * Build once, ship everywhere (load-balanced sites): the panel asks the first
+ * server to zip what it just built. On main the zip goes straight into the
+ * panel's releases folder; an agent writes it to its own tmp folder and
+ * uploads it afterwards through /agent/upload/:taskId.
+ */
+function packageTarget(payload, spec, o) {
+  const want = payload.package;
+  if (!want || typeof want !== "object") return null;
+  if (o.isMain && typeof want.file === "string" && path.isAbsolute(want.file)) return { file: path.resolve(want.file), direct: true };
+  if (!o.uploadFile) {
+    o.log("(this server cannot upload a packaged build — the other servers will build for themselves)");
+    return null;
+  }
+  const name = `built-${spec.siteId}-${crypto.randomBytes(4).toString("hex")}.zip`;
+  return { file: path.join(o.dataDir, "tmp", name), name, direct: false };
+}
+
+async function deliverPackage(pkg, packaged, o) {
+  if (!packaged || packaged.error) return { error: packaged?.error || "the deploy engine did not package the build" };
+  if (pkg.direct) return { size: packaged.size, sha256: packaged.sha256, fileCount: packaged.fileCount };
+  o.log("Uploading the packaged build to the panel…");
+  try {
+    const up = await o.uploadFile(pkg.file, { name: pkg.name, size: packaged.size, sha256: packaged.sha256 });
+    o.log(`Uploaded (${(packaged.size / 1048576).toFixed(1)} MB).`);
+    return { size: up?.size ?? packaged.size, sha256: up?.sha256 || packaged.sha256, fileCount: packaged.fileCount, uploaded: true };
+  } catch (err) {
+    o.log(`!! Could not upload the packaged build: ${err.message}`);
+    return { error: `upload failed: ${err.message}` };
+  } finally {
+    rmrf(pkg.file);
   }
 }
 
@@ -908,7 +955,24 @@ async function dryRunSite(type, spec, payload, o) {
       await step(`── Download ──`);
       await step(`[dry-run] would download release ${rel.id || "?"} from ${rel.file || rel.url || "?"} and verify sha256 ${rel.sha256 ? rel.sha256.slice(0, 12) + "…" : "(none)"}`);
       await step(`── Build ──`);
-      await step(`[dry-run] would unpack into ${where}, install and build (${spec.type})`);
+      await step(
+        rel.prebuilt
+          ? `[dry-run] would unpack into ${where} and install dependencies — the archive is the build made on ${rel.builtOn || "the first server"}, so the build step is skipped`
+          : `[dry-run] would unpack into ${where}, install and build (${spec.type})`,
+      );
+      let packaged;
+      const pkg = packageTarget(payload, spec, o);
+      if (pkg) {
+        await step(`── Package ──`);
+        await step(`[dry-run] would zip the built tree (without node_modules, .env files, uploads, logs, .next/cache) for the other servers`);
+        ensureDir(path.dirname(pkg.file));
+        const buf = makeZip([
+          { name: "package.json", data: Buffer.from(JSON.stringify({ name: spec.siteId, version: rel.version || "0.0.0" })) },
+          { name: ".next/BUILD_ID", data: Buffer.from(`dry-run-${crypto.randomBytes(4).toString("hex")}`) },
+        ]);
+        fs.writeFileSync(pkg.file, buf);
+        packaged = await deliverPackage(pkg, { size: buf.length, sha256: crypto.createHash("sha256").update(buf).digest("hex"), fileCount: 2 }, o);
+      }
       if (spec.type !== "node") await writeSiteVhost(spec, o);
       await step(`── Swap & restart ──`);
       await step(spec.type === "node" ? `[dry-run] pm2 start/restart ${pm2NameOf(spec)}` : `[dry-run] nginx serves ${siteRoot(spec)}`);
@@ -916,7 +980,7 @@ async function dryRunSite(type, spec, payload, o) {
       await step(`[dry-run] ${healthUrlOf(spec)} → ok`);
       st.running = true;
       st.version = rel.version || st.version || "dry-run";
-      return { running: true, healthy: true, version: st.version, dryRun: true, summary: { version: st.version, seconds: 1 } };
+      return { running: true, healthy: true, version: st.version, dryRun: true, packaged, summary: { version: st.version, seconds: 1, buildMode: rel.prebuilt ? "prebuilt" : "built" } };
     }
     case "site.rollback":
       await step(`[dry-run] would restore the previous build snapshot in ${where}`);

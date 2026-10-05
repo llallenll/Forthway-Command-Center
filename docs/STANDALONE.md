@@ -892,3 +892,48 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     Requests with % vs the previous period, Compare overlays the previous period, "Collecting since …" note; website **Traffic**
     tab (`views/site-traffic.js`; hooks in site.js) with the same card + Top pages + Top referrers. Styles `.tr-*` in app.css;
     `charts.js` shows date-only tooltips for 30d; mock route in mock.js. `/api/dashboard` is unchanged (CPU is still kept 24 h).
+- **SITES / TASKS / CLUSTER — build once, ship everywhere (load-balanced sites).** Building a
+  release separately on every server gave each server its own Next.js chunk hashes, build ID and
+  Server Action IDs, so HTML from one server asked for chunks only it had (`ChunkLoadError`, 404 on
+  `/_next/static/chunks/…`) and Server Action POSTs to another server failed ("Failed to find Server
+  Action"). Now, for a site with `loadBalanced` + ≥2 targets + a build command (and a release that
+  is not already prebuilt):
+  - **First server builds and packages.** `site.deploy` payload gains `package: { releaseId:
+    "<rel>-built", file? }`. The engine (`Deployer.packageBuild`, run right after the build, before
+    the swap) zips the staging tree *with* build output but *without* `node_modules`, the work dir
+    (`.forthway`), `.git`, `.env*` files, the preserve list (uploads, logs), `.next/cache`,
+    `build-info.json`, `*.log` (limit 65 000 files / 2 GiB — zipwrite has no zip64). Main writes it
+    straight to `dataDir/releases/<rel>-built.zip`; an agent uploads it via `POST /agent/upload/:taskId`
+    (now also accepted for a `site.deploy` that carries `payload.package`; the panel picks the
+    destination, never the agent). Result field `packaged: { size, sha256, fileCount, uploaded? } |
+    { error }`. A packaging/upload failure does not fail that server's deploy; the panel logs it and
+    the remaining servers build for themselves (the old behaviour) — also what happens with an agent
+    too old to package.
+  - **Other servers deploy the package.** `release` payload gains `prebuilt: true, builtOn`; the
+    engine treats `job.prebuilt` like a detected `.next/BUILD_ID` (works for `dist/`/`out/` builds
+    too): it still installs dependencies (`--include=dev` kept) and runs prepare (an explicit
+    prepare, or the auto `npx prisma generate` when deps/schema changed — the generated client lives
+    in `node_modules/.prisma`, which is never shipped), and skips the build. `forceBuild` still wins.
+  - **Storage.** Not a release of its own: recorded on the source release as `release.built = { sha256,
+    size, fileCount, builtOn, builtAt, fingerprint }`, file `releases/<rel>-built.zip`, deleted with the
+    release by retention/delete. `GET /agent/releases/<rel>-built` serves it (same token/node auth).
+    `publicRelease` gains `built: { builtOn, builtOnName, builtAt, size, sizeHuman, fileCount,
+    available } | null` (UI badge "Shared build").
+  - **Reuse.** Redeploys, `rollback` (with or without `releaseId`) and servers added through
+    `PATCH /api/sites/:id` deploy the stored build to every server when its `fingerprint` (sha of the
+    site's variables incl. the managed key, build settings, publicDir) still matches; otherwise the
+    release is built once on the first server and shipped again (`PATCH` add-server then redeploys all
+    targets). Rollback without `releaseId` on such a site redeploys the previous release this way instead
+    of restoring each server's own snapshot. After-deploy scripts still run once, on the first server.
+    Single-server sites are unchanged.
+  - **Server Actions key.** Node sites get a panel-managed `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`
+    (32 random bytes, base64), created on the first deploy unless the site's own env defines it, stored
+    encrypted as `site.actionsKeyEnc`, merged under the site's env in every task spec (site env and
+    linked DB vars win). `GET /api/sites/:id/env` gains `managed: [{ key, value (masked), pending, note }]`,
+    shown read-only in the Environment tab.
+  - **Mixed releases.** `publicSite` gains `releasesInLine` and `releaseSpread: [{ releaseId, version,
+    servers: [{ id, name }] }]` (non-empty only when targets disagree); server state gains `build`
+    ("built" | "prebuilt" | "shipped from <server>"). A rolling deploy that stops part-way logs and
+    returns "Servers are on different releases — redeploy to bring them in line" with who is on what,
+    and the site Overview shows that warning with a redeploy button. The nginx `/_next/static/` retry
+    on 404 (`proxy_next_upstream http_404`) stays as a safety net.

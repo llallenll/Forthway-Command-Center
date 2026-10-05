@@ -23,7 +23,8 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 
 import { extractZip, inspectZip } from "./zip.mjs";
-import { ensureDir, rmrf, exists, readJson, writeJson, mirror, copyDir, hardlinkDir, makeMatcher, sha1File, humanBytes } from "./fsx.mjs";
+import { ensureDir, rmrf, exists, readJson, writeJson, mirror, copyDir, hardlinkDir, makeMatcher, sha1File, humanBytes, walk } from "./fsx.mjs";
+import { makeZip } from "./zipwrite.mjs";
 import { mergeEnvFile, shadowedKeys, lintEnv } from "./env.mjs";
 
 export const ENGINE_VERSION = "2.0.0";
@@ -677,6 +678,52 @@ export class Deployer {
     return n;
   }
 
+  /**
+   * Zip a freshly built tree so the other servers of a load-balanced site can
+   * deploy exactly these files instead of building their own (separate builds
+   * get different chunk hashes, build IDs and Server Action IDs).
+   *
+   * Left out: what every server makes or keeps for itself — dependencies (each
+   * installs them from the lockfile), the engine's work folder, .env files,
+   * the preserve list (uploads, logs) and Next.js's build cache.
+   */
+  packageBuild(dir, file, log = this.log) {
+    const excluded = ["node_modules", this.workDirName, ".git", ".next/cache", "build-info.json", ...this.S.preserve];
+    const byPath = makeMatcher(excluded);
+    const skip = (rel) => byPath(rel) || /(^|\/)\.env(\.[^/]*)?$/.test(rel) || /\.log$/.test(rel);
+    const MAX_FILES = 65_000; // no zip64 in shared/zipwrite.mjs
+    const MAX_BYTES = 2 * 1024 ** 3;
+    const entries = [];
+    let bytes = 0;
+    for (const rel of walk(dir, { skip })) {
+      const abs = path.join(dir, rel);
+      let st;
+      try {
+        st = fs.statSync(abs); // follows symlinks; a link to a directory is skipped
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      bytes += st.size;
+      if (entries.length >= MAX_FILES || bytes > MAX_BYTES) {
+        throw new Error(`the build is too big to package (more than ${MAX_FILES} files or ${humanBytes(MAX_BYTES)})`);
+      }
+      entries.push({ name: rel, data: fs.readFileSync(abs), mode: st.mode & 0o777 });
+    }
+    if (!entries.length) throw new Error("there is nothing to package");
+    const buf = makeZip(entries);
+    ensureDir(path.dirname(file));
+    const part = `${file}.part`;
+    fs.writeFileSync(part, buf, { mode: 0o600 });
+    fs.renameSync(part, file);
+    const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+    log?.line(
+      `Packaged the build for the other servers: ${entries.length} files, ${humanBytes(buf.length)} ` +
+        `(left out: node_modules, .env files, ${excluded.filter((x) => !["node_modules", ".env"].includes(x)).join(", ")}).`,
+    );
+    return { file, size: buf.length, sha256, fileCount: entries.length };
+  }
+
   async _buildStaging(p, job, log, zipInfo) {
     // Before anything reads it: prisma generate and next build both look for
     // a .env in the directory they are run from, which is staging.
@@ -762,8 +809,15 @@ export class Deployer {
 
     // --- build ----------------------------------------------------------
     log.setStep("Build");
-    if (zipInfo.prebuilt && !job.forceBuild) {
-      log.line("The archive already contains a compiled build — using it as-is.");
+    // job.prebuilt: the panel says outright that this archive is a build made
+    // on another server of the same site (build once, ship everywhere). That
+    // covers builds the .next/BUILD_ID heuristic cannot see (dist/, out/ …).
+    if ((zipInfo.prebuilt || job.prebuilt) && !job.forceBuild) {
+      log.line(
+        job.prebuilt
+          ? `The archive is the build made on ${job.builtOn || "the first server"} — using it as-is, so every server serves identical files.`
+          : "The archive already contains a compiled build — using it as-is.",
+      );
       return "prebuilt";
     }
     if (job.skipBuild) {
@@ -912,6 +966,24 @@ export class Deployer {
     this._seedPreserved(p, log);
 
     const buildMode = await this._buildStaging(p, job, log, zipInfo);
+
+    // Build once, ship everywhere: zip the freshly built tree now — before the
+    // downtime window, and before the app has run and written anything — so
+    // the other servers of a load-balanced site get exactly these files.
+    let packaged = null;
+    if (job.packageTo) {
+      log.setStep("Package");
+      try {
+        packaged = this.packageBuild(p.staging, job.packageTo, log);
+      } catch (err) {
+        // Not fatal for this server: the panel falls back to building on each.
+        rmrf(job.packageTo);
+        rmrf(`${job.packageTo}.part`);
+        log.line(`!! Could not package the build: ${err.message}`);
+        packaged = { error: err.message };
+      }
+    }
+
     this._writeBuildInfo(p.staging, {
       version: newVersion,
       releaseId: job.releaseId,
@@ -985,6 +1057,7 @@ export class Deployer {
       serving,
       health,
       migrations: this.listMigrationScripts(),
+      packaged,
       summary: {
         seconds,
         buildMode,
