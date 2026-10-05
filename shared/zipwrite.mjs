@@ -3,13 +3,16 @@
  * without needing the `zip` command installed.
  */
 
-import { deflateRawSync, crc32 } from "node:zlib";
+import * as zlib from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
 import { walk } from "./fsx.mjs";
 
-// node:zlib exposes crc32 from Node 20.12+/22. Fall back to a table version.
-let crc32of = crc32;
+const { deflateRawSync } = zlib;
+
+// node:zlib exposes crc32 from Node 20.15+/22.2. Read it off the namespace: a named
+// import of a missing export fails at load time (agents on Ubuntu's Node 18 crashed).
+let crc32of = zlib.crc32;
 if (typeof crc32of !== "function") {
   const TABLE = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
