@@ -29,10 +29,12 @@
  * Data:
  *   config.cloudflare = { apiTokenEnc, accountId, accountName, viaLogin,
  *                         connectors: [{ id, name, tokenEnc, autoStart, cfId }],
- *                         panel: { hostname, tunnelId } | null }
+ *                         panel: { hostname, tunnelId } | null,
+ *                         phpmyadmin: { hostname, tunnelId } | null,
+ *                         domainCreds: [{ id, tokenEnc, viaLogin, accountId, zones: [{ id, name }], addedAt }] }
  *   site.cloudflare   = { enabled, tunnelId, hostnames: [] }   (owned/validated by SITES,
  *                        hostnames ⊆ site.domains; other domains are Direct)
- *   cloudflareRoutes  = { id, owner: "site:<id>"|"panel", siteId, hostname, tunnelId, zoneId,
+ *   cloudflareRoutes  = { id, owner: "site:<id>"|"panel"|"phpmyadmin", siteId, hostname, tunnelId, zoneId,
  *                         zoneName, service, ruleKey, ingress: "created"|"adopted"|null,
  *                         dnsRecordId, dnsCreated, status: "active"|"error"|"manual", error, syncedAt }
  *
@@ -144,7 +146,12 @@ function createFakeCf(file) {
   const ZONES = [
     { id: "zone0000000000000000000000000001", name: "example.com", status: "active" },
     { id: "zone0000000000000000000000000002", name: "example.org", status: "active" },
+    // Only visible to a token scoped to it ("zones:example.net" — what a simulated
+    // "Add domain" login hands out), like a real one-domain `cloudflared tunnel login`.
+    { id: "zone0000000000000000000000000003", name: "example.net", status: "pending" },
   ];
+  const zonesFor = (token) =>
+    token.startsWith("zones:") ? ZONES.filter((z) => token.slice(6).split(",").includes(z.name)) : ZONES.filter((z) => z.name !== "example.net");
   let st = { tunnels: [], configs: {}, dns: [] };
   try {
     st = { ...st, ...JSON.parse(fs.readFileSync(file, "utf8")) };
@@ -170,7 +177,7 @@ function createFakeCf(file) {
     let x;
     if (u.pathname === "/user/tokens/verify") return { id: "fake-token", status: "active" };
     if (u.pathname === "/accounts") return [ACCOUNT];
-    if (u.pathname === "/zones") return ZONES;
+    if (u.pathname === "/zones") return zonesFor(token);
     if ((x = m(/^\/accounts\/([^/]+)\/cfd_tunnel$/))) {
       if (x[1] !== ACCOUNT.id) throw cfError(7003, "Could not route to account", 404);
       if (method === "POST") {
@@ -199,7 +206,7 @@ function createFakeCf(file) {
       }
     }
     if ((x = m(/^\/zones\/([^/]+)\/dns_records(?:\/([^/]+))?$/))) {
-      const zone = ZONES.find((z) => z.id === x[1]);
+      const zone = zonesFor(token).find((z) => z.id === x[1]);
       if (!zone) throw cfError(7003, "Could not route to zone", 404);
       if (!x[2] && method === "GET") return st.dns.filter((r) => r.zoneId === zone.id && (!q.get("name") || r.name === q.get("name")));
       if (!x[2] && method === "POST") {
@@ -674,18 +681,109 @@ function createCloudflare(ctx) {
   function invalidate() {
     cache.zones = cache.tunnels = null;
   }
+  async function listZones(token, accountId) {
+    const all = [];
+    for (let page = 1; page <= 20; page++) {
+      const r = await cfCall(token, `/zones?account.id=${encodeURIComponent(accountId)}&per_page=50&page=${page}`);
+      all.push(...r.map((z) => ({ id: z.id, name: z.name, status: z.status })));
+      if (r.length < 50 || FAKE) break;
+    }
+    return all;
+  }
+
+  /**
+   * Every domain (zone) the panel can manage, each tagged with the credential that
+   * reaches it: `source` "main" (the account's login / API token) or a domainCreds id.
+   * `cloudflared tunnel login` authorises one domain per login, so further domains
+   * come from "Add domain" (another login, or an API token for more zones).
+   */
   async function zones({ fresh = false } = {}) {
     const c = creds();
     if (!c) return [];
     if (!fresh && cache.zones && cache.zones.accountId === c.accountId && Date.now() - cache.zones.at < CACHE_MS) return cache.zones.items;
-    const all = [];
-    for (let page = 1; page <= 20; page++) {
-      const r = await cfCall(c.token, `/zones?account.id=${encodeURIComponent(c.accountId)}&per_page=50&page=${page}`);
-      all.push(...r.map((z) => ({ id: z.id, name: z.name, status: z.status })));
-      if (r.length < 50 || FAKE) break;
+    const all = (await listZones(c.token, c.accountId)).map((z) => ({ ...z, source: "main" }));
+    const seen = new Set(all.map((z) => z.id));
+    let dirty = false;
+    for (const d of accountDomainCreds()) {
+      let list;
+      try {
+        list = await listZones(reveal(d.tokenEnc), c.accountId);
+        if (d.error) dirty = true;
+        delete d.error;
+      } catch (err) {
+        if (d.error !== err.message) dirty = true;
+        d.error = err.message;
+        list = (d.zones || []).map((z) => ({ ...z, status: "unknown" }));
+      }
+      const names = JSON.stringify(list.map((z) => [z.id, z.name]));
+      if (!d.error && names !== JSON.stringify((d.zones || []).map((z) => [z.id, z.name]))) {
+        d.zones = list.map((z) => ({ id: z.id, name: z.name }));
+        dirty = true;
+      }
+      for (const z of list) {
+        if (seen.has(z.id)) continue;
+        seen.add(z.id);
+        all.push({ ...z, source: d.id, ...(d.error ? { error: d.error } : {}) });
+      }
     }
+    if (dirty) save();
     cache.zones = { at: Date.now(), accountId: c.accountId, items: all };
     return all;
+  }
+
+  // ------------------------------------------------------------- domains
+
+  function domainCreds() {
+    const c = conf();
+    if (!Array.isArray(c.domainCreds)) c.domainCreds = [];
+    return c.domainCreds;
+  }
+  const accountDomainCreds = () => domainCreds().filter((d) => d.accountId === conf().accountId && d.tokenEnc);
+
+  /** The API token that can edit DNS in this zone (a zone from zones(), or just its id). */
+  function tokenForZone(c, zoneOrId) {
+    const id = typeof zoneOrId === "string" ? zoneOrId : zoneOrId?.id;
+    const z = typeof zoneOrId === "object" && zoneOrId?.source ? zoneOrId : cache.zones?.items?.find((x) => x.id === id);
+    const src = z ? z.source : accountDomainCreds().find((d) => (d.zones || []).some((x) => x.id === id))?.id;
+    if (!src || src === "main") return c.token;
+    const d = accountDomainCreds().find((x) => x.id === src);
+    return (d && reveal(d.tokenEnc)) || c.token;
+  }
+
+  /**
+   * Remember another credential for more domains of the connected account.
+   * Returns { cred, added: [zone names] }.
+   */
+  async function addDomainCred(token, { viaLogin = false, accountId = null } = {}) {
+    const c = creds();
+    if (!c) throw httpError(400, "Connect your Cloudflare account first.", { code: "cloudflare_not_connected" });
+    if (accountId && accountId !== c.accountId) {
+      throw httpError(400, `That domain belongs to a different Cloudflare account than the connected one (${conf().accountName || c.accountId}). Pick a domain in the same account.`);
+    }
+    if (token === c.token || accountDomainCreds().some((d) => reveal(d.tokenEnc) === token)) throw httpError(409, "Those credentials are already connected.");
+    let list;
+    try {
+      list = await listZones(token, c.accountId);
+    } catch (err) {
+      throw httpError(400, `Cloudflare refused those credentials: ${err.message}`);
+    }
+    if (!list.length) throw httpError(400, `Those credentials can't see any domain in ${conf().accountName || "the connected account"}.`);
+    const have = new Set((await zones({ fresh: true })).map((z) => z.id));
+    const added = list.filter((z) => !have.has(z.id));
+    if (!added.length) throw httpError(409, `Already available: ${list.map((z) => z.name).join(", ")}.`);
+    const cred = {
+      id: `cfd_${crypto.randomBytes(5).toString("hex")}`,
+      tokenEnc: ctx.secrets.encrypt(token),
+      viaLogin: !!viaLogin,
+      accountId: c.accountId,
+      zones: list.map((z) => ({ id: z.id, name: z.name })),
+      addedAt: now(),
+    };
+    domainCreds().push(cred);
+    save();
+    invalidate();
+    emitStatusSoon();
+    return { cred, added: added.map((z) => z.name) };
   }
   async function accountTunnels({ fresh = false } = {}) {
     const c = creds();
@@ -739,6 +837,13 @@ function createCloudflare(ctx) {
         ? { hostname, service: `https://127.0.0.1:${port}`, originRequest: { noTLSVerify: true } }
         : { hostname, service: `http://127.0.0.1:${port}` };
     }
+    if (kind === "phpmyadmin") {
+      // phpMyAdmin's own nginx vhost (Settings → phpMyAdmin port). With a certificate that
+      // port only speaks TLS (plain http gets a 497 redirect), so go in over https.
+      return https
+        ? { hostname, service: `https://127.0.0.1:${port}`, originRequest: { originServerName: https, noTLSVerify: true } }
+        : { hostname, service: `http://127.0.0.1:${port}` };
+    }
     // A website: the nginx front door, which picks the vhost by Host header.
     // With an active certificate nginx's :80 block only redirects to https,
     // which through a tunnel would loop — so go to :443 with SNI instead.
@@ -751,6 +856,7 @@ function createCloudflare(ctx) {
   // ----------------------------------------------------------------- DNS
 
   async function ensureDns(c, zone, d, prev, replaceExisting, log) {
+    c = { ...c, token: tokenForZone(c, zone) };
     const content = `${d.tunnelId}.cfargotunnel.com`;
     const recs = await cfCall(c.token, `/zones/${zone.id}/dns_records?name=${encodeURIComponent(d.hostname)}&per_page=50`);
     const mine = recs.find((r) => r.type === "CNAME" && String(r.content).toLowerCase() === content);
@@ -812,6 +918,42 @@ function createCloudflare(ctx) {
     const p = conf().panel;
     if (!p?.hostname || !p.tunnelId) return [];
     return [{ hostname: p.hostname, tunnelId: p.tunnelId, rule: ruleFor(p.hostname, "panel", { https: panelTls(), port: panelPort() }) }];
+  }
+
+  /** Where the tunnel reaches phpMyAdmin: { port, tls: certificate name | null }, from the phpmyadmin module. */
+  function pmaTarget() {
+    try {
+      return ctx.phpmyadmin?.tunnelTarget?.() || { port: 8081, tls: null };
+    } catch {
+      return { port: 8081, tls: null };
+    }
+  }
+  const pmaService = () => {
+    const t = pmaTarget();
+    return `${t.tls ? "https" : "http"}://127.0.0.1:${t.port}`;
+  };
+  function desiredForPhpMyAdmin() {
+    const p = conf().phpmyadmin;
+    if (!p?.hostname || !p.tunnelId) return [];
+    const t = pmaTarget();
+    return [{ hostname: p.hostname, tunnelId: p.tunnelId, rule: ruleFor(p.hostname, "phpmyadmin", { https: t.tls || false, port: t.port }) }];
+  }
+
+  /** Re-point phpMyAdmin's tunnel route after its port or certificate changed. Returns the job, or null. */
+  function syncPhpMyAdmin({ force = false } = {}) {
+    const desired = desiredForPhpMyAdmin();
+    const current = ledger("phpmyadmin");
+    if (!desired.length && !current.length) return null;
+    if (!force && inSync(desired, current)) return null;
+    return ctx.jobs.start(
+      { type: "cloudflare.sync", title: "Cloudflare route for phpMyAdmin", lock: false },
+      ({ log }) => serial(() => reconcile("phpmyadmin", desiredForPhpMyAdmin(), { log })),
+    );
+  }
+
+  /** The hostname phpMyAdmin is published on through a tunnel, or null. */
+  function phpmyadminHostname() {
+    return conf().phpmyadmin?.hostname || null;
   }
 
   function inSync(desired, current) {
@@ -927,9 +1069,10 @@ function createCloudflare(ctx) {
     for (const e of removing) {
       if (e.dnsCreated && e.dnsRecordId && e.zoneId) {
         try {
-          const r = await cfCall(c.token, `/zones/${e.zoneId}/dns_records/${e.dnsRecordId}`);
+          const zt = tokenForZone(c, e.zoneId);
+          const r = await cfCall(zt, `/zones/${e.zoneId}/dns_records/${e.dnsRecordId}`);
           if (r?.type === "CNAME" && /\.cfargotunnel\.com$/i.test(r.content || "")) {
-            await cfCall(c.token, `/zones/${e.zoneId}/dns_records/${e.dnsRecordId}`, { method: "DELETE" });
+            await cfCall(zt, `/zones/${e.zoneId}/dns_records/${e.dnsRecordId}`, { method: "DELETE" });
             log(`${e.hostname}: deleted the DNS record the panel created.`);
           } else {
             log(`${e.hostname}: DNS record was changed outside the panel — left in place.`);
@@ -1043,6 +1186,8 @@ function createCloudflare(ctx) {
     if (!hostnames.length) return { ok: true };
     const panelHost = conf().panel?.hostname;
     if (panelHost && hostnames.includes(panelHost)) throw httpError(409, `${panelHost} is the panel's own Cloudflare hostname.`, { code: "cloudflare_hostname_taken" });
+    const pmaHost = conf().phpmyadmin?.hostname;
+    if (pmaHost && hostnames.includes(pmaHost)) throw httpError(409, `${pmaHost} is phpMyAdmin's Cloudflare hostname.`, { code: "cloudflare_hostname_taken" });
     const local = conf().connectors.find((t) => t.cfId === cfg.tunnelId);
     const c = creds();
     if (!c) {
@@ -1102,6 +1247,8 @@ function createCloudflare(ctx) {
       connectedConnectors: connectors.filter((x) => x.connected).length,
       panel: c.panel?.hostname ? { hostname: c.panel.hostname, tunnelId: c.panel.tunnelId, route: ledger("panel").map(publicRoute)[0] || null } : null,
       panelService: `${panelTls() ? "https" : "http"}://127.0.0.1:${panelPort()}`,
+      phpmyadmin: c.phpmyadmin?.hostname ? { hostname: c.phpmyadmin.hostname, tunnelId: c.phpmyadmin.tunnelId, route: ledger("phpmyadmin").map(publicRoute)[0] || null } : null,
+      phpmyadminService: pmaService(),
       routes: db.list(COLL).length,
       routeErrors: db.list(COLL, (r) => r.status === "error").length,
       binary: binaryStatus(),
@@ -1144,6 +1291,7 @@ function createCloudflare(ctx) {
     startedAt: 0,
     output: [],
     fakeUntil: 0,
+    purpose: "connect",
     get certPath() {
       return path.join(loginHome, ".cloudflared", "cert.pem");
     },
@@ -1168,18 +1316,20 @@ function createCloudflare(ctx) {
       }
       return null;
     },
-    async start() {
+    async start({ purpose = "connect" } = {}) {
       this.cancel();
       this.url = "";
       this.error = "";
       this.output = [];
+      this.purpose = purpose;
       if (FAKE) {
         this.url = "https://dash.cloudflare.com/argotunnel?simulated=1";
         this.fakeUntil = Date.now() + 2500;
         this.startedAt = Date.now();
         return { ok: true, url: this.url, simulated: true };
       }
-      const already = await this.adoptExistingCert();
+      // An existing certificate is for a domain we already have; "Add domain" needs a fresh login.
+      const already = purpose === "connect" ? await this.adoptExistingCert() : null;
       if (already) return { ok: true, done: true, ...already };
       if (DRY && !findBinary()) throw httpError(400, "cloudflared isn't installed here (dry run: nothing is downloaded). Use an API token instead.");
       fs.mkdirSync(path.dirname(this.certPath), { recursive: true, mode: 0o700 });
@@ -1232,6 +1382,7 @@ function createCloudflare(ctx) {
       if (FAKE && this.fakeUntil) {
         if (Date.now() < this.fakeUntil) return { running: true, url: this.url, done: false, error: "" };
         this.fakeUntil = 0;
+        if (this.purpose === "domain") return this.finishDomain({ apiToken: "zones:example.net", accountId: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" });
         await storeCreds({ apiToken: "simulated-login-token", accountId: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" }, { viaLogin: true });
         return { running: false, url: this.url, done: true, error: "", accountName: conf().accountName };
       }
@@ -1252,10 +1403,19 @@ function createCloudflare(ctx) {
       }
       this.cancel();
       if (!cr) return { ...waiting, running: false, error: this.error || "You are logged in, but that certificate does not carry an API token this panel can use. Use an API token instead." };
+      if (this.purpose === "domain") return this.finishDomain(cr);
       const can = await canManage(cr.apiToken, cr.accountId);
       if (!can.ok) return { ...waiting, running: false, error: `Logged in, but those credentials cannot manage tunnels — ${can.reason} Use an API token instead.` };
       await storeCreds(cr, { viaLogin: true });
       return { running: false, url: this.url, done: true, error: "", accountName: conf().accountName };
+    },
+    async finishDomain(cr) {
+      try {
+        const { added } = await addDomainCred(cr.apiToken, { viaLogin: true, accountId: cr.accountId });
+        return { running: false, url: this.url, done: true, error: "", purpose: "domain", added };
+      } catch (err) {
+        return { running: false, url: this.url, done: false, error: err.message, purpose: "domain" };
+      }
     },
     cancel() {
       this.startedAt = 0;
@@ -1366,6 +1526,7 @@ function createCloudflare(ctx) {
         c.accountId = "";
         c.accountName = "";
         c.viaLogin = false;
+        c.domainCreds = [];
         save();
         invalidate();
         audit(admin, "cloudflare.disconnect", {});
@@ -1414,12 +1575,82 @@ function createCloudflare(ctx) {
     });
     router.get("/api/cloudflare/login", async (req, res, { admin }) => {
       const r = await login.poll();
-      if (r.done) audit(admin, "cloudflare.connect", { via: "login", account: r.accountName });
+      if (r.done && r.purpose === "domain") audit(admin, "cloudflare.domain.add", { via: "login", domains: r.added });
+      else if (r.done) audit(admin, "cloudflare.connect", { via: "login", account: r.accountName });
       return r;
     });
     router.post("/api/cloudflare/login/cancel", async () => {
       login.cancel();
       return { ok: true };
+    });
+
+    // ---- domains: which zones the panel can route, and more of them
+    const sourceLabel = (src) => {
+      if (src === "main") return conf().viaLogin ? "Account login" : "Account API token";
+      const d = accountDomainCreds().find((x) => x.id === src);
+      return d ? (d.viaLogin ? "Domain login" : `API token ${hint(reveal(d.tokenEnc)) || ""}`.trim()) : "—";
+    };
+    router.get("/api/cloudflare/domains", async () => {
+      if (!creds()) return { connected: false, items: [], sources: [] };
+      let items = [];
+      let error = null;
+      try {
+        items = await zones();
+      } catch (err) {
+        error = err.message;
+      }
+      const ledgerAll = db.list(COLL);
+      return {
+        connected: true,
+        error,
+        items: items.map((z) => ({
+          id: z.id,
+          name: z.name,
+          status: z.status,
+          source: z.source,
+          sourceLabel: sourceLabel(z.source),
+          removable: z.source !== "main",
+          error: z.error || null,
+          routes: ledgerAll.filter((r) => r.zoneId === z.id).length,
+        })),
+        sources: accountDomainCreds().map((d) => ({ id: d.id, label: sourceLabel(d.id), viaLogin: !!d.viaLogin, zones: (d.zones || []).map((z) => z.name), addedAt: d.addedAt, error: d.error || null })),
+        addSiteUrl: `https://dash.cloudflare.com/${encodeURIComponent(conf().accountId || "")}/add-site`,
+      };
+    });
+    router.post("/api/cloudflare/domains", async (req, res, { body, admin }) => {
+      const token = String(body.token || "").trim();
+      if (!token) throw httpError(400, "Paste an API token first.");
+      const r = await addDomainCred(token, { viaLogin: false });
+      audit(admin, "cloudflare.domain.add", { via: "token", domains: r.added });
+      return { ok: true, added: r.added };
+    });
+    router.post("/api/cloudflare/domains/login", async () => {
+      needCreds();
+      return login.start({ purpose: "domain" });
+    });
+    router.delete("/api/cloudflare/domains/:id", async (req, res, { params, admin }) => {
+      const list = domainCreds();
+      const d = list.find((x) => x.id === params.id);
+      if (!d) throw httpError(404, "Not found.");
+      // Zones only this credential reaches would lose their DNS management.
+      const others = await wrap(async () => {
+        const c = creds();
+        if (!c) return new Set();
+        const ids = new Set((await listZones(c.token, c.accountId).catch(() => [])).map((z) => z.id));
+        for (const o of accountDomainCreds()) if (o.id !== d.id) for (const z of o.zones || []) ids.add(z.id);
+        return ids;
+      });
+      const lost = (d.zones || []).filter((z) => !others.has(z.id));
+      const inUse = db.list(COLL, (r) => lost.some((z) => z.id === r.zoneId));
+      if (inUse.length) {
+        throw httpError(409, `${inUse.map((r) => r.hostname).join(", ")} ${inUse.length === 1 ? "is" : "are"} routed on ${lost.map((z) => z.name).join(", ")}. Move or remove ${inUse.length === 1 ? "that route" : "those routes"} first.`);
+      }
+      conf().domainCreds = list.filter((x) => x !== d);
+      save();
+      invalidate();
+      audit(admin, "cloudflare.domain.remove", { domains: (d.zones || []).map((z) => z.name) });
+      emitStatusSoon();
+      return { ok: true, removed: (d.zones || []).map((z) => z.name) };
     });
 
     // ---- tunnels in the account
@@ -1568,6 +1799,7 @@ function createCloudflare(ctx) {
                 targets: mine?.siteId ? siteTargets(sitesById[mine.siteId]) : null,
                 loadBalanced: mine?.siteId ? !!sitesById[mine.siteId]?.loadBalanced : false,
                 panel: mine?.owner === "panel",
+                phpmyadmin: mine?.owner === "phpmyadmin",
               };
             });
           } catch (err) {
@@ -1614,6 +1846,7 @@ function createCloudflare(ctx) {
         if (!UUID_RE.test(tunnelId)) throw httpError(400, "Pick which tunnel publishes the panel.");
         const clash = db.list("sites").find((s) => (s.domains || []).includes(hostname));
         if (clash) throw httpError(409, `${hostname} is a domain of website “${clash.name}”.`);
+        if (c.phpmyadmin?.hostname === hostname) throw httpError(409, `${hostname} is phpMyAdmin's hostname — the panel needs a hostname of its own.`);
         if (creds()) {
           const z = await wrap(() => zones());
           if (!zoneForHostname(z, hostname)) throw httpError(400, `${hostname} isn't in your Cloudflare account.`, { code: "cloudflare_zone_missing" });
@@ -1649,6 +1882,40 @@ function createCloudflare(ctx) {
       return { ok: true, panel: status().panel, job, panelUrlSet };
     });
 
+    // ---- phpMyAdmin on a hostname. A tunnel only carries hostnames (→ one local
+    // service each), never extra ports, so "panel.example.com:8081" can't work through
+    // it: phpMyAdmin gets its own hostname → its nginx vhost on this server.
+    router.put("/api/cloudflare/phpmyadmin", async (req, res, { body, admin }) => {
+      const hostname = String(body.hostname || "").trim().toLowerCase().replace(/\.$/, "");
+      const c = conf();
+      if (hostname) {
+        if (!HOST_RE.test(hostname)) throw httpError(400, "That is not a usable hostname.");
+        const tunnelId = String(body.tunnelId || c.connectors.find((x) => x.cfId)?.cfId || "");
+        if (!UUID_RE.test(tunnelId)) throw httpError(400, "Pick which tunnel publishes phpMyAdmin.");
+        if (c.panel?.hostname === hostname) throw httpError(409, `${hostname} is the panel's own hostname — phpMyAdmin needs a hostname of its own (for example pma.${hostname.split(".").slice(1).join(".") || hostname}).`);
+        const clash = db.list("sites").find((s) => (s.domains || []).includes(hostname));
+        if (clash) throw httpError(409, `${hostname} is a domain of website “${clash.name}”.`);
+        if (creds()) {
+          const z = await wrap(() => zones());
+          if (!zoneForHostname(z, hostname)) throw httpError(400, `${hostname} isn't in your Cloudflare account.`, { code: "cloudflare_zone_missing" });
+        }
+        c.phpmyadmin = { hostname, tunnelId };
+      } else {
+        c.phpmyadmin = null;
+      }
+      save();
+      audit(admin, hostname ? "cloudflare.phpmyadmin.publish" : "cloudflare.phpmyadmin.unpublish", { hostname: hostname || null });
+      const job = ctx.jobs.start(
+        { type: "cloudflare.sync", title: hostname ? `Publish phpMyAdmin on ${hostname}` : "Unpublish phpMyAdmin from Cloudflare", adminId: admin?.id || null, lock: false },
+        ({ log }) => serial(() => reconcile("phpmyadmin", desiredForPhpMyAdmin(), { log })),
+      );
+      emitStatusSoon();
+      try {
+        ctx.events?.broadcast?.("phpmyadmin", { at: now() });
+      } catch {}
+      return { ok: true, phpmyadmin: status().phpmyadmin, job };
+    });
+
     /**
      * Forget everything about Cloudflare, locally. Routes, DNS records and
      * tunnels stay in the Cloudflare account (deleting them would take sites
@@ -1666,13 +1933,15 @@ function createCloudflare(ctx) {
       if (c.accountId) removed.push("which account to use");
       if (c.connectors.length) removed.push(`${c.connectors.length} connector token${c.connectors.length === 1 ? "" : "s"}`);
       if (c.panel?.hostname) removed.push(`the panel hostname ${c.panel.hostname}`);
+      if (c.phpmyadmin?.hostname) removed.push(`the phpMyAdmin hostname ${c.phpmyadmin.hostname}`);
+      if (domainCreds().length) removed.push(`${domainCreds().length} extra domain credential${domainCreds().length === 1 ? "" : "s"}`);
       const routesN = db.list(COLL).length;
       if (routesN) {
         db.removeWhere(COLL, () => true);
         removed.push(`the record of ${routesN} route${routesN === 1 ? "" : "s"} the panel made`);
         remaining.push(`${routesN} public hostname${routesN === 1 ? "" : "s"} and their DNS records are still in your Cloudflare account — remove them in the dashboard if you no longer want them.`);
       }
-      ctx.config.cloudflare = { apiTokenEnc: "", accountId: "", accountName: "", viaLogin: false, connectors: [], panel: null };
+      ctx.config.cloudflare = { apiTokenEnc: "", accountId: "", accountName: "", viaLogin: false, connectors: [], panel: null, phpmyadmin: null, domainCreds: [] };
       save();
       invalidate();
       for (const file of login.candidateCerts()) {
@@ -1742,6 +2011,8 @@ function createCloudflare(ctx) {
       validateSite,
       siteRoutes,
       isTunnelHostname,
+      phpmyadminHostname,
+      syncPhpMyAdmin,
     },
   };
 }

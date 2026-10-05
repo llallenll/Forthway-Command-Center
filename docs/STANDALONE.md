@@ -689,7 +689,16 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     loopback request to `fcc-signon.php` must answer 401 with the sign-on page. Uninstall removes vhost, pool, files and the
     `fcc-pma` user; databases are untouched. Under DRY_RUN every step is logged, nothing is downloaded or installed, generated
     files + a pool preview are written under `dataDir/phpmyadmin/`.
+  - Cloudflare Tunnel: a tunnel carries hostnames (each → one local service), never extra ports, so a panel reached as
+    `panel.example.com` can't reach phpMyAdmin on `panel.example.com:8081`. `PUT /api/cloudflare/phpmyadmin { hostname, tunnelId }`
+    (Settings → Cloudflare → Publish phpMyAdmin; empty hostname unpublishes) adds ledger owner `"phpmyadmin"`: ingress
+    `<hostname> → http://127.0.0.1:<port>` (`https://…` + `originServerName` + `noTLSVerify` when the vhost has a certificate) and a
+    proxied CNAME. It must differ from the panel's hostname and every site domain. Links then use `https://<hostname>`; the route is
+    re-synced whenever the vhost is applied or the port changes. The generated PHP treats `X-Forwarded-Proto: https` from loopback
+    (cloudflared) as HTTPS for cookie `secure`. Status adds `tunnel: { hostname } | null` and `panelTunnel`, and warns when the
+    panel is tunnelled but phpMyAdmin isn't.
   - Sign-on: `POST /api/databases/:id/phpmyadmin` (admin) → `{ url, expiresAt, database, tls }`; `url` =
+    `https://<tunnel hostname>/fcc-signon.php?token=…` when published through a tunnel, else
     `<scheme>://<cert name | hostname | the host the admin used for the panel | panel address>:<port>/fcc-signon.php?token=<64 hex>`,
     single use, 60 s, kept in memory (hashed). The script POSTs `{ token }` to `http(s)://127.0.0.1:<FCC_PORT>/internal/pma/redeem`
     with `X-FCC-PMA-Secret`. That public route only answers requests from loopback / this machine without any proxy headers
@@ -725,7 +734,8 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   - **Ledger** collection `cloudflareRoutes`: `{ id, owner: "site:<id>"|"panel", siteId, hostname, tunnelId, zoneId, zoneName,
     service, ruleKey, ingress: "created"|"adopted"|null, dnsRecordId, dnsCreated, status: "active"|"error"|"manual", error, code, syncedAt }`.
   - **config.json** `cloudflare: { apiTokenEnc, accountId, accountName, viaLogin, connectors: [{ id, name, tokenEnc, autoStart, cfId }],
-    panel: { hostname, tunnelId } | null }` — tokens encrypted with `ctx.secrets`. Connecting: (1) *Log in with Cloudflare* —
+    panel: { hostname, tunnelId } | null, phpmyadmin: { hostname, tunnelId } | null, domainCreds: [{ id, tokenEnc, viaLogin, accountId,
+    zones: [{ id, name }], addedAt }] }` — tokens encrypted with `ctx.secrets`. Connecting: (1) *Log in with Cloudflare* —
     `cloudflared tunnel login` with `HOME=dataDir/cloudflared-home`, the origin cert carries account + API token;
     (2) API token (Account·Cloudflare Tunnel·Edit, Zone·DNS·Edit, Zone·Zone·Read); (3) connector token only — the connector runs,
     hostnames get `status: "manual"` with dashboard instructions. Connectors run `cloudflared --no-autoupdate tunnel run` with
@@ -749,6 +759,16 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     (publish the panel → `http(s)://127.0.0.1:<panel port>`; `""` unpublishes) → `{ panel, job }` ·
     `POST /api/cloudflare/reset` → `{ removed, remaining, tunnelStopped }` (local only: stops connectors, deletes credentials,
     connector tokens, the login cert under dataDir and the ledger; tunnels, routes and DNS stay in Cloudflare).
+  - **Domains**: `cloudflared tunnel login` authorises ONE zone per login, and an API token may be limited to some zones, so
+    further zones of the same account come from extra credentials in `domainCreds`. `zones()` merges the main credentials' zones
+    with each extra credential's (tagged `source: "main" | <cred id>`); DNS reads/writes for a zone use the token of the credential
+    that reaches it (`tokenForZone`); tunnel config always uses the main credentials. `GET /api/cloudflare/domains` →
+    `{ items: [{ id, name, status, source, sourceLabel, removable, error, routes }], sources, addSiteUrl }` ·
+    `POST /api/cloudflare/domains/login` (a `cloudflared tunnel login` whose cert is stored as a domain credential; poll with
+    `GET /api/cloudflare/login` → `{ done, purpose: "domain", added }`; a cert for another account is refused) ·
+    `POST /api/cloudflare/domains { token }` (must add at least one zone not already available) ·
+    `DELETE /api/cloudflare/domains/:id` (409 while a ledger route sits on a zone only that credential reaches). Disconnect and
+    reset forget them. UI: Settings → Cloudflare → Domains (between Connectors and the Publish cards; Routes come after those).
   - **SSE `cloudflare`**: `{ kind: "status", status }` (coalesced), `{ kind: "log", id, line }` (connector output),
     `{ kind: "routes", owner, siteId }` (after a sync). Added to `events.js` TYPES. Audit actions `cloudflare.*`.
   - **Panel hostname & SSE**: the panel's rule sets no `disableChunkedEncoding` and no short timeouts (the `/api/events`

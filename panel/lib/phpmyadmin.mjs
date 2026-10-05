@@ -133,7 +133,11 @@ export function renderConfigInc({ base, mysqlPort = 3306 }) {
 declare(strict_types=1);
 
 $fcc = require dirname(__DIR__) . '/fcc.php';
-$secure = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+// Through a Cloudflare Tunnel, cloudflared reaches nginx over loopback and the visitor's
+// HTTPS is only stated in X-Forwarded-Proto (trusted from loopback only).
+$secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
+        && strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https');
 
 $cfg['blowfish_secret'] = $fcc['blowfish'];
 
@@ -182,7 +186,11 @@ header('Referrer-Policy: no-referrer');
 header('X-Robots-Tag: noindex, nofollow');
 header('X-Frame-Options: DENY');
 
-$secure = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+// Through a Cloudflare Tunnel, cloudflared reaches nginx over loopback and the visitor's
+// HTTPS is only stated in X-Forwarded-Proto (trusted from loopback only).
+$secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
+        && strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https');
 session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'secure' => $secure, 'httponly' => true, 'samesite' => 'Lax']);
 session_name('${SIGNON_SESSION}');
 session_start();
@@ -512,8 +520,29 @@ export function register(router, ctx) {
     return validHostname(h) ? h : null;
   }
 
+  /** Hostname phpMyAdmin is published on through a Cloudflare Tunnel (Settings → Cloudflare), or null. */
+  function tunnelHost() {
+    try {
+      return ctx.cloudflare?.phpmyadminHostname?.() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Hostname the panel itself is published on through a Cloudflare Tunnel, or null. */
+  function panelTunnelHost() {
+    try {
+      return ctx.cloudflare?.status?.().panel?.hostname || null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Browser-facing base URL of phpMyAdmin. */
   function baseUrl(req) {
+    // A tunnel carries hostnames, not ports: Cloudflare serves it on 443 with its own certificate.
+    const tunnel = tunnelHost();
+    if (tunnel) return `https://${tunnel}`;
     const c = cfg();
     const tls = c.vhost?.tls || null;
     const host = tls || c.hostname || hostFromRequest(req) || ctx.mysql?.publicHost?.() || "127.0.0.1";
@@ -642,7 +671,17 @@ export function register(router, ctx) {
     const r = await applyNginxFile(nginxFile(), content, { log });
     cfg().vhost = { port: portOf(), hostname: cfg().hostname || "", tls: tls?.name || null, file: nginxFile(), appliedAt: new Date().toISOString() };
     await save();
+    syncTunnel();
     return r;
+  }
+
+  /** Keep phpMyAdmin's Cloudflare Tunnel route (if any) pointing at the current port / scheme. */
+  function syncTunnel() {
+    try {
+      ctx.cloudflare?.syncPhpMyAdmin?.();
+    } catch (e) {
+      console.warn(`[fcc] phpmyadmin: tunnel route sync: ${e.message}`);
+    }
   }
 
   function portFree(port) {
@@ -739,7 +778,13 @@ export function register(router, ctx) {
     const nginxOk = DRY_RUN || !!which("nginx");
     const warnings = [];
     if (c.installed && !installed) warnings.push(`The phpMyAdmin files are missing from ${appDir()}. Install it again.`);
-    if (installed && !c.vhost?.tls)
+    const tunnel = tunnelHost();
+    const panelTunnel = panelTunnelHost();
+    if (installed && !tunnel && panelTunnel)
+      warnings.push(
+        `The panel is reached through a Cloudflare Tunnel (${panelTunnel}). A tunnel only carries hostnames, not extra ports, so ${panelTunnel}:${portOf()} can't reach phpMyAdmin. Publish phpMyAdmin on a hostname of its own under Settings → Cloudflare → Publish phpMyAdmin.`,
+      );
+    if (installed && !c.vhost?.tls && !tunnel)
       warnings.push(
         "phpMyAdmin is served over plain HTTP, so database passwords and data cross the network unencrypted. Set a hostname that has a Let's Encrypt certificate on this server (for example the panel's domain) to switch to HTTPS.",
       );
@@ -755,7 +800,9 @@ export function register(router, ctx) {
       port: portOf(),
       hostname: c.hostname || "",
       tlsName: tlsName() || null,
-      tls: installed ? !!c.vhost?.tls : !!tlsFor(tlsName()),
+      tls: tunnel ? true : installed ? !!c.vhost?.tls : !!tlsFor(tlsName()),
+      tunnel: tunnel ? { hostname: tunnel } : null,
+      panelTunnel: panelTunnel || null,
       url: installed ? baseUrl(req) : null,
       nginx: { installed: nginxOk, file: nginxFile() },
       php: { fpm: !!fpm, version: fpm?.version || null, pool: fpm ? path.join(fpm.poolDir, `${POOL}.conf`) : null, socket: SOCKET },
@@ -1088,6 +1135,7 @@ export function register(router, ctx) {
       }
     }
     await save();
+    if (!isInstalled() && changed.includes("port")) syncTunnel(); // installed: applyVhost() did it
     audit(admin, "phpmyadmin.settings.update", { type: "phpmyadmin", id: "phpmyadmin", name: "phpMyAdmin" }, { fields: changed, port: portOf(), hostname: c.hostname || "" });
     broadcast();
     return statusView(null);
@@ -1112,7 +1160,7 @@ export function register(router, ctx) {
     const exp = Date.now() + TOKEN_TTL_MS;
     tokens.set(hashToken(token), { databaseId: rec.id, adminId: admin?.id || null, exp });
     audit(admin, "database.phpmyadmin.open", { type: "database", id: rec.id, name: rec.name, projectId: rec.projectId });
-    return { url: `${baseUrl(req)}/fcc-signon.php?token=${token}`, expiresAt: new Date(exp).toISOString(), database: rec.name, tls: !!cfg().vhost?.tls };
+    return { url: `${baseUrl(req)}/fcc-signon.php?token=${token}`, expiresAt: new Date(exp).toISOString(), database: rec.name, tls: !!tunnelHost() || !!cfg().vhost?.tls };
   }
 
   /** Only phpMyAdmin's sign-on script on this machine, talking to the panel directly. */
@@ -1146,6 +1194,8 @@ export function register(router, ctx) {
 
   ctx.phpmyadmin = {
     status: () => statusView(null),
+    /** For the Cloudflare module: where a tunnel reaches phpMyAdmin's vhost. */
+    tunnelTarget: () => ({ port: portOf(), tls: cfg().vhost?.tls || null }),
     issueToken: (databaseId, admin) => issueToken(databaseId, admin, null),
     // for start()
     _refresh: async () => {

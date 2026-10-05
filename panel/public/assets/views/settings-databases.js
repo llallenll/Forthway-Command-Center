@@ -115,7 +115,7 @@ export async function phpMyAdminSettings(box, ctx) {
         ${s.warnings?.length ? html`<div class="card-body" style="padding-bottom:0">${s.warnings.map((w) => html`<div class="note warn" style="margin-bottom:10px">${icon("alert")}<div>${w}</div></div>`)}</div>` : ""}
         <div class="card-body"><dl class="kv">
           <dt>Status</dt><dd><span class="status"><span class="dot ${tone}"></span>${s.installed ? (s.dryRun ? "Installed (simulated)" : "Installed") : "Not installed"}</span>${s.updateAvailable ? html` <span class="badge blue">${s.latestVersion} available</span>` : s.latestVersion && s.installed ? html` <span class="badge ok">${icon("check")}Up to date</span>` : ""}</dd>
-          <dt>Address</dt><dd>${s.url ? html`<span class="mono">${s.url}</span> ${s.tls ? html`<span class="badge ok">${icon("lock")}HTTPS</span>` : html`<span class="badge warn">HTTP</span>`}` : html`<span class="mono">port ${s.port}</span>${s.tlsName ? html` · <span class="muted">HTTPS ${s.tls ? `with the certificate for ${s.tlsName}` : `not available (no certificate for ${s.tlsName})`}</span>` : ""}`}</dd>
+          <dt>Address</dt><dd>${s.url ? html`<span class="mono">${s.url}</span> ${s.tls ? html`<span class="badge ok">${icon("lock")}HTTPS</span>` : html`<span class="badge warn">HTTP</span>`}${s.tunnel ? html` <span class="badge blue">${icon("cloud")}Cloudflare Tunnel</span>` : ""}` : html`<span class="mono">port ${s.port}</span>${s.tlsName ? html` · <span class="muted">HTTPS ${s.tls ? `with the certificate for ${s.tlsName}` : `not available (no certificate for ${s.tlsName})`}</span>` : ""}`}</dd>
           <dt>PHP-FPM</dt><dd>${s.php?.fpm ? html`PHP ${s.php.version} · own pool <span class="mono">${s.php.socket}</span>` : s.apt ? html`<span class="muted">Not installed — the install job adds ${s.packages.join(", ")}</span>` : html`<span class="muted">Not installed. Install php-fpm with mysqli, mbstring, xml, zip and gd first.</span>`}</dd>
           <dt>nginx</dt><dd>${s.nginx?.installed ? html`<span class="mono">${s.nginx.file}</span>` : html`<span class="muted">not installed</span>`}</dd>
           <dt>Files</dt><dd class="mono">${s.dir}</dd>
@@ -127,6 +127,9 @@ export async function phpMyAdminSettings(box, ctx) {
 
       <form class="card" data-form novalidate>
         <div class="card-head"><div><h3>Where it's served</h3><div class="sub">A separate nginx site on the main server, on its own port.</div></div></div>
+        ${s.tunnel || s.panelTunnel ? html`<div class="card-body" style="padding-bottom:0"><div class="note">${icon("cloud")}<div>${s.tunnel
+          ? html`Published through Cloudflare Tunnel on <span class="mono">${s.tunnel.hostname}</span> — links use that hostname, and the port below is only where the tunnel reaches it on this server.`
+          : html`The panel is reached through a Cloudflare Tunnel, which can't carry port ${s.port}. Give phpMyAdmin its own hostname under <a href="#/settings/cloudflare">Settings → Cloudflare → Publish phpMyAdmin</a>.`}</div></div></div>` : ""}
         <div class="card-body"><div class="form-grid">
           ${field("Port", html`<input class="input mono" name="port" inputmode="numeric" value="${s.port}" autocomplete="off"/>`, html`Allow it in your firewall: <span class="mono">ufw allow ${s.port}/tcp</span>`)}
           ${field("Hostname (optional)", html`<input class="input mono" name="hostname" value="${s.hostname || ""}" placeholder="${s.tlsName || "any"}" autocomplete="off" spellcheck="false"/>`,
