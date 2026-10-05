@@ -154,16 +154,20 @@ export class Deployer {
    * watch it happen. Rejects on a non-zero exit so a failed build stops the
    * deploy right there.
    */
-  run(cmd, { cwd, log = this.log, env = {}, timeoutMs = 30 * 60_000, allowFail = false } = {}) {
+  run(cmd, { cwd, log = this.log, env = {}, unsetEnv = [], timeoutMs = 30 * 60_000, allowFail = false } = {}) {
     // Asked to stop between two commands: do not start another one.
     if (this.aborted) return Promise.reject(abortError(this.aborted));
+    // `unsetEnv` is applied last, so a key the site's own variables set (e.g.
+    // NODE_ENV=production) cannot sneak back in after the caller removed it.
+    const childEnv = { ...process.env, ...this._appEnv(), ...env };
+    for (const key of unsetEnv) delete childEnv[key];
     return new Promise((resolve, reject) => {
       log?.line(`$ ${cmd}`);
       const child = spawn(cmd, {
         cwd: cwd || this.S.appDir || process.cwd(),
         shell: true,
         detached: true, // own process group, so a timeout can kill the whole tree
-        env: { ...process.env, ...this._appEnv(), ...env },
+        env: childEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
       this.jobChild = child;
@@ -709,10 +713,16 @@ export class Deployer {
         log.line("package.json and the lockfile are unchanged — skipping the install step.");
       } else {
         // NODE_ENV must NOT be "production" here or npm drops devDependencies
-        // (typescript, prisma, bundlers) and the build fails.
-        const env = { ...process.env };
-        delete env.NODE_ENV;
-        await this.run(this.S.build.install, { cwd: p.staging, log, env, timeoutMs: 20 * 60_000 });
+        // (typescript, prisma, tailwindcss, bundlers) and the build fails. The
+        // site's own variables usually set it, so it is removed after they are
+        // merged, and npm is told outright to include dev dependencies.
+        await this.run(this.S.build.install, {
+          cwd: p.staging,
+          log,
+          env: { NPM_CONFIG_INCLUDE: "dev", NPM_CONFIG_PRODUCTION: "false" },
+          unsetEnv: ["NODE_ENV", "npm_config_production", "npm_config_omit", "NPM_CONFIG_OMIT"],
+          timeoutMs: 20 * 60_000,
+        });
       }
     } else {
       log.line("No install command configured — skipping dependencies.");
