@@ -243,8 +243,7 @@ function createLb(ctx) {
   const realIpFailed = (err) => String(err?.message || "").includes(REALIP_FILE);
 
   function proxyLocation(site, up) {
-    return [
-      "    location / {",
+    const headers = [
       `        proxy_pass http://${up};`,
       "        proxy_http_version 1.1;",
       "        proxy_set_header Host $host;",
@@ -258,9 +257,29 @@ function createLb(ctx) {
       "        proxy_connect_timeout 5s;",
       "        proxy_send_timeout 300s;",
       "        proxy_read_timeout 300s;",
+    ];
+    const out = [];
+    if (site.loadBalanced) {
+      // Hashed build files (Next.js chunks) only exist on a server that built or
+      // received that exact release. While servers differ — mid rolling deploy,
+      // or after one failed — a chunk can 404 on the server nginx picked; ask
+      // the others before giving up. These are immutable GETs, safe to retry.
+      out.push(
+        "    location ^~ /_next/static/ {",
+        ...headers,
+        "        proxy_next_upstream error timeout http_404 http_502 http_503 http_504;",
+        "        proxy_next_upstream_tries 0;",
+        "    }",
+        "",
+      );
+    }
+    out.push(
+      "    location / {",
+      ...headers,
       site.loadBalanced ? "        proxy_next_upstream error timeout http_502 http_503 http_504;" : null,
       "    }",
-    ].filter((l) => l !== null);
+    );
+    return out.filter((l) => l !== null);
   }
 
   function render(site) {
