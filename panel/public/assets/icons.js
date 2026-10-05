@@ -75,6 +75,9 @@ const P = {
   dot: '<circle cx="12" cy="12" r="3.5"/>',
   wand: '<path d="m14.5 4.5 5 5L8 21l-5-5z"/><path d="m12 7 5 5"/>',
   bell: '<path d="M6 16.5V11a6 6 0 1 1 12 0v5.5l1.5 2H4.5z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>', // MONITOR: text alerts
+  message: '<path d="M4.5 6.5A2.5 2.5 0 0 1 7 4h10a2.5 2.5 0 0 1 2.5 2.5v7A2.5 2.5 0 0 1 17 16h-6l-4.5 3.5V16H7a2.5 2.5 0 0 1-2.5-2.5z"/><path d="M8.5 9h7M8.5 12h4.5"/>', // Notifications: Bird SMS
+  // Discord mark (filled, simplified): Notifications → Discord webhooks
+  discord: '<path fill="currentColor" stroke="none" d="M19.3 5.3A17 17 0 0 0 15.1 4l-.5 1.1a15.6 15.6 0 0 0-5.2 0L8.9 4a17 17 0 0 0-4.2 1.3C2 9.3 1.3 13.2 1.6 17a17.2 17.2 0 0 0 5.2 2.6l1.1-1.8c-.6-.2-1.2-.5-1.7-.8l.4-.3a12.2 12.2 0 0 0 10.8 0l.4.3c-.5.3-1.1.6-1.7.8l1.1 1.8a17.1 17.1 0 0 0 5.2-2.6c.4-4.4-.7-8.3-2.9-11.7zM8.7 14.7c-1 0-1.9-1-1.9-2.1s.8-2.1 1.9-2.1 1.9 1 1.9 2.1-.8 2.1-1.9 2.1zm6.6 0c-1 0-1.9-1-1.9-2.1s.8-2.1 1.9-2.1 1.9 1 1.9 2.1-.8 2.1-1.9 2.1z"/>',
 };
 
 export function icon(name, cls = "") {

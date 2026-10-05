@@ -848,6 +848,50 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     (`#/settings/notifications`); Websites list + project page rows get a `[data-uptime]` slot (dot, 24 h %, mini 24 h strip) filled by
     `bindUptime()` — no `.site-row` grid changes; dashboard "N websites down" card (`downBanner`); global toast on down/up (app.js).
     Small hooks in site.js, sites.js, project.js, settings.js, dashboard.js, app.js, events.js, icons.js (`bell`), app.css (`.up-*`, `.inc*`, `.rcp-*`).
+- **MONITOR — Discord webhook alerts + Settings → Notifications as channel rows (`panel/lib/notify-discord.mjs`, new; `monitor.mjs`).**
+  - **Config** (`config.json` → `notifications.discord: { webhooks: [{ id: "dwh_…", name, enabled, urlEnc, mention, createdAt }] }`, ≤ 10).
+    A webhook URL is a secret: validated (`https://` + host exactly `discord.com`, `discordapp.com`, `ptb.`/`canary.` of either; no
+    userinfo, port, `#`, or query other than `thread_id`/`wait`; path `/api[/vN]/webhooks/<snowflake>/<token>`), reduced to
+    `https://discord.com/api/webhooks/<id>/<token>[?thread_id=]`, encrypted with `ctx.secrets`, never returned or logged; the API shows
+    `urlHint` `…/api/webhooks/1234…5678/••••`. Posts always go to `https://discord.com/api/webhooks/<id>/<token>?wait=true` with
+    `redirect: "error"` (no SSRF). `mention` (DOWN alerts only): up to 5 of `@here`, `@everyone`, `<@userId>`, `<@&roleId>`.
+  - **Message**: `{ username: "Forthway", content?: mention, embeds: [{ title: "🔴 Down|🔴 Still down|🟢 Back up: <site>", description,
+    color (down/reminder #ff5d7a, up #3ddc97, test #4a72ff), url: https://<domain> (or the custom check URL), fields: Domain, Cause, Down
+    since (`<t:…:f>` + relative), Duration/Downtime, Unhealthy servers, Panel link (`ctx.panelUrl()/#/sites/<id>/uptime`), timestamp,
+    footer: panel name }], allowed_mentions: { parse: ["everyone"] only for @here/@everyone, users/roles: exactly the configured ids } }`
+    (`parse: []` on every other post). User text is markdown-escaped; no `avatar_url`.
+  - **Cadence** = SMS rules, per webhook instead of per number: DOWN post, reminder every `repeatMinutes` (site → panel default), "back
+    up" post to every webhook that got the alert (`notifyRecovery`); one non-recovery post per webhook per site per 10 min (same
+    `FCC_MONITOR_SMS_MIN_GAP_SEC`), first blocked post logged as `skipped`. `notify()` now fans out to `notifySms()` (unchanged) and
+    `notifyDiscord()` (own lock, webhooks in parallel), neither awaited by the check loop. **Rate limits**: 429 → wait `retry_after`
+    (body) / `Retry-After`; 5xx + network errors → backoff 1, 2, 4, 8, 16 s; ≤ 5 retries; other 4xx stop (404 → "webhook was deleted");
+    `retry_after` > 120 s gives up. Errors are scrubbed of the token / `webhooks/<id>/<token>` path.
+  - **Per site** (`monitors`): `discordEnabled` (default true) + `discordSkip: [webhookId]` (default `[]`: every enabled panel webhook,
+    including ones added later). Removing a panel webhook prunes it from every `discordSkip`.
+  - **Logging**: incident `alerts` entries `{ at, channel: "discord", kind, webhookId, to: <webhook name>, ok, simulated, skipped, error,
+    status, attempts, rateLimited, messageId, text: <embed title> }` (SMS entries have no `channel`); incident `discord: { [webhookId]:
+    { lastAt, ok } }` (hidden from the API like `notify`); activity `monitor.discord`; SSE `monitor` `{ kind: "sms", channel: "discord", … }`.
+    `state.json` gains `lastSend: { bird: { at, ok, simulated, error, test? }, discord: { [webhookId]: … } }` (drives the row badges).
+  - **DRY_RUN**: nothing is posted — `[monitor] [dry-run] would post to Discord "<name>": <title>`, recorded as `simulated`. Only under
+    DRY_RUN, `FCC_DISCORD_API_BASE=http://127.0.0.1:<port>/api` (loopback hosts only) makes posts go to a local fake Discord over real
+    HTTP (for testing 429 handling etc.); production always uses `https://discord.com/api`.
+  - **API**: `GET /api/notifications/settings` adds `lastSend` (Bird) and `discord: { webhooks: [{ id, name, enabled, mention, urlSet,
+    urlHint, urlUnreadable, last }], active, max, testEndpoint }` · `PUT` accepts `discord: { webhooks: [{ id?, name, enabled, url?,
+    clearUrl?, mention }] }` = the full list (left out = removed; `url` only when adding/changing; new ones need `url`; duplicates refused)
+    · `POST /api/notifications/test { channel: "discord", webhookId }` → `{ channel, webhookId, ok, simulated, error, status, attempts,
+    messageId, title }` (5 s cooldown per webhook; SMS test unchanged) · `GET /api/sites/:id/monitor` adds `notifications.discord:
+    { webhooks: [{ id, name, enabled, ready, mention }], active, testEndpoint }` and `discordTargets: [webhookId]` · `PUT
+    /api/sites/:id/monitor` accepts `discordEnabled`, `discordSkip` · summaries add `discord: { enabled, webhooks }` · `GET /api/monitor`
+    `notifications.discord` (bool).
+  - **UI**: Settings → Notifications is now a "Notification channels" card in the Updates → "Roll back" style: one row per channel
+    (Bird SMS, Discord; icon tile, title, state sub-line, badge Active / Off / Not set up / Error: last send failed, Edit/Set up, chevron).
+    Each row header is a `<button aria-expanded aria-controls>`; one row open at a time, height animated with `grid-template-rows`
+    (none under reduced motion), closed panels `inert`. Bird panel = the former form (same fields/validation, "Send test SMS"); Discord
+    panel = webhook list editor (name, enabled, URL write-only, mention, last result, Send test, add/remove). "Alert rules" card below
+    (repeat interval, recovery alerts). Uptime tab: "Discord" line in Checks, a "Discord alerts" card (Post to Discord switch +
+    per-webhook checkboxes), incident log rows carry an SMS / Discord channel badge. icons.js: `message`, `discord` (filled mark);
+    app.css `.nch*`, `.dwh*`, `.dsc-*`, `.badge.ch-discord`; components.js activity verbs `monitor.sms`, `monitor.discord`.
+    No mock.js changes (notifications aren't mocked there).
 - **ANALYTICS — unique visitors, page views, requests (new module `panel/lib/analytics.mjs`, in MODULES after `monitor`).**
   - **Input**: CLUSTER's access-log tailer hands each batch of new lines to `ctx.analytics.ingest(site, lines)` (one hook in
     `cluster.mjs tailAccessLogs`). Nothing is added to the websites: no script, no cookie.

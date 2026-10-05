@@ -1240,3 +1240,56 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
   .tr-kpi-v { flex-direction: column; align-items: flex-start; gap: 3px; }
   .tr-kpi-v > span:first-child { font-size: 20px; }
 }
+
+/* Settings → Notifications: channel rows (accordion, "Roll back" card style) + Discord webhooks */
+.nch { border-bottom: 1px solid var(--line); }
+.nch:last-child { border-bottom: 0; }
+.nch-head { width: 100%; border: 0; border-bottom: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.nch-head:hover, .nch.open .nch-head { background: rgba(148, 166, 255, 0.035); }
+.nch-head:focus-visible { outline: 2px solid var(--blue-3); outline-offset: -2px; border-radius: 10px; }
+.nch-head .li-title, .nch-head .li-sub { display: block; }
+.nch-head .li-title { color: var(--text); }
+.nch-tile { color: var(--text-2); }
+.nch-tile.discord { background: rgba(88, 101, 242, 0.16); color: #8f9bff; }
+.nch-chev { color: var(--muted); transition: transform 0.25s ease; }
+.nch.open .nch-chev { transform: rotate(180deg); }
+.nch-btn { pointer-events: none; }
+.nch-panel { display: grid; grid-template-rows: 0fr; visibility: hidden; transition: grid-template-rows 0.28s ease, visibility 0s linear 0.28s; }
+.nch.open .nch-panel { grid-template-rows: 1fr; visibility: visible; transition: grid-template-rows 0.28s ease, visibility 0s; }
+.nch-inner { overflow: hidden; min-height: 0; }
+.nch-body { padding: 6px 20px 20px 66px; }
+.nch-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.nch-foot { display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+.nch-test { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.nch-sub-h { font-weight: 650; font-size: 13.5px; margin-bottom: 10px; }
+.dwh-list { display: grid; gap: 12px; margin-bottom: 12px; }
+.dwh { border: 1px solid var(--line-2); border-radius: 12px; padding: 14px; background: rgba(148, 166, 255, 0.025); }
+.dwh-top { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; margin-bottom: 12px; }
+.dwh-key { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; background: rgba(148, 166, 255, 0.07); flex: none; }
+.dwh-last { padding-top: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.dwh-last > span { display: inline-flex; align-items: flex-start; gap: 6px; }
+.dwh-last .ico { margin-top: 2px; }
+.dwh-foot { display: flex; align-items: center; margin-top: 10px; }
+.dwh [data-hres] { margin-top: 10px; }
+.badge.ch-discord { background: rgba(88, 101, 242, 0.14); color: #a3adff; border-color: rgba(88, 101, 242, 0.26); }
+.dsc-hooks { display: grid; gap: 8px; margin-top: 4px; }
+.dsc-hook { display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer; }
+.dsc-ico { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; background: rgba(88, 101, 242, 0.16); color: #8f9bff; flex: none; }
+@media (max-width: 640px) {
+  .nch-body { padding: 4px 14px 16px; }
+  .nch-head { align-items: flex-start; }
+  .nch-head .li-sub { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .nch-head .li-right { padding-top: 6px; gap: 6px; }
+  .nch-btn { display: none; }
+  .nch-long { display: none; }
+  .nch-head .li-right .badge { max-width: 132px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dwh-top { grid-template-columns: minmax(0, 1fr) auto; }
+  .dwh-top .switch { order: 3; grid-column: 1 / -1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nch-panel, .nch.open .nch-panel, .nch-chev { transition: none; }
+}
+
+/* HTTPS lock beside a website's domain (kept out of the health column so every row is the same height) */
+.site-https { display: inline-flex; vertical-align: -1px; margin-right: 5px; color: var(--green, #46d17e); opacity: 0.9; }
+.site-https svg { width: 12px; height: 12px; }

@@ -19,10 +19,10 @@ export function siteRow(s, { serversById = {}, projectsById = {}, showProject = 
   return html`<div class="site-row" data-href="#/sites/${s.id}" role="link" tabindex="0">
     <div class="site-id">${typeIco(s.type)}
       <div style="min-width:0"><div class="site-name">${s.name}</div>
-        <div class="site-dom">${(s.domains || [])[0] || html`<span class="dim">No domain</span>`}${(s.domains || []).length > 1 ? html` <span class="dim">+${s.domains.length - 1}</span>` : ""}</div></div></div>
+        <div class="site-dom">${href.startsWith("https:") ? html`<span class="site-https" title="Served over HTTPS${s.ssl?.status === "active" ? " (Let's Encrypt)" : " (Cloudflare)"}">${icon("lock", "xs")}</span>` : ""}${(s.domains || [])[0] || html`<span class="dim">No domain</span>`}${(s.domains || []).length > 1 ? html` <span class="dim">+${s.domains.length - 1}</span>` : ""}</div></div></div>
     <div class="site-meta">${lbBadge(s, serversById)}
       <span class="tiny muted row" style="gap:8px">${showProject && p ? html`<span class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(p.color)}"></span>${p.name}</span><span class="dim">·</span>` : ""}${TYPE_LABEL[s.type] || s.type}${ver ? html`<span class="dim">·</span><span class="mono">v${ver}</span>` : ""}<span class="site-health-inline row" style="gap:8px"><span class="dim">·</span>${healthChip(s)}<span data-uptime="${s.id}" data-compact></span></span></span></div>
-    <div class="site-health">${healthChip(s)}<div data-uptime="${s.id}"></div>${s.ssl?.status === "active" ? html`<div class="tiny muted row mt-8" style="gap:6px">${icon("lock", "xs")}HTTPS</div>` : ""}</div>
+    <div class="site-health">${healthChip(s)}<div data-uptime="${s.id}"></div></div>
     <div class="site-actions btn-row" style="flex-wrap:nowrap">
       ${href ? html`<a class="icon-btn sm ghost" href="${href}" target="_blank" rel="noopener noreferrer" title="Open ${s.domains[0]}" data-stop>${icon("external")}</a>` : ""}
       <span class="icon-btn sm ghost" aria-hidden="true">${icon("chevronRight")}</span></div>

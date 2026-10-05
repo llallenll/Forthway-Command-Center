@@ -36,6 +36,14 @@
  * per 10 minutes, except recovery texts. Every attempt is logged on the incident
  * and in the activity log. Sending never throws into the monitoring loop.
  * FCC_DRY_RUN=1 never calls Bird: sends are logged and recorded as simulated.
+ *
+ * Discord (config.json `notifications.discord.webhooks`, see notify-discord.mjs):
+ * the same rules and cadence as SMS, per webhook instead of per phone number —
+ * a post on DOWN (with the webhook's optional mention), reminders every
+ * `repeatMinutes`, and a "back up" post to every webhook that got the alert.
+ * Each website posts to every enabled panel webhook except the ones it skips
+ * (`discordSkip`), unless `discordEnabled` is off. Posting runs beside SMS and
+ * the check loop (its own lock, retries with backoff on 429/5xx) and never throws.
  */
 
 import fs from "node:fs";
@@ -46,6 +54,7 @@ import https from "node:https";
 import { httpError } from "./http.mjs";
 import * as sys from "./sys.mjs";
 import { writeFileAtomic } from "./store.mjs";
+import { parseWebhookUrl, canonicalWebhookUrl, webhookHint, parseMention, buildDiscordPayload, postWebhook, apiBase as discordApiBase, scrubSecret } from "./notify-discord.mjs";
 
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
@@ -63,6 +72,7 @@ const SMS_TIMEOUT_MS = 15_000;
 const MAX_RECIPIENTS = 25;
 const MAX_ALERTS_PER_INCIDENT = 300;
 const MAX_INCIDENTS_PER_SITE = 300;
+const MAX_WEBHOOKS = 10;
 
 const DEFAULTS = Object.freeze({
   intervalSec: 60,
@@ -77,10 +87,12 @@ const DEFAULTS = Object.freeze({
   recipients: [],
   includeDefaults: true,
   repeatMinutes: null, // null = the panel-wide default
+  discordEnabled: true, // post to the panel's Discord webhooks…
+  discordSkip: [], // …except these webhook ids
   paused: false,
 });
 
-const NOTIF_DEFAULTS = Object.freeze({ enabled: false, repeatMinutes: 60, notifyRecovery: true, defaults: [], bird: {} });
+const NOTIF_DEFAULTS = Object.freeze({ enabled: false, repeatMinutes: 60, notifyRecovery: true, defaults: [], bird: {}, discord: { webhooks: [] } });
 
 export const PHONE_RE = /^\+[1-9]\d{6,14}$/;
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i;
@@ -471,11 +483,13 @@ function createMonitor(ctx) {
   const rt = new Map(); // siteId -> runtime
   let rate = {}; // `${siteId}|${phone}` -> last non-recovery send (ms)
   let gaps = []; // [{ from, to }] panel offline
+  let lastSend = { bird: null, discord: {} }; // last attempt per channel (badges in Settings → Notifications)
   const inFlight = new Set();
   const sending = new Set();
   const changed = new Set();
   const timers = [];
   let lastTestAt = 0;
+  const lastDiscordTestAt = new Map();
   let stateDirty = false;
 
   // ---------------------------------------------------------- settings
@@ -497,7 +511,31 @@ function createMonitor(ctx) {
 
   function notif() {
     const n = ctx.config.notifications || {};
-    return { ...NOTIF_DEFAULTS, ...n, bird: { ...(n.bird || {}) } };
+    return { ...NOTIF_DEFAULTS, ...n, bird: { ...(n.bird || {}) }, discord: { webhooks: [...(n.discord?.webhooks || [])] } };
+  }
+
+  /** Panel webhooks with their decrypted target ({ id, token, threadId } or null). Never expose `hook`. */
+  function discordHooks() {
+    return notif().discord.webhooks.map((w) => {
+      let hook = null;
+      if (w.urlEnc) {
+        try {
+          hook = parseWebhookUrl(ctx.secrets.decrypt(w.urlEnc));
+        } catch { /* unreadable (panel key changed) or invalid */ }
+      }
+      return { id: w.id, name: w.name || "Discord", enabled: w.enabled !== false, mention: w.mention || "", hasUrl: !!w.urlEnc, hook };
+    });
+  }
+  function discordPublic(w) {
+    const last = lastSend.discord[w.id] || null;
+    return { id: w.id, name: w.name, enabled: w.enabled, mention: w.mention, urlSet: w.hasUrl, urlHint: w.hook ? webhookHint(w.hook) : null, urlUnreadable: w.hasUrl && !w.hook, last };
+  }
+  /** Webhooks a site posts to (enabled, with a usable URL, not skipped by the site). */
+  function discordTargetsFor(siteId) {
+    const s = settingsFor(siteId);
+    if (s.discordEnabled === false) return [];
+    const skip = new Set(s.discordSkip || []);
+    return discordHooks().filter((w) => w.enabled && w.hook && !skip.has(w.id));
   }
   function birdKey() {
     const enc = ctx.config.notifications?.bird?.accessKeyEnc;
@@ -608,6 +646,7 @@ function createMonitor(ctx) {
     } catch { /* first boot */ }
     const now = Date.now();
     rate = j?.rate && typeof j.rate === "object" ? j.rate : {};
+    if (j?.lastSend && typeof j.lastSend === "object") lastSend = { bird: j.lastSend.bird || null, discord: { ...(j.lastSend.discord || {}) } };
     gaps = Array.isArray(j?.gaps) ? j.gaps.filter((g) => now - Date.parse(g.to) < KEEP_DAYS * DAY) : [];
     for (const [id, r] of Object.entries(j?.sites || {})) {
       if (!getSite(id)) continue;
@@ -666,7 +705,7 @@ function createMonitor(ctx) {
     const now = Date.now();
     for (const [k, t] of Object.entries(rate)) if (now - t > Math.max(SMS_MIN_GAP_MS, DAY)) delete rate[k];
     try {
-      writeFileAtomic(statePath, JSON.stringify({ v: 1, savedAt: iso(now), sites, rate, gaps }), 0o600);
+      writeFileAtomic(statePath, JSON.stringify({ v: 1, savedAt: iso(now), sites, rate, gaps, lastSend }), 0o600);
       stateDirty = false;
     } catch (err) {
       console.warn(`[monitor] could not write state: ${err.message}`);
@@ -782,6 +821,7 @@ function createMonitor(ctx) {
       pauseUntil: s.pauseUntil || null,
       intervalSec: s.intervalSec,
       sms: { enabled: !!s.smsEnabled, recipients: recipientsFor(site.id).length },
+      discord: { enabled: s.discordEnabled !== false, webhooks: discordTargetsFor(site.id).length },
       target: targetFor(site, s).url || null,
     };
   }
@@ -826,7 +866,7 @@ function createMonitor(ctx) {
 
   function publicIncident(i) {
     const end = i.endedAt ? Date.parse(i.endedAt) : Date.now();
-    return { ...i, notify: undefined, open: !i.endedAt, durationMs: i.durationMs ?? end - Date.parse(i.startedAt), alerts: [...(i.alerts || [])].reverse() };
+    return { ...i, notify: undefined, discord: undefined, open: !i.endedAt, durationMs: i.durationMs ?? end - Date.parse(i.startedAt), alerts: [...(i.alerts || [])].reverse() };
   }
 
   function incidentsOf(filter = {}) {
@@ -839,7 +879,7 @@ function createMonitor(ctx) {
 
   function settingsView(siteId) {
     const s = settingsFor(siteId);
-    return { ...s, recipients: (s.recipients || []).map((r) => ({ ...r })), repeatMinutesDefault: notif().repeatMinutes, minIntervalSec: MIN_INTERVAL_SEC };
+    return { ...s, recipients: (s.recipients || []).map((r) => ({ ...r })), discordSkip: [...(s.discordSkip || [])], repeatMinutesDefault: notif().repeatMinutes, minIntervalSec: MIN_INTERVAL_SEC };
   }
 
   function notificationsView() {
@@ -863,6 +903,18 @@ function createMonitor(ctx) {
       notifyRecovery: n.notifyRecovery !== false,
       minGapMinutes: Math.round(SMS_MIN_GAP_MS / MINUTE * 10) / 10,
       dryRun: sys.DRY_RUN,
+      lastSend: lastSend.bird || null,
+      discord: discordView(),
+    };
+  }
+
+  function discordView() {
+    const hooks = discordHooks();
+    return {
+      webhooks: hooks.map(discordPublic),
+      active: hooks.some((w) => w.enabled && w.hook),
+      max: MAX_WEBHOOKS,
+      testEndpoint: discordApiBase().override, // dry run posting to a local test server
     };
   }
 
@@ -900,6 +952,10 @@ function createMonitor(ctx) {
   }
 
   function logAlert(site, incId, entry) {
+    if (!entry.skipped) {
+      lastSend.bird = { at: entry.at, ok: !!entry.ok, simulated: !!entry.simulated, error: entry.error || null };
+      stateDirty = true;
+    }
     const inc = db.get("incidents", incId);
     if (inc) {
       const alerts = [...(inc.alerts || []), entry];
@@ -918,7 +974,12 @@ function createMonitor(ctx) {
    * "check" after every check while down (reminders + recipients added later),
    * "up" on recovery. Never throws.
    */
-  async function notify(siteId, incId, kind) {
+  function notify(siteId, incId, kind) {
+    notifySms(siteId, incId, kind);
+    notifyDiscord(siteId, incId, kind);
+  }
+
+  async function notifySms(siteId, incId, kind) {
     const lock = `${incId}|${kind === "up" ? "up" : "down"}`; // a recovery text never waits behind reminders
     if (sending.has(lock)) return;
     sending.add(lock);
@@ -985,6 +1046,129 @@ function createMonitor(ctx) {
     }
   }
 
+  // ---------------------------------------------------------- Discord
+
+  /**
+   * Posts one payload to a panel webhook (or simulates it under DRY_RUN).
+   * Never throws; the result never contains the webhook URL or token.
+   */
+  async function postDiscord(w, payload) {
+    const { base, override } = discordApiBase();
+    if (sys.DRY_RUN && !override) {
+      console.log(`[monitor] [dry-run] would post to Discord "${w.name}": ${payload.embeds?.[0]?.title || ""}${payload.content ? ` (${payload.content})` : ""}`);
+      return { ok: true, simulated: true, status: null, attempts: 0, rateLimited: 0, error: null, messageId: null };
+    }
+    if (override) console.log(`[monitor] [dry-run] posting to the Discord test endpoint for "${w.name}": ${payload.embeds?.[0]?.title || ""}`);
+    try {
+      const r = await postWebhook(w.hook, payload, { base, log: (m) => console.log(`[monitor] Discord "${w.name}": ${scrubSecret(m, w.hook)}`) });
+      return { ...r, simulated: false, error: r.error ? scrubSecret(r.error, w.hook) : null };
+    } catch (err) {
+      return { ok: false, simulated: false, status: null, attempts: 0, rateLimited: 0, error: scrubSecret(err?.message || "post failed", w.hook), messageId: null };
+    }
+  }
+
+  function siteLinkInfo(site) {
+    const t = targetFor(site);
+    let panelLink = null;
+    try {
+      panelLink = `${String(ctx.panelUrl?.() || "").replace(/\/+$/, "")}/#/sites/${encodeURIComponent(site.id)}/uptime`;
+      if (!/^https?:\/\//.test(panelLink)) panelLink = null;
+    } catch { /* no panel URL */ }
+    const domain = (site.domains || [])[0] || "";
+    let siteUrl = null;
+    if (DOMAIN_RE.test(domain)) {
+      const secure = site.ssl?.status === "active" || !!(site.cloudflare?.enabled && (site.cloudflare.hostnames || []).includes(domain));
+      siteUrl = `${secure ? "https" : "http"}://${domain}`;
+    } else if (t.how === "custom") siteUrl = t.url;
+    return { domain, siteUrl, panelLink, panelName: ctx.config.panelName || "Forthway Command Center" };
+  }
+
+  function logDiscord(site, incId, entry) {
+    if (!entry.skipped) {
+      lastSend.discord[entry.webhookId] = { at: entry.at, ok: !!entry.ok, simulated: !!entry.simulated, error: entry.error || null };
+      stateDirty = true;
+    }
+    const inc = db.get("incidents", incId);
+    if (inc) db.update("incidents", incId, { alerts: [...(inc.alerts || []), entry].slice(-MAX_ALERTS_PER_INCIDENT), lastAlertAt: entry.at });
+    try {
+      ctx.activity?.(null, "monitor.discord", { type: "site", id: site.id, name: site.name },
+        { kind: entry.kind, webhook: entry.to, ok: entry.ok, simulated: entry.simulated || undefined, skipped: entry.skipped || undefined, attempts: entry.attempts || undefined, error: entry.error || undefined, incidentId: incId });
+    } catch { /* audit is best effort */ }
+    if (!entry.ok && !entry.skipped) console.warn(`[monitor] Discord post to "${entry.to}" for ${site.name} failed: ${entry.error}`);
+    ctx.events?.broadcast("monitor", { kind: "sms", channel: "discord", siteId: site.id, incidentId: incId, ok: entry.ok, simulated: !!entry.simulated });
+  }
+
+  /** Discord counterpart of notifySms: same rules, per webhook. Never throws. */
+  async function notifyDiscord(siteId, incId, kind) {
+    const lock = `${incId}|discord|${kind === "up" ? "up" : "down"}`;
+    if (sending.has(lock)) return;
+    sending.add(lock);
+    try {
+      const site = getSite(siteId);
+      const inc = db.get("incidents", incId);
+      if (!site || !inc) return;
+      const n = notif();
+      const s = settingsFor(siteId);
+      if (s.discordEnabled === false) return;
+      const info = siteLinkInfo(site);
+      const startedAt = Date.parse(inc.startedAt);
+      const hooks = new Map(discordHooks().filter((w) => w.hook).map((w) => [w.id, w]));
+      const one = async (w, kindOut, payload) => {
+        const r = await postDiscord(w, payload);
+        return { at: iso(Date.now()), channel: "discord", kind: kindOut, webhookId: w.id, to: w.name, ok: r.ok, simulated: r.simulated, error: r.error, status: r.status ?? null, attempts: r.attempts || 0, rateLimited: r.rateLimited || 0, messageId: r.messageId || null, text: payload.embeds?.[0]?.title || "" };
+      };
+
+      if (kind === "up") {
+        if (n.notifyRecovery === false) return;
+        const notified = Object.entries(inc.discord || {}).filter(([, x]) => x.ok).map(([id]) => hooks.get(id)).filter(Boolean);
+        const durationMs = (inc.endedAt ? Date.parse(inc.endedAt) : Date.now()) - startedAt;
+        await Promise.all(notified.map(async (w) => {
+          const payload = buildDiscordPayload("up", { ...info, name: site.name, since: startedAt, durationMs });
+          logDiscord(site, incId, await one(w, "up", payload));
+        }));
+        return;
+      }
+
+      const repeatMs = Math.max(1, Number(s.repeatMinutes) || Number(n.repeatMinutes) || 60) * MINUTE;
+      await Promise.all(discordTargetsFor(siteId).map(async (w) => {
+        const fresh = db.get("incidents", incId);
+        if (!fresh || fresh.endedAt) return; // recovered meanwhile
+        const prev = fresh.discord?.[w.id];
+        const rkey = `${siteId}|discord:${w.id}`;
+        const lastRate = Number(rate[rkey]) || 0;
+        let msgKind;
+        if (!prev) msgKind = "down";
+        else {
+          const dueAt = prev.lastAt + (prev.ok ? repeatMs : SMS_MIN_GAP_MS);
+          if (Date.now() < dueAt) return;
+          msgKind = prev.ok ? "reminder" : "down";
+        }
+        if (Date.now() - lastRate < SMS_MIN_GAP_MS) {
+          if (!prev) {
+            const cur0 = db.get("incidents", incId);
+            db.update("incidents", incId, { discord: { ...(cur0?.discord || {}), [w.id]: { lastAt: lastRate, ok: false, skipped: true } } });
+            logDiscord(site, incId, { at: iso(Date.now()), channel: "discord", kind: msgKind, webhookId: w.id, to: w.name, ok: false, skipped: true, error: `rate limited (one post per ${fmtDuration(SMS_MIN_GAP_MS)} per webhook per website)` });
+          }
+          return;
+        }
+        rate[rkey] = Date.now();
+        stateDirty = true;
+        const cause = fresh.lastCause || fresh.cause;
+        const site2 = getSite(siteId) || site;
+        const servers = upstreams(site2).filter((u) => u.healthy === false || u.down).map((u) => u.name);
+        const payload = buildDiscordPayload(msgKind, { ...info, name: site.name, cause, since: startedAt, durationMs: Date.now() - startedAt, servers: servers.length ? servers : fresh.servers, mention: msgKind === "down" ? w.mention : "" });
+        const entry = await one(w, msgKind, payload);
+        const cur = db.get("incidents", incId);
+        if (cur) db.update("incidents", incId, { discord: { ...(cur.discord || {}), [w.id]: { lastAt: Date.now(), ok: entry.ok } } });
+        logDiscord(site, incId, entry);
+      }));
+    } catch (err) {
+      console.warn(`[monitor] Discord alerting failed for ${siteId}: ${err.message}`);
+    } finally {
+      sending.delete(lock);
+    }
+  }
+
   // ------------------------------------------------------------ checks
 
   function openIncident(site, r, now, cause) {
@@ -1007,6 +1191,7 @@ function createMonitor(ctx) {
       servers: ups.filter((u) => u.healthy === false || u.down).map((u) => u.name),
       failedChecks: r.fails,
       notify: {},
+      discord: {},
       alerts: [],
       gaps: [],
       lastAlertAt: null,
@@ -1224,8 +1409,67 @@ function createMonitor(ctx) {
     if (has("smsEnabled")) out.smsEnabled = !!body.smsEnabled;
     if (has("includeDefaults")) out.includeDefaults = !!body.includeDefaults;
     if (has("recipients")) out.recipients = sanitizeRecipients(body.recipients, "Recipients");
+    if (has("discordEnabled")) out.discordEnabled = !!body.discordEnabled;
+    if (has("discordSkip")) {
+      if (!Array.isArray(body.discordSkip)) throw httpError(400, "discordSkip must be a list of webhook ids.");
+      const known = new Set(notif().discord.webhooks.map((w) => w.id));
+      out.discordSkip = [...new Set(body.discordSkip.map((x) => String(x)).filter((x) => known.has(x)))];
+    }
     if (has("repeatMinutes")) out.repeatMinutes = body.repeatMinutes === null || body.repeatMinutes === "" ? null : clampInt(body.repeatMinutes, 1, 1440, null);
     return out;
+  }
+
+  /**
+   * body.discord = { webhooks: [{ id?, name, enabled, url?, clearUrl?, mention }] } — the full list
+   * (webhooks left out are removed). `url` only when adding or changing it; it is validated,
+   * reduced to discord.com/api/webhooks/<id>/<token> and stored encrypted.
+   */
+  function sanitizeDiscord(input, current) {
+    if (!input || typeof input !== "object" || !Array.isArray(input.webhooks)) throw httpError(400, "discord.webhooks must be a list.");
+    if (input.webhooks.length > MAX_WEBHOOKS) throw httpError(400, `At most ${MAX_WEBHOOKS} Discord webhooks.`);
+    const byId = new Map((current?.webhooks || []).map((w) => [w.id, w]));
+    const out = [];
+    const seenHooks = new Set();
+    for (const [i, item] of input.webhooks.entries()) {
+      if (!item || typeof item !== "object") throw httpError(400, "Each webhook must be an object.");
+      const prev = item.id ? byId.get(String(item.id)) : null;
+      const name = cleanStr(item.name, 60) || prev?.name || `Discord ${i + 1}`;
+      let urlEnc = prev?.urlEnc || null;
+      if (item.clearUrl) urlEnc = null;
+      const url = String(item.url ?? "").trim();
+      if (url) {
+        let parsed;
+        try {
+          parsed = parseWebhookUrl(url);
+        } catch (err) {
+          throw httpError(400, `${name}: ${err.message}`);
+        }
+        urlEnc = ctx.secrets.encrypt(canonicalWebhookUrl(parsed));
+      } else if (!prev && !item.clearUrl) {
+        throw httpError(400, `${name}: paste the webhook URL.`);
+      }
+      let mention = "";
+      try {
+        mention = parseMention(item.mention ?? prev?.mention ?? "").text;
+      } catch (err) {
+        throw httpError(400, `${name}: ${err.message}`);
+      }
+      if (urlEnc) {
+        let key = urlEnc;
+        try { const h = parseWebhookUrl(ctx.secrets.decrypt(urlEnc)); key = `${h.id}|${h.threadId || ""}`; } catch { /* unreadable */ }
+        if (seenHooks.has(key)) throw httpError(400, `${name}: that webhook is already in the list.`);
+        seenHooks.add(key);
+      }
+      out.push({
+        id: prev?.id || db.newId("dwh"),
+        name,
+        enabled: item.enabled === undefined ? prev?.enabled !== false : !!item.enabled,
+        urlEnc,
+        mention,
+        createdAt: prev?.createdAt || iso(Date.now()),
+      });
+    }
+    return { webhooks: out };
   }
 
   function routes(router) {
@@ -1237,7 +1481,7 @@ function createMonitor(ctx) {
         if (i.degraded) counts.degraded++;
       }
       const n = notificationsView();
-      return { items, counts, notifications: { enabled: n.enabled, configured: n.configured || n.dryRun, dryRun: n.dryRun } };
+      return { items, counts, notifications: { enabled: n.enabled, configured: n.configured || n.dryRun, dryRun: n.dryRun, discord: n.discord.active } };
     });
 
     router.get("/api/sites/:id/monitor", (req, res, { params, query }) => {
@@ -1248,7 +1492,9 @@ function createMonitor(ctx) {
         settings: settingsView(site.id),
         effective: { ...targetFor(site), path: checkPath(site, settingsFor(site.id)), healthPath: site.healthPath || "" },
         recipients: recipientsFor(site.id),
-        notifications: { enabled: n.enabled, configured: n.configured, dryRun: n.dryRun, defaults: n.defaults, repeatMinutes: n.repeatMinutes, notifyRecovery: n.notifyRecovery, minGapMinutes: n.minGapMinutes },
+        notifications: { enabled: n.enabled, configured: n.configured, dryRun: n.dryRun, defaults: n.defaults, repeatMinutes: n.repeatMinutes, notifyRecovery: n.notifyRecovery, minGapMinutes: n.minGapMinutes,
+          discord: { webhooks: n.discord.webhooks.map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ready: !!w.urlHint, mention: !!w.mention })), active: n.discord.active, testEndpoint: n.discord.testEndpoint } },
+        discordTargets: discordTargetsFor(site.id).map((w) => w.id),
         series: series(site.id, query.range),
         days: dayStrip(site.id),
         incidents: incidentsOf({ siteId: site.id, limit: Math.min(100, Number(query.limit) || 25) }),
@@ -1268,7 +1514,8 @@ function createMonitor(ctx) {
       ctx.events?.broadcast("monitor", { kind: "settings", siteId: site.id });
       changed.add(site.id);
       // a recipient added while the site is down gets the "down" text now
-      if (r.incidentId && (patch.smsEnabled || patch.recipients || patch.includeDefaults)) notify(site.id, r.incidentId, "check");
+      if (r.incidentId && (patch.smsEnabled || patch.recipients || patch.includeDefaults)) notifySms(site.id, r.incidentId, "check");
+      if (r.incidentId && (patch.discordEnabled || patch.discordSkip)) notifyDiscord(site.id, r.incidentId, "check");
       return { settings: settingsView(site.id), summary: summary(site), recipients: recipientsFor(site.id) };
     });
 
@@ -1347,23 +1594,52 @@ function createMonitor(ctx) {
       if (body.defaults !== undefined) { n.defaults = sanitizeRecipients(body.defaults, "Default recipients"); fields.push("defaults"); }
       if (body.repeatMinutes !== undefined) { n.repeatMinutes = clampInt(body.repeatMinutes, 1, 1440, 60); fields.push("repeatMinutes"); }
       if (body.notifyRecovery !== undefined) { n.notifyRecovery = !!body.notifyRecovery; fields.push("notifyRecovery"); }
+      if (body.discord !== undefined) {
+        n.discord = sanitizeDiscord(body.discord, n.discord);
+        fields.push("discord");
+      }
       n.bird = bird;
       n.provider = "bird";
       ctx.config.notifications = n;
       ctx.saveConfig();
       if (fields.length) ctx.activity?.(admin, "notifications.settings.update", { type: "settings", id: "notifications", name: "Notifications" }, { fields: [...new Set(fields)] });
       ctx.events?.broadcast("monitor", { kind: "notifications" });
+      if (body.discord !== undefined) {
+        // forget per-site skips and last results of removed webhooks
+        const ids = new Set((n.discord.webhooks || []).map((w) => w.id));
+        for (const id of Object.keys(lastSend.discord)) if (!ids.has(id)) delete lastSend.discord[id];
+        for (const m of db.list("monitors")) {
+          if (Array.isArray(m.discordSkip) && m.discordSkip.some((x) => !ids.has(x))) db.update("monitors", m.id, { discordSkip: m.discordSkip.filter((x) => ids.has(x)) });
+        }
+        stateDirty = true;
+      }
       const view = notificationsView();
       return { ...view, warning: view.enabled && !view.configured && !view.dryRun ? `Alerts are on, but Bird isn't fully set up: ${view.problem}` : null };
     });
 
     router.post("/api/notifications/test", async (req, res, { body = {}, admin }) => {
+      if (body.channel === "discord") {
+        const w = discordHooks().find((x) => x.id === String(body.webhookId || ""));
+        if (!w) throw httpError(404, "That Discord webhook doesn't exist (save it first).");
+        if (!w.hook) throw httpError(400, w.hasUrl ? "The saved webhook URL can't be read (the panel key changed) — paste it again." : "Add the webhook URL first.");
+        if (Date.now() - (lastDiscordTestAt.get(w.id) || 0) < 5000) throw httpError(429, "Wait a few seconds between test posts.");
+        lastDiscordTestAt.set(w.id, Date.now());
+        const payload = buildDiscordPayload("test", { panelName: ctx.config.panelName, panelLink: (() => { try { return `${String(ctx.panelUrl?.() || "").replace(/\/+$/, "")}/#/settings/notifications`; } catch { return null; } })() });
+        const r = await postDiscord(w, payload);
+        lastSend.discord[w.id] = { at: iso(Date.now()), ok: !!r.ok, simulated: !!r.simulated, error: r.error || null, test: true };
+        stateDirty = true;
+        ctx.activity?.(admin, "notifications.test", { type: "settings", id: "notifications", name: "Notifications" }, { channel: "discord", webhook: w.name, ok: r.ok, simulated: r.simulated || undefined, attempts: r.attempts || undefined, error: r.error || undefined });
+        ctx.events?.broadcast("monitor", { kind: "notifications" });
+        return { channel: "discord", webhookId: w.id, ok: r.ok, simulated: !!r.simulated, error: r.error || null, status: r.status ?? null, attempts: r.attempts || 0, messageId: r.messageId || null, title: payload.embeds[0].title };
+      }
       const to = normalizePhone(body.to);
       if (!to) throw httpError(400, "Enter a phone number in international (E.164) format, like +15551234567.");
       if (Date.now() - lastTestAt < 5000) throw httpError(429, "Wait a few seconds between test texts.");
       lastTestAt = Date.now();
       const text = buildMessage("test", { panelName: ctx.config.panelName });
       const r = await sendSms(to, text);
+      lastSend.bird = { at: iso(Date.now()), ok: !!r.ok, simulated: !!r.simulated, error: r.error || null, test: true };
+      stateDirty = true;
       ctx.activity?.(admin, "notifications.test", { type: "settings", id: "notifications", name: "Notifications" }, { to, ok: r.ok, simulated: r.simulated || undefined, error: r.error || undefined });
       return { ok: r.ok, simulated: !!r.simulated, error: r.error || null, api: r.api || null, messageId: r.id || null, to, text };
     });

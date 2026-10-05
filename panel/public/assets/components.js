@@ -77,6 +77,7 @@ const ACT_VERB = {
   "backup.delete": "deleted a backup of", "backup.download": "downloaded a backup of", "backup.restore.start": "started restoring", "backup.update": "updated a backup of",
   "release.delete": "deleted a release of", "release.github": "pulled a release for", "job.cancel": "cancelled",
   "database.phpmyadmin.open": "opened phpMyAdmin for", "database.phpmyadmin.signon": "signed in to phpMyAdmin for", "phpmyadmin.install": "installed", "phpmyadmin.update": "updated",
+  "monitor.sms": "texted an alert about", "monitor.discord": "posted a Discord alert about",
   "phpmyadmin.uninstall": "removed", "phpmyadmin.settings.update": "changed settings of", "mysql.settings.update": "changed the database host settings", "mysql.bind.update": "changed the MySQL listen address",
 };
 const ACT_ICON = { site: "globe", database: "database", server: "server", project: "folder", admin: "user", lb: "balance", loadbalancer: "balance", settings: "settings", backup: "archive" };
