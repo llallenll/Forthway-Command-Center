@@ -64,7 +64,7 @@ function paintTop() {
     { label: "Activity log", icon: "activity", onClick: () => (location.hash = "#/activity") },
     { sep: true },
     { label: "Sign out", icon: "logout", danger: true, onClick: logout },
-  ], { head: html`<div class="menu-head"><div class="strong">${me.name || ""}</div><div class="muted small">${me.email || ""}</div></div>` });
+  ], { head: html`<div class="menu-head"><div class="strong">${me.name || ""}</div><div class="muted small">${me.github ? `@${me.github.login}` : me.email || ""}</div></div>` });
 }
 
 /* ── live-updates chip: what the SSE / polling connection is doing ── */
@@ -131,6 +131,18 @@ function toggleLivePop(btn) {
     document.removeEventListener("keydown", key);
     window.removeEventListener("resize", closeLivePop);
   };
+}
+
+/* Password sign-in is being retired: nag until Settings → Security switches the panel to GitHub-only. */
+function paintAuthBanner() {
+  const el = $("#authBanner");
+  if (!el) return;
+  const on = !MOCK && state.settings?.authMode === "password";
+  el.hidden = !on;
+  if (!on) return mount(el, html``);
+  mount(el, html`<div class="auth-banner" role="status">${icon("alert")}<div><div class="strong">Password sign-in is being retired — set up Sign in with GitHub in Settings → Security</div>
+    <div class="muted">${state.me?.github ? "Your GitHub account is linked. Switch the panel to GitHub-only when every admin is linked." : "Link your GitHub account, then switch the panel to GitHub-only."}</div></div>
+    <a class="btn btn-sm btn-primary" href="#/settings/security">${icon("github")}Open Security</a></div>`);
 }
 
 async function logout() {
@@ -313,8 +325,9 @@ async function boot() {
   });
 
   window.addEventListener("hashchange", route);
-  window.addEventListener("fcc:me", () => paintTop());
-  window.addEventListener("fcc:settings", () => { paintBrand(); paintSidebarStatus(); });
+  window.addEventListener("fcc:me", () => { paintTop(); paintAuthBanner(); });
+  window.addEventListener("fcc:settings", () => { paintBrand(); paintSidebarStatus(); paintAuthBanner(); });
+  paintAuthBanner();
   route();
 }
 

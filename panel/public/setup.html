@@ -11,6 +11,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" />
 <link rel="stylesheet" href="assets/app.css" />
+<link rel="stylesheet" href="assets/auth.css" />
 </head>
 <body class="auth-body" data-page="setup">
 <main class="auth-shell">
@@ -26,48 +27,58 @@
       <div class="auth-float"><div class="af-l"><span class="dot ok"></span>Deploys</div><div class="af-v">Zero-downtime</div></div>
     </div>
   </section>
-  <section class="auth-form">
+  <section class="auth-form setup">
     <h1>Set up your panel</h1>
-    <p class="sub">Create the first admin account. You can add more admins later.</p>
-    <form id="form" novalidate>
-      <div class="field"><label for="name">Your name</label><input class="input" id="name" name="name" autocomplete="name" required autofocus /></div>
-      <div class="field"><label for="email">Email</label><input class="input" id="email" name="email" type="email" autocomplete="username" required /></div>
-      <div class="field"><label for="password">Password</label>
-        <div class="pw-wrap"><input class="input" id="password" name="password" type="password" autocomplete="new-password" minlength="8" required /><button type="button" class="icon-btn" data-toggle-pw aria-label="Show password"></button></div>
-        <div class="strength" id="strength"><i></i><i></i><i></i><i></i></div>
-        <div class="hint" id="pwHint">At least 8 characters.</div></div>
-      <div class="field"><label for="confirm">Confirm password</label>
-        <div class="pw-wrap"><input class="input" id="confirm" name="confirm" type="password" autocomplete="new-password" required /><button type="button" class="icon-btn" data-toggle-pw aria-label="Show password"></button></div>
-        <div class="hint" id="confirmHint" aria-live="polite"></div></div>
-      <div class="field"><label for="panelName">Panel name <span class="dim">(optional)</span></label><input class="input" id="panelName" name="panelName" placeholder="Forthway" autocomplete="off" /></div>
-      <div class="error-box" id="err" hidden></div>
-      <button class="btn btn-primary btn-lg btn-block" id="go" type="submit">Create admin &amp; continue</button>
+    <p class="sub">Three short steps. You'll sign in with GitHub — no passwords to keep.</p>
+    <ol class="auth-steps" id="steps"><li data-step="1">Panel</li><li data-step="2">GitHub app</li><li data-step="3">Sign in</li></ol>
+    <div class="error-box" id="err" role="alert" hidden style="margin-top:16px"></div>
+
+    <form class="setup-pane" id="paneCode" novalidate hidden>
+      <h2>Enter the setup code</h2>
+      <p class="lead">So nobody else who finds this new panel can claim it, setup needs the code the server printed when it started.</p>
+      <div class="field"><label for="code">Setup code</label><input class="input code-input" id="code" name="code" placeholder="XXXX-XXXX-XXXX" autocomplete="one-time-code" spellcheck="false" maxlength="20" required /></div>
+      <p class="auth-help">Find it with <code id="codeCmd">sudo cat /var/lib/fcc/setup-code</code> (or <code>journalctl -u fcc</code>).</p>
+      <button class="btn btn-primary btn-lg btn-block" type="submit" data-go>Continue</button>
     </form>
-    <p class="foot" id="foot"></p>
+
+    <form class="setup-pane" id="pane1" novalidate hidden>
+      <h2>Name and address</h2>
+      <div class="field"><label for="panelName">Panel name <span class="dim">(optional)</span></label><input class="input" id="panelName" name="panelName" placeholder="Forthway" maxlength="60" autocomplete="off" /></div>
+      <div class="field"><label for="panelUrl">Panel URL</label><input class="input mono" id="panelUrl" name="panelUrl" placeholder="https://panel.example.com" autocomplete="off" spellcheck="false" required />
+        <div class="hint">The address you and GitHub use to reach this panel. Prefilled from how you opened it.</div></div>
+      <button class="btn btn-primary btn-lg btn-block" type="submit" data-go>Continue</button>
+    </form>
+
+    <form class="setup-pane" id="pane2" novalidate hidden>
+      <h2>Create a GitHub OAuth App</h2>
+      <div class="auth-help">
+        <ol>
+          <li>Open <a href="https://github.com/settings/applications/new" target="_blank" rel="noopener noreferrer">github.com/settings/applications/new</a> (or your organization's Settings → Developer settings → OAuth Apps).</li>
+          <li><b>Application name</b>: anything, e.g. <span id="appName">Forthway Command Center</span>.</li>
+          <li>Paste the two addresses below, leave <b>Enable Device Flow</b> off, and click <b>Register application</b>.</li>
+          <li>Copy the <b>Client ID</b>, click <b>Generate a new client secret</b>, and paste both here.</li>
+        </ol>
+      </div>
+      <div class="copy-field"><span>Homepage URL</span><div class="secret"><code id="homeUrl"></code><button class="btn btn-sm" type="button" data-copy-from="homeUrl">Copy</button></div></div>
+      <div class="copy-field"><span>Authorization callback URL</span><div class="secret"><code id="cbUrl"></code><button class="btn btn-sm" type="button" data-copy-from="cbUrl">Copy</button></div></div>
+      <div class="field"><label for="clientId">Client ID</label><input class="input mono" id="clientId" name="clientId" autocomplete="off" spellcheck="false" required /></div>
+      <div class="field"><label for="clientSecret">Client secret</label>
+        <div class="pw-wrap"><input class="input mono" id="clientSecret" name="clientSecret" type="password" autocomplete="off" spellcheck="false" /><button type="button" class="icon-btn" data-toggle-pw aria-label="Show secret"></button></div>
+        <div class="hint" id="secretHint">Stored encrypted on this server and never shown again.</div></div>
+      <div class="setup-row"><button class="btn btn-lg" type="button" data-back="1">Back</button><button class="btn btn-primary btn-lg" type="submit" data-go>Save and continue</button></div>
+    </form>
+
+    <div class="setup-pane" id="pane3" hidden>
+      <h2>Sign in to become the owner</h2>
+      <p class="lead">The GitHub account you sign in with now becomes this panel's owner. You can add more admins by GitHub username afterwards.</p>
+      <a class="btn btn-white btn-github btn-block" id="gh" href="auth/github?mode=setup"><svg class="gh-mark" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>Sign in with GitHub</span></a>
+      <div class="setup-row"><button class="btn" type="button" data-back="2">Back</button><span class="grow"></span></div>
+    </div>
+
+    <button class="btn btn-block auth-dev" id="dev" type="button" hidden style="margin-top:14px">Dev sign-in (dry run only) — skip GitHub</button>
+    <p class="auth-recover" id="foot"></p>
   </section>
 </main>
-<script type="module">
-  // Confirm-password guard. Runs on the document in the capture phase, so a
-  // mismatch is stopped before assets/auth.js submits the form.
-  const pw = document.getElementById("password"), cf = document.getElementById("confirm");
-  const hint = document.getElementById("confirmHint"), err = document.getElementById("err");
-  const check = () => {
-    const bad = cf.value !== "" && cf.value !== pw.value;
-    cf.classList.toggle("invalid", bad);
-    hint.textContent = !cf.value ? "" : bad ? "Doesn't match yet." : "Passwords match.";
-    hint.style.color = !cf.value ? "" : bad ? "var(--err)" : "var(--ok)";
-  };
-  pw.addEventListener("input", check);
-  cf.addEventListener("input", check);
-  document.addEventListener("submit", (e) => {
-    if (e.target.id !== "form" || cf.value === pw.value) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    err.hidden = false;
-    err.textContent = cf.value ? "The two passwords don't match." : "Type your password again to confirm it.";
-    cf.focus();
-  }, true);
-</script>
 <script type="module" src="assets/auth.js"></script>
 </body>
 </html>

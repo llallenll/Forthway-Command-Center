@@ -295,6 +295,9 @@ R("POST", "/api/login", (p, b) => {
   return { ok: true, admin: me };
 });
 R("POST", "/api/logout", () => ({ ok: true }));
+R("GET", "/api/auth", () => ({ githubOnly: false, githubConfigured: true, github: { clientId: "Ov23liMockClient", clientSecretSet: true, clientSecretHint: "••••9f2c", org: "" },
+  callbackUrl: "https://panel.forthway.dev/auth/github/callback", homepageUrl: "https://panel.forthway.dev", panelUrlFixed: true, newAppUrl: "https://github.com/settings/applications/new",
+  admins: clone(db.admins), unlinked: db.admins.filter((a) => !a.github).map((a) => a.name), canSwitch: false, blockers: ["Link your own GitHub account."], switchedAt: null }));
 R("GET", "/api/me", () => clone(me));
 R("PATCH", "/api/me", (p, b) => { Object.assign(me, pick(b, ["name", "email"])); activity("admin.update", "admin", me); return clone(me); });
 R("POST", "/api/me/password", (p, b) => { if (!b.current) err(400, "Current password is required."); if ((b.next || "").length < 10) err(400, "New password must be at least 10 characters."); return { ok: true }; });

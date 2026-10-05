@@ -119,10 +119,32 @@ packages. `--purge` deletes local backups, so copy anything you want first.
 
 ## First login and admins
 
-The setup page creates the **owner** account: name, email, password. After
-that you sign in with email and password, and can add more admins under
-**Settings → Admins**. Every admin can do everything; the owner just cannot be
-deleted, and nobody can delete themselves, so there is always a way back in.
+Everyone signs in with **GitHub** — there are no panel passwords. The setup
+page walks you through it:
+
+1. **Setup code.** A fresh panel prints a one-time code to its log and to
+   `/var/lib/fcc/setup-code` (`sudo cat /var/lib/fcc/setup-code`, or
+   `journalctl -u fcc`), so a stranger who finds the new panel can't claim it.
+2. **Panel name and URL**, then **create a GitHub OAuth App** at
+   <https://github.com/settings/applications/new> with the Homepage URL and
+   Authorization callback URL (`<panel URL>/auth/github/callback`) the page
+   shows, and paste its Client ID and a new Client secret.
+3. **Sign in with GitHub.** That GitHub account becomes the **owner**.
+
+Add more admins under **Settings → Admins** by GitHub username; they can sign
+in right away. Admins are matched by GitHub account id, so renaming a GitHub
+account is fine. Optionally, **Settings → Security** also lets in every member
+of one GitHub organization. Every admin can do everything; the owner just
+cannot be deleted, and nobody can delete themselves.
+
+**Panels installed before GitHub sign-in** keep password sign-in until you
+switch: in **Settings → Security** save the OAuth App, click **Link GitHub**
+(every admin should), then **Switch to GitHub-only**. Passwords then stop
+working and their hashes are deleted.
+
+**Locked out** (OAuth App deleted, secret rotated…)? On the server run
+`sudo node /opt/fcc/panel/recover.mjs`. It prints a one-time sign-in link for
+the owner, valid for 15 minutes; fix things in Settings → Security.
 
 Sign-in attempts are throttled per address. Every change anyone makes — a
 deploy, a restore, a revealed database password — goes into the **Activity**
@@ -333,11 +355,11 @@ systemd timer renews certificates on its own.
 ## Security notes
 
 **The panel runs as root.** It has to: it writes nginx configs, manages MySQL,
-runs certbot and takes server backups. That makes the admin password the key
-to the machine. Use long, unique passwords, keep the admin list short, and
-remove admins who no longer need access.
+runs certbot and takes server backups. That makes every admin's GitHub account
+a key to the machine: turn on two-factor authentication on GitHub, keep the
+admin list short, and remove admins who no longer need access.
 
-**Put it behind HTTPS.** You type a password into it and agents send their
+**Put it behind HTTPS.** Session cookies travel to it and agents send their
 tokens to it. Install with `FCC_PANEL_DOMAIN` (and then, if you like,
 `FCC_HOST=127.0.0.1` so the plain-HTTP port is not exposed at all). Without a
 domain, reach it over an SSH tunnel rather than over the open internet.

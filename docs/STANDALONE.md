@@ -937,3 +937,58 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     returns "Servers are on different releases — redeploy to bring them in line" with who is on what,
     and the site Overview shows that warning with a redeploy button. The nginx `/_next/static/` retry
     on 404 (`proxy_next_upstream http_404`) stays as a safety net.
+- **CORE — Sign in with GitHub replaces passwords** (`panel/lib/login.mjs`, registered from
+  core-routes; `panel/recover.mjs`). GitHub OAuth App web flow with PKCE S256; admins are matched
+  on the numeric GitHub user id (login/avatar refreshed at each sign-in), the GitHub access token
+  is revoked and dropped right after the identity check, never stored.
+  - **Config.** `config.auth = { provider: "github" | undefined, github: { clientId, clientSecretEnc,
+    org? }, switchedAt?, switchedBy? }`. `provider: "github"` = GitHub-only (password routes refuse);
+    undefined = a panel from before this change, which keeps password sign-in until switched.
+    The secret is `ctx.secrets`-encrypted and only ever returned as a hint. Scope `read:user user:email`
+    (+ `read:org` when `org` is set). Callback URL = `ctx.panelUrl(req) + "/auth/github/callback"`
+    (config.panelUrl → FCC_PANEL_URL → the request, honouring FCC_TRUST_PROXY).
+  - **Admin record.** `admin { …, email (may be "" for GitHub admins), github: { id, login, avatarUrl,
+    linkedAt, via?: "org" } | null, sessionVersion }`; `passwordSalt/passwordHash` only until
+    GitHub-only (then deleted). `publicAdmin` adds `github: { id, login, avatarUrl } | null` and
+    `hasPassword`.
+  - **Sessions.** Same signed cookie, but `pv` (password fingerprint) is replaced by
+    `sv = admin.sessionVersion`; bumped by sign-out-everywhere, GitHub (un)link/change, password
+    change/reset. Old `pv` cookies stay valid until GitHub-only. `ctx.auth` gains `mode()`,
+    `bumpSessions(id)`, `seal(purpose, payload)` / `unseal(purpose, token)` (domain-separated HMAC,
+    with `exp`), and `setSession/clearSession` now append Set-Cookie headers.
+  - **Routes** (public unless noted):
+    `GET /auth/github?mode=login|link|setup&next=` → state+verifier in signed `fcc_oauth` cookie
+    (HttpOnly, SameSite=Lax, Path=/auth/github, 10 min) → 302 to GitHub; redirects first to the panel
+    URL's host if the browser is on another host. `GET /auth/github/callback` → on success a tiny HTML
+    page that `location.replace()`s (a Strict cookie isn't sent on a navigation started on github.com);
+    on failure 302 to `/login?error=<code>[&login=]`, `/setup?error=`, or
+    `/?auth_error=<code>#/settings/security` (link). Codes: not_admin, state, denied, github_error,
+    client, redirect, not_configured, throttled, session, taken, origin, recovery, recovery_expired.
+    Callback failures count in the login throttle. `next` must be a panel path; it always lands on
+    `/#<path>` (no open redirect).
+    `GET /auth/recover?token=` — redeems the one-time link from `recover.mjs` (sha256 in
+    `dataDir/recovery.json`, 600, 15 min, deleted on use).
+    `GET /api/setup` adds `auth: { github, githubOnly, passwordLogin, devLogin }` and, while setting up
+    with a verified code, `{ setupVerified, panelName, panelUrl, suggestedPanelUrl, callbackPath,
+    clientId, clientSecretSet, setupCodeFile }`. `POST /api/setup/verify { code }` → `fcc_setup` cookie
+    (Strict, 2 h). `POST /api/setup { panelName, panelUrl, clientId, clientSecret }` (needs that
+    cookie) — the old `{ name, email, password }` setup is gone; the first GitHub sign-in in setup
+    mode creates the owner, sets provider "github" and deletes `dataDir/setup-code` (created at boot
+    while there are no admins, mode 600, printed to the journal). `POST /api/auth/dev` — only with
+    FCC_DRY_RUN=1 **and** FCC_DEV_LOGIN=1 (404 otherwise).
+    Session routes: `GET /api/auth` (security view: OAuth app incl. hint, callback/homepage URL,
+    admins + linked state, `canSwitch`, `blockers`), `PATCH /api/auth { clientId?, clientSecret?, org? }`,
+    `POST /api/auth/github-only` (needs the OAuth app, the caller linked and the owner linked; drops
+    password hashes), `DELETE /api/me/github` (not when GitHub-only), `POST /api/me/sessions/revoke`.
+    `POST /api/admins { githubLogin, name? }` (resolved with `api.github.com/users/<login>`, panel
+    token if set); `PATCH /api/admins/:id { githubLogin }` sets/changes someone else's account (ends
+    their sessions). `POST /api/login`, `/api/me/password` and password fields refuse when GitHub-only.
+    `GET /api/settings` adds `authMode: "password"|"github"` and `githubSignInReady`.
+  - **Test hooks.** `FCC_GITHUB_OAUTH_BASE` / `FCC_GITHUB_API_BASE` replace github.com /
+    api.github.com — honoured only with FCC_DRY_RUN=1.
+  - **UI.** login.html = one "Sign in with GitHub" button (+ the password form only during the
+    migration window, + dev button), callback error messages (`assets/login-errors.js`), recovery hint.
+    setup.html = setup code → name/URL → OAuth App instructions with copyable URLs → sign in.
+    Settings gains **Security** (`views/settings-auth.js`, which now also holds Admins and Account);
+    the app shell shows a "Password sign-in is being retired" banner while `authMode` is "password".
+    Styles in `assets/auth.css` (not app.css).

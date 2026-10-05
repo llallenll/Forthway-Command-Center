@@ -1,4 +1,4 @@
-// Settings: General · Admins · Servers & load balancing · Backups · GitHub · Updates · Account.
+// Settings: General · Admins · Security · Servers & load balancing · Backups · GitHub · Updates · Account.
 // Routed as #/settings/<section>. Every user-supplied string goes through html``.
 import { html, raw, mount, $, on, ago, initials, plural, toast, toastError, confirmDialog, formDialog, openMenu, emptyState, errorState, skeletonRows, debounce } from "../util.js";
 import { icon } from "../icons.js";
@@ -9,10 +9,12 @@ import { cloudflareSettings } from "./cloudflare.js"; // Cloudflare section (liv
 import { mysqlSettings, phpMyAdminSettings } from "./settings-databases.js"; // Databases + phpMyAdmin sections
 import { notificationsSettings } from "./monitor.js"; // Notifications section (uptime SMS alerts via Bird)
 import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliased: avoids clashing with the shared import line)
+import { admins, security, account } from "./settings-auth.js"; // Admins + Security + Account (Sign in with GitHub)
 
 const SECTIONS = [
   { id: "general", label: "General", icon: "settings", render: general },
   { id: "admins", label: "Admins", icon: "users", render: admins },
+  { id: "security", label: "Security", icon: "shield", render: security },
   { id: "servers", label: "Servers & load balancing", icon: "balance", render: serversLb },
   { id: "backups", label: "Backups", icon: "archive", render: backups },
   { id: "databases", label: "Databases", icon: "database", render: mysqlSettings },
@@ -23,7 +25,7 @@ const SECTIONS = [
   { id: "updates", label: "Updates", icon: "refresh", render: updates },
   { id: "account", label: "Account", icon: "user", render: account },
 ];
-const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications" };
+const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", auth: "security", login: "security", signin: "security", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications" };
 
 export default async function settings(ctx) {
   const { root, params } = ctx;
@@ -102,102 +104,7 @@ async function general(box, ctx) {
   });
 }
 
-/* ───────── Admins ───────── */
-
-async function admins(box, ctx) {
-  let items = [];
-  const me = () => ctx.state.me || {};
-  const load = async () => {
-    items = (await get("/api/admins")).items || [];
-    if (ctx.alive()) paint();
-  };
-  const paint = () => {
-    const iAmOwner = me().role === "owner";
-    mount(box, html`<div class="card">
-      <div class="card-head"><div><h3>Admins</h3><div class="sub">${plural(items.length, "person", "people")} can sign in to this panel. Every admin has full access.</div></div>
-        <div class="right"><button class="btn btn-primary btn-sm" data-add>${icon("plus")}Add admin</button></div></div>
-      ${items.length ? html`<div class="list">${items.map((a) => {
-        const self = a.id === me().id;
-        return html`<div class="list-item" data-admin="${a.id}">
-          <span class="avatar" style="width:34px;height:34px;border-radius:10px">${initials(a.name || a.email)}</span>
-          <div class="li-main"><div class="li-title">${a.name || a.email}${self ? html` <span class="dim" style="font-weight:500">(you)</span>` : ""}</div>
-            <div class="li-sub">${a.email} · ${a.lastLoginAt ? html`last signed in ${ago(a.lastLoginAt)}` : "never signed in"}</div></div>
-          <div class="li-right">${a.role === "owner" ? html`<span class="badge blue" title="The owner can't be removed and is the only one who can edit the owner or hand ownership over.">${icon("shield")}Owner</span>` : html`<span class="badge">Admin</span>`}
-            <button class="icon-btn ghost sm" data-amenu="${a.id}" aria-label="Actions for ${a.name || a.email}">${icon("more", "sm")}</button></div></div>`;
-      })}</div>` : emptyState({ ico: "users", title: "No admins", sm: true })}
-      <div class="card-foot"><span class="muted small">${iAmOwner ? "You're the owner. To step down, make another admin the owner." : "Only the owner can edit the owner or transfer ownership."} Forgotten passwords are reset here by another admin.</span></div>
-    </div>`);
-  };
-  await load();
-
-  const adminFields = (a) => [
-    { name: "name", label: "Name", value: a?.name || "", required: true, attrs: 'maxlength="80"' },
-    { name: "email", label: "Email", type: "email", value: a?.email || "", required: true, autocomplete: "off" },
-  ];
-  const pwFields = (required) => [
-    { name: "password", label: required ? "Password" : "New password", type: "password", required, autocomplete: "new-password", hint: required ? "At least 8 characters. Share it with them privately." : "Leave blank to keep their current password." },
-    { name: "confirm", label: "Confirm password", type: "password", required, autocomplete: "new-password" },
-  ];
-  const checkPw = (v) => { if ((v.password || v.confirm) && v.password !== v.confirm) throw new Error("The two passwords don't match."); };
-
-  on(box, "click", "[data-add]", async () => {
-    const r = await formDialog({
-      title: "Add an admin", sub: "They can sign in right away with this email and password.", ico: "users",
-      fields: [...adminFields(), ...pwFields(true)], submitText: "Add admin",
-      onSubmit: async (v) => { checkPw(v); return post("/api/admins", { name: v.name, email: v.email, password: v.password }); },
-    });
-    if (r) { toast(`${r.name || r.email} can now sign in`, "ok"); load(); }
-  });
-
-  on(box, "click", "[data-amenu]", (e, b) => {
-    const a = items.find((x) => x.id === b.dataset.amenu);
-    if (!a) return;
-    const self = a.id === me().id, iAmOwner = me().role === "owner";
-    const canEdit = a.role !== "owner" || self || iAmOwner;
-    openMenu(b, [
-      self ? { label: "Edit your account", icon: "user", onClick: () => (location.hash = "#/settings/account") }
-        : { label: a.role === "owner" ? "Edit owner" : "Edit or reset password", icon: "edit", disabled: !canEdit, onClick: () => editAdmin(a) },
-      iAmOwner && !self && { label: "Make owner", icon: "shield", onClick: () => makeOwner(a) },
-      !self && a.role !== "owner" && { sep: true },
-      !self && a.role !== "owner" && { label: "Remove admin", icon: "trash", danger: true, onClick: () => removeAdmin(a) },
-    ]);
-  });
-
-  async function editAdmin(a) {
-    const r = await formDialog({
-      title: `Edit ${a.name || a.email}`, ico: "edit",
-      fields: [...adminFields(a), ...pwFields(false)],
-      onSubmit: async (v) => {
-        checkPw(v);
-        const body = { name: v.name, email: v.email };
-        if (v.password) body.password = v.password;
-        return patch(`/api/admins/${a.id}`, body);
-      },
-    });
-    if (r) { toast("Admin updated", "ok"); load(); }
-  }
-  async function makeOwner(a) {
-    const ok = await confirmDialog({
-      title: `Make ${a.name || a.email} the owner?`, ico: "shield",
-      message: "There is only ever one owner. You'll become a regular admin and can't undo this yourself — only the new owner can hand it back.",
-      confirmText: "Transfer ownership", typed: a.email,
-    });
-    if (!ok) return;
-    try {
-      await patch(`/api/admins/${a.id}`, { role: "owner" });
-      toast(`${a.name || a.email} is now the owner`, "ok");
-      const fresh = await get("/api/me").catch(() => null);
-      if (fresh) announce("fcc:me", fresh, (ctx.state.me ||= {}));
-      load();
-    } catch (ex) { toastError(ex, "Couldn't transfer ownership"); }
-  }
-  async function removeAdmin(a) {
-    const ok = await confirmDialog({ title: `Remove ${a.name || a.email}?`, message: "They're signed out everywhere and can no longer sign in. Their past activity stays in the log.", danger: true, confirmText: "Remove admin" });
-    if (!ok) return;
-    try { await del(`/api/admins/${a.id}`); toast(`${a.name || a.email} removed`, "ok"); load(); }
-    catch (ex) { toastError(ex, "Couldn't remove admin"); }
-  }
-}
+/* Admins, Security and Account live in settings-auth.js. */
 
 /* ───────── Servers & load balancing ───────── */
 
@@ -447,64 +354,4 @@ async function updates(box, ctx) {
   });
   ctx.on("updates", (d) => { if (d && d.installed) { u = d; paint(); } });
   ctx.on("job", (j) => { if (j && /^panel\.(update|restore)$/.test(j.type || "") && j.finishedAt) refresh(); });
-}
-
-/* ───────── Account ───────── */
-
-async function account(box, ctx) {
-  const me = await get("/api/me");
-  if (!ctx.alive()) return;
-  announce("fcc:me", me, (ctx.state.me ||= {}));
-  mount(box, html`
-    <form class="card" data-profile novalidate>
-      <div class="card-head"><span class="avatar lg" data-av>${initials(me.name || me.email)}</span><div><h3>Your profile</h3><div class="sub">${me.role === "owner" ? "Owner" : "Admin"}${me.lastLoginAt ? html` · signed in ${ago(me.lastLoginAt)}` : ""}</div></div></div>
-      <div class="card-body"><div class="form-grid">
-        ${field("Name", html`<input class="input" name="name" maxlength="80" value="${me.name || ""}" autocomplete="name"/>`)}
-        ${field("Email", html`<input class="input" type="email" name="email" value="${me.email || ""}" autocomplete="username"/>`, "You sign in with this.")}
-        <div class="error-box span-2" data-err hidden></div>
-      </div></div>
-      <div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save profile</button></div>
-    </form>
-    <form class="card" data-pw novalidate>
-      <div class="card-head"><div><h3>Password</h3><div class="sub">Changing it signs you out on every other device.</div></div></div>
-      <div class="card-body"><div class="form-stack" style="max-width:420px">
-        <input type="text" name="username" value="${me.email || ""}" autocomplete="username" hidden/>
-        ${field("Current password", html`<input class="input" type="password" name="current" autocomplete="current-password"/>`)}
-        ${field("New password", html`<input class="input" type="password" name="next" autocomplete="new-password"/>`, "At least 8 characters. A long passphrase is best.")}
-        ${field("Confirm new password", html`<input class="input" type="password" name="confirm" autocomplete="new-password"/>`)}
-        <div class="error-box" data-err hidden></div>
-      </div></div>
-      <div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("lock")}Change password</button></div>
-    </form>`);
-
-  const prof = $("[data-profile]", box);
-  prof.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const err = $("[data-err]", prof), btn = $("[data-save]", prof);
-    const body = { name: prof.elements.name.value.trim(), email: prof.elements.email.value.trim() };
-    if (!body.name || !body.email) { showErr(err, "Name and email are both required."); return; }
-    showErr(err, ""); setBusy(btn, true);
-    try {
-      const r = await patch("/api/me", body);
-      announce("fcc:me", r, (ctx.state.me ||= {}));
-      $("[data-av]", prof).textContent = initials(r.name || r.email);
-      toast("Profile saved", "ok");
-    } catch (ex) { showErr(err, ex.message); }
-    finally { setBusy(btn, false); }
-  });
-
-  const pw = $("[data-pw]", box);
-  pw.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const err = $("[data-err]", pw), btn = $("[data-save]", pw), f = pw.elements;
-    if (!f.current.value || !f.next.value) { showErr(err, "Enter your current password and a new one."); return; }
-    if (f.next.value !== f.confirm.value) { showErr(err, "The new passwords don't match."); f.confirm.focus(); return; }
-    showErr(err, ""); setBusy(btn, true);
-    try {
-      await post("/api/me/password", { current: f.current.value, next: f.next.value });
-      pw.reset();
-      toast("Password changed", "ok", { msg: "Other sessions have been signed out." });
-    } catch (ex) { showErr(err, ex.message); }
-    finally { setBusy(btn, false); }
-  });
 }

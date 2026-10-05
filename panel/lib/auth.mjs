@@ -1,18 +1,26 @@
 /**
  * Admin accounts and sessions.
  *
- * Admins sign in with email + password (scrypt, per-user salt). Sessions are
- * stateless HMAC-signed cookies so a panel restart mid-deploy does not sign
- * anybody out. The cookie carries:
+ * Admins sign in with GitHub (lib/login.mjs). Panels installed before that
+ * keep email + password sign-in (scrypt, per-user salt) until an admin
+ * switches to GitHub-only in Settings → Security (config.auth.provider ===
+ * "github"); after that every password path is refused.
+ *
+ * Sessions are stateless HMAC-signed cookies so a panel restart mid-deploy
+ * does not sign anybody out. The cookie carries:
  *
  *   a    the admin id — a session for a deleted admin is refused;
  *   exp  expiry (ms since epoch);
- *   pv   a fingerprint of the admin's current password hash — changing or
- *        resetting a password ends every other session for that admin.
+ *   sv   the admin's sessionVersion — bumped by "sign out everywhere",
+ *        unlinking/relinking GitHub and password changes, which ends every
+ *        older session for that admin.
+ *
+ * Cookies from before sessionVersion carry `pv` (a fingerprint of the
+ * password hash) instead; they are still honoured until GitHub-only is on.
  *
  * `authenticate(req)` returns the PUBLIC view of the admin
- * ({ id, email, name, role, createdAt, lastLoginAt }) or null. Handlers never
- * see password material.
+ * ({ id, email, name, role, github, createdAt, lastLoginAt }) or null.
+ * Handlers never see password material.
  */
 
 import crypto from "node:crypto";
@@ -66,9 +74,18 @@ export function publicAdmin(a) {
     email: a.email,
     name: a.name,
     role: a.role,
+    github: a.github ? { id: a.github.id, login: a.github.login, avatarUrl: a.github.avatarUrl || "" } : null,
+    hasPassword: !!a.passwordHash,
     createdAt: a.createdAt,
     lastLoginAt: a.lastLoginAt || null,
   };
+}
+
+/** Add a Set-Cookie header without dropping ones already set on `res`. */
+export function appendSetCookie(res, value) {
+  const prev = res.getHeader("Set-Cookie");
+  const list = prev ? (Array.isArray(prev) ? prev : [String(prev)]) : [];
+  res.setHeader("Set-Cookie", [...list, value]);
 }
 
 // --------------------------------------------------------------- cookies
@@ -190,20 +207,33 @@ export function createAuth({ db, config }) {
   const fingerprint = (admin) =>
     crypto.createHmac("sha256", secret()).update(`pv:${admin.passwordHash || ""}`).digest("base64url").slice(0, 16);
 
-  function sign(payload) {
-    const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
-    const mac = crypto.createHmac("sha256", secret()).update(body).digest("base64url");
-    return `${body}.${mac}`;
+  /** Where sign-in may come from right now (config.auth, see lib/login.mjs). */
+  function mode() {
+    const a = config.auth || {};
+    const gh = a.github || {};
+    const githubOnly = a.provider === "github";
+    return { githubConfigured: !!(gh.clientId && gh.clientSecretEnc), githubOnly, passwordLogin: !githubOnly };
   }
 
-  function unsign(token) {
+  // Session tokens MAC the body alone (unchanged, so existing cookies stay
+  // valid); every other purpose MACs "<purpose>.<body>". A base64url body
+  // never contains ".", so one kind can never pass for another.
+  const mac = (body, purpose) =>
+    crypto.createHmac("sha256", secret()).update(purpose ? `${purpose}.${body}` : body).digest("base64url");
+
+  function sign(payload, purpose = "") {
+    const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    return `${body}.${mac(body, purpose)}`;
+  }
+
+  function unsign(token, purpose = "") {
     if (!token || typeof token !== "string") return null;
     const dot = token.indexOf(".");
     if (dot <= 0) return null;
     const body = token.slice(0, dot);
-    const mac = token.slice(dot + 1);
-    const expected = crypto.createHmac("sha256", secret()).update(body).digest("base64url");
-    if (!tokenMatches(mac, expected)) return null;
+    const mac_ = token.slice(dot + 1);
+    const expected = mac(body, purpose);
+    if (!tokenMatches(mac_, expected)) return null;
     try {
       return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
     } catch {
@@ -213,7 +243,7 @@ export function createAuth({ db, config }) {
 
   function issue(admin) {
     const now = Date.now();
-    return sign({ a: admin.id, iat: now, exp: now + SESSION_TTL_MS, pv: fingerprint(admin) });
+    return sign({ a: admin.id, iat: now, exp: now + SESSION_TTL_MS, sv: admin.sessionVersion || 0 });
   }
 
   function cookieHeader(token, req) {
@@ -240,7 +270,13 @@ export function createAuth({ db, config }) {
     if (!payload || typeof payload.exp !== "number" || payload.exp <= Date.now()) return null;
     const admin = db.get("admins", payload.a);
     if (!admin) return null;
-    if (!tokenMatches(payload.pv, fingerprint(admin))) return null;
+    if (typeof payload.sv === "number") {
+      if (payload.sv !== (admin.sessionVersion || 0)) return null;
+    } else if (payload.pv && !mode().githubOnly) {
+      if (!admin.passwordHash || !tokenMatches(payload.pv, fingerprint(admin))) return null; // pre-sessionVersion cookie
+    } else {
+      return null;
+    }
     return admin;
   }
 
@@ -251,11 +287,18 @@ export function createAuth({ db, config }) {
 
   /** Set the session cookie on a response that is about to be sent. */
   function setSession(res, req, admin) {
-    res.setHeader("Set-Cookie", cookieHeader(issue(admin), req));
+    appendSetCookie(res, cookieHeader(issue(admin), req));
   }
 
   function clearSession(res, req) {
-    res.setHeader("Set-Cookie", clearCookieHeader(req));
+    appendSetCookie(res, clearCookieHeader(req));
+  }
+
+  /** End every session of an admin (theirs and anyone holding an old cookie). Returns the record. */
+  function bumpSessions(adminId) {
+    const a = db.get("admins", adminId);
+    if (!a) return null;
+    return db.update("admins", adminId, { sessionVersion: (a.sessionVersion || 0) + 1 });
   }
 
   /** Look up an admin by email (case-insensitive). Full record. */
@@ -269,6 +312,12 @@ export function createAuth({ db, config }) {
   let dummy = null;
   async function checkCredentials(email, password) {
     const admin = findByEmail(email);
+    if (admin && !admin.passwordHash) {
+      // GitHub-only admin: burn the same time as a wrong password.
+      dummy ||= await hashPassword(crypto.randomBytes(12).toString("hex"));
+      await verifyPassword(String(password ?? ""), dummy.salt, dummy.hash);
+      return null;
+    }
     if (!admin) {
       dummy ||= await hashPassword(crypto.randomBytes(12).toString("hex"));
       await verifyPassword(String(password ?? ""), dummy.salt, dummy.hash);
@@ -286,5 +335,12 @@ export function createAuth({ db, config }) {
     findByEmail,
     checkCredentials,
     issue,
+    bumpSessions,
+    mode,
+    seal: (purpose, payload) => sign(payload, purpose),
+    unseal: (purpose, token) => {
+      const p = unsign(token, purpose);
+      return p && typeof p.exp === "number" && p.exp > Date.now() ? p : null;
+    },
   };
 }

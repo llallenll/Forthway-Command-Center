@@ -603,6 +603,6 @@ server.listen(PORT, HOST, () => {
   console.log(`  mods  ${loaded.map((m) => m.name).join(", ")}`);
   if (sys.DRY_RUN) console.log("  mode  DRY RUN — system commands are logged, not run");
   if (interrupted) console.log(`  jobs  ${interrupted} interrupted job(s) marked failed (panel restarted)`);
-  if (!db.list("admins").length) console.log("\n  Not set up yet — open the address above to create the first admin.");
+  if (!db.list("admins").length) console.log(`\n  Not set up yet — open the address above; it asks for the setup code in ${path.join(DATA_DIR, "setup-code")}.`);
   console.log("");
 });

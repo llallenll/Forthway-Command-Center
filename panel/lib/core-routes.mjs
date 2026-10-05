@@ -1,5 +1,6 @@
 /**
- * CORE routes: first-run setup, sign-in, the signed-in admin, other admins,
+ * CORE routes: first-run setup, sign-in (GitHub sign-in, setup and recovery
+ * live in login.mjs and are registered from here), the signed-in admin, other admins,
  * projects, panel settings, the dashboard summary, jobs, the audit log and
  * the live event stream.
  *
@@ -19,6 +20,7 @@ import {
   publicAdmin,
   requestIp,
 } from "./auth.mjs";
+import { registerLogin, ensureSetupCode, validGithubLogin } from "./login.mjs";
 
 const ACTIVITY_KEPT = 5000;
 const DASHBOARD_PROBE_MS = 3000;
@@ -190,45 +192,19 @@ export function register(router, ctx) {
   // `bootId` + `commit` come from the updates module (lets the UI see a restart finish).
   router.get("/healthz", { public: true }, () => ({ ok: true, version: ctx.version, setup: !needsSetup(), ...(ctx.updates?.health?.() || {}) }));
 
-  router.get("/api/setup", { public: true }, () => ({
+  // Setup itself (setup code → OAuth app → first GitHub sign-in = owner) is in login.mjs.
+  router.get("/api/setup", { public: true }, (req) => ({
     needsSetup: needsSetup(),
     version: ctx.version,
     hostname: os.hostname(),
     panelName: ctx.config.panelName || "Forthway Command Center",
+    ...(ctx.loginInfo?.(req) || {}),
   }));
 
-  router.post("/api/setup", { public: true }, async (req, res, { body }) => {
-    sameOrigin(req);
-    if (!needsSetup()) throw httpError(409, "This panel is already set up. Sign in instead.");
-    const name = readName(body.name);
-    const email = readEmail(body.email);
-    const password = readPassword(body.password);
-    const { salt, hash } = await hashPassword(password);
-    // Re-check after the (async) hash: two browsers racing the setup page
-    // must not both become owner.
-    if (!needsSetup()) throw httpError(409, "This panel is already set up. Sign in instead.");
-    const admin = db.insert("admins", {
-      email,
-      name,
-      passwordSalt: salt,
-      passwordHash: hash,
-      role: "owner",
-      lastLoginAt: new Date().toISOString(),
-    });
-    const panelName = clean(body.panelName, 60);
-    if (panelName) {
-      ctx.config.panelName = panelName;
-      ctx.saveConfig();
-    }
-    db.save({ immediate: true });
-    auth.setSession(res, req, admin);
-    ctx.activity(admin, "setup.complete", { type: "admin", id: admin.id, name: admin.name });
-    console.log(`[fcc] setup complete — owner ${admin.email}`);
-    return { ok: true, admin: publicAdmin(admin) };
-  });
-
+  // Password sign-in: only for panels that have not switched to GitHub-only yet.
   router.post("/api/login", { public: true }, async (req, res, { body }) => {
     sameOrigin(req);
+    if (auth.mode().githubOnly) throw httpError(403, "Password sign-in is turned off. Use Sign in with GitHub.");
     const ip = requestIp(req);
     const gate = auth.throttle.check(ip);
     if (!gate.allowed) {
@@ -245,7 +221,7 @@ export function register(router, ctx) {
     auth.throttle.succeed(ip);
     db.update("admins", admin.id, { lastLoginAt: new Date().toISOString() });
     auth.setSession(res, req, admin);
-    ctx.activity(admin, "admin.login", { type: "admin", id: admin.id, name: admin.name }, { ip });
+    ctx.activity(admin, "admin.login", { type: "admin", id: admin.id, name: admin.name }, { ip, via: "password" });
     return { ok: true, admin: publicAdmin(admin) };
   });
 
@@ -264,7 +240,10 @@ export function register(router, ctx) {
   router.patch("/api/me", (req, res, { admin, body }) => {
     const patch = {};
     if (body.name !== undefined) patch.name = readName(body.name);
-    if (body.email !== undefined) patch.email = readEmail(body.email, admin.id);
+    if (body.email !== undefined) {
+      // GitHub-linked admins don't sign in with their email, so it may be blank.
+      patch.email = admin.github && !String(body.email ?? "").trim() ? "" : readEmail(body.email, admin.id);
+    }
     const fields = Object.keys(patch).filter((k) => patch[k] !== admin[k]);
     const updated = db.update("admins", admin.id, patch);
     if (fields.length) ctx.activity(admin, "admin.update", { type: "admin", id: admin.id, name: updated.name }, { fields });
@@ -272,6 +251,7 @@ export function register(router, ctx) {
   });
 
   router.post("/api/me/password", async (req, res, { admin, body }) => {
+    if (auth.mode().githubOnly) throw httpError(400, "Password sign-in is turned off; there is no password to change.");
     const key = `pw:${admin.id}`;
     const gate = auth.throttle.check(key);
     if (!gate.allowed) throw httpError(429, "Too many attempts. Try again later.");
@@ -283,7 +263,8 @@ export function register(router, ctx) {
     auth.throttle.succeed(key);
     const next = readPassword(body.next);
     const { salt, hash } = await hashPassword(next);
-    const updated = db.update("admins", admin.id, { passwordSalt: salt, passwordHash: hash });
+    const full2 = db.get("admins", admin.id);
+    const updated = db.update("admins", admin.id, { passwordSalt: salt, passwordHash: hash, sessionVersion: (full2.sessionVersion || 0) + 1 });
     db.save({ immediate: true });
     // Other sessions for this admin are now invalid; keep this one going.
     auth.setSession(res, req, updated);
@@ -305,7 +286,26 @@ export function register(router, ctx) {
       .map(publicAdmin),
   }));
 
+  // Add by GitHub username (resolved to the numeric id they sign in with).
+  // { name, email, password } still works until the panel is GitHub-only.
   router.post("/api/admins", async (req, res, { admin, body }) => {
+    if (body.githubLogin !== undefined) {
+      const gh = await ctx.githubUser(body.githubLogin);
+      const dup = db.list("admins").find((a) => a.github && Number(a.github.id) === gh.id);
+      if (dup) throw httpError(409, `@${gh.login} is already an admin (${dup.name || dup.email}).`);
+      const created = db.insert("admins", {
+        email: "",
+        name: clean(body.name, 80) || gh.name || gh.login,
+        role: "admin",
+        github: { id: gh.id, login: gh.login, avatarUrl: gh.avatarUrl, linkedAt: new Date().toISOString() },
+        sessionVersion: 0,
+        lastLoginAt: null,
+      });
+      db.save({ immediate: true });
+      ctx.activity(admin, "admin.create", { type: "admin", id: created.id, name: created.name }, { github: gh.login });
+      return publicAdmin(created);
+    }
+    if (auth.mode().githubOnly) throw httpError(400, "Add admins by GitHub username.");
     const name = readName(body.name);
     const email = readEmail(body.email);
     const password = readPassword(body.password);
@@ -326,13 +326,34 @@ export function register(router, ctx) {
 
     const patch = {};
     if (body.name !== undefined) patch.name = readName(body.name);
-    if (body.email !== undefined) patch.email = readEmail(body.email, target.id);
+    if (body.email !== undefined) {
+      patch.email = (target.github || body.githubLogin) && !String(body.email ?? "").trim() ? "" : readEmail(body.email, target.id);
+    }
+    let endSessions = false;
     if (body.password !== undefined && body.password !== "") {
+      if (auth.mode().githubOnly) throw httpError(400, "Password sign-in is turned off.");
       if (self) throw httpError(400, "Change your own password from your account settings.");
       const { salt, hash } = await hashPassword(readPassword(body.password));
       patch.passwordSalt = salt;
       patch.passwordHash = hash;
+      endSessions = true;
     }
+    if (body.githubLogin !== undefined) {
+      // Set (or change) someone's GitHub account. Ends their current sessions.
+      if (self) throw httpError(400, "Link your own account from Settings → Security, so GitHub can confirm it's you.");
+      if (body.githubLogin === null || body.githubLogin === "") {
+        if (auth.mode().githubOnly || !target.passwordHash) throw httpError(400, "They would have no way to sign in. Remove the admin instead.");
+        patch.github = null;
+      } else {
+        if (!validGithubLogin(String(body.githubLogin).replace(/^@/, ""))) throw httpError(400, "That isn't a valid GitHub username.");
+        const gh = await ctx.githubUser(body.githubLogin);
+        const dup = db.list("admins").find((a) => a.id !== target.id && a.github && Number(a.github.id) === gh.id);
+        if (dup) throw httpError(409, `@${gh.login} is already linked to ${dup.name || dup.email}.`);
+        if (Number(target.github?.id) !== gh.id) patch.github = { id: gh.id, login: gh.login, avatarUrl: gh.avatarUrl, linkedAt: new Date().toISOString() };
+      }
+      if (patch.github !== undefined) endSessions = true;
+    }
+    if (endSessions) patch.sessionVersion = (target.sessionVersion || 0) + 1;
     let transferred = false;
     if (body.role !== undefined && body.role !== target.role) {
       if (!callerIsOwner) throw httpError(403, "Only the owner can change roles.");
@@ -350,7 +371,7 @@ export function register(router, ctx) {
     const updated = db.update("admins", target.id, patch);
     if (transferred) db.update("admins", admin.id, { role: "admin" });
     db.save({ immediate: true });
-    const fields = Object.keys(patch).filter((k) => k !== "passwordSalt");
+    const fields = Object.keys(patch).filter((k) => k !== "passwordSalt" && k !== "sessionVersion");
     ctx.activity(admin, transferred ? "admin.transfer-owner" : "admin.update", { type: "admin", id: target.id, name: updated.name }, {
       fields: fields.map((f) => (f === "passwordHash" ? "password" : f)),
     });
@@ -516,6 +537,9 @@ export function register(router, ctx) {
     version: ctx.version,
     hostname: os.hostname(),
     dryRun: !!ctx.sys?.DRY_RUN,
+    // "github" once password sign-in is off; "password" during the migration (UI shows a banner).
+    authMode: auth.mode().githubOnly ? "github" : "password",
+    githubSignInReady: auth.mode().githubConfigured,
   });
 
   router.get("/api/settings", () => settingsView());
@@ -621,6 +645,8 @@ export function register(router, ctx) {
   // { events: [{ id, type, data }], last } from the same ring buffer.
   router.get("/api/events/poll", (req, res, { query }) =>
     ctx.events.poll(res, Number(query.after) || 0, query.wait === undefined ? 25 : Number(query.wait)));
+
+  registerLogin(router, ctx, { needsSetup, panelToken: () => githubTokenPlain() });
 }
 
 function readColor(value) {
@@ -629,4 +655,13 @@ function readColor(value) {
   return /^(#[0-9a-f]{3,8}|[a-z][a-z0-9-]{0,23})$/i.test(c) ? c : null;
 }
 
-export async function start() {}
+export async function start(ctx) {
+  // A fresh panel can only be claimed with this code (see login.mjs).
+  if (ctx.db.list("admins").length) return;
+  try {
+    const code = ensureSetupCode(ctx.dataDir);
+    console.log(`\n  Setup code: ${code}\n  (also in ${ctx.dataDir}/setup-code — the setup page asks for it)\n`);
+  } catch (err) {
+    console.error(`[fcc] could not write the setup code: ${err.message}`);
+  }
+}
