@@ -1527,6 +1527,16 @@ function createCloudflare(ctx) {
     });
 
     // ---- routes
+    function siteTargets(site) {
+      if (!site) return null;
+      try {
+        const ups = ctx.lb?.upstreams?.(site) || [];
+        return ups.map((u) => ({ server: u.name || u.serverId, address: `${u.address}:${u.port}`, healthy: u.healthy ?? null }));
+      } catch {
+        return null;
+      }
+    }
+
     router.get("/api/cloudflare/routes", async () => {
       const all = db.list(COLL);
       const sitesById = Object.fromEntries(db.list("sites").map((s) => [s.id, s]));
@@ -1553,6 +1563,10 @@ function createCloudflare(ctx) {
                 adopted: !!mine && mine.ingress === "adopted",
                 siteId: mine?.siteId || null,
                 siteName: mine?.siteId ? sitesById[mine.siteId]?.name || null : null,
+                // The tunnel hands site traffic to nginx (the front door); these are
+                // where nginx sends it on, so the UI can show the whole route.
+                targets: mine?.siteId ? siteTargets(sitesById[mine.siteId]) : null,
+                loadBalanced: mine?.siteId ? !!sitesById[mine.siteId]?.loadBalanced : false,
                 panel: mine?.owner === "panel",
               };
             });

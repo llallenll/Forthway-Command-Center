@@ -247,6 +247,16 @@ export async function cloudflareSettings(box, ctx) {
     return [...m.values()];
   }
 
+  // A website's tunnel rule points at nginx on this server; nginx then forwards
+  // to the site's port (or every server in its pool). Show both hops so ":80"
+  // isn't mistaken for the app's port.
+  function routeText(r) {
+    if (!r.siteId || !r.targets?.length) return html`→ ${r.service}`;
+    const shown = r.targets.slice(0, 3).map((t) => `${t.address}${t.server ? ` (${t.server})` : ""}`).join(", ");
+    const more = r.targets.length > 3 ? ` +${r.targets.length - 3} more` : "";
+    return html`→ nginx ${r.service.replace(/^https?:\/\//, "")} → ${shown}${more}${r.loadBalanced ? html` <span class="muted">· load balanced</span>` : ""}`;
+  }
+
   function routesView() {
     if (!routes) return html`<div class="card-body"><span class="muted small">Loading…</span></div>`;
     if (routes.error) return html`<div class="card-body"><div class="error-box">${icon("alert")}<div>${routes.error}</div></div></div>`;
@@ -258,7 +268,7 @@ export async function cloudflareSettings(box, ctx) {
         ${t.error ? html`<div class="card-body" style="padding-top:0"><span class="muted small">${t.error}</span></div>`
         : html`<div class="list">${t.rules.map((r) => html`<div class="list-item">
             <span class="li-ico">${icon(r.catchAll ? "x" : r.panel ? "dashboard" : r.siteId ? "globe" : "link", "sm")}</span>
-            <div class="li-main"><div class="li-title ${r.catchAll ? "muted" : "mono"}">${r.catchAll ? "Everything else (catch-all)" : html`${r.hostname}${r.path ? html`<span class="muted">${r.path}</span>` : ""}`}</div><div class="li-sub mono">→ ${r.service}</div></div>
+            <div class="li-main"><div class="li-title ${r.catchAll ? "muted" : "mono"}">${r.catchAll ? "Everything else (catch-all)" : html`${r.hostname}${r.path ? html`<span class="muted">${r.path}</span>` : ""}`}</div><div class="li-sub mono">${routeText(r)}</div></div>
             <div class="li-right">${r.catchAll ? html`<span class="badge">Always last</span>` : r.panel ? html`<span class="badge blue">Panel</span>` : r.siteId ? html`<a class="badge blue" href="#/sites/${r.siteId}/domains">${r.siteName || "Website"}</a>${r.adopted ? html`<span class="badge" title="Existed before the panel managed it; it won't be deleted">Adopted</span>` : ""}` : html`<span class="badge" title="Made in the Cloudflare dashboard — the panel leaves it alone">Dashboard</span>`}</div></div>`)}</div>`}`)}`;
   }
 
