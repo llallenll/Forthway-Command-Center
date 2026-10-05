@@ -1623,13 +1623,30 @@ function createCloudflare(ctx) {
         c.panel = null;
       }
       save();
-      audit(admin, hostname ? "cloudflare.panel.publish" : "cloudflare.panel.unpublish", { hostname: hostname || null });
+      // Sign in with GitHub, agent install commands and links all use the Panel
+      // URL. When it's unset or still an IP / localhost address, the published
+      // hostname is clearly the address to use from now on.
+      let panelUrlSet = null;
+      if (hostname) {
+        let current = null;
+        try {
+          current = ctx.config.panelUrl ? new URL(ctx.config.panelUrl).hostname : null;
+        } catch {
+          current = null;
+        }
+        if (!current || current === "localhost" || /^[\d.]+$/.test(current) || current.includes(":")) {
+          ctx.config.panelUrl = `https://${hostname}`;
+          ctx.saveConfig();
+          panelUrlSet = ctx.config.panelUrl;
+        }
+      }
+      audit(admin, hostname ? "cloudflare.panel.publish" : "cloudflare.panel.unpublish", { hostname: hostname || null, ...(panelUrlSet ? { panelUrl: panelUrlSet } : {}) });
       const job = ctx.jobs.start(
         { type: "cloudflare.sync", title: hostname ? `Publish the panel on ${hostname}` : "Unpublish the panel from Cloudflare", adminId: admin?.id || null, lock: false },
         ({ log }) => serial(() => reconcile("panel", desiredForPanel(), { log })),
       );
       emitStatusSoon();
-      return { ok: true, panel: status().panel, job };
+      return { ok: true, panel: status().panel, job, panelUrlSet };
     });
 
     /**

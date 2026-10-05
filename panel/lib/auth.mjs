@@ -106,10 +106,13 @@ export function readCookies(req) {
 }
 
 /**
- * Proxy headers (X-Forwarded-For / -Proto / -Host) are only believed when
- * FCC_TRUST_PROXY=1 — i.e. the panel sits behind its own nginx on 127.0.0.1
- * (install.sh sets it with a panel domain). Otherwise anyone could pick their
- * own IP for the login throttle by sending the header.
+ * Proxy headers (X-Forwarded-For / -Proto / -Host, CF-Connecting-IP,
+ * CF-Visitor) are believed when FCC_TRUST_PROXY=1 (the panel behind its own
+ * nginx — install.sh sets it with a panel domain), or when the connection
+ * itself comes from this machine (127.0.0.1 / ::1): that is the panel's own
+ * cloudflared ("Publish this panel") or nginx, and nobody on the network can
+ * open a loopback connection. Otherwise anyone could pick their own IP for the
+ * login throttle, or the scheme of callback URLs, by sending the header.
  */
 export const TRUST_PROXY = process.env.FCC_TRUST_PROXY === "1";
 
@@ -117,10 +120,26 @@ function firstHeader(req, name) {
   return String(req.headers[name] || "").split(",")[0].trim();
 }
 
+function socketIp(req) {
+  return (req.socket?.remoteAddress || "?").replace(/^::ffff:/, "");
+}
+
+function fromLoopback(req) {
+  const ip = socketIp(req);
+  return ip === "::1" || /^127\./.test(ip);
+}
+
+function trusted(req) {
+  return TRUST_PROXY || fromLoopback(req);
+}
+
 /** Client IP for throttling/audit: socket address unless the proxy is trusted. */
 export function requestIp(req) {
-  const sock = (req.socket?.remoteAddress || "?").replace(/^::ffff:/, "");
-  if (!TRUST_PROXY) return sock;
+  const sock = socketIp(req);
+  if (!trusted(req)) return sock;
+  // Cloudflare's tunnel/proxy states the visitor's address outright.
+  const cf = firstHeader(req, "cf-connecting-ip");
+  if (cf) return cf;
   // The LAST X-Forwarded-For entry is the one our own nginx appended
   // ($proxy_add_x_forwarded_for); earlier ones are whatever the client sent.
   const chain = String(req.headers["x-forwarded-for"] || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -129,16 +148,22 @@ export function requestIp(req) {
 
 /** "https" or "http" as the browser sees it. */
 export function requestProto(req, config) {
-  if (TRUST_PROXY) {
+  if (trusted(req)) {
     const p = firstHeader(req, "x-forwarded-proto").toLowerCase();
     if (p === "https" || p === "http") return p;
+    try {
+      const v = JSON.parse(String(req.headers["cf-visitor"] || "{}")); // {"scheme":"https"}
+      if (v?.scheme === "https" || v?.scheme === "http") return v.scheme;
+    } catch {
+      /* not JSON */
+    }
   }
   return config?.tls || req.socket?.encrypted ? "https" : "http";
 }
 
 /** Host as the browser sees it. */
 export function requestHost(req) {
-  return (TRUST_PROXY && firstHeader(req, "x-forwarded-host")) || firstHeader(req, "host");
+  return (trusted(req) && firstHeader(req, "x-forwarded-host")) || firstHeader(req, "host");
 }
 
 /** Secure cookies when the browser reached us over HTTPS (directly or via a trusted proxy). */

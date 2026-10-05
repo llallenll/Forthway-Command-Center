@@ -401,6 +401,7 @@ export async function cloudflareSettings(box, ctx) {
     try {
       const r = await put("/api/cloudflare/panel", { hostname: form.elements.hostname.value.trim(), tunnelId: form.elements.tunnelId?.value });
       if (r.job) jobStarted(r.job, r.panel ? `Publishing the panel on ${r.panel.hostname}` : "Unpublishing the panel");
+      if (r.panelUrlSet) toast("Panel URL updated", "info", { msg: `Set to ${r.panelUrlSet} — use it for Sign in with GitHub (callback ${r.panelUrlSet}/auth/github/callback).` });
       setTimeout(load, 1200);
     } catch (ex) { toastError(ex, "Couldn't save"); busy(b, false); }
   });
