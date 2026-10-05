@@ -1,7 +1,7 @@
 import { html, mount, $, on, fmtBytes, plural, emptyState, errorState, skeletonRows, debounce, toastError, openModal } from "../util.js";
 import { icon } from "../icons.js";
 import { get, post } from "../api.js";
-import { pageHead, databasesTable, dbMenu, revealCredentials, createDatabase } from "../components.js";
+import { pageHead, databasesTable, dbMenu, revealCredentials, createDatabase, openPhpMyAdmin } from "../components.js";
 
 export default async function databases(ctx) {
   const { root } = ctx;
@@ -22,8 +22,8 @@ export default async function databases(ctx) {
     if (mysql.rootOk === false) return mount(box, html`<div class="note warn" style="margin-bottom:16px;align-items:center">${icon("key")}<div style="flex:1">The panel can't log in to MySQL as root. Enter the root password once so it can manage databases.</div><button class="btn btn-sm" data-root>Set root password</button></div>`);
     const bindLocal = /^(127\.|localhost|::1)/.test(mysql.bindAddress || "");
     const remoteDbs = items.filter((d) => d.remoteAccess).length;
-    mount(box, html`${bindLocal && remoteDbs ? html`<div class="note warn" style="margin-bottom:14px">${icon("alert")}<div>MySQL only listens on <span class="mono">${mysql.bindAddress}</span>, so websites on agent servers can't reach the ${plural(remoteDbs, "database")} that allow agent access. Reinstall with <span class="mono">FCC_MYSQL_REMOTE=1</span> (binds 0.0.0.0) and allow port 3306 from your agent servers' addresses only.</div></div>` : ""}
-      <div class="row wrap" style="gap:10px;margin-bottom:18px"><span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>${mysql.flavor === "mariadb" ? "MariaDB" : "MySQL"} ${mysql.version || ""} running</span>${mysql.bindAddress ? html`<span class="badge mono">bind ${mysql.bindAddress}</span>` : ""}
+    mount(box, html`${bindLocal && (remoteDbs || mysql.mainSitesVia === "panel") ? html`<div class="note warn" style="margin-bottom:14px;align-items:center">${icon("alert")}<div style="flex:1">MySQL only listens on <span class="mono">${mysql.bindAddress}</span>${remoteDbs ? html`, so websites on agent servers can't reach the ${plural(remoteDbs, "database")} that allow agent access` : ""}${mysql.mainSitesVia === "panel" ? html`${remoteDbs ? " — and" : ","} websites on this server use <span class="mono">127.0.0.1</span> instead of the panel address <span class="mono">${mysql.publicHost}</span>` : ""}. Let it listen on the network from Settings → Databases (or reinstall with <span class="mono">FCC_MYSQL_REMOTE=1</span>), and allow port 3306 from your agent servers' addresses only.</div><a class="btn btn-sm" href="#/settings/databases">${icon("settings")}Fix in Settings</a></div>` : ""}
+      <div class="row wrap" style="gap:10px;margin-bottom:18px"><span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>${mysql.flavor === "mariadb" ? "MariaDB" : "MySQL"} ${mysql.version || ""} running</span>${mysql.bindAddress ? html`<span class="badge mono">bind ${mysql.bindAddress}</span>` : ""}${mysql.publicHost ? html`<a class="badge mono" href="#/settings/databases" title="Database host shown in credentials">host ${mysql.publicHost}</a>` : ""}
       <span class="badge">${icon("database")}${items.length} database${items.length === 1 ? "" : "s"}</span><span class="badge">${icon("hardDrive")}${fmtBytes(items.reduce((a, d) => a + (d.sizeBytes || 0), 0))} total</span></div>`);
   };
   const paint = () => {
@@ -52,6 +52,7 @@ export default async function databases(ctx) {
   on(root, "change", "[data-proj]", (e) => { projectFilter = e.target.value; paint(); });
   on(root, "input", "[data-q]", debounce((e) => { q = e.target.value.trim().toLowerCase(); paint(); }, 120));
   on(root, "click", "[data-db-creds]", (e, b) => revealCredentials(items.find((d) => d.id === b.dataset.dbCreds)));
+  on(root, "click", "[data-db-pma]", (e, b) => openPhpMyAdmin(items.find((d) => d.id === b.dataset.dbPma)));
   on(root, "click", "[data-db-menu]", (e, b) => dbMenu(b, items.find((d) => d.id === b.dataset.dbMenu), load));
   on(root, "click", "[data-root]", () => {
     openModal({ title: "MySQL root password", sub: "Stored encrypted with the panel key. Only needed when socket authentication isn't available.", ico: "key",

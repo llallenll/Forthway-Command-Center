@@ -41,9 +41,11 @@ const PUBLIC_DIR = path.join(HERE, "public");
 const VERSION = "3.0.0";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
-const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups"];
+const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups", "cloudflare", "updates", "phpmyadmin"];
 const START_TIMEOUT_MS = 15_000;
-const SSE_PING_MS = 20_000;
+const SSE_PING_MS = 15_000;
+const SSE_PAD = `:${" ".repeat(2048)}\n\n`; // pushes the first bytes past proxy buffer thresholds
+const EVENT_BUFFER = 500; // recent events kept for Last-Event-ID replay and /api/events/poll
 
 function fatal(message) {
   console.error(`\n[fcc] ${message}\n`);
@@ -159,6 +161,15 @@ function createEvents(db) {
   const clients = new Set(); // { res, adminId, ping }
   const local = new EventEmitter();
   local.setMaxListeners(100);
+  // Ring buffer of recent broadcasts. Ids start at the boot time in ms so they
+  // keep increasing across restarts (a browser's stale Last-Event-ID is then
+  // always older than anything new).
+  let seq = Date.now();
+  const recent = []; // { id, type, data }
+  const waiters = new Set(); // long-poll requests waiting for the next event
+
+  const eventsAfter = (after) => recent.filter((e) => e.id > after);
+  const sseChunk = (e) => `id: ${e.id}\nevent: ${e.type}\ndata: ${JSON.stringify(e.data ?? null)}\n\n`;
 
   function write(client, chunk) {
     try {
@@ -178,8 +189,12 @@ function createEvents(db) {
 
   return {
     broadcast(event, data) {
-      const chunk = `event: ${event}\ndata: ${JSON.stringify(data ?? null)}\n\n`;
+      const entry = { id: ++seq, type: event, data: data ?? null };
+      recent.push(entry);
+      if (recent.length > EVENT_BUFFER) recent.splice(0, recent.length - EVENT_BUFFER);
+      const chunk = sseChunk(entry);
       for (const c of clients) write(c, chunk);
+      for (const w of [...waiters]) w(100); // short coalesce: bursts come back in one reply
       if (event !== "error" && local.listenerCount(event)) {
         try {
           local.emit(event, data);
@@ -189,6 +204,12 @@ function createEvents(db) {
       }
     },
 
+    /**
+     * Opens an SSE stream. Every broadcast carries an `id:`; a reconnecting
+     * browser sends Last-Event-ID (or ?lastEventId= on a fresh EventSource)
+     * and gets whatever it missed from the ring buffer. The stream is never
+     * compressed (nothing here gzips, and no-transform asks proxies not to).
+     */
     subscribe(req, res, admin) {
       res.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
@@ -197,22 +218,62 @@ function createEvents(db) {
         "X-Accel-Buffering": "no",
       });
       res.socket?.setNoDelay?.(true);
+      res.flushHeaders?.();
       const client = { res, adminId: admin?.id || null, ping: null };
       clients.add(client);
-      res.write(`retry: 3000\n\nevent: hello\ndata: ${JSON.stringify({ version: VERSION, at: new Date().toISOString() })}\n\n`);
+      const lastId = Number(req.headers["last-event-id"] || new URL(req.url, "http://x").searchParams.get("lastEventId") || 0);
+      const missed = lastId > 0 && lastId <= seq ? eventsAfter(lastId) : [];
+      res.write(`${SSE_PAD}retry: 3000\n\nevent: hello\ndata: ${JSON.stringify({ version: VERSION, at: new Date().toISOString(), last: seq })}\n\n${missed.map(sseChunk).join("")}`);
       client.ping = setInterval(() => {
         // A deleted admin's open stream is closed at the next ping.
         if (client.adminId && !db.get("admins", client.adminId)) return drop(client);
-        write(client, `: ping ${Date.now()}\n\n`);
+        // A real (named) event, not a comment, so the browser can tell a
+        // stalled stream from a quiet one.
+        write(client, `event: ping\ndata: ${Date.now()}\n\n`);
       }, SSE_PING_MS);
       client.ping.unref?.();
       req.on("close", () => drop(client));
+    },
+
+    /**
+     * Long-poll fallback for when a proxy buffers the SSE stream. Answers at
+     * once when events newer than `after` exist (or `after` is missing or
+     * from the future, e.g. a clock change: the caller just resyncs to
+     * `last`), otherwise waits up to `waitSec` for the next broadcast.
+     */
+    poll(res, after, waitSec) {
+      const reply = () => {
+        const events = after > 0 && after <= seq ? eventsAfter(after) : [];
+        return { events, last: events.length ? events[events.length - 1].id : seq };
+      };
+      if (!(after > 0) || after > seq || eventsAfter(after).length) return Promise.resolve(reply());
+      const ms = Math.max(0, Math.min(30, Number.isFinite(waitSec) ? waitSec : 25)) * 1000;
+      if (!ms) return Promise.resolve(reply());
+      return new Promise((resolve) => {
+        let timer = null, coalescing = false;
+        const done = (delayMs) => {
+          if (delayMs > 0) {
+            // First event arms a short timer; later events in the burst don't extend it.
+            if (!coalescing) { coalescing = true; clearTimeout(timer); timer = setTimeout(done, delayMs); }
+            return;
+          }
+          clearTimeout(timer);
+          waiters.delete(done);
+          res.off?.("close", done);
+          resolve(reply());
+        };
+        timer = setTimeout(done, ms);
+        timer.unref?.();
+        waiters.add(done);
+        res.on?.("close", done); // client went away: stop waiting
+      });
     },
 
     on: (event, fn) => local.on(event, fn),
     off: (event, fn) => local.off(event, fn),
     clientCount: () => clients.size,
     closeAll() {
+      for (const w of [...waiters]) w();
       for (const c of [...clients]) drop(c);
     },
   };

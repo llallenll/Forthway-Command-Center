@@ -1,7 +1,7 @@
 import { html, mount, $, on, colorOf, ago, fmtNum, emptyState, errorState, skeletonRows, toast, toastError, confirmDialog, openMenu, debounce } from "../util.js";
 import { icon } from "../icons.js";
 import { get, del } from "../api.js";
-import { tabsBar, databasesTable, dbMenu, revealCredentials, createDatabase, backupsTable, bindBackupActions, activityItem } from "../components.js";
+import { tabsBar, databasesTable, dbMenu, revealCredentials, createDatabase, backupsTable, bindBackupActions, activityItem, openPhpMyAdmin } from "../components.js";
 import { siteRow, bindSiteRows } from "./sites.js";
 import { projectDialog } from "./projects.js";
 
@@ -87,6 +87,7 @@ export default async function project(ctx) {
     await load();
     on(box, "click", "[data-newdb]", async () => { if (await createDatabase({ projectId: p.id })) load(); });
     on(box, "click", "[data-db-creds]", (e, b) => revealCredentials(items.find((d) => d.id === b.dataset.dbCreds)));
+    on(box, "click", "[data-db-pma]", (e, b) => openPhpMyAdmin(items.find((d) => d.id === b.dataset.dbPma)));
     on(box, "click", "[data-db-menu]", (e, b) => dbMenu(b, items.find((d) => d.id === b.dataset.dbMenu), load));
     ctx.on(["database", "backup", "site"], debounce(load, 400));
   }

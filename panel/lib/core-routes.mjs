@@ -187,7 +187,8 @@ export function register(router, ctx) {
 
   // ------------------------------------------------------------ public
 
-  router.get("/healthz", { public: true }, () => ({ ok: true, version: ctx.version, setup: !needsSetup() }));
+  // `bootId` + `commit` come from the updates module (lets the UI see a restart finish).
+  router.get("/healthz", { public: true }, () => ({ ok: true, version: ctx.version, setup: !needsSetup(), ...(ctx.updates?.health?.() || {}) }));
 
   router.get("/api/setup", { public: true }, () => ({
     needsSetup: needsSetup(),
@@ -615,6 +616,11 @@ export function register(router, ctx) {
   router.get("/api/events", (req, res, { admin }) => {
     ctx.events.subscribe(req, res, admin);
   });
+
+  // Long-poll fallback (events.js switches to it when a proxy buffers SSE):
+  // { events: [{ id, type, data }], last } from the same ring buffer.
+  router.get("/api/events/poll", (req, res, { query }) =>
+    ctx.events.poll(res, Number(query.after) || 0, query.wait === undefined ? 25 : Number(query.wait)));
 }
 
 function readColor(value) {

@@ -212,7 +212,7 @@ sites.targets(site)                  // serverIds it runs on: loadBalanced ? sit
 ```js
 mysql.status()                       // { installed, running, version, rootOk, error }
 mysql.envFor(databaseId, { serverId })  // { DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DATABASE_URL }
-                                     // DB_HOST is 127.0.0.1 on main, the main server's private/public address on workers
+                                     // DB_HOST: the panel address (see Changes: DATA — database host); 127.0.0.1 on main only as fallback
 mysql.syncRemoteHosts()              // re-grant users for current worker addresses (call on servers-changed)
 mysql.dump(databaseId, { file, log, signal })  -> Promise
 ```
@@ -569,3 +569,164 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     never the bundled DB dump. Database restore: checksum check → safety backup → drop/recreate schema (grants survive) → load.
   - Agent server backups: `cluster.runTask(id, "server.backup", { include: { panel: false, sites, nginx }, appDirs, file })`,
     then the archive CLUSTER stored at `result.file` is moved to `backups/server/<id>/` and its sha256 checked.
+- **UPDATES — panel self-update (`panel/lib/updates.mjs`, port of v2 hub/lib/updates.mjs).**
+  - Channel: `version.json` in the install dir (`repo`, `ref`, `commit`, written by install.sh) → `config.updates.{repo,ref}` →
+    `llallenll/Forthway-Command-Center@standalone`. Installed commit: version.json `commit`, else `.git` HEAD (dev checkout).
+    A version.json whose `version` differs from the running `VERSION` is ignored (stale stamp → "update available").
+  - Check = `GET /repos/:repo/commits/:ref` + `GET /repos/:repo/compare/<installed>...<latest>` (2 API calls; the new VERSION is
+    read from raw.githubusercontent). Uses the panel GitHub token (`config.github.tokenEnc`, or legacy plain `token`).
+    Runs 30 s after boot and every 6 h (cooldown 6 h), on page load (skipped if < 10 min old), on the button (≥ 20 s apart);
+    a rate-limit answer pauses all checks until `x-ratelimit-reset`. Last result is kept in `dataDir/updates-state.json`.
+  - Routes: `GET /api/updates` → `{ installed: { version, commit, shortCommit, repo, ref, installedAt, source, stale },
+    repo, ref, latest: { commit, shortCommit, version, message, author, date, url } | null, available: true|false|null,
+    reason, changes: [{ sha, shortSha, message, author, date, url }] (newest first, ≤ 100), totalChanges, compareUrl,
+    lastCheckedAt, error, checking, rateLimitedUntil, tokenSet, simulate: "dry-run"|"git-checkout"|null,
+    restartMode: "systemd"|"service"|"manual"|"simulated", job: { id, type, status } | null, restart, bootId }`.
+    `POST /api/updates/check { force? }` → same. `POST /api/updates/apply` → job (`panel.update`, lock `panel:update`; 409 while
+    one runs). `GET /api/updates/backups` → `{ items: [{ id, takenAt, reason, was, updatingTo, items, size, simulated, valid }] }`.
+    `POST /api/updates/backups/:id/restore` → job (`panel.restore`). SSE `updates` = the status (plus `restarting: true` just
+    before a restart). `ctx.updates = { status, check, listBackups, health }`.
+  - Apply: tarball of the exact checked commit (codeload; API tarball when a token is set) → staged in `<FCC_DIR>/.update-staging.*`
+    → must contain `panel/server.mjs` + `shared/` → `node --check` server.mjs, core-routes.mjs, updates.mjs → backup of
+    `panel node shared scripts patches README.md install.sh LICENSE version.json` to `dataDir/update-backups/<timestamp>/`
+    (+ `_backup.json`; last 3 kept) → per-item rename swap (rolled back on failure) → new version.json
+    (`{ version, repo, ref, commit, source: "github", via: "panel", updatedFrom, backup }`). Never touches the data dir, /etc/fcc
+    or sites (refuses if the data dir is inside a code item). Restore: `node --check` the backup → safety backup → swap back.
+  - Restart after a successful job (2 s later, once the log/SSE flushed): under systemd (`INVOCATION_ID`) the process SIGTERMs
+    itself (graceful shutdown → `Restart=always`); else if `systemctl is-active fcc` → detached `systemctl restart fcc`; else the
+    job tells the admin to restart. Agents get new files from `/install/files` at their next hello.
+  - Simulation: with `FCC_DRY_RUN=1` or when the panel runs from a git checkout, download/verify/backup are real (in the data
+    dir) but the swap, version.json and restart are only logged — the working copy is never written.
+  - CORE touch: `/healthz` also returns `bootId` and `commit` (from `ctx.updates.health()`); the UI polls it after an update
+    and reloads when `bootId` changes. UI: Settings → Updates (`#/settings/updates`), top-bar "Update available" chip.
+- **DATA — database host = panel address (mysql.mjs, additive).**
+  - New settings `config.mysql.publicHost` (override; must not be loopback) and `config.mysql.mainSitesVia: "panel"|"localhost"`
+    (default `"panel"`). Effective panel address = `publicHost` → main server `privateHost` → main server `host` → panel URL
+    hostname → first non-internal interface address (loopback values are skipped at every step).
+  - Credentials (`POST /api/databases/:id/credentials`), the public view's `host`, the create dialog and `DATABASE_URL` use the
+    panel address. Credentials also return `mainSitesHost` and `listensOnPublic`; `remoteHost` is kept (= panel address).
+  - `envFor(id, { serverId })`: agent servers → panel address. Main server → panel address when `mainSitesVia = "panel"` **and**
+    MySQL's `bind_address` accepts it (0.0.0.0 / * / :: / the address itself); otherwise `127.0.0.1` (unknown bind = 127.0.0.1,
+    so a site never gets a host it can't reach). The last seen bind address is persisted as `config.mysql.lastBindAddress`.
+    `envFor(id, { host })` forces a host. Public db view adds `mainSitesHost`.
+  - Accounts: with `mainSitesVia = "panel"` every database user is also created for this server's own addresses (the panel
+    address' IPs + non-internal interface IPs), because a connection to the public/private IP appears from it. Synced by
+    `syncRemoteHosts()` (boot, servers-changed, settings change, bind change); hosts are still never `%`.
+  - `GET /api/mysql/status` also returns `publicHost, publicHostOverride, publicHostDefault, publicHostSource, mainSitesVia,
+    mainSitesHost, listensOnPublic`. Under DRY_RUN `bindAddress` is simulated (`config.mysql.dryRunBind`, default 127.0.0.1).
+  - `GET /api/mysql/settings` → the above + `{ port, bindAddress, bindConfigFile, flavor, sitesUsingDatabases, dryRun }`.
+    `PUT /api/mysql/settings { publicHost?, mainSitesVia?, pushEnv = true }` → settings + `{ changed, sync, changedSites, jobs }`:
+    re-syncs accounts first, then `ctx.sites.pushEnv()` for each linked website whose DB_HOST changed. Audit `mysql.settings.update`.
+  - `POST /api/mysql/bind { mode: "network"|"local" }` → job `mysql.bind` (lock `mysql.server`): writes the installer's own drop-in
+    (`/etc/mysql/mysql.conf.d/zz-fcc.cnf` or `/etc/mysql/mariadb.conf.d/99-fcc.cnf`, same content as `FCC_MYSQL_REMOTE`),
+    sets `FCC_MYSQL_REMOTE=1|0` in `/etc/fcc/installer.env` so a re-run keeps it, `systemctl restart mysql|mariadb` (file
+    restored on failure), waits for MySQL, re-syncs accounts, pushes env to websites whose DB_HOST changed. 3306 is not opened
+    in ufw. Audit `mysql.bind.update`.
+  - `ctx.mysql` extras: `publicHost()`, `mainSitesHost()`, `settings()`, `localLogin(id)` (login over 127.0.0.1 for local tools —
+    never returned to a browser), `refreshAddresses()`. Create/rotate/credentials responses are `Cache-Control: no-store`.
+  - UI: Settings → Databases (`#/settings/databases`, `views/settings-databases.js`) shows the effective hosts, the override,
+    the main-server choice, and a "Listen on the network…" button when bind is local; the Databases page links there.
+- **DATA — phpMyAdmin (`panel/lib/phpmyadmin.mjs`, module `phpmyadmin`).**
+  - Files: `<FCC_DIR>/phpmyadmin/` (dev: `dataDir/phpmyadmin/`): `app/` = official release from
+    `https://files.phpmyadmin.net/phpMyAdmin/<v>/phpMyAdmin-<v>-all-languages.tar.gz`, verified against the published `.sha256`
+    (latest version from `https://www.phpmyadmin.net/home_page/version.json`); `setup/ examples/ test/` removed;
+    `app/config.inc.php` (0640 root:fcc-pma, `auth_type 'signon'`, session `FCCSignonSession`, 127.0.0.1:<mysql port>, no root,
+    no password change, no arbitrary server, version check off); `app/fcc-signon.php`; `fcc.php` (outside the web root,
+    0640 root:fcc-pma: shared secret, 32-byte `blowfish_secret`, loopback redeem URL, panel URL — secrets are stored encrypted
+    in `config.phpmyadmin.secretEnc/blowfishEnc` and survive updates); `sessions/`, `tmp/` (0700 fcc-pma).
+    Not in install.sh's / updates' code items, so panel updates keep it.
+  - Runs in its own php-fpm pool `/etc/php/<v>/fpm/pool.d/fcc-phpmyadmin.conf` as system user `fcc-pma`
+    (socket `/run/php/fcc-phpmyadmin.sock`, listen owner = nginx user), so PHP websites in the `www` pool can't read its
+    secrets or sign-on sessions. Tested with `php-fpm<v> -t` before reload (restored on failure).
+  - nginx: `/etc/nginx/conf.d/fcc-phpmyadmin.conf` (dev: `dataDir/nginx/`), `listen <port>` (default 8081, `[::]` too when IPv6
+    exists), `server_name <hostname|_>`, never `default_server`. HTTPS automatically when `/etc/letsencrypt/live/<name>/` exists
+    for `name` = configured hostname, else the panel URL's domain (497 → https redirect); otherwise plain HTTP with a UI warning.
+    Denies dotfiles, `setup|libraries|templates|vendor|sql|examples|test|src|locale|tmp`, `config.inc.php`; the sign-on URL is
+    not access-logged. CLUSTER: `loadbalancer.applyAll()` skips `fcc-phpmyadmin.conf` (it is not a website file).
+  - Routes: `GET /api/phpmyadmin[?check=1]` → `{ installed, version, installedAt, sha256, dir, port, hostname, tlsName, tls, url,
+    nginx: { installed, file }, php: { fpm, version, pool, socket }, apt, packages, latestVersion, latestCheckedAt, latestError,
+    updateAvailable, lastCheck, busyJobId, warnings, dryRun }` (check=1 looks up the latest version, cached 6 h).
+    `PUT /api/phpmyadmin/settings { port, hostname }` (1024–65535, not the panel port / 3306 / a site's port / a busy port;
+    re-applies the vhost when installed, reverted on nginx -t failure). `POST /api/phpmyadmin/install { version? }`,
+    `POST /api/phpmyadmin/update { version? }`, `DELETE /api/phpmyadmin` → job (`phpmyadmin.install|update|uninstall`, lock
+    `phpmyadmin`, 409 while one runs). Install: apt packages (`php-fpm php-mysql php-mbstring php-xml php-zip php-gd php-curl
+    php-intl`, only missing ones; without apt-get an existing php-fpm is required) → version → download + sha256 → extract to a
+    staging dir → generated files → pool → swap `app/` (old one restored on failure) → nginx (test + reload, rollback) → a
+    loopback request to `fcc-signon.php` must answer 401 with the sign-on page. Uninstall removes vhost, pool, files and the
+    `fcc-pma` user; databases are untouched. Under DRY_RUN every step is logged, nothing is downloaded or installed, generated
+    files + a pool preview are written under `dataDir/phpmyadmin/`.
+  - Sign-on: `POST /api/databases/:id/phpmyadmin` (admin) → `{ url, expiresAt, database, tls }`; `url` =
+    `<scheme>://<cert name | hostname | the host the admin used for the panel | panel address>:<port>/fcc-signon.php?token=<64 hex>`,
+    single use, 60 s, kept in memory (hashed). The script POSTs `{ token }` to `http(s)://127.0.0.1:<FCC_PORT>/internal/pma/redeem`
+    with `X-FCC-PMA-Secret`. That public route only answers requests from loopback / this machine without any proxy headers
+    (`X-Forwarded-*`, `X-Real-IP`, `Forwarded`, `Via` → 403), with the right secret; the token is deleted on first use (410 when
+    expired/used) and it returns the database user's own login `{ user, password, host: "127.0.0.1", port, db }`. phpMyAdmin then
+    shows only that database (the user's grants). No root/"admin" sign-in on purpose (root is socket-auth only).
+  - Audit: `phpmyadmin.install|update|uninstall`, `phpmyadmin.settings.update`, `database.phpmyadmin.open` (link issued),
+    `database.phpmyadmin.signon` (link redeemed). SSE `phpmyadmin` on changes. UI: Settings → phpMyAdmin
+    (`#/settings/phpmyadmin`), "phpMyAdmin" button + "Open in phpMyAdmin" menu item per database.
+  - OPS: `install.sh` `FCC_PHPMYADMIN=1` installs the PHP packages (same as `FCC_PHP=1`) and allows 8081/tcp in ufw; the panel
+    job does the rest.
+- **CLOUDFLARE — Cloudflare Zero Trust / Cloudflare Tunnel (`panel/lib/cloudflare.mjs`, new module, loaded after backups).**
+  Ported from v2 (`hub/lib/cloudflare.mjs`, `hub/lib/tunnel.mjs`, the cfLogin flow in `hub/server.mjs`).
+  - **Delivery per domain.** A website's domain is either *Direct* (DNS A record → main server, nginx :80/:443, certbot) or
+    *Cloudflare Tunnel* (Zero Trust public hostname). New site field, owned/shape-checked by SITES (`sanitizeCloudflare` in
+    sites.mjs): `site.cloudflare = { enabled, tunnelId (Cloudflare tunnel UUID), hostnames: [] }`; `hostnames ⊆ domains` are
+    delivered through the tunnel, every other domain stays Direct. Accepted on `POST /api/projects/:id/sites` and
+    `PATCH /api/sites/:id` (`cloudflare` key); changing `domains` re-intersects `hostnames` (empty → `enabled: false`). Public site
+    view has `cloudflare` (always an object) and `url` is `https://` for tunnel domains. When `enabled`, SITES awaits
+    `ctx.cloudflare.validateSite(cf, { domains, siteId })` before saving: 400 `{ error, code }` with `code` one of
+    `cloudflare_not_connected | cloudflare_tunnel_missing | cloudflare_tunnel_local | cloudflare_zone_missing (+ hostnames, zones)`,
+    409 `cloudflare_hostname_taken` (the panel's own hostname), 502 `cloudflare_unreachable`. After create / a change of
+    `cloudflare` or `domains`, SITES calls `ctx.cloudflare.syncSite(site)`; the delete job calls `await ctx.cloudflare.removeSite(site, { log })`.
+  - **Routing.** Each tunnel hostname = ingress rule `{ hostname, service: "http://127.0.0.1:80", originRequest: { httpHostHeader: hostname } }`
+    + proxied CNAME `hostname → <tunnelId>.cfargotunnel.com` (comment "Forthway Command Center"). Traffic therefore enters the
+    same nginx front door as Direct domains (LB, health checks, access logs unchanged). When the site's `ssl.status === "active"`
+    the rule becomes `https://127.0.0.1:443` with `originServerName` + `noTLSVerify` (nginx's :80 block only redirects to https,
+    which would loop through a tunnel); CLOUDFLARE listens to `lb` events with `ssl` and re-syncs. Only rules / DNS records the
+    panel created are changed or deleted; dashboard-made rules are kept in order, an identical pre-existing rule or CNAME is
+    *adopted* (never deleted), and the catch-all (existing one, else `http_status:404`) is always written last. A clashing
+    A/AAAA/CNAME record or a different existing rule is an error on that hostname unless the admin asks to replace it
+    (`replaceExisting`). All ingress read-modify-writes are serialised.
+  - **Ledger** collection `cloudflareRoutes`: `{ id, owner: "site:<id>"|"panel", siteId, hostname, tunnelId, zoneId, zoneName,
+    service, ruleKey, ingress: "created"|"adopted"|null, dnsRecordId, dnsCreated, status: "active"|"error"|"manual", error, code, syncedAt }`.
+  - **config.json** `cloudflare: { apiTokenEnc, accountId, accountName, viaLogin, connectors: [{ id, name, tokenEnc, autoStart, cfId }],
+    panel: { hostname, tunnelId } | null }` — tokens encrypted with `ctx.secrets`. Connecting: (1) *Log in with Cloudflare* —
+    `cloudflared tunnel login` with `HOME=dataDir/cloudflared-home`, the origin cert carries account + API token;
+    (2) API token (Account·Cloudflare Tunnel·Edit, Zone·DNS·Edit, Zone·Zone·Read); (3) connector token only — the connector runs,
+    hostnames get `status: "manual"` with dashboard instructions. Connectors run `cloudflared --no-autoupdate tunnel run` with
+    `TUNNEL_TOKEN` in env (never argv), detached, backoff 2 s → 60 s, fatal on a rejected token, pid files in `dataDir/run/`
+    (a leftover connector from a crashed panel is stopped). cloudflared is taken from PATH, else `dataDir/bin/cloudflared`,
+    downloaded from Cloudflare's GitHub releases on first use (linux amd64/arm64/arm).
+  - **`ctx.cloudflare`**: `status()`, `options()` (tunnels + zone names for pickers), `zones({ fresh })`, `syncSite(site, { replaceExisting, admin, force })`
+    → job record (`type: "cloudflare.sync"`, `lock: false`) or null when nothing to do, `removeSite(site, { log })` → Promise,
+    `validateSite(cf, { domains, siteId })`, `siteRoutes(siteId)`, `isTunnelHostname(h)`. Exports `stop()` (stops connectors).
+  - **Routes** (admin): `GET /api/cloudflare` (status + accounts, zones, account tunnels, `warning`, `error`) ·
+    `GET /api/cloudflare/status` · `GET /api/cloudflare/options` · `GET /api/cloudflare/zones` ·
+    `POST /api/cloudflare/token { token }` (`""` disconnects) · `POST /api/cloudflare/account { accountId }` ·
+    `POST|GET /api/cloudflare/login` (start → `{ url }` / poll → `{ done, error }`), `POST /api/cloudflare/login/cancel` ·
+    `POST /api/cloudflare/tunnels { name? | tunnelId?, start?, autoStart? }` (create or adopt a dashboard-managed tunnel, run it here) ·
+    `GET|POST /api/cloudflare/connectors` (`{ token, name?, autoStart? }`), `PATCH|DELETE /api/cloudflare/connectors/:id`,
+    `POST /api/cloudflare/connectors/:id/start|stop|restart`, `GET /api/cloudflare/connectors/:id/logs?lines=` ·
+    `POST /api/cloudflare/install` · `GET /api/cloudflare/routes` (`{ items: ledger, tunnels: [{ tunnelId, name, rules: [{ hostname, path,
+    service, catchAll, managed, adopted, siteId, siteName, panel }], error }] }`) · `GET /api/cloudflare/sites/:id`
+    (`{ cloudflare, connected, domains: [{ hostname, mode: "direct"|"tunnel", route }], leftovers }`) ·
+    `POST /api/cloudflare/sites/:id/sync { replaceExisting? }` → job · `PUT /api/cloudflare/panel { hostname, tunnelId }`
+    (publish the panel → `http(s)://127.0.0.1:<panel port>`; `""` unpublishes) → `{ panel, job }` ·
+    `POST /api/cloudflare/reset` → `{ removed, remaining, tunnelStopped }` (local only: stops connectors, deletes credentials,
+    connector tokens, the login cert under dataDir and the ledger; tunnels, routes and DNS stay in Cloudflare).
+  - **SSE `cloudflare`**: `{ kind: "status", status }` (coalesced), `{ kind: "log", id, line }` (connector output),
+    `{ kind: "routes", owner, siteId }` (after a sync). Added to `events.js` TYPES. Audit actions `cloudflare.*`.
+  - **Panel hostname & SSE**: the panel's rule sets no `disableChunkedEncoding` and no short timeouts (the `/api/events`
+    stream must survive; cloudflared defaults keep it open); the panel creates no cache / Rocket Loader rules.
+  - **UI**: wizard Domains step — "How visitors reach it" (Direct / Cloudflare Tunnel cards), per-domain Direct/Tunnel switch,
+    tunnel picker, zone check, not-connected notice linking to Settings → Cloudflare, DNS box text per mode; website
+    Domains & SSL tab — per-domain delivery + live route status, retry / "Replace existing records", certbot card replaced by
+    "Cloudflare terminates HTTPS" when every domain is tunnelled; Settings → Cloudflare (`#/settings/cloudflare`). Code in
+    `public/assets/views/cloudflare.js`; small hooks in wizard.js, site.js, settings.js, sites.js (`siteUrl`), app.css (`.cf-*`).
+  - **Dev**: `FCC_DRY_RUN=1` never spawns or downloads cloudflared (connectors simulated) and never reads a cert from `$HOME`.
+    `FCC_DRY_RUN=1 FCC_CLOUDFLARE_FAKE=1` also replaces api.cloudflare.com with an in-memory fake (account "Dev account
+    (simulated)", zones example.com / example.org, any token except `bad`, login completes after ~2 s), persisted in
+    `dataDir/cloudflare-fake.json` — no network.
+  - CLUSTER, please: `lb.issueCertificate()` requests every `site.domains` entry; consider skipping tunnel hostnames
+    (`ctx.cloudflare?.isTunnelHostname(d)`) — they don't need a certificate (validation would still go through the tunnel).

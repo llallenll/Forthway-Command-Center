@@ -1,20 +1,27 @@
-// Settings: General · Admins · Servers & load balancing · Backups · GitHub · Account.
+// Settings: General · Admins · Servers & load balancing · Backups · GitHub · Updates · Account.
 // Routed as #/settings/<section>. Every user-supplied string goes through html``.
 import { html, raw, mount, $, on, ago, initials, plural, toast, toastError, confirmDialog, formDialog, openMenu, emptyState, errorState, skeletonRows, debounce } from "../util.js";
 import { icon } from "../icons.js";
 import { get, post, patch, del } from "../api.js";
 import { pageHead, openJobLog, serverKind, METHOD_LABEL } from "../components.js";
 import { scheduleForm } from "./backups.js";
+import { cloudflareSettings } from "./cloudflare.js"; // Cloudflare section (lives in its own file)
+import { mysqlSettings, phpMyAdminSettings } from "./settings-databases.js"; // Databases + phpMyAdmin sections
+import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliased: avoids clashing with the shared import line)
 
 const SECTIONS = [
   { id: "general", label: "General", icon: "settings", render: general },
   { id: "admins", label: "Admins", icon: "users", render: admins },
   { id: "servers", label: "Servers & load balancing", icon: "balance", render: serversLb },
   { id: "backups", label: "Backups", icon: "archive", render: backups },
+  { id: "databases", label: "Databases", icon: "database", render: mysqlSettings },
+  { id: "phpmyadmin", label: "phpMyAdmin", icon: "layers", render: phpMyAdminSettings },
   { id: "github", label: "GitHub", icon: "github", render: github },
+  { id: "cloudflare", label: "Cloudflare", icon: "cloud", render: cloudflareSettings },
+  { id: "updates", label: "Updates", icon: "refresh", render: updates },
   { id: "account", label: "Account", icon: "user", render: account },
 ];
-const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account" };
+const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", tunnel: "cloudflare", zerotrust: "cloudflare" };
 
 export default async function settings(ctx) {
   const { root, params } = ctx;
@@ -303,6 +310,141 @@ async function github(box, ctx) {
     try { s = await patch("/api/settings", { githubToken: "" }); announce("fcc:settings", s, (ctx.state.settings ||= {})); toast("GitHub token removed", "ok"); paint(); }
     catch (ex) { toastError(ex, "Couldn't remove the token"); setBusy(b, false); }
   });
+}
+
+/* ───────── Updates (panel self-update) ───────── */
+
+async function updates(box, ctx) {
+  let u = await get("/api/updates");
+  let backupsList = [];
+  const loadBackups = async () => { try { backupsList = (await get("/api/updates/backups")).items || []; } catch { backupsList = []; } };
+  await loadBackups();
+  if (!ctx.alive()) return;
+  const short = (sha) => (sha ? String(sha).slice(0, 7) : "");
+  const ghLink = (url, text) => html`<a href="${url}" target="_blank" rel="noopener noreferrer" class="mono" style="color:var(--text)">${text}</a>`;
+  const share = () => window.dispatchEvent(new CustomEvent("fcc:updates", { detail: u }));
+  const RESTART_HINT = {
+    systemd: "The panel restarts by itself and this page reloads when it's back (usually a few seconds).",
+    service: "fcc.service is restarted for you and this page reloads when it's back.",
+    manual: "This panel isn't running under systemd, so restart it yourself after updating.",
+    simulated: "Development mode: the download and checks are real, but nothing in this folder is replaced and nothing restarts.",
+  };
+
+  const paint = () => {
+    const inst = u.installed || {};
+    const L = u.latest;
+    const busy = u.job;
+    const repoRef = `${u.repo}@${u.ref}`;
+    const badge = u.restart?.pending ? html`<span class="badge blue">${icon("restart")}Restarting…</span>`
+      : busy ? html`<span class="badge blue">${icon("refresh")}${busy.type === "panel.restore" ? "Restoring…" : "Updating…"}</span>`
+      : u.available === true ? html`<span class="badge warn">${icon("arrowUp")}Update available</span>`
+      : u.available === false ? html`<span class="badge ok">${icon("check")}Up to date</span>`
+      : html`<span class="badge">${u.lastCheckedAt ? "Unknown" : "Not checked"}</span>`;
+    const showUpdate = !!L && u.available !== false;
+    mount(box, html`
+      <div class="card">
+        <div class="card-head" style="flex-wrap:wrap">
+          <div class="row" style="flex:1 1 260px;min-width:0;gap:12px"><span style="width:38px;height:38px;border-radius:11px;display:grid;place-items:center;flex:none;background:rgba(74,114,255,.14);color:#9db3ff">${icon("sparkles")}</span>
+            <div style="min-width:0"><h3>Panel version <span class="muted" style="font-weight:500;margin-left:6px">v${inst.version || "—"}</span></h3>
+              <div class="sub">${inst.shortCommit ? html`Commit <span class="mono">${inst.shortCommit}</span> · ` : ""}from <span class="mono">${repoRef}</span></div></div></div>
+          <div class="right row" style="gap:8px">${badge}<button class="btn btn-sm" type="button" data-check ${u.checking ? raw("disabled") : ""}>${icon("refresh")}Check for updates</button></div>
+        </div>
+        <div class="card-body">
+          ${u.simulate ? html`<div class="note warn" style="margin-bottom:14px">${icon("info")}<div>${u.simulate === "dry-run" ? "Dry run" : "Running from a git checkout"} — checking GitHub is real, but <b>Update now</b> and <b>Restore</b> only simulate the swap: downloads, checks and backups go to the data folder and this folder is never overwritten.</div></div>` : ""}
+          ${u.error ? html`<div class="error-box" style="margin-bottom:14px">${icon("alert")}<div>${u.error}</div></div>` : ""}
+          <dl class="kv">
+            <dt>Installed</dt><dd>v${inst.version || "—"}${inst.commit ? html` · ${ghLink(`https://github.com/${u.repo}/commit/${inst.commit}`, inst.shortCommit)}` : html` · <span class="muted">commit unknown</span>`}${inst.installedAt ? html` <span class="muted">· installed ${ago(inst.installedAt)}</span>` : ""}</dd>
+            <dt>Channel</dt><dd><span class="mono">${repoRef}</span></dd>
+            <dt>Latest on GitHub</dt><dd>${L ? html`${L.version ? `v${L.version} · ` : ""}${ghLink(L.url, L.shortCommit)} <span class="muted">— ${L.message}${L.date ? html` · ${ago(L.date)}` : ""}</span>` : html`<span class="muted">—</span>`}</dd>
+            <dt>Last checked</dt><dd>${u.checking ? "Checking…" : u.lastCheckedAt ? ago(u.lastCheckedAt) : html`<span class="muted">never</span>`}${u.rateLimitedUntil ? html` <span class="badge warn">rate limited until ${new Date(u.rateLimitedUntil).toLocaleTimeString()}</span>` : ""}</dd>
+          </dl>
+          ${u.reason ? html`<p class="hint mt-16">${u.reason}${!u.tokenSet ? " Checks are anonymous (60 GitHub requests an hour); a token in Settings → GitHub raises that." : ""}</p>` : ""}
+        </div>
+      </div>
+
+      ${showUpdate ? html`<div class="card">
+        <div class="card-head"><div><h3>What's new</h3><div class="sub">${u.changes.length
+          ? html`${u.totalChanges && u.totalChanges > u.changes.length ? `${u.totalChanges} commits (newest ${u.changes.length} shown)` : plural(u.changes.length, "new commit")} since ${inst.shortCommit || "your version"}`
+          : `Updating to ${L.version ? `v${L.version} · ` : ""}${L.shortCommit}`}</div></div>
+          ${u.compareUrl ? html`<div class="right"><a class="btn btn-sm" href="${u.compareUrl}" target="_blank" rel="noopener noreferrer">${icon("external")}Compare on GitHub</a></div>` : ""}</div>
+        ${u.changes.length ? html`<div class="list">${u.changes.map((c) => html`<a class="list-item" href="${c.url}" target="_blank" rel="noopener noreferrer">
+            <span class="li-ico">${icon("branch", "sm")}</span>
+            <div class="li-main"><div class="li-title" style="white-space:normal">${c.message}</div><div class="li-sub"><span class="mono">${c.shortSha}</span>${c.author ? ` · ${c.author}` : ""}${c.date ? ` · ${ago(c.date)}` : ""}</div></div>
+            <div class="li-right">${icon("external", "sm")}</div></a>`)}</div>`
+          : html`<div class="card-body"><p class="muted small">GitHub can't list the commits between this install and ${L.shortCommit} (the installed commit is unknown to it). The newest commit is: <b style="color:var(--text)">${L.message}</b>.</p></div>`}
+        <div class="card-foot" style="flex-wrap:wrap"><span class="muted small" style="flex:1 1 260px">${RESTART_HINT[u.restartMode] || ""} Agent servers pick up their new files automatically when they reconnect.</span>
+          ${busy ? html`<button class="btn" type="button" data-view-job>${icon("fileText")}View progress</button>`
+            : html`<button class="btn btn-primary" type="button" data-apply ${u.restart?.pending ? raw("disabled") : ""}>${icon("arrowUp")}${u.available === true ? "Update now" : "Install latest"}</button>`}</div>
+      </div>` : ""}
+
+      <div class="card">
+        <div class="card-head"><div><h3>Roll back</h3><div class="sub">The panel's code is backed up before every update and restore (the last 3 are kept).</div></div></div>
+        ${backupsList.length ? html`<div class="list">${backupsList.map((b) => html`<div class="list-item">
+            <span class="li-ico">${icon("history", "sm")}</span>
+            <div class="li-main"><div class="li-title">${b.was?.version ? `v${b.was.version}` : "Unknown version"}${b.was?.commit ? html` · <span class="mono">${short(b.was.commit)}</span>` : ""}</div>
+              <div class="li-sub">${b.takenAt ? ago(b.takenAt) : b.id} · ${b.reason === "before-restore" ? "taken before a restore" : `taken before updating to ${short(b.updatingTo?.commit) || "a newer version"}`}${b.size ? ` · ${updFmtBytes(b.size)}` : ""}</div></div>
+            <div class="li-right">${b.simulated ? html`<span class="badge hide-sm">simulated</span>` : ""}${!b.valid ? html`<span class="badge err">incomplete</span>` : ""}
+              <button class="btn btn-sm" type="button" data-restore="${b.id}" ${busy || !b.valid || u.restart?.pending ? raw("disabled") : ""}>${icon("rollback")}Restore</button></div></div>`)}</div>`
+          : html`<div class="card-body"><p class="muted small">No backups yet — one is taken automatically before each update.</p></div>`}
+        <div class="card-body" style="padding-top:0"><p class="hint">Restoring puts that code back (panel, node, shared, scripts…) and restarts the panel. Your data, websites, databases and <span class="mono">/etc/fcc</span> are never touched by updates or restores.</p></div>
+      </div>`);
+  };
+  paint();
+
+  const refresh = async () => {
+    try { [u] = await Promise.all([get("/api/updates"), loadBackups()]); } catch { return; }
+    if (ctx.alive()) { paint(); share(); }
+  };
+  const followJob = (job) => {
+    if (!job?.id) return;
+    const off = ctx.on("job", (j) => {
+      if (j?.id !== job.id || !j.finishedAt) return;
+      off();
+      if (j.status === "succeeded") {
+        const mode = j.result?.restart;
+        if (mode === "systemd" || mode === "service") window.dispatchEvent(new CustomEvent("fcc:restarting", { detail: { bootId: u.bootId } }));
+        else if (mode === "simulated") toast("Simulated — nothing was replaced", "info", { msg: "Download, checks and backup ran for real; this folder was left alone." });
+        else if (mode === "manual") toast("Panel code updated", "info", { msg: "Restart the panel process to run the new version." });
+      }
+      refresh();
+    });
+  };
+
+  on(box, "click", "[data-check]", async (e, b) => {
+    setBusy(b, true);
+    try {
+      u = await post("/api/updates/check", { force: true });
+      share();
+      if (!u.error) toast(u.available === true ? "An update is available" : u.available === false ? "The panel is up to date" : "Checked GitHub", u.available === true ? "info" : "ok");
+    } catch (ex) { toastError(ex, "Couldn't check for updates"); }
+    if (ctx.alive()) paint();
+  });
+  on(box, "click", "[data-view-job]", () => u.job && openJobLog(u.job.id));
+  on(box, "click", "[data-apply]", async (e, b) => {
+    const inst = u.installed || {}, L = u.latest || {};
+    const ok = await confirmDialog({
+      title: "Update the panel?", ico: "arrowUp", confirmText: "Update now",
+      message: html`Install ${L.version ? `v${L.version} ` : ""}<span class="mono">${L.shortCommit || ""}</span> from <span class="mono">${u.repo}@${u.ref}</span> over v${inst.version}${inst.shortCommit ? html` <span class="mono">${inst.shortCommit}</span>` : ""}. The current code is backed up first and can be restored from this page. ${RESTART_HINT[u.restartMode] || ""}`,
+    });
+    if (!ok) return;
+    setBusy(b, true);
+    try { const job = await post("/api/updates/apply"); followJob(job); openJobLog(job.id); await refresh(); }
+    catch (ex) { toastError(ex, "Couldn't start the update"); setBusy(b, false); }
+  });
+  on(box, "click", "[data-restore]", async (e, b) => {
+    const bk = backupsList.find((x) => x.id === b.dataset.restore);
+    if (!bk) return;
+    const ok = await confirmDialog({
+      title: "Restore this version?", danger: true, confirmText: "Restore and restart",
+      message: html`Put back the panel code from ${bk.takenAt ? ago(bk.takenAt) : bk.id}${bk.was?.version ? ` (v${bk.was.version}${bk.was.commit ? ` · ${short(bk.was.commit)}` : ""})` : ""}. The code running now is backed up first. ${RESTART_HINT[u.restartMode] || ""}`,
+    });
+    if (!ok) return;
+    setBusy(b, true);
+    try { const job = await post(`/api/updates/backups/${encodeURIComponent(bk.id)}/restore`); followJob(job); openJobLog(job.id); await refresh(); }
+    catch (ex) { toastError(ex, "Couldn't start the restore"); setBusy(b, false); }
+  });
+  ctx.on("updates", (d) => { if (d && d.installed) { u = d; paint(); } });
+  ctx.on("job", (j) => { if (j && /^panel\.(update|restore)$/.test(j.type || "") && j.finishedAt) refresh(); });
 }
 
 /* ───────── Account ───────── */

@@ -33,6 +33,8 @@
 #   FCC_MYSQL_REMOTE=1             MySQL listens on 0.0.0.0 so agent servers can reach it (0 to revert)
 #   FCC_FIREWALL=1                 enable ufw: allow SSH, 80, 443 and the panel port
 #   FCC_PHP=1                      also install php-fpm (for "php" websites)
+#   FCC_PHPMYADMIN=1               also install the PHP packages phpMyAdmin needs and allow its port
+#                                  (8081) in ufw; then install it from Settings → phpMyAdmin
 #   FCC_REPO=owner/repo            fetch the source from GitHub instead of this folder
 #   FCC_REF=standalone             branch or tag to fetch
 #   FCC_GITHUB_TOKEN=…             token for a private repository
@@ -93,7 +95,7 @@ apt_install() {
 }
 pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
 
-usage() { sed -n '2,46p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
+usage() { sed -n '2,48p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
 
 # ------------------------------------------------------------------- flags
 
@@ -119,7 +121,7 @@ load_saved() {
   local k v
   while IFS='=' read -r k v || [ -n "$k" ]; do
     case "$k" in
-      FCC_DIR|FCC_DATA_DIR|FCC_SITES_DIR|FCC_PORT|FCC_HOST|FCC_PANEL_DOMAIN|FCC_EMAIL|FCC_DB|FCC_MYSQL_REMOTE|FCC_FIREWALL|FCC_PHP|FCC_REPO|FCC_REF)
+      FCC_DIR|FCC_DATA_DIR|FCC_SITES_DIR|FCC_PORT|FCC_HOST|FCC_PANEL_DOMAIN|FCC_EMAIL|FCC_DB|FCC_MYSQL_REMOTE|FCC_FIREWALL|FCC_PHP|FCC_PHPMYADMIN|FCC_REPO|FCC_REF)
         if [ -z "${!k+x}" ]; then printf -v "$k" '%s' "$v"; export "${k?}"; fi ;;
     esac
   done <"$SAVED_ENV"
@@ -138,6 +140,7 @@ FCC_DB="${FCC_DB:-}"
 FCC_MYSQL_REMOTE="${FCC_MYSQL_REMOTE:-}"
 FCC_FIREWALL="${FCC_FIREWALL:-0}"
 FCC_PHP="${FCC_PHP:-0}"
+FCC_PHPMYADMIN="${FCC_PHPMYADMIN:-0}"
 FCC_REPO="${FCC_REPO:-}"
 FCC_REF="${FCC_REF:-$DEFAULT_REF}"
 
@@ -425,7 +428,7 @@ install_certbot() {
 }
 
 install_php() {
-  [ "$FCC_PHP" = "1" ] || return 0
+  [ "$FCC_PHP" = "1" ] || [ "$FCC_PHPMYADMIN" = "1" ] || return 0
   apt_install php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl
   local fpm
   fpm="$(systemctl list-unit-files 'php*-fpm.service' --no-legend 2>/dev/null | awk '{print $1}' | sort -V | tail -1)"
@@ -454,6 +457,7 @@ setup_firewall() {
   ufw allow 80/tcp comment 'FCC nginx http' >/dev/null
   ufw allow 443/tcp comment 'FCC nginx https' >/dev/null
   ufw allow "${FCC_PORT}/tcp" comment 'FCC panel' >/dev/null
+  if [ "$FCC_PHPMYADMIN" = "1" ]; then ufw allow 8081/tcp comment 'FCC phpMyAdmin' >/dev/null; fi
   if [ "$active" -eq 0 ]; then
     ufw --force enable >/dev/null
     ok "ufw enabled: SSH (${sp}), 80, 443, ${FCC_PORT}"
@@ -586,7 +590,7 @@ save_answers() {
   {
     echo "# Written by install.sh — the choices a plain re-run reuses. Environment variables override."
     local k
-    for k in FCC_DIR FCC_DATA_DIR FCC_SITES_DIR FCC_PORT FCC_HOST FCC_PANEL_DOMAIN FCC_EMAIL FCC_DB FCC_MYSQL_REMOTE FCC_FIREWALL FCC_PHP FCC_REPO FCC_REF; do
+    for k in FCC_DIR FCC_DATA_DIR FCC_SITES_DIR FCC_PORT FCC_HOST FCC_PANEL_DOMAIN FCC_EMAIL FCC_DB FCC_MYSQL_REMOTE FCC_FIREWALL FCC_PHP FCC_PHPMYADMIN FCC_REPO FCC_REF; do
       printf '%s=%s\n' "$k" "${!k:-}"
     done
   } >"${SAVED_ENV}.tmp"
@@ -878,7 +882,7 @@ step "Fetching the Command Center";  find_source
 step "nginx";                        install_nginx
 step "Database server";              install_db
 step "certbot";                      install_certbot
-if [ "$FCC_PHP" = "1" ]; then step "PHP"; install_php; fi
+if [ "$FCC_PHP" = "1" ] || [ "$FCC_PHPMYADMIN" = "1" ]; then step "PHP"; install_php; fi
 step "Firewall";                     setup_firewall
 step "Installing files";             install_code
 save_answers

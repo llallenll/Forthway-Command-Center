@@ -390,6 +390,7 @@ function createLb(ctx) {
       const ownedRe = /^fcc-[A-Za-z0-9_-]+\.conf$/;
       for (const f of fs.readdirSync(dir)) {
         if (!ownedRe.test(f) || f === COMMON_FILE || f.startsWith("fcc-app-")) continue;
+        if (f === "fcc-phpmyadmin.conf") continue; // DATA's phpMyAdmin vhost (panel/lib/phpmyadmin.mjs), not a website
         const full = path.join(dir, f);
         if (!want.has(full)) want.set(full, null);
       }
@@ -456,8 +457,19 @@ function createLb(ctx) {
   async function issueCertificate(site, { log = () => {}, email, signal } = {}) {
     const s = typeof site === "string" ? getSite(site) : site;
     if (!s) throw new Error("Site not found");
-    const domains = domainsOf(s);
-    if (!domains.length) throw new Error("Add a domain to this website before requesting a certificate.");
+    // Domains delivered through a Cloudflare Tunnel are left off the certificate:
+    // Cloudflare terminates HTTPS for them, the tunnel reaches nginx without
+    // verifying the origin certificate, and Let's Encrypt's HTTP-01 renewal
+    // checks could not reach them through the tunnel anyway.
+    const tunnelled = (d) => !!ctx.cloudflare?.isTunnelHostname?.(d);
+    const domains = domainsOf(s).filter((d) => !tunnelled(d));
+    if (!domains.length) {
+      throw new Error(
+        domainsOf(s).length
+          ? "Every domain on this website goes through a Cloudflare Tunnel — Cloudflare already provides HTTPS for them."
+          : "Add a domain to this website before requesting a certificate.",
+      );
+    }
     if (!sys.DRY_RUN && !sys.which("certbot")) {
       throw new Error("certbot is not installed on the main server (apt install certbot python3-certbot-nginx).");
     }

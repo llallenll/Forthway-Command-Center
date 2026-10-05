@@ -175,6 +175,19 @@ export function sanitizeEnv(input) {
   return out;
 }
 
+// CLOUDFLARE (added by lib/cloudflare.mjs): `site.cloudflare = { enabled, tunnelId, hostnames }`.
+// hostnames ⊆ domains are delivered through a Cloudflare Tunnel; the other domains stay Direct.
+// Shape only here — whether the tunnel/zones exist is checked by ctx.cloudflare.validateSite().
+export function sanitizeCloudflare(input, domains = []) {
+  const off = { enabled: false, tunnelId: "", hostnames: [] };
+  if (!input || typeof input !== "object" || !input.enabled) return off;
+  const tunnelId = String(input.tunnelId || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(tunnelId)) throw httpError(400, "Pick which Cloudflare tunnel delivers this website.");
+  const list = Array.isArray(input.hostnames) ? input.hostnames : domains;
+  const hostnames = normalizeDomains(list).filter((h) => domains.includes(h));
+  return hostnames.length ? { enabled: true, tunnelId, hostnames } : off;
+}
+
 function sanitizeHealthPath(v) {
   const s = String(v ?? "").trim();
   if (!s) return "";
@@ -350,7 +363,7 @@ export function register(router, ctx) {
       slug: site.slug,
       type: site.type,
       domains: site.domains || [],
-      url: site.domains?.[0] ? `${site.ssl?.enabled ? "https" : "http"}://${site.domains[0]}` : null,
+      url: site.domains?.[0] ? `${site.ssl?.enabled || (site.cloudflare?.enabled && site.cloudflare.hostnames?.includes(site.domains[0])) ? "https" : "http"}://${site.domains[0]}` : null, // CLOUDFLARE: tunnel = https
       port: site.port,
       appDir: site.appDir,
       docRoot: site.type === "node" ? null : docRoot(site),
@@ -364,6 +377,7 @@ export function register(router, ctx) {
       envCount: Object.keys(env).length,
       linkedDatabaseIds: site.linkedDatabaseIds || [],
       ssl: site.ssl || { enabled: false, status: "none" },
+      cloudflare: site.cloudflare || { enabled: false, tunnelId: "", hostnames: [] }, // CLOUDFLARE
       currentReleaseId: site.currentReleaseId || null,
       previousReleaseId: site.previousReleaseId || null,
       currentVersion: rel?.version || null,
@@ -473,6 +487,19 @@ export function register(router, ctx) {
       for (const d of domains) {
         if ((s.domains || []).includes(d)) throw httpError(409, `${d} is already used by website "${s.name}".`);
       }
+    }
+  }
+
+  // CLOUDFLARE: tunnel delivery is validated and written by lib/cloudflare.mjs (ctx.cloudflare).
+  async function assertCloudflare(cf, domains, siteId = null) {
+    if (!ctx.cloudflare?.validateSite) throw httpError(400, "Cloudflare support isn't loaded on this panel, so domains can only be delivered directly.");
+    await ctx.cloudflare.validateSite(cf, { domains, siteId });
+  }
+  function cloudflareSync(site, admin) {
+    try {
+      ctx.cloudflare?.syncSite?.(site, { admin });
+    } catch (err) {
+      console.warn(`[fcc] cloudflare sync for ${site?.id} could not start: ${err.message}`);
     }
   }
 
@@ -1193,6 +1220,8 @@ export function register(router, ctx) {
 
     const domains = normalizeDomains(body.domains);
     assertDomainsFree(domains);
+    const cloudflare = sanitizeCloudflare(body.cloudflare, domains); // CLOUDFLARE
+    if (cloudflare.enabled) await assertCloudflare(cloudflare, domains);
     const loadBalanced = !!body.loadBalanced;
     const serverIds = validatePlacement(loadBalanced, body.serverIds ?? body.serverId);
     const lbMethod = body.lbMethod || "round_robin";
@@ -1232,6 +1261,7 @@ export function register(router, ctx) {
       env: sanitizeEnv(body.env),
       linkedDatabaseIds: validateLinkedDatabases(body.linkedDatabaseIds, project.id),
       ssl: { enabled: false, status: "none", issuedAt: null, error: null },
+      cloudflare, // CLOUDFLARE
       currentReleaseId: null,
       previousReleaseId: null,
       state: {},
@@ -1240,6 +1270,7 @@ export function register(router, ctx) {
     db.insert("sites", site);
     audit(admin, "site.create", site, { type, domains, loadBalanced, serverIds });
     emit(site);
+    cloudflareSync(site, admin); // CLOUDFLARE
     return publicSite(site);
   });
 
@@ -1270,6 +1301,11 @@ export function register(router, ctx) {
       patch.domains = normalizeDomains(b.domains);
       assertDomainsFree(patch.domains, site.id);
     }
+    if ("cloudflare" in b || "domains" in b) { // CLOUDFLARE: tunnel hostnames follow the domain list
+      const doms = patch.domains || site.domains || [];
+      patch.cloudflare = sanitizeCloudflare("cloudflare" in b ? b.cloudflare : site.cloudflare, doms);
+      if ("cloudflare" in b && patch.cloudflare.enabled) await assertCloudflare(patch.cloudflare, doms, site.id);
+    }
     if ("lbMethod" in b) {
       if (!LB_METHODS.includes(b.lbMethod)) throw httpError(400, `Load-balancing method must be one of: ${LB_METHODS.join(", ")}.`);
       patch.lbMethod = b.lbMethod;
@@ -1299,13 +1335,15 @@ export function register(router, ctx) {
     const portChanged = changed("port");
     const frontDoorChanged = changed("domains") || changed("lbMethod") || changed("loadBalanced") || added.length || removed.length || portChanged;
     const envChanged = changed("env") || changed("linkedDatabaseIds");
+    const cloudflareChanged = changed("cloudflare") || changed("domains"); // CLOUDFLARE (before db.update mutates `site`)
     const needsJob = deployed && (frontDoorChanged || envChanged);
     if (needsJob) assertIdle(site.id);
 
+    const changedKeys = Object.keys(patch).filter(changed); // before db.update mutates `site`
     const updated = db.update("sites", site.id, patch);
-    const changedKeys = Object.keys(patch).filter(changed);
     if (changedKeys.length) audit(admin, "site.update", updated, { fields: changedKeys, added, removed });
     emit(updated);
+    if (cloudflareChanged) cloudflareSync(updated, admin); // CLOUDFLARE
 
     let job = null;
     if (needsJob) {
@@ -1385,6 +1423,14 @@ export function register(router, ctx) {
           log("✓ front door (nginx) entry removed.");
         } catch (err) {
           log(`!! removing the nginx entry failed: ${err.message}`);
+        }
+      }
+      if (ctx.cloudflare?.removeSite) { // CLOUDFLARE: drop the tunnel routes + DNS records the panel made
+        try {
+          const r = await ctx.cloudflare.removeSite(cur, { log });
+          if (r?.removed) log("✓ Cloudflare Tunnel routes removed.");
+        } catch (err) {
+          log(`!! removing Cloudflare Tunnel routes failed: ${err.message}`);
         }
       }
       const rels = listReleases(site.id);

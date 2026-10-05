@@ -76,6 +76,8 @@ const ACT_VERB = {
   "database.update": "updated database", "mysql.root.update": "updated the MySQL root login", "backup.database": "backed up", "backup.server": "backed up server",
   "backup.delete": "deleted a backup of", "backup.download": "downloaded a backup of", "backup.restore.start": "started restoring", "backup.update": "updated a backup of",
   "release.delete": "deleted a release of", "release.github": "pulled a release for", "job.cancel": "cancelled",
+  "database.phpmyadmin.open": "opened phpMyAdmin for", "database.phpmyadmin.signon": "signed in to phpMyAdmin for", "phpmyadmin.install": "installed", "phpmyadmin.update": "updated",
+  "phpmyadmin.uninstall": "removed", "phpmyadmin.settings.update": "changed settings of", "mysql.settings.update": "changed the database host settings", "mysql.bind.update": "changed the MySQL listen address",
 };
 const ACT_ICON = { site: "globe", database: "database", server: "server", project: "folder", admin: "user", lb: "balance", loadbalancer: "balance", settings: "settings", backup: "archive" };
 export function targetHref(t) {
@@ -139,9 +141,24 @@ export async function openJobLog(jobId) {
     pre.insertAdjacentHTML("beforeend", lines.map(logLineHTML).join(""));
     if (follow.checked || atBottom) pre.scrollTop = pre.scrollHeight;
   };
+  // Lines reach the log file at once but the live stream in ~250ms batches, so
+  // the first batches after loading the file can repeat its last lines. For a
+  // few seconds after load, drop a batch's leading lines that match the tail.
+  let tail = [], dedupeUntil = 0;
+  const dropOverlap = (lines) => {
+    if (Date.now() > dedupeUntil || !tail.length) return lines;
+    for (let k = Math.min(lines.length, tail.length); k > 0; k--) {
+      let same = true;
+      for (let i = 0; i < k; i++) if (tail[tail.length - k + i] !== lines[i]) { same = false; break; }
+      if (same) return lines.slice(k);
+    }
+    return lines;
+  };
   const offLog = onEvent("job.log", (d) => {
     if (d?.id !== jobId) return;
-    if (!ready) buffered.push(...(d.lines || [])); else append(d.lines || []);
+    if (!ready) { buffered.push(...(d.lines || [])); return; }
+    const fresh = dropOverlap(d.lines || []);
+    if (fresh.length) append(fresh);
   });
   const offJob = onEvent("job", (d) => { if (d?.id === jobId) { job = d; paintMeta(); } });
   const tick = setInterval(paintMeta, 1000);
@@ -156,8 +173,20 @@ export async function openJobLog(jobId) {
     const lines = text ? text.replace(/\n$/, "").split("\n") : [];
     pre.innerHTML = "";
     if (!lines.length && !buffered.length) pre.innerHTML = `<span class="muted">${job.status === "queued" ? "Waiting to start…" : "No output yet."}</span>`;
-    const seen = new Set(lines);
-    append([...lines, ...buffered.filter((l) => !seen.has(l))]);
+    tail = lines.slice(-200);
+    dedupeUntil = Date.now() + 3000;
+    // Lines that arrived while the file was loading are usually already in it,
+    // as one contiguous run somewhere near the end.
+    const containedIn = (hay, needle) => {
+      outer: for (let j = hay.length - needle.length; j >= 0; j--) {
+        for (let i = 0; i < needle.length; i++) if (hay[j + i] !== needle[i]) continue outer;
+        return true;
+      }
+      return false;
+    };
+    const extra = buffered.length && containedIn(tail, buffered) ? [] : dropOverlap(buffered);
+    append([...lines, ...extra]);
+    tail = [...lines, ...extra].slice(-200);
     ready = true;
   } catch (e) {
     mount(pre, html`<span class="log-line err">Couldn't load the log: ${e.message}</span>`);
@@ -370,8 +399,8 @@ export async function revealCredentials(d) {
   if (!ok) return;
   try {
     const c = await post(`/api/databases/${d.id}/credentials`);
-    openModal({ title: `${d.name} credentials`, sub: "Host is for apps on the main server.", ico: "key", size: "lg",
-      body: html`${connectionDetails(c)}${c.remoteHost ? html`<div class="note mt-16">${icon("server")}<div>Apps on agent servers connect to <span class="mono">${c.remoteHost}:${c.port}</span> — linked websites get this automatically.</div></div>` : ""}`,
+    openModal({ title: `${d.name} credentials`, sub: "Host is the panel's database address (Settings → Databases).", ico: "key", size: "lg",
+      body: html`${connectionDetails(c)}${c.mainSitesHost && c.mainSitesHost !== c.host ? html`<div class="note mt-16">${icon("server")}<div>Linked websites on the main server use <span class="mono">${c.mainSitesHost}:${c.port}</span>${c.listensOnPublic === false ? " because MySQL only listens locally" : ""}. They get the right host automatically.</div></div>` : ""}${d.remoteAccess === false ? html`<div class="note mt-16">${icon("info")}<div>Agent server access is off for this database — only this server can sign in with these credentials.</div></div>` : ""}`,
       foot: html`<button class="btn btn-primary" data-close>Done</button>` });
   } catch (e) { toastError(e, "Couldn't reveal credentials"); }
 }
@@ -438,6 +467,20 @@ export async function deleteDatabase(d) {
   }
 }
 
+/** One-time phpMyAdmin sign-in link for this database, opened in a new tab. */
+export async function openPhpMyAdmin(d) {
+  const w = window.open("", "_blank"); // open now, so the popup isn't blocked after the await
+  try {
+    const r = await post(`/api/databases/${d.id}/phpmyadmin`, {});
+    if (w) { try { w.opener = null; } catch {} w.location.replace(r.url); }
+    else location.assign(r.url);
+  } catch (e) {
+    w?.close();
+    if (e?.body?.notInstalled) toast("phpMyAdmin isn't installed", "warn", { msg: "Install it under Settings → phpMyAdmin.", action: { label: "Open settings →", fn: () => (location.hash = "#/settings/phpmyadmin") } });
+    else toastError(e, "Couldn't open phpMyAdmin");
+  }
+}
+
 export async function toggleRemoteAccess(d) {
   try { await patch(`/api/databases/${d.id}`, { remoteAccess: !d.remoteAccess }); toast(d.remoteAccess ? "Agent servers can no longer connect" : "Agent servers can now connect", "ok"); return true; }
   catch (e) { toastError(e, "Couldn't change remote access"); return false; }
@@ -446,6 +489,7 @@ export async function toggleRemoteAccess(d) {
 export function dbMenu(anchor, d, after) {
   openMenu(anchor, [
     { label: "Reveal credentials", icon: "eye", onClick: () => revealCredentials(d) },
+    { label: "Open in phpMyAdmin", icon: "external", onClick: () => openPhpMyAdmin(d) },
     { label: "Rotate password", icon: "key", onClick: () => rotatePassword(d).then(after) },
     { label: "Import .sql / .sql.gz", icon: "upload", onClick: () => importSql(d) },
     { label: "Back up now", icon: "archive", onClick: () => backupDatabaseNow(d) },
@@ -471,7 +515,7 @@ export function databasesTable(items, { projectsById = {}, showProject = true, m
         <td class="num">${fmtBytes(d.sizeBytes)}</td>
         <td class="hide-sm">${d.lastBackup ? html`<span class="status"><span class="dot ok"></span>${ago(d.lastBackup.createdAt)}</span>` : html`<span class="status"><span class="dot warn"></span>Never</span>`}</td>
         <td class="hide-sm">${(d.linkedSites || []).length ? html`<div class="chips">${d.linkedSites.slice(0, 2).map((s) => html`<a class="badge" href="#/sites/${s.id}">${icon("globe")}${s.name}</a>`)}${d.linkedSites.length > 2 ? html`<span class="badge">+${d.linkedSites.length - 2}</span>` : ""}</div>` : html`<span class="dim small">Not linked</span>`}</td>
-        <td class="actions"><div class="btn-row"><button class="btn btn-sm hide-sm" data-db-creds="${d.id}">${icon("eye")}Credentials</button><button class="icon-btn sm" data-db-menu="${d.id}" aria-label="More actions">${icon("more")}</button></div></td>
+        <td class="actions"><div class="btn-row"><button class="icon-btn sm hide-sm" data-db-pma="${d.id}" title="Open in phpMyAdmin (signs you in as this database's user)" aria-label="Open ${d.name} in phpMyAdmin">${icon("external", "sm")}</button><button class="btn btn-sm hide-sm" data-db-creds="${d.id}">${icon("eye")}Credentials</button><button class="icon-btn sm" data-db-menu="${d.id}" aria-label="More actions">${icon("more")}</button></div></td>
       </tr>`;
     })}</tbody></table></div></div>`;
 }

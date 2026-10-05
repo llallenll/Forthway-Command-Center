@@ -7,7 +7,8 @@ import { pageHead, lbBadge, healthChip, typeIco, TYPE_LABEL } from "../component
 export function siteUrl(s, domain) {
   const d = domain || (s.domains || [])[0];
   if (!d || d.startsWith("*.")) return "";
-  return `${s.ssl?.status === "active" ? "https" : "http"}://${d}`;
+  const tunnel = s.cloudflare?.enabled && (s.cloudflare.hostnames || []).includes(d); // Cloudflare serves HTTPS
+  return `${s.ssl?.status === "active" || tunnel ? "https" : "http"}://${d}`;
 }
 
 export function siteRow(s, { serversById = {}, projectsById = {}, showProject = true } = {}) {

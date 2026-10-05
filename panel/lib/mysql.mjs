@@ -27,6 +27,7 @@ import crypto from "node:crypto";
 import zlib from "node:zlib";
 import dns from "node:dns/promises";
 import net from "node:net";
+import os from "node:os";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
@@ -174,6 +175,39 @@ export function cleanHost(h) {
 
 function urlHost(h) {
   return net.isIPv6(h) ? `[${h}]` : h;
+}
+
+/** localhost, 127.0.0.0/8, ::1 (and the v4-mapped form). */
+export function isLoopback(h) {
+  if (typeof h !== "string") return false;
+  const s = h.replace(/^::ffff:/i, "").toLowerCase();
+  return s === "localhost" || s === "::1" || /^127\./.test(s);
+}
+
+/** Non-internal interface addresses of this machine (no link-local, no zone ids). */
+export function localAddresses() {
+  const out = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list || []) {
+      if (ni.internal || !ni.address || ni.address.includes("%") || /^fe80:/i.test(ni.address)) continue;
+      if (validHost(ni.address)) out.push(ni.address);
+    }
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * Does a MySQL bind_address value accept connections on `ips`?
+ * true / false, or null when the bind address is unknown.
+ * Handles "*", "0.0.0.0", "::", comma lists (MySQL ≥ 8.0.13 / MariaDB ≥ 10.11).
+ */
+export function bindAccepts(bind, ips) {
+  if (bind == null || String(bind).trim() === "") return null;
+  const parts = String(bind).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (parts.some((p) => p === "*" || p === "0.0.0.0" || p === "::")) return true;
+  const want = (ips || []).map((s) => String(s).toLowerCase());
+  if (want.length && want.every((ip) => isLoopback(ip))) return parts.some((p) => isLoopback(p));
+  return want.some((ip) => parts.includes(ip));
 }
 
 function scrub(err, secrets) {
@@ -416,10 +450,11 @@ export function register(router, ctx) {
 
   let statusCache = null;
   async function status({ fresh = false } = {}) {
-    if (!fresh && statusCache && Date.now() - statusCache.at < 10_000) return statusCache.value;
+    if (!fresh && statusCache && Date.now() - statusCache.at < 10_000) return { ...statusCache.value, ...hostInfo() };
     let value;
     if (DRY_RUN) {
-      value = { installed: true, running: true, rootOk: true, version: "dry-run", flavor: "mysql", authMode: "dry-run", error: null, dryRun: true };
+      // Bind address is simulated so the "listen on the network" flow can be exercised.
+      value = { installed: true, running: true, rootOk: true, version: "dry-run", flavor: "mysql", authMode: "dry-run", bindAddress: mcfg().dryRunBind || "127.0.0.1", error: null, dryRun: true };
     } else if (!bin()) {
       value = { installed: false, running: false, rootOk: false, version: null, error: "MySQL is not installed on this server." };
     } else {
@@ -458,7 +493,115 @@ export function register(router, ctx) {
       }
     }
     statusCache = { at: Date.now(), value };
-    return value;
+    if (value.rootOk && value.bindAddress !== undefined) rememberBind(value.bindAddress);
+    return { ...value, ...hostInfo() };
+  }
+
+  // ---------------------------------------------------------- addresses
+  //
+  // "Panel address" (config.mysql.publicHost, else derived) is the host shown
+  // in credentials and used by websites on agent servers. Websites on the main
+  // server use it too (config.mysql.mainSitesVia = "panel", the default) once
+  // MySQL actually listens on it; otherwise, or with "localhost", 127.0.0.1.
+
+  let bindKnown = mcfg().lastBindAddress ?? null; // last bind_address we saw (persisted)
+  let publicIps = { host: null, ips: [] }; // DNS cache for a hostname publicHost
+
+  function rememberBind(bind) {
+    const b = bind == null ? null : String(bind);
+    if (b === bindKnown) return;
+    bindKnown = b;
+    mcfg().lastBindAddress = b;
+    try {
+      ctx.saveConfig?.();
+    } catch {}
+  }
+
+  function defaultPublicHost() {
+    let m = null;
+    try {
+      m = ctx.cluster?.getServer?.(ctx.cluster?.MAIN_ID || MAIN_ID);
+    } catch {}
+    for (const [raw, source] of [
+      [m?.privateHost, "main server private address"],
+      [m?.host, "main server address"],
+    ]) {
+      const h = cleanHost(raw);
+      if (h && !isLoopback(h)) return { host: h, source };
+    }
+    try {
+      const h = cleanHost(new URL(ctx.panelUrl()).hostname.replace(/^\[|\]$/g, ""));
+      if (h && !isLoopback(h)) return { host: h, source: "panel URL" };
+    } catch {}
+    const ip = localAddresses().find((a) => net.isIPv4(a)) || localAddresses()[0];
+    if (ip) return { host: ip, source: "detected address" };
+    return { host: "127.0.0.1", source: "fallback" };
+  }
+
+  function publicHost() {
+    const o = cleanHost(mcfg().publicHost || "");
+    return o || defaultPublicHost().host;
+  }
+
+  /** IPs `publicHost()` stands for (sync; hostnames use the last DNS answer). */
+  function publicHostIps() {
+    const h = publicHost();
+    if (net.isIP(h)) return [h];
+    return publicIps.host === h ? publicIps.ips : [];
+  }
+
+  async function resolvePublicHost() {
+    const h = publicHost();
+    if (net.isIP(h)) return [h];
+    try {
+      const addrs = await Promise.race([
+        dns.lookup(h, { all: true }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000)),
+      ]);
+      publicIps = { host: h, ips: addrs.map((a) => a.address).filter(validHost) };
+    } catch {
+      publicIps = { host: h, ips: [] };
+    }
+    return publicIps.ips;
+  }
+
+  /** true when MySQL listens on the panel address (null = unknown). */
+  function listensOnPublic() {
+    const h = publicHost();
+    if (isLoopback(h)) return true;
+    const ips = publicHostIps();
+    if (!ips.length) return bindAccepts(bindKnown, []) ? true : bindKnown == null ? null : false;
+    return bindAccepts(bindKnown, ips);
+  }
+
+  const mainSitesVia = () => (mcfg().mainSitesVia === "localhost" ? "localhost" : "panel");
+
+  /** DB_HOST for websites on the main server. Unknown bind → 127.0.0.1 (always works). */
+  function mainSitesHost() {
+    if (mainSitesVia() === "localhost") return "127.0.0.1";
+    return listensOnPublic() === true ? publicHost() : "127.0.0.1";
+  }
+
+  /** Account hosts a connection from this server to the panel address can appear from. */
+  async function mainSelfHosts() {
+    const out = new Set();
+    for (const ip of await resolvePublicHost()) if (!isLoopback(ip)) out.add(ip);
+    for (const ip of localAddresses()) out.add(ip);
+    return [...out].filter(validHost);
+  }
+
+  function hostInfo() {
+    const d = defaultPublicHost();
+    const listens = listensOnPublic();
+    return {
+      publicHost: publicHost(),
+      publicHostOverride: cleanHost(mcfg().publicHost || "") || "",
+      publicHostDefault: d.host,
+      publicHostSource: cleanHost(mcfg().publicHost || "") ? "setting" : d.source,
+      mainSitesVia: mainSitesVia(),
+      mainSitesHost: mainSitesHost(),
+      listensOnPublic: listens,
+    };
   }
 
   // ---------------------------------------------------------- hosts
@@ -492,8 +635,11 @@ export function register(router, ctx) {
 
   async function desiredHosts(remoteAccess) {
     const base = ["localhost", "127.0.0.1"];
-    if (!remoteAccess) return base;
-    return [...new Set([...base, ...(await workerHosts())])];
+    // Websites on the main server that connect via the panel address appear
+    // from this server's own address(es), so those need an account too.
+    if (mainSitesVia() === "panel") base.push(...(await mainSelfHosts()));
+    if (remoteAccess) base.push(...(await workerHosts()));
+    return [...new Set(base)];
   }
 
   async function existingHosts(user) {
@@ -576,7 +722,8 @@ export function register(router, ctx) {
       collation: rec.collation,
       remoteAccess: !!rec.remoteAccess,
       hosts: rec.hosts || [],
-      host: "127.0.0.1",
+      host: publicHost(),
+      mainSitesHost: mainSitesHost(),
       port: Number(cfg.port) || 3306,
       sizeBytes: rec.sizeBytes || 0,
       sizeCheckedAt: rec.sizeCheckedAt || null,
@@ -890,20 +1037,19 @@ export function register(router, ctx) {
     log?.("Import finished.");
   }
 
-  function mainAddress() {
-    let m = null;
-    try {
-      m = ctx.cluster?.getServer?.(ctx.cluster?.MAIN_ID || MAIN_ID);
-    } catch {}
-    return cleanHost(m?.privateHost) || cleanHost(m?.host) || cleanHost(mcfg().publicHost) || "127.0.0.1";
-  }
+  /** The panel address (kept under its old name for callers). */
+  const mainAddress = () => publicHost();
 
-  /** Env vars for a website on `serverId`. Synchronous so SITES can call it from specFor(). */
-  function envFor(databaseId, { serverId } = {}) {
+  /**
+   * Env vars for a website on `serverId`. Synchronous so SITES can call it from specFor().
+   * Main server → mainSitesHost() (panel address, or 127.0.0.1); agent servers → panel address.
+   * `{ host }` forces a host (credentials view).
+   */
+  function envFor(databaseId, { serverId, host: forceHost } = {}) {
     const rec = ctx.db.get("databases", databaseId);
     if (!rec) return null;
     const pw = decrypt(rec.passwordEnc);
-    const host = !serverId || serverId === MAIN_ID ? "127.0.0.1" : mainAddress();
+    const host = forceHost || (!serverId || serverId === MAIN_ID ? mainSitesHost() : publicHost());
     const port = String(Number(mcfg().port) || 3306);
     return {
       DB_HOST: host,
@@ -947,6 +1093,211 @@ export function register(router, ctx) {
     return status({ fresh: true });
   }
 
+  // ---------------------------------------------------------- address settings
+
+  function siteTargets(site) {
+    try {
+      const t = ctx.sites?.targets?.(site);
+      if (Array.isArray(t) && t.length) return t;
+    } catch {}
+    return site.loadBalanced && Array.isArray(site.serverIds) && site.serverIds.length ? site.serverIds : [site.serverIds?.[0] || MAIN_ID];
+  }
+
+  function sitesWithDatabases() {
+    return ctx.db.list("sites", (s) => Array.isArray(s.linkedDatabaseIds) && s.linkedDatabaseIds.length > 0);
+  }
+
+  /** siteId → the DB_HOST each of its servers gets right now. */
+  function envHostsSnapshot() {
+    const out = new Map();
+    for (const s of sitesWithDatabases()) out.set(s.id, siteTargets(s).map((t) => (t === MAIN_ID ? mainSitesHost() : publicHost())).join(","));
+    return out;
+  }
+
+  function changedSites(before) {
+    const after = envHostsSnapshot();
+    return sitesWithDatabases().filter((s) => before.get(s.id) !== after.get(s.id));
+  }
+
+  /** One SITES env-push job per website (rewrites .env, restarts). */
+  function pushEnvTo(sites, admin) {
+    const jobs = [];
+    if (typeof ctx.sites?.pushEnv !== "function") return jobs;
+    for (const s of sites) {
+      try {
+        const j = ctx.sites.pushEnv(s, { admin, restart: true });
+        if (j?.id) jobs.push({ id: j.id, siteId: s.id });
+      } catch (e) {
+        console.error(`[fcc] env push for ${s.name} failed: ${e.message}`);
+      }
+    }
+    return jobs;
+  }
+
+  const bindConfigPath = (flavor) =>
+    flavor === "mariadb" ? "/etc/mysql/mariadb.conf.d/99-fcc.cnf" : "/etc/mysql/mysql.conf.d/zz-fcc.cnf";
+
+  function settingsView() {
+    const st = statusCache?.value || null;
+    return {
+      ...hostInfo(),
+      port: Number(mcfg().port) || 3306,
+      bindAddress: st?.bindAddress ?? bindKnown,
+      bindConfigFile: bindConfigPath(st?.flavor),
+      flavor: st?.flavor || null,
+      sitesUsingDatabases: sitesWithDatabases().length,
+      dryRun: DRY_RUN,
+    };
+  }
+
+  async function updateSettings(body, admin) {
+    const cfg = mcfg();
+    const before = envHostsSnapshot();
+    const changed = [];
+    if (body.publicHost !== undefined) {
+      const raw = String(body.publicHost ?? "").trim();
+      let v = "";
+      if (raw) {
+        v = cleanHost(raw);
+        if (!v) throw httpError(400, "Database host must be a hostname or an IP address (no port, no path).");
+        if (isLoopback(v)) throw httpError(400, `${v} only works on this server. To make websites on the main server use it, choose "localhost" for them instead.`);
+      }
+      if (v !== (cleanHost(cfg.publicHost || "") || "")) {
+        changed.push("publicHost");
+        if (v) cfg.publicHost = v;
+        else delete cfg.publicHost;
+      }
+    }
+    if (body.mainSitesVia !== undefined) {
+      if (!["panel", "localhost"].includes(body.mainSitesVia)) throw httpError(400, 'mainSitesVia must be "panel" or "localhost".');
+      if (body.mainSitesVia !== mainSitesVia()) {
+        changed.push("mainSitesVia");
+        cfg.mainSitesVia = body.mainSitesVia;
+      }
+    }
+    if (!changed.length) return { ...settingsView(), changed, changedSites: [], jobs: [] };
+    await ctx.saveConfig?.();
+    publicIps = { host: null, ips: [] };
+    await resolvePublicHost();
+    audit(admin, "mysql.settings.update", { type: "mysql", id: "settings", name: "MySQL connection" }, { fields: changed, publicHost: publicHost(), mainSitesVia: mainSitesVia() });
+    // Accounts first, so a website restarted with a new DB_HOST can sign in.
+    let sync = null;
+    try {
+      sync = await syncRemoteHosts();
+    } catch (e) {
+      sync = { error: e.message };
+    }
+    const affected = changedSites(before);
+    const jobs = body.pushEnv === false ? [] : pushEnvTo(affected, admin);
+    broadcast("database", { action: "settings" });
+    return { ...settingsView(), changed, sync, changedSites: affected.map((s) => ({ id: s.id, name: s.name })), jobs };
+  }
+
+  /** Keep the installer's remembered FCC_MYSQL_REMOTE in step, so a re-run doesn't undo this. */
+  function updateInstallerEnv(value, log) {
+    const f = "/etc/fcc/installer.env";
+    try {
+      if (!fs.existsSync(f)) return;
+      const lines = fs.readFileSync(f, "utf8").split("\n");
+      let found = false;
+      const out = lines.map((l) => (/^FCC_MYSQL_REMOTE=/.test(l) ? ((found = true), `FCC_MYSQL_REMOTE=${value}`) : l));
+      if (!found) out.splice(out[out.length - 1] === "" ? out.length - 1 : out.length, 0, `FCC_MYSQL_REMOTE=${value}`);
+      const tmp = `${f}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, out.join("\n"), { mode: 0o600 });
+      fs.renameSync(tmp, f);
+      log(`Remembered FCC_MYSQL_REMOTE=${value} in ${f}, so re-running the installer keeps it.`);
+    } catch (e) {
+      log(`Could not update ${f}: ${e.message}`);
+    }
+  }
+
+  /**
+   * Job: write the bind-address drop-in the installer owns (same file, same
+   * format as FCC_MYSQL_REMOTE) and restart MySQL. "network" → 0.0.0.0,
+   * "local" → 127.0.0.1. Accounts are still per host, never '%'.
+   */
+  function setBind(mode, admin) {
+    if (!["network", "local"].includes(mode)) throw httpError(400, 'mode must be "network" or "local".');
+    const bind = mode === "network" ? "0.0.0.0" : "127.0.0.1";
+    const job = ctx.jobs.start(
+      {
+        type: "mysql.bind",
+        title: mode === "network" ? "Let MySQL accept network connections" : "Limit MySQL to local connections",
+        lock: "mysql.server",
+        adminId: admin?.id,
+      },
+      async ({ log, signal }) => {
+        const before = envHostsSnapshot();
+        const st = await status({ fresh: true });
+        if (!st.installed) throw new Error("MySQL is not installed on this server.");
+        const flavor = st.flavor || (which("mariadbd") || which("mariadb") ? "mariadb" : "mysql");
+        const file = bindConfigPath(flavor);
+        const content = [
+          "# Managed by the Forthway Command Center installer.",
+          "# FCC_MYSQL_REMOTE=1 → 0.0.0.0 (agent servers connect); otherwise local only.",
+          "[mysqld]",
+          `bind-address = ${bind}`,
+          ...(flavor === "mysql" ? ["mysqlx-bind-address = 127.0.0.1"] : []),
+          "",
+        ].join("\n");
+        log(`${file}: bind-address = ${bind}`);
+        if (DRY_RUN) {
+          for (const l of content.trim().split("\n")) log(`[dry-run]   ${l}`);
+          log(`[dry-run] systemctl restart ${flavor === "mariadb" ? "mariadb" : "mysql"}`);
+          mcfg().dryRunBind = bind;
+          await ctx.saveConfig?.();
+        } else {
+          if (!fs.existsSync(path.dirname(file)))
+            throw new Error(`${path.dirname(file)} does not exist — this MySQL is not laid out like Debian/Ubuntu's. Set "bind-address = ${bind}" in its config by hand and restart it.`);
+          if (!which("systemctl")) throw new Error("systemctl is not available, so MySQL can't be restarted from the panel.");
+          const prev = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+          const tmp = `${file}.${process.pid}.tmp`;
+          fs.writeFileSync(tmp, content, { mode: 0o644 });
+          fs.renameSync(tmp, file);
+          const svc = flavor === "mariadb" ? "mariadb" : "mysql";
+          log(`Restarting ${svc} — open connections drop for a few seconds…`);
+          try {
+            await run("systemctl", ["restart", svc], { log, signal, timeoutMs: 180_000 });
+          } catch (e) {
+            if (prev === null) fs.rmSync(file, { force: true });
+            else fs.writeFileSync(file, prev);
+            await run("systemctl", ["restart", svc], { allowFail: true, timeoutMs: 180_000 }).catch(() => {});
+            throw new Error(`MySQL did not restart with the new setting, so the previous file was put back. ${e.message}`);
+          }
+          updateInstallerEnv(mode === "network" ? "1" : "0", log);
+        }
+        connCache = null;
+        statusCache = null;
+        let st2 = null;
+        for (let i = 0; i < 15; i++) {
+          if (signal?.aborted) throw new Error("Cancelled");
+          st2 = await status({ fresh: true });
+          if (st2.rootOk) break;
+          await new Promise((r) => setTimeout(r, 2000));
+        }
+        if (!st2?.rootOk) throw new Error(`MySQL is not answering after the restart: ${st2?.error || "unknown error"}`);
+        log(`MySQL is back. bind_address = ${st2.bindAddress ?? "unknown"}`);
+        const sync = await syncRemoteHosts({ log });
+        const affected = changedSites(before);
+        const jobs = affected.length ? pushEnvTo(affected, admin) : [];
+        if (affected.length) log(`DB_HOST changes for ${affected.map((s) => s.name).join(", ")} — updating their environment (separate jobs).`);
+        if (mode === "network")
+          log("MySQL now listens on every interface. The installer never opens 3306 in ufw — allow it only from your agent servers (ufw allow from <agent-ip> to any port 3306 proto tcp) and keep it closed in your provider's firewall.");
+        broadcast("database", { action: "settings" });
+        return { bindAddress: st2.bindAddress ?? null, sync, jobs };
+      },
+    );
+    audit(admin, "mysql.bind.update", { type: "mysql", id: "bind", name: "MySQL listen address" }, { mode, bindAddress: bind, jobId: job?.id });
+    return job;
+  }
+
+  /** Login for a local tool (phpMyAdmin single sign-on). Never sent to a browser. */
+  function localLogin(databaseId) {
+    const rec = ctx.db.get("databases", databaseId);
+    if (!rec) return null;
+    return { id: rec.id, projectId: rec.projectId, db: rec.name, user: rec.user, password: decrypt(rec.passwordEnc), host: "127.0.0.1", port: Number(mcfg().port) || 3306 };
+  }
+
   // ---------------------------------------------------------- API object
 
   ctx.mysql = {
@@ -961,11 +1312,26 @@ export function register(router, ctx) {
     refreshSizes,
     pushEnvForLinkedSites: (id, opts) => pushEnvForLinkedSites(getRec(id), opts),
     publicView: (id) => publicDb(ctx.db.get("databases", id)),
+    publicHost,
+    mainSitesHost,
+    settings: settingsView,
+    localLogin,
+    refreshAddresses: resolvePublicHost,
   };
 
   // ---------------------------------------------------------- routes
 
   router.get("/api/mysql/status", async () => status({ fresh: true }));
+
+  router.get("/api/mysql/settings", async () => {
+    await status().catch(() => null);
+    await resolvePublicHost();
+    return settingsView();
+  });
+
+  router.put("/api/mysql/settings", async (req, res, { body, admin }) => updateSettings(body || {}, admin));
+
+  router.post("/api/mysql/bind", async (req, res, { body, admin }) => setBind(String(body?.mode || ""), admin));
 
   router.post("/api/mysql/root", async (req, res, { body, admin }) => setRootPassword(body || {}, admin));
 
@@ -977,9 +1343,10 @@ export function register(router, ctx) {
     return { items: items.map(publicDb) };
   });
 
-  router.post("/api/projects/:projectId/databases", async (req, res, { params, body, admin }) =>
-    createDatabase({ ...(body || {}), projectId: params.projectId }, admin),
-  );
+  router.post("/api/projects/:projectId/databases", async (req, res, { params, body, admin }) => {
+    res.setHeader("Cache-Control", "no-store"); // the response carries the password, once
+    return createDatabase({ ...(body || {}), projectId: params.projectId }, admin);
+  });
 
   router.get("/api/databases/:id", async (req, res, { params }) => {
     getRec(params.id);
@@ -1020,8 +1387,9 @@ export function register(router, ctx) {
 
   router.post("/api/databases/:id/credentials", async (req, res, { params, admin }) => {
     const rec = getRec(params.id);
-    const env = envFor(rec.id, { serverId: MAIN_ID });
+    const env = envFor(rec.id, { host: publicHost() });
     audit(admin, "database.credentials.reveal", { type: "database", id: rec.id, name: rec.name });
+    res.setHeader("Cache-Control", "no-store");
     return {
       user: rec.user,
       password: env.DB_PASSWORD,
@@ -1029,13 +1397,16 @@ export function register(router, ctx) {
       port: Number(env.DB_PORT),
       name: rec.name,
       url: env.DATABASE_URL,
-      remoteHost: rec.remoteAccess ? mainAddress() : null,
+      remoteHost: rec.remoteAccess ? publicHost() : null,
+      mainSitesHost: mainSitesHost(),
+      listensOnPublic: listensOnPublic(),
     };
   });
 
-  router.post("/api/databases/:id/password", async (req, res, { params, body, admin }) =>
-    rotatePassword(getRec(params.id), body?.password, admin),
-  );
+  router.post("/api/databases/:id/password", async (req, res, { params, body, admin }) => {
+    res.setHeader("Cache-Control", "no-store");
+    return rotatePassword(getRec(params.id), body?.password, admin);
+  });
 
   router.post("/api/databases/:id/import", { raw: true }, async (req, res, { params, query, admin }) => {
     const rec = getRec(params.id);
@@ -1086,4 +1457,11 @@ export async function start(ctx) {
   // Reconcile once after boot (workers may have changed while we were down).
   const t = setTimeout(onChange, 15_000);
   t.unref?.();
+  // Learn the bind address and resolve the panel address early, so envFor()
+  // hands websites on the main server the right DB_HOST.
+  const warm = setTimeout(() => {
+    Promise.resolve(ctx.mysql?.refreshAddresses?.()).catch(() => {});
+    Promise.resolve(ctx.mysql?.status?.()).catch(() => {});
+  }, 1000);
+  warm.unref?.();
 }

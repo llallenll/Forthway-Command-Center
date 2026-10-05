@@ -4,6 +4,7 @@ import { get, post, patch, put, del, upload, MOCK } from "../api.js";
 import { tabsBar, lbBadge, healthChip, siteHealth, typeIco, TYPE_LABEL, METHOD_LABEL, serverKind, jobItem, bindJobClicks, jobStarted, openJobLog, serverPicker, envEditor, dropzone } from "../components.js";
 import { lbMethodSelect, methodHint } from "./wizard.js";
 import { siteUrl } from "./sites.js";
+import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
 const TABS = [
@@ -280,46 +281,97 @@ export default async function site(ctx) {
   /* ── domains & SSL ── */
   if (tab === "domains") {
     let domains = [...(S.domains || [])];
+    const mainHost = servers.find((s) => s.role === "main")?.host || "";
+    // Per-domain delivery: Direct (A record → main) or Cloudflare Tunnel (views/cloudflare.js).
+    const savedCf = () => (S.cloudflare?.enabled ? S.cloudflare : { enabled: false, tunnelId: "", hostnames: [] });
+    const CF = { domains, hosts: new Set(savedCf().hostnames), tunnelId: savedCf().tunnelId || "", opts: null };
+    let cfRoutes = null;
+    const tunnelOnly = () => (S.domains || []).length > 0 && (S.domains || []).every((d) => savedCf().hostnames.includes(d));
     mount(box, html`<div class="grid-2">
       <div class="card"><div class="card-head"><h3>Domains</h3><div class="right"><button class="btn btn-sm btn-primary" data-savedom disabled>${icon("check")}Save</button></div></div>
         <div class="card-body"><div class="input-group"><input class="input mono" data-dom placeholder="www.example.com" spellcheck="false" autocomplete="off"/><button class="btn" data-adddom>${icon("plus")}Add</button></div>
-        <div class="chips mt-16" data-doms></div>
-        <p class="hint mt-16">Point each domain's A record at the main server${servers.find((s) => s.role === "main")?.host ? html` (<span class="mono">${servers.find((s) => s.role === "main").host}</span>)` : ""}. Saving rewrites the nginx config and reloads it.</p></div></div>
-      <div class="card"><div class="card-head"><h3>HTTPS certificate</h3><span class="sub">Let's Encrypt via certbot</span></div><div data-sslcard></div></div>
+        <div class="mt-16" data-doms></div>
+        <div class="mt-16" data-cf></div>
+        <div class="mt-16" data-dnsnote></div>
+        <div class="btn-row mt-12" data-cfactions></div>
+        <p class="hint mt-12">Each domain is delivered <b>Direct</b> (DNS A record → the main server) or through a <b>Cloudflare Tunnel</b>. Saving rewrites the nginx config and the tunnel routes.</p></div></div>
+      <div class="card"><div class="card-head"><h3>HTTPS certificate</h3><span class="sub" data-sslsub>Let's Encrypt via certbot</span></div><div data-sslcard></div></div>
       </div>
       <div class="card mt-20"><div class="card-head"><h3>nginx configuration</h3><span class="sub">Generated — read-only</span><div class="right"><button class="btn btn-sm" data-copyconf>${icon("copy")}Copy</button></div></div>
         <div class="card-body"><pre class="code" data-conf><span class="muted">Loading…</span></pre></div></div>`);
-    const paintSsl = () => { const ssl = S.ssl || {}; mount($("[data-sslcard]", box), html`<div class="card-body">
+    const paintSsl = () => { const ssl = S.ssl || {};
+      $("[data-sslsub]", box).textContent = tunnelOnly() ? "Handled by Cloudflare" : "Let's Encrypt via certbot";
+      if (tunnelOnly()) {
+        mount($("[data-sslcard]", box), html`<div class="card-body"><div class="row" style="gap:14px;align-items:flex-start">
+          <span class="li-ico cf-ico-tun" style="width:44px;height:44px;border-radius:13px;display:grid;place-items:center;flex:none">${icon("cloud")}</span>
+          <div style="flex:1;min-width:0"><div class="strong">Cloudflare terminates HTTPS</div>
+            <div class="muted small mt-8">Every domain of this website is delivered through a Cloudflare Tunnel. Visitors get Cloudflare's edge certificate and traffic reaches this server through the tunnel, so no certbot certificate is needed here.</div></div></div></div>`);
+        return;
+      }
+      const mixed = savedCf().hostnames.length > 0;
+      mount($("[data-sslcard]", box), html`<div class="card-body">
           <div class="row" style="gap:14px;align-items:flex-start">
             <span class="li-ico" style="width:44px;height:44px;border-radius:13px;display:grid;place-items:center;flex:none;${ssl.status === "active" ? "background:rgba(61,220,151,.12);color:var(--ok)" : ssl.status === "failed" ? "background:rgba(255,93,122,.12);color:var(--err)" : "background:rgba(148,166,255,.08);color:var(--muted)"}">${icon(ssl.status === "failed" ? "alert" : "lock")}</span>
             <div style="flex:1;min-width:0"><div class="strong">${ssl.status === "active" ? "Certificate active" : ssl.status === "failed" ? "Last request failed" : ssl.status === "pending" ? "Request in progress" : "No certificate yet"}</div>
-              <div class="muted small mt-8">${ssl.status === "active" ? html`Issued ${fmtDate(ssl.issuedAt, false)}${ssl.expiresAt ? html` · expires ${fmtDate(ssl.expiresAt, false)} (auto-renews)` : ""}` : ssl.status === "failed" ? ssl.error || "certbot reported an error." : "Issue a free certificate once every domain resolves to this server."}</div></div>
+              <div class="muted small mt-8">${ssl.status === "active" ? html`Issued ${fmtDate(ssl.issuedAt, false)}${ssl.expiresAt ? html` · expires ${fmtDate(ssl.expiresAt, false)} (auto-renews)` : ""}` : ssl.status === "failed" ? ssl.error || "certbot reported an error." : "Issue a free certificate once every direct domain resolves to this server."}</div>
+              ${mixed ? html`<div class="muted small mt-8 cf-sub">${icon("cloud", "xs")} Tunnel domains get HTTPS from Cloudflare; the certificate is for the Direct domains.</div>` : ""}</div>
           </div>
           <div class="btn-row mt-20"><button class="btn ${ssl.status === "active" ? "" : "btn-primary"}" data-ssl>${icon("shield")}${ssl.status === "active" ? "Re-issue certificate" : "Issue certificate"}</button></div>
         </div>`); };
     paintSsl();
     ctx.on(["site", "lb"], (d) => { if ((d?.id === S.id || d?.siteId === S.id) && d?.ssl) { S.ssl = d.ssl; paintSsl(); if (d.id) loadConf(); } });
+    const dirty = () => JSON.stringify(domains) !== JSON.stringify(S.domains || []) || JSON.stringify(deliveryPayload(CF)) !== JSON.stringify(deliveryPayload({ domains: S.domains || [], hosts: new Set(savedCf().hostnames), tunnelId: savedCf().tunnelId }));
     const paintDoms = () => {
-      mount($("[data-doms]", box), domains.length ? html`${domains.map((d, i) => html`<span class="chip">${icon("globe", "xs")}<span class="mono">${d}</span><button data-rmdom="${i}" aria-label="Remove ${d}">${icon("x", "xs")}</button></span>`)}` : html`<span class="muted small">No domains.</span>`);
-      $("[data-savedom]", box).disabled = JSON.stringify(domains) === JSON.stringify(S.domains || []);
+      mount($("[data-doms]", box), domainRows(CF, { routes: dirty() ? null : cfRoutes, mainHost }));
+      mount($("[data-cf]", box), cfPanel(CF));
+      mount($("[data-dnsnote]", box), dnsNote(CF, mainHost));
+      const errs = (cfRoutes || []).filter((r) => r.status === "error");
+      const conflict = errs.some((r) => r.code === "dns_conflict" || /already (?:has|routed)/.test(r.error || ""));
+      mount($("[data-cfactions]", box), !dirty() && savedCf().hostnames.length && CF.opts?.connected ? html`<button class="btn btn-sm" data-cfsync>${icon("refresh")}${errs.length ? "Retry Cloudflare routes" : "Re-sync Cloudflare routes"}</button>
+        ${conflict ? html`<button class="btn btn-sm btn-danger" data-cfreplace>${icon("alert")}Replace existing records</button>` : ""}` : html``);
+      $("[data-savedom]", box).disabled = !dirty();
     };
-    paintDoms();
+    const loadCf = async () => {
+      const [o, r] = await Promise.all([loadCfOptions(), get(`/api/cloudflare/sites/${S.id}`).catch(() => null)]);
+      if (!ctx.alive()) return;
+      CF.opts = o; pickDefaultTunnel(CF);
+      cfRoutes = r ? r.domains.map((x) => x.route).filter(Boolean) : null;
+      paintDoms();
+    };
+    paintDoms(); loadCf();
+    bindDelivery(box, CF, { repaint: paintDoms });
+    ctx.on(["cloudflare"], (d) => { if (d?.kind === "routes" && d.siteId === S.id) loadCf(); });
     const add = () => {
       const inp = $("[data-dom]", box);
+      const allTunnel = domains.length > 0 && domains.every((d) => CF.hosts.has(d));
       for (const v of inp.value.split(/[\s,]+/).map((x) => x.trim().toLowerCase()).filter(Boolean)) {
         if (!/^(\*\.)?([a-z0-9-]+\.)+[a-z0-9-]{2,}$/.test(v)) { toast(`“${v}” isn't a valid domain`, "warn"); continue; }
-        if (!domains.includes(v)) domains.push(v);
+        if (!domains.includes(v)) { domains.push(v); if (allTunnel) CF.hosts.add(v); }
       }
       inp.value = ""; paintDoms();
     };
     $("[data-adddom]", box).onclick = add;
     $("[data-dom]", box).onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } };
-    on(box, "click", "[data-rmdom]", (e, b) => { domains.splice(+b.dataset.rmdom, 1); paintDoms(); });
+    on(box, "click", "[data-rmdom]", (e, b) => { const d = domains[+b.dataset.rmdom]; domains.splice(+b.dataset.rmdom, 1); CF.hosts.delete(d); paintDoms(); });
     const loadConf = async () => { try { const r = await get(`/api/sites/${S.id}/nginx`); $("[data-conf]", box).textContent = r.config || "# (empty)"; } catch (e) { $("[data-conf]", box).textContent = "# Couldn't load: " + e.message; } };
     on(box, "click", "[data-savedom]", async (e, b) => {
       if (!domains.length) { toast("Keep at least one domain", "warn"); return; }
+      const cfErr = validateDelivery(CF); if (cfErr) { toast(cfErr, "warn"); return; }
       b.classList.add("loading");
-      try { const r = await patch(`/api/sites/${S.id}`, { domains }); if (r?.job?.id) jobStarted(r.job, "Applying domains"); S.domains = [...domains]; paintDoms(); paintHead(); loadConf(); toast("Domains saved", "ok", { msg: "nginx was reloaded." }); } catch (ex) { toastError(ex, "Couldn't save domains"); } finally { b.classList.remove("loading"); }
+      try {
+        const r = await patch(`/api/sites/${S.id}`, { domains, cloudflare: deliveryPayload(CF) });
+        if (r?.job?.id) jobStarted(r.job, "Applying domains");
+        S.domains = [...domains]; S.cloudflare = r.cloudflare || deliveryPayload(CF);
+        paintDoms(); paintHead(); paintSsl(); loadConf(); setTimeout(loadCf, 800);
+        toast("Domains saved", "ok", { msg: tunnelHosts(CF).length ? "nginx reloaded; Cloudflare routes are being written." : "nginx was reloaded." });
+      } catch (ex) { toastError(ex, "Couldn't save domains"); } finally { b.classList.remove("loading"); }
+    });
+    on(box, "click", "[data-cfsync],[data-cfreplace]", async (e, b) => {
+      const replace = !!b.dataset.cfreplace;
+      if (replace && !(await confirmDialog({ title: "Replace existing DNS records and routes?", danger: true, confirmText: "Replace",
+        message: "For the tunnel domains that failed, the panel deletes their existing A / AAAA / CNAME records (and any route on this tunnel for the same hostname) in Cloudflare and replaces them with the tunnel's. Anything else on those hostnames stops receiving traffic." }))) return;
+      b.classList.add("loading");
+      try { const job = await post(`/api/cloudflare/sites/${S.id}/sync`, { replaceExisting: replace }); if (job?.id) jobStarted(job, "Writing Cloudflare routes"); } catch (ex) { toastError(ex); } finally { b.classList.remove("loading"); }
     });
     on(box, "click", "[data-ssl]", async (e, b) => {
       b.classList.add("loading");

@@ -2,6 +2,7 @@ import { html, raw, mount, $, $$, on, colorOf, slug, plural, fmtBytes, emptyStat
 import { icon } from "../icons.js";
 import { get, post } from "../api.js";
 import { serverPicker, envEditor, METHOD_LABEL, TYPE_LABEL, lbBadge, serverKind, jobStarted } from "../components.js";
+import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts } from "./cloudflare.js";
 
 const TYPES = [
   { id: "node", icon: "node", title: "Node.js", desc: "Next.js, Express, Nuxt, Remix… built and kept running with pm2." },
@@ -55,7 +56,10 @@ export default async function wizard(ctx) {
     build: { ...BUILD_DEFAULTS.node },
     loadBalanced: false, single: (servers.find((s) => s.role === "main") || servers[0])?.id, multi: servers.filter((s) => s.lbEligible !== false && s.online).slice(0, 3).map((s) => s.id), lbMethod: "round_robin",
     healthPath: "/", linked: [], env: {}, pullNow: true,
+    delivery: "direct", // "direct" | "cloudflare" — see views/cloudflare.js
   };
+  // Cloudflare Tunnel delivery: hosts = domains routed through the tunnel (the rest stay Direct).
+  const CF = { domains: W.domains, hosts: new Set(), tunnelId: "", opts: null };
   let picker = null, envEd = null;
 
   mount(root, html`
@@ -75,6 +79,10 @@ export default async function wizard(ctx) {
       if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(W.name)) return "Use lowercase letters, numbers and dashes for the name.";
     }
     if (s === "domains" && !W.domains.length) return "Add at least one domain (you can use a temporary one).";
+    if (s === "domains" && W.delivery === "cloudflare") {
+      if (!tunnelHosts(CF).length) return "Set at least one domain to Tunnel, or choose Direct delivery.";
+      const e = validateDelivery(CF); if (e) return e;
+    }
     if (s === "source" && W.source === "github" && !/^[\w.-]+\/[\w.-]+$/.test(W.repo)) return "Enter the repository as owner/name.";
     if (s === "hosting") {
       if (W.loadBalanced && W.multi.length < 2) return "Pick at least 2 servers to load balance across.";
@@ -85,6 +93,33 @@ export default async function wizard(ctx) {
   };
 
   const paintSteps = () => mount($("[data-steps]", root), html`${STEPS.map((s, i) => html`<button class="step ${i === W.step ? "active" : ""} ${i < W.step ? "done" : ""}" data-go="${i}"><span class="n">${i < W.step ? icon("check", "xs") : i + 1}</span>${s.label}</button>`)}`);
+
+  // ---- Domains step: domain list + Direct / Cloudflare Tunnel delivery (views/cloudflare.js)
+  const mainHost = () => servers.find((s) => s.role === "main")?.host || "";
+  function paintDomains() {
+    const el = $("[data-doms]", body);
+    if (!el) return;
+    const cf = W.delivery === "cloudflare";
+    mount(el, cf ? domainRows(CF, { mainHost: mainHost() })
+      : html`<div class="chips">${W.domains.length ? html`${W.domains.map((d, i) => html`<span class="chip">${icon("globe", "xs")}<span class="mono">${d}</span><button data-rmdom="${i}" aria-label="Remove">${icon("x", "xs")}</button></span>`)}` : html`<span class="muted small">No domains yet.</span>`}</div>`);
+    mount($("[data-cf]", body), cf ? cfPanel(CF, { always: true }) : html``);
+    mount($("[data-dnsnote]", body), dnsNote(cf ? CF : { ...CF, hosts: new Set() }, mainHost()));
+  }
+  function addDomain() {
+    const inp = $("[data-dom]", body);
+    const vals = inp.value.split(/[\s,]+/).map((x) => x.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "")).filter(Boolean);
+    for (const v of vals) {
+      if (!/^(\*\.)?([a-z0-9-]+\.)+[a-z0-9-]{2,}$/.test(v)) { toast(`“${v}” isn't a valid domain`, "warn"); continue; }
+      if (!W.domains.includes(v)) { W.domains.push(v); if (W.delivery === "cloudflare") CF.hosts.add(v); }
+    }
+    inp.value = ""; paintDomains(); inp.focus();
+  }
+  async function ensureCfOptions(force = false) {
+    if (CF.opts && !force) return;
+    CF.opts = await loadCfOptions();
+    pickDefaultTunnel(CF);
+    if (STEPS[W.step].id === "domains") paintDomains();
+  }
 
   function render() {
     paintSteps();
@@ -110,22 +145,20 @@ export default async function wizard(ctx) {
       mount(body, html`<h2>Domains</h2><p class="lead">Every domain is served by nginx on the main server${main?.host ? html` (<span class="mono">${main.host}</span>)` : ""}, which then forwards to wherever the site runs.</p>
         <div class="field"><label>Add a domain</label><div class="input-group"><input class="input mono" data-dom placeholder="example.com" autocomplete="off" spellcheck="false"/><button class="btn" data-adddom>${icon("plus")}Add</button></div>
           <div class="hint">Press Enter to add. Add both <span class="mono">example.com</span> and <span class="mono">www.example.com</span> if you want both.</div></div>
-        <div class="chips mt-16" data-doms></div>
-        <div class="note mt-20">${icon("info")}<div>Point each domain's DNS <b>A record</b> at <span class="mono">${main?.host || "the main server"}</span>. Once DNS resolves you can issue a free HTTPS certificate from the website's <b>Domains & SSL</b> tab.</div></div>`);
-      const paintDoms = () => mount($("[data-doms]", body), W.domains.length ? html`${W.domains.map((d, i) => html`<span class="chip">${icon("globe", "xs")}<span class="mono">${d}</span><button data-rmdom="${i}" aria-label="Remove">${icon("x", "xs")}</button></span>`)}` : html`<span class="muted small">No domains yet.</span>`);
-      const add = () => {
-        const inp = $("[data-dom]", body);
-        const vals = inp.value.split(/[\s,]+/).map((x) => x.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "")).filter(Boolean);
-        for (const v of vals) {
-          if (!/^(\*\.)?([a-z0-9-]+\.)+[a-z0-9-]{2,}$/.test(v)) { toast(`“${v}” isn't a valid domain`, "warn"); continue; }
-          if (!W.domains.includes(v)) W.domains.push(v);
-        }
-        inp.value = ""; paintDoms(); inp.focus();
-      };
-      paintDoms();
-      $("[data-adddom]", body).onclick = add;
-      $("[data-dom]", body).onkeydown = (e) => { if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); } };
-      on(body, "click", "[data-rmdom]", (e, b) => { W.domains.splice(+b.dataset.rmdom, 1); paintDoms(); });
+        <div class="mt-16" data-doms></div>
+        <div class="label mt-24" style="margin-bottom:10px">How visitors reach it</div>
+        <div class="mode-switch">
+          <label class="choice ${W.delivery === "direct" ? "selected" : ""}"><input type="radio" name="delivery" value="direct" ${W.delivery === "direct" ? raw("checked") : ""}/><span class="c-mark"></span>
+            <span class="c-title"><span class="c-ico">${icon("globe")}</span>Direct</span><span class="c-desc">DNS A record → this server. nginx answers on ports 80/443 and HTTPS comes from Let's Encrypt.</span></label>
+          <label class="choice ${W.delivery === "cloudflare" ? "selected" : ""}"><input type="radio" name="delivery" value="cloudflare" ${W.delivery === "cloudflare" ? raw("checked") : ""}/><span class="c-mark"></span>
+            <span class="c-title"><span class="c-ico">${icon("cloud")}</span>Cloudflare Tunnel</span><span class="c-desc">Zero Trust public hostname. No A record or open ports — Cloudflare handles HTTPS and sends visitors through the tunnel to nginx here.</span></label>
+        </div>
+        <div class="mt-16" data-cf></div>
+        <div class="mt-20" data-dnsnote></div>`);
+      paintDomains();
+      $("[data-adddom]", body).onclick = addDomain;
+      $("[data-dom]", body).onkeydown = (e) => { if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addDomain(); } };
+      if (W.delivery === "cloudflare") ensureCfOptions();
     }
 
     if (id === "source") {
@@ -206,6 +239,7 @@ export default async function wizard(ctx) {
           <dt>Project</dt><dd><span class="row" style="gap:8px"><span class="dot" style="background:${colorOf(p?.color)}"></span>${p?.name}</span></dd>
           <dt>Type</dt><dd>${TYPE_LABEL[W.type]}</dd>
           <dt>Domains</dt><dd><div class="chips">${W.domains.map((d) => html`<span class="badge mono">${d}</span>`)}</div></dd>
+          <dt>Delivery</dt><dd>${W.delivery === "cloudflare" && tunnelHosts(CF).length ? html`<span class="row" style="gap:8px;flex-wrap:wrap">${icon("cloud", "sm")}Cloudflare Tunnel <span class="muted small">${(CF.opts?.tunnels || []).find((t) => t.id === CF.tunnelId)?.name || ""} · ${tunnelHosts(CF).join(", ")}${tunnelHosts(CF).length < W.domains.length ? html` · others Direct` : ""}</span></span>` : html`Direct <span class="muted small">(DNS A record → ${mainHost() || "main server"})</span>`}</dd>
           <dt>Source</dt><dd>${W.source === "github" ? html`<span class="row" style="gap:8px">${icon("github", "sm")}<span class="mono">${W.repo}@${W.branch}</span></span>` : "Zip upload"}</dd>
           <dt>Hosting</dt><dd><div class="stack" style="gap:8px">${lbBadge(fake, sById)}
             ${W.loadBalanced ? html`<span class="muted small">${fake.serverIds.map((i) => sById[i]?.name).join(", ")} · ${METHOD_LABEL[W.lbMethod]}</span>` : html`<span class="muted small">${serverKind(sById[W.single])} · ${sById[W.single]?.host || ""}</span>`}</div></dd>
@@ -217,6 +251,15 @@ export default async function wizard(ctx) {
       $("[data-pull]", body)?.addEventListener("change", (e) => (W.pullNow = e.target.checked));
     }
   }
+
+  // Domains step (bound once; the step re-renders inside `body`)
+  on(body, "click", "[data-rmdom]", (e, b) => { const d = W.domains[+b.dataset.rmdom]; W.domains.splice(+b.dataset.rmdom, 1); CF.hosts.delete(d); paintDomains(); });
+  on(body, "change", "input[name=delivery]", (e) => {
+    W.delivery = e.target.value;
+    if (W.delivery === "cloudflare" && !CF.hosts.size) W.domains.forEach((d) => CF.hosts.add(d));
+    render();
+  });
+  bindDelivery(body, CF, { repaint: paintDomains });
 
   // two-way bind simple fields
   on(body, "input", "[data-k]", (e, el) => { W[el.dataset.k] = el.value.trim(); if (el.dataset.k === "name") { const v = slug(el.value); if (v !== el.value && el.value.endsWith(" ")) el.value = v; } });
@@ -248,6 +291,7 @@ export default async function wizard(ctx) {
       const site = await post(`/api/projects/${W.projectId}/sites`, {
         name: W.name, type: W.type, domains: W.domains, loadBalanced: W.loadBalanced, serverIds: W.loadBalanced ? W.multi : [W.single], lbMethod: W.lbMethod, healthPath: W.healthPath,
         github: W.source === "github" ? { repo: W.repo, branch: W.branch } : null, settings, env: W.env, linkedDatabaseIds: W.linked,
+        cloudflare: W.delivery === "cloudflare" ? deliveryPayload(CF) : null,
       });
       toast(`${site.name} created`, "ok", { msg: W.loadBalanced ? `Load balanced across ${W.multi.length} servers.` : "Single server." });
       if (W.source === "github" && W.pullNow) {
