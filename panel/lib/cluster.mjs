@@ -37,7 +37,9 @@ const ONLINE_MS = 45_000;
 const POLL_WAIT_MS = 25_000;
 const METRICS_INTERVAL_MS = 15_000;
 const LOST_CONTACT_MS = 90_000;
-const PICKUP_TIMEOUT_MS = 90_000;
+// Long enough to cover an agent that is restarting to pick up the panel's newer
+// files before it takes the task (an older agent waits 60s before reconnecting).
+const PICKUP_TIMEOUT_MS = 180_000;
 const CANCEL_GRACE_MS = 30_000;
 const MINUTE = 60_000;
 const KEEP_MS = 24 * 60 * MINUTE;
@@ -720,6 +722,30 @@ function createCluster(ctx) {
 
   // --------------------------------------------------------- agent files
 
+  /** One hash over every file the agents run, so "is this agent current?" is a compare. */
+  function filesDigest() {
+    const h = crypto.createHash("sha256");
+    for (const [rel, sum] of [...agentFiles()].sort(([a], [b]) => a.localeCompare(b))) h.update(`${rel}:${sum}\n`);
+    return h.digest("hex");
+  }
+  // serverId -> the files digest that agent was confirmed to be running at its
+  // last hello. Agents long-poll and only say hello when they start, so after
+  // the panel's files change (a panel update) an agent would otherwise keep
+  // deploying with the old engine until someone restarted it.
+  const currentAt = new Map();
+  // serverId -> { digest, at } of the last time we asked it to reconnect, so an
+  // agent that cannot update (FCC_NODE_NO_UPDATE, a failing download) is asked
+  // at most once per digest per 10 minutes and still gets its work.
+  const nudged = new Map();
+  function agentIsStale(serverId) {
+    const digest = filesDigest();
+    if (currentAt.get(serverId) === digest) return false;
+    const last = nudged.get(serverId);
+    if (last && last.digest === digest && Date.now() - last.at < 10 * MINUTE) return false;
+    nudged.set(serverId, { digest, at: Date.now() });
+    return true;
+  }
+
   let filesCache = null;
   function agentFiles() {
     if (filesCache && Date.now() - filesCache.at < 10_000) return filesCache.files;
@@ -975,6 +1001,8 @@ function createCluster(ctx) {
       const have = body.files && typeof body.files === "object" ? body.files : {};
       const update = [];
       for (const [rel, h] of agentFiles()) if (have[rel] !== h) update.push(rel);
+      if (body.files && !update.length) currentAt.set(s.id, filesDigest());
+      else currentAt.delete(s.id);
       console.log(`[cluster] agent hello from ${s.name} (${s.id}) v${patch.agentVersion || "?"}${update.length ? ` — ${update.length} file(s) to update` : ""}`);
       serversChanged("hello", s.id);
       checkOnline();
@@ -992,6 +1020,14 @@ function createCluster(ctx) {
       const s = node(req);
       const running = new Set(String(query.running || "").split(",").filter(Boolean));
       reconcile(s.id, running);
+      // Out of date and idle: have it reconnect (which updates it) before it
+      // takes any work. Newer agents understand `rehello`; older ones only
+      // reconnect after a 401, which they wait 60s on — once.
+      if (!running.size && agentIsStale(s.id)) {
+        console.log(`[cluster] ${s.name} (${s.id}) is running older agent files — asking it to reconnect and update`);
+        if (query.v) return { tasks: [], cancel: [], rehello: true };
+        throw httpError(401, "This agent is out of date — reconnect to fetch the panel's newer files.");
+      }
       const first = takeWork(s.id);
       if (first.tasks.length || first.cancel.length) return first;
       const wait = Math.max(0, Math.min(POLL_WAIT_MS, Number(query.wait) * 1000 || POLL_WAIT_MS));

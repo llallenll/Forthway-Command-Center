@@ -319,9 +319,15 @@ async function pollLoop() {
   let backoff = 1000;
   while (!stopping) {
     try {
-      const qs = new URLSearchParams({ wait: String(Math.round(pollWaitMs / 1000)), running: [...running.keys()].join(",") });
+      // v=2: this agent understands `rehello` (reconnect to pick up newer files).
+      const qs = new URLSearchParams({ v: "2", wait: String(Math.round(pollWaitMs / 1000)), running: [...running.keys()].join(",") });
       const r = await api("GET", `/agent/poll?${qs}`, undefined, { timeoutMs: pollWaitMs + 15_000 });
       backoff = 1000;
+      if (r?.rehello && !running.size) {
+        log("the panel has newer agent files — reconnecting to update.");
+        await hello(); // exits (and systemd restarts us) when it applied an update
+        continue;
+      }
       for (const id of r?.cancel || []) running.get(id)?.ctrl.abort();
       for (const t of r?.tasks || []) runTask(t).catch((err) => log(`task ${t.id} crashed: ${err.message}`));
     } catch (err) {

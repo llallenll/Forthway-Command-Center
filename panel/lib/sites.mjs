@@ -656,8 +656,25 @@ export function register(router, ctx) {
     return out;
   }
 
+  /**
+   * npm skips devDependencies (tailwindcss, typescript, prisma…) whenever
+   * NODE_ENV=production is in its environment — and it usually is: the
+   * systemd units set it, and so do many sites' own variables. A build needs
+   * them, so an npm install/ci without an explicit choice gets --include=dev.
+   * This is done here, on the command itself, so it holds on every server
+   * whatever version of the deploy engine that server is running.
+   */
+  function withDevDeps(cmd) {
+    const c = String(cmd || "");
+    if (!/^\s*npm\s+(ci|install|i)(\s|$)/.test(c)) return c;
+    if (/--include[= ]dev|--production|--omit[= ]|--only[= ]prod/.test(c)) return c;
+    return c.replace(/^(\s*npm\s+(?:ci|install|i))(?=\s|$)/, "$1 --include=dev");
+  }
+
   function buildSpec(site, serverId, linkedVars) {
     const env = { ...(site.env || {}), ...linkedVars };
+    const settings = deployerSettings(site, env);
+    if (settings?.build?.install) settings.build = { ...settings.build, install: withDevDeps(settings.build.install) };
     return {
       siteId: site.id,
       projectId: site.projectId,
@@ -671,7 +688,7 @@ export function register(router, ctx) {
       healthPath: site.healthPath ?? "",
       phpVersion: site.type === "php" ? site.settings?.phpVersion || "" : undefined,
       serverId,
-      settings: deployerSettings(site, env),
+      settings,
       env,
     };
   }
