@@ -54,6 +54,32 @@ export function clientIp(req) {
   return (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "?").trim();
 }
 
+/** Read and discard what is left of a request body (capped), so an error answer reaches the client. */
+export function drainBody(req, { max = 128 * 1024 * 1024, timeoutMs = 120_000 } = {}) {
+  if (req.readableEnded || req.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    let n = 0;
+    const done = () => {
+      clearTimeout(timer);
+      req.off("data", onData);
+      req.off("end", done);
+      req.off("error", done);
+      req.off("close", done);
+      resolve();
+    };
+    const onData = (chunk) => {
+      n += chunk.length;
+      if (n > max) done();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    req.on("data", onData);
+    req.on("end", done);
+    req.on("error", done);
+    req.on("close", done);
+    req.resume();
+  });
+}
+
 export async function readBody(req, limitBytes = 5 * 1024 * 1024) {
   const chunks = [];
   let total = 0;
@@ -165,6 +191,10 @@ export class Router {
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 500;
       if (status === 500) console.error(`[fcc] ${req.method} ${url.pathname}`, err);
+      // An upload refused before its body was read: read the rest first. Answering
+      // mid-upload makes browsers (through Cloudflare especially) report a dropped
+      // connection instead of this error.
+      if (route.opts.raw && !res.headersSent) await drainBody(req);
       if (!res.headersSent) sendJson(res, status, { error: err.message, ...(err.extra || {}) });
       else res.end();
     }

@@ -441,9 +441,14 @@ function serveFile(req, res, file) {
     return sendJson(res, 404, { error: "Not found" });
   }
   const etag = `W/"${stat.size.toString(36)}-${Math.floor(stat.mtimeMs).toString(36)}"`;
+  const ext = path.extname(file).toLowerCase();
+  // Through Cloudflare (tunnel or proxy) "no-cache" gets rewritten to the zone's Browser
+  // Cache TTL (4 h by default), so browsers kept running old code after a panel update.
+  // Cloudflare leaves "no-store" alone; the panel's code is small, so skip caching there.
+  const viaCloudflare = !!req.headers["cf-ray"];
   const headers = {
-    "Content-Type": MIME[path.extname(file).toLowerCase()] || "application/octet-stream",
-    "Cache-Control": "no-cache",
+    "Content-Type": MIME[ext] || "application/octet-stream",
+    "Cache-Control": viaCloudflare && (ext === ".js" || ext === ".css") ? "no-store" : "no-cache",
     ETag: etag,
     "X-Content-Type-Options": "nosniff",
   };
