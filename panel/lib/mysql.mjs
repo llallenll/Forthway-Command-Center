@@ -42,6 +42,11 @@ const DB_NAME_MAX = 64;
 const USER_MAX = 32;
 const PREFIX_MAX = 16;
 const IMPORT_LIMIT = 4 * 1024 * 1024 * 1024; // 4 GB per upload
+// Chunked imports: Cloudflare (a tunnel or the orange cloud in front of the panel) refuses
+// request bodies over 100 MB on Free/Pro, so the browser sends big dumps in pieces.
+const IMPORT_CHUNK_MAX = 95 * 1024 * 1024;
+const UPLOAD_ID_RE = /^[a-f0-9]{16,64}$/;
+const UPLOAD_STALE_MS = 24 * 3600_000;
 
 /** charset → allowed collations (first is the default). */
 export const CHARSETS = {
@@ -330,6 +335,47 @@ export async function receiveToFile(req, dest, limit) {
     throw e;
   }
   return { size, sha256: hash.digest("hex") };
+}
+
+/**
+ * Append one piece of a chunked upload to `dest`. The file must already be exactly
+ * `offset` bytes (409 with { size } otherwise, so the browser can resume); a failed
+ * piece is cut off again. Resolves { size } — the file's new length.
+ */
+export async function appendToFile(req, dest, { offset, total, chunkMax }) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  let have = 0;
+  try {
+    have = fs.statSync(dest).size;
+  } catch {}
+  if (have !== offset) throw httpError(409, "The upload is out of step — resuming.", { size: have });
+  const declared = Number(req.headers["content-length"] || 0);
+  if (declared > chunkMax) throw httpError(413, "Upload piece is too large.");
+  if (offset + declared > total) throw httpError(400, "Upload is longer than announced.");
+  let n = 0;
+  const meter = new Transform({
+    transform(chunk, _e, cb) {
+      n += chunk.length;
+      if (n > chunkMax) return cb(httpError(413, "Upload piece is too large."));
+      if (offset + n > total) return cb(httpError(400, "Upload is longer than announced."));
+      cb(null, chunk);
+    },
+  });
+  try {
+    await pipeline(req, meter, fs.createWriteStream(dest, { flags: "a", mode: 0o600 }));
+  } catch (e) {
+    try {
+      fs.truncateSync(dest, offset);
+    } catch {}
+    throw e;
+  }
+  return { size: offset + n };
+}
+
+async function sha256File(file) {
+  const hash = crypto.createHash("sha256");
+  await pipeline(fs.createReadStream(file), hash);
+  return hash.digest("hex");
 }
 
 // ------------------------------------------------------------- the module
@@ -1408,20 +1454,9 @@ export function register(router, ctx) {
     return rotatePassword(getRec(params.id), body?.password, admin);
   });
 
-  router.post("/api/databases/:id/import", { raw: true }, async (req, res, { params, query, admin }) => {
-    const rec = getRec(params.id);
-    const filename = String(query.filename || "import.sql").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
-    if (!/\.(sql|sql\.gz|gz)$/i.test(filename)) throw httpError(400, "Upload a .sql or .sql.gz file.");
-    const st = await status({ fresh: true });
-    if (!st.rootOk) throw httpError(503, st.error || "MySQL is not available.");
-    const tmp = path.join(ctx.dataDir, "tmp", "imports", `${rec.id}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
-    const { size, sha256 } = await receiveToFile(req, tmp, IMPORT_LIMIT);
-    if (!size) {
-      fs.rmSync(tmp, { force: true });
-      throw httpError(400, "The upload was empty.");
-    }
+  function startImport(rec, tmp, { filename, size, sha256, admin }) {
     audit(admin, "database.import", { type: "database", id: rec.id, name: rec.name }, { filename, size, sha256 });
-    const job = ctx.jobs.start(
+    return ctx.jobs.start(
       { type: "database.import", title: `Import ${filename} into ${rec.name}`, projectId: rec.projectId, databaseId: rec.id, adminId: admin?.id },
       async ({ log, signal }) => {
         try {
@@ -1434,7 +1469,59 @@ export function register(router, ctx) {
         }
       },
     );
-    return job;
+  }
+
+  const importsDir = () => path.join(ctx.dataDir, "tmp", "imports");
+  function pruneStaleUploads() {
+    try {
+      for (const f of fs.readdirSync(importsDir())) {
+        if (!f.includes("-up-")) continue;
+        const file = path.join(importsDir(), f);
+        if (Date.now() - fs.statSync(file).mtimeMs > UPLOAD_STALE_MS) fs.rmSync(file, { force: true });
+      }
+    } catch {}
+  }
+
+  /**
+   * One upload: the whole dump as the body. Chunked (?upload=<id>&offset=&total=):
+   * pieces appended to one temp file; the last one starts the import job, the others
+   * answer { ok, size }.
+   */
+  router.post("/api/databases/:id/import", { raw: true }, async (req, res, { params, query, admin }) => {
+    const rec = getRec(params.id);
+    const filename = String(query.filename || "import.sql").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+    if (!/\.(sql|sql\.gz|gz)$/i.test(filename)) throw httpError(400, "Upload a .sql or .sql.gz file.");
+
+    if (query.upload !== undefined) {
+      const id = String(query.upload);
+      const offset = Number(query.offset);
+      const total = Number(query.total);
+      if (!UPLOAD_ID_RE.test(id)) throw httpError(400, "Bad upload id.");
+      if (!Number.isSafeInteger(total) || total <= 0) throw httpError(400, "The upload was empty.");
+      if (total > IMPORT_LIMIT) throw httpError(413, "Upload is too large.");
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset >= total) throw httpError(400, "Bad upload offset.");
+      const tmp = path.join(importsDir(), `${rec.id}-up-${id}`);
+      if (offset === 0) {
+        const st = await status({ fresh: true });
+        if (!st.rootOk) throw httpError(503, st.error || "MySQL is not available.");
+        fs.rmSync(tmp, { force: true });
+        pruneStaleUploads();
+      }
+      const { size } = await appendToFile(req, tmp, { offset, total, chunkMax: IMPORT_CHUNK_MAX });
+      if (size < total) return { ok: true, size };
+      const sha256 = await sha256File(tmp);
+      return startImport(rec, tmp, { filename, size, sha256, admin });
+    }
+
+    const st = await status({ fresh: true });
+    if (!st.rootOk) throw httpError(503, st.error || "MySQL is not available.");
+    const tmp = path.join(importsDir(), `${rec.id}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
+    const { size, sha256 } = await receiveToFile(req, tmp, IMPORT_LIMIT);
+    if (!size) {
+      fs.rmSync(tmp, { force: true });
+      throw httpError(400, "The upload was empty.");
+    }
+    return startImport(rec, tmp, { filename, size, sha256, admin });
   });
 }
 

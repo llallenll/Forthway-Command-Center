@@ -2,7 +2,7 @@
 import { html, raw, $, $$, on, frag, mount, ago, fmtDate, fmtBytes, fmtUsage, fmtDuration, pct, toneFor, initials, plural,
   toast, toastError, openModal, confirmDialog, openMenu, secretBox, emptyState, colorOf } from "./util.js";
 import { icon } from "./icons.js";
-import { api, get, post, patch, del, upload, getText, download } from "./api.js";
+import { api, get, post, patch, del, upload, uploadChunked, getText, download } from "./api.js";
 import { onEvent } from "./events.js";
 
 /* ───────── badges & small markup ───────── */
@@ -438,7 +438,7 @@ export async function importSql(d) {
         if (!/\.(sql|sql\.gz|gz)$/i.test(file.name)) { toast("That doesn't look like a SQL dump", "warn", { msg: "Use a .sql or .sql.gz file." }); return; }
         $("[data-prog]", el).hidden = false; $("[data-fname]", el).textContent = file.name; $("[data-dz]", el).hidden = true;
         try {
-          const job = await upload(`/api/databases/${d.id}/import?filename=${encodeURIComponent(file.name)}`, file, (p) => {
+          const job = await uploadChunked(`/api/databases/${d.id}/import?filename=${encodeURIComponent(file.name)}`, file, (p) => {
             $(".progress > div", el).style.width = (p * 100).toFixed(0) + "%"; $("[data-pct]", el).textContent = (p * 100).toFixed(0) + "%";
           });
           close(true);

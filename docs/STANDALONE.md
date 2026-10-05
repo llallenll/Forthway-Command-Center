@@ -544,6 +544,10 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   - `POST /api/databases/:id/password { password? }` → `{ password, job, jobs: [{ id, siteId }], sites }` — one
     `ctx.sites.pushEnv()` job per linked site.
   - `POST /api/databases/:id/import?filename=` (`.sql`/`.sql.gz`/`.gz`, gzip detected by magic, ≤ 4 GB) → job record.
+    Chunked: `&upload=<16–64 hex>&offset=&total=` appends one piece (≤ 95 MB — Cloudflare refuses bodies over 100 MB) to
+    `tmp/imports/<db>-up-<id>`; the file must be exactly `offset` bytes long (else 409 `{ size }` to resume), offset 0 restarts
+    it, a failed piece is truncated off. Pieces before the last answer `{ ok, size }`; the last starts the job. The UI's
+    `uploadChunked()` sends 32 MB pieces, retrying network/5xx failures. Unfinished uploads are pruned after 24 h.
     Imports run as the **database's own user** over 127.0.0.1 (a dump can't touch other schemas); backup restores run as root.
   - `POST /api/databases/:id/credentials` also returns `remoteHost` (address agent servers use) when remoteAccess.
   - `ctx.mysql` extras: `dumpAll({ file, log, signal })`, `restore(dbId, { file, log, signal, as: "root"|"user" })`,
