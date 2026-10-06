@@ -388,6 +388,34 @@ R("POST", "/api/projects/:projectId/sites", (p, b) => {
   emit("site", siteView(s));
   return siteView(s);
 });
+R("GET", "/api/sites/:id/usage", (p, b, q) => { // USAGE (panel/lib/usage.mjs)
+  const s = find("sites", p.id);
+  const range = ["1h", "24h", "7d", "30d"].includes(q.range) ? q.range : "24h";
+  const [n, step] = { "1h": [60, MIN], "24h": [288, 5 * MIN], "7d": [168, HOUR], "30d": [120, 6 * HOUR] }[range];
+  const node = (s.type || "node") === "node";
+  const ids = s.loadBalanced ? s.serverIds : [s.serverIds?.[0] || "main"];
+  const to = Math.floor(Date.now() / step) * step;
+  const wave = (t, k) => Math.sin(t / step / 9 + k) * 0.5 + 0.5;
+  const per = Object.fromEntries(ids.map((sid, k) => [sid, Array.from({ length: n }, (_, i) => {
+    const t = to - (n - 1 - i) * step;
+    return { t, cpu: node ? Math.round((4 + wave(t, k) * 22 + Math.random() * 4) * 10) / 10 : null, mem: node ? Math.round((110 + wave(t, k) * 50) * MB) : null };
+  })]));
+  const series = per[ids[0]].map((pt, i) => ({ t: pt.t, cpu: node ? Math.round(ids.reduce((a, sid) => a + per[sid][i].cpu, 0) * 10) / 10 : null, mem: node ? ids.reduce((a, sid) => a + per[sid][i].mem, 0) : null }));
+  const servers = ids.map((sid) => {
+    const last = per[sid][n - 1], srv = db.servers.find((x) => x.id === sid);
+    return { id: sid, name: srv?.name || sid, online: true, cores: srv?.info?.cpus || 4, memTotal: srv?.info?.memTotal || 8 * GB, cpu: last.cpu, mem: last.mem, procs: node ? 2 : 0, source: node ? "pm2" : "nginx", disk: 240 * MB, diskAt: ago(4 * MIN), at: ago(20e3), error: null, stale: false };
+  });
+  const vals = (k) => series.map((x) => x[k]).filter((v) => v != null);
+  const avg = (k) => (vals(k).length ? vals(k).reduce((a, v) => a + v, 0) / vals(k).length : null);
+  const max = (k) => (vals(k).length ? Math.max(...vals(k)) : null);
+  return {
+    range, step, from: to - (n - 1) * step, to, type: s.type || "node", simulated: false, cores: servers.reduce((a, x) => a + x.cores, 0), memTotal: servers.reduce((a, x) => a + x.memTotal, 0),
+    series, perServer: ids.length > 1 ? per : undefined, servers,
+    current: { cpu: series[n - 1].cpu, mem: series[n - 1].mem, disk: 240 * MB, procs: node ? 2 * ids.length : 0, at: ago(20e3) },
+    avg: { cpu: avg("cpu") == null ? null : Math.round(avg("cpu") * 10) / 10, mem: avg("mem") == null ? null : Math.round(avg("mem")) },
+    peak: { cpu: max("cpu"), mem: max("mem") },
+  };
+});
 R("GET", "/api/sites/:id", (p) => {
   const s = find("sites", p.id);
   return { ...siteView(s), upstreams: upstreams(s), releases: clone(db.releases.filter((r) => r.siteId === s.id).slice(0, 20)) };

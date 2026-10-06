@@ -38,10 +38,10 @@ import { createActivity } from "./lib/core-routes.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 const PUBLIC_DIR = path.join(HERE, "public");
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
-const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "analytics"];
+const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "analytics", "usage"];
 const START_TIMEOUT_MS = 15_000;
 const SSE_PING_MS = 15_000;
 const SSE_PAD = `:${" ".repeat(2048)}\n\n`; // pushes the first bytes past proxy buffer thresholds

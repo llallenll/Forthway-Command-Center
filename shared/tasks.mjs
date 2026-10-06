@@ -46,6 +46,7 @@ export const TASK_TYPES = [
   "site.script",
   "server.metrics",
   "server.backup",
+  "sites.usage",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -66,6 +67,7 @@ export const TASK_TIMEOUTS_MS = {
   "site.script": SCRIPT_TIMEOUT_MS + 2 * 60_000, // the task kills the script itself at SCRIPT_TIMEOUT_MS
   "server.metrics": 30_000,
   "server.backup": 6 * 60 * 60_000,
+  "sites.usage": 60_000,
 };
 
 const NOOP = () => {};
@@ -89,6 +91,8 @@ export async function executeTask(type, payload = {}, opts = {}) {
       return collectMetrics();
     case "server.backup":
       return serverBackup(payload, o);
+    case "sites.usage":
+      return sitesUsage(payload);
     case "site.status":
       return siteStatus(payload, o);
     case "site.logs":
@@ -1010,6 +1014,293 @@ async function dryRunSite(type, spec, payload, o) {
       return { removed: true, deletedFiles: false, dryRun: true };
   }
   throw new Error(`Unknown task type "${type}"`);
+}
+
+// -------------------------------------------------------------- site usage
+
+/*
+ * sites.usage { specs: [{ siteId, type, appDir, port, pm2Name, restart: { mode, service } }] }
+ *   → { at, cores, memTotal, simulated?, sites: { [siteId]: { cpu, mem, procs, source, disk, diskAt } } }
+ *
+ * cpu    % of one core (top/pm2 style), averaged since the previous call for the same
+ *        processes — null the first time a process is seen.
+ * mem    resident memory (RSS, bytes) of the app's processes and their children.
+ * source how the processes were found: "pm2" (by process name), "systemd" (the unit's
+ *        cgroup), "port" (whoever listens on the site's port), "nginx" (static/php:
+ *        nginx and php-fpm are shared, so there is nothing of its own to measure),
+ *        or null (not running). procs = 0 then.
+ * disk   bytes on disk under appDir, measured in the background at most every 15 min
+ *        (null until the first walk finishes).
+ * Linux only (/proc); elsewhere cpu/mem are null. Specs never carry env values.
+ */
+
+const CLK_TCK = 100; // USER_HZ — 100 on every Linux build that matters
+const DISK_EVERY_MS = 15 * 60_000;
+const DISK_MAX_ENTRIES = 500_000;
+const procTicks = new Map(); // `${pid}:${starttime}` -> { ticks, at }
+const diskCache = new Map(); // appDir -> { bytes, at, running }
+
+function readProcTable() {
+  let names;
+  try {
+    names = fs.readdirSync("/proc");
+  } catch {
+    return null;
+  }
+  const procs = new Map(); // pid -> { ppid, ticks, start }
+  for (const n of names) {
+    if (!/^\d+$/.test(n)) continue;
+    let txt;
+    try {
+      txt = fs.readFileSync(`/proc/${n}/stat`, "utf8");
+    } catch {
+      continue; // exited meanwhile
+    }
+    const f = txt.slice(txt.lastIndexOf(")") + 2).split(" ");
+    // f[0] state, f[1] ppid, f[11] utime, f[12] stime, f[19] starttime
+    procs.set(Number(n), { ppid: Number(f[1]), ticks: Number(f[11]) + Number(f[12]), start: f[19] });
+  }
+  return procs;
+}
+
+function withDescendants(roots, procs) {
+  const kids = new Map();
+  for (const [pid, p] of procs) {
+    if (!kids.has(p.ppid)) kids.set(p.ppid, []);
+    kids.get(p.ppid).push(pid);
+  }
+  const out = new Set();
+  const stack = roots.filter((pid) => procs.has(pid));
+  while (stack.length) {
+    const pid = stack.pop();
+    if (out.has(pid)) continue;
+    out.add(pid);
+    for (const k of kids.get(pid) || []) stack.push(k);
+  }
+  return [...out];
+}
+
+function rssBytes(pid) {
+  try {
+    const m = /VmRSS:\s+(\d+)\s*kB/.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"));
+    return m ? Number(m[1]) * 1024 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Ports in LISTEN state → socket inodes, from /proc/net/tcp{,6}. */
+function listenInodes(ports) {
+  const want = new Set(ports);
+  const out = new Map(); // inode -> port
+  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let txt;
+    try {
+      txt = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of txt.split("\n").slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c.length < 10 || c[3] !== "0A") continue;
+      const port = parseInt(c[1].split(":").pop(), 16);
+      if (want.has(port)) out.set(c[9], port);
+    }
+  }
+  return out;
+}
+
+/** port -> [pid] for the processes holding those listening sockets. */
+function pidsByPort(ports, procs) {
+  const inodes = listenInodes(ports);
+  const out = new Map();
+  if (!inodes.size) return out;
+  for (const pid of procs.keys()) {
+    let fds;
+    try {
+      fds = fs.readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      let link;
+      try {
+        link = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+      } catch {
+        continue;
+      }
+      const m = /^socket:\[(\d+)\]$/.exec(link);
+      const port = m && inodes.get(m[1]);
+      if (!port) continue;
+      if (!out.has(port)) out.set(port, []);
+      if (!out.get(port).includes(pid)) out.get(port).push(pid);
+    }
+  }
+  return out;
+}
+
+async function pm2Pids() {
+  const r = await sys.run("pm2", ["jlist"], { allowFail: true, timeoutMs: 20_000 }).catch(() => null);
+  const out = new Map(); // name -> [pid]
+  if (!r || r.code !== 0 || !r.stdout) return out;
+  try {
+    for (const p of JSON.parse(r.stdout.slice(r.stdout.indexOf("[")))) {
+      if (!(p.pid > 0) || p.pm2_env?.status !== "online") continue;
+      if (!out.has(p.name)) out.set(p.name, []);
+      out.get(p.name).push(p.pid);
+    }
+  } catch {
+    /* unreadable */
+  }
+  return out;
+}
+
+/** Every pid in a systemd unit's cgroup (v2), else its MainPID. */
+async function systemdPids(unit) {
+  const r = await sys.run("systemctl", ["show", "-p", "MainPID", "-p", "ControlGroup", unit], { allowFail: true, timeoutMs: 10_000 }).catch(() => null);
+  if (!r || r.code !== 0) return [];
+  const main = Number(/^MainPID=(\d+)/m.exec(r.stdout)?.[1] || 0);
+  const cg = /^ControlGroup=(\/\S*)/m.exec(r.stdout)?.[1];
+  if (cg) {
+    try {
+      const pids = fs.readFileSync(path.join("/sys/fs/cgroup", cg, "cgroup.procs"), "utf8").split("\n").map(Number).filter((n) => n > 0);
+      if (pids.length) return pids;
+    } catch {
+      /* cgroup v1 or no access */
+    }
+  }
+  return main > 0 ? [main] : [];
+}
+
+/** Disk usage of a directory, walked in the background; returns the cached value. */
+function dirBytes(dir) {
+  const c = diskCache.get(dir);
+  if (!c?.running && (!c || Date.now() - c.at > DISK_EVERY_MS)) {
+    const entry = { bytes: c?.bytes ?? null, at: c?.at ?? 0, running: true };
+    diskCache.set(dir, entry);
+    walkBytes(dir)
+      .then((bytes) => Object.assign(entry, { bytes, at: Date.now(), running: false }))
+      .catch(() => Object.assign(entry, { at: Date.now(), running: false }));
+  }
+  const e = diskCache.get(dir);
+  return { bytes: e.bytes, at: e.at ? new Date(e.at).toISOString() : null };
+}
+
+async function walkBytes(root) {
+  if (!(await fs.promises.stat(root)).isDirectory()) throw new Error(`${root} is not a directory`);
+  let total = 0;
+  let seen = 0;
+  const inodes = new Set();
+  const stack = [root];
+  while (stack.length && seen < DISK_MAX_ENTRIES) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      seen++;
+      const p = path.join(dir, e.name);
+      let st;
+      try {
+        st = await fs.promises.lstat(p);
+      } catch {
+        continue;
+      }
+      if (st.nlink > 1 && !st.isDirectory()) {
+        const k = `${st.dev}:${st.ino}`;
+        if (inodes.has(k)) continue;
+        inodes.add(k);
+      }
+      total += st.blocks != null ? st.blocks * 512 : st.size;
+      if (st.isDirectory()) stack.push(p);
+    }
+  }
+  return total;
+}
+
+function simulatedUsage(spec) {
+  let h = 0;
+  for (const ch of String(spec.siteId)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  const disk = (40 + (h % 400)) * 1024 * 1024;
+  if (spec.type !== "node") return { cpu: null, mem: null, procs: 0, source: "nginx", disk, diskAt: new Date().toISOString() };
+  const t = Date.now() / 60_000;
+  const wave = Math.sin(t / 9 + (h % 7)) * 0.5 + 0.5;
+  return {
+    cpu: round1(2 + (h % 12) + wave * 18 + Math.random() * 4),
+    mem: Math.round((90 + (h % 160) + wave * 40 + Math.random() * 6) * 1024 * 1024),
+    procs: 1 + (h % 3),
+    source: "pm2",
+    disk,
+    diskAt: new Date().toISOString(),
+  };
+}
+
+async function sitesUsage(payload) {
+  const specs = (Array.isArray(payload?.specs) ? payload.specs : []).filter((s) => s && /^[A-Za-z0-9_-]+$/.test(String(s.siteId || "")));
+  const base = { at: new Date().toISOString(), cores: os.cpus().length, memTotal: os.totalmem(), sites: {} };
+  if (sys.DRY_RUN) {
+    for (const s of specs) base.sites[s.siteId] = simulatedUsage(s);
+    return { ...base, simulated: true };
+  }
+  const procs = readProcTable();
+  const now = Date.now();
+  const nodeSpecs = specs.filter((s) => (s.type || "node") === "node");
+  const pm2 = procs && nodeSpecs.some((s) => !["systemd", "command"].includes(s.restart?.mode)) ? await pm2Pids() : new Map();
+  const roots = new Map(); // siteId -> { pids, source }
+  for (const s of nodeSpecs) {
+    if (!procs) break;
+    if (s.restart?.mode === "systemd" && s.restart.service) {
+      const pids = await systemdPids(String(s.restart.service));
+      if (pids.length) roots.set(s.siteId, { pids, source: "systemd" });
+    } else if (s.restart?.mode !== "command") {
+      const pids = pm2.get(String(s.pm2Name || `fcc-${s.siteId}`));
+      if (pids?.length) roots.set(s.siteId, { pids, source: "pm2" });
+    }
+  }
+  const byPort = procs ? pidsByPort(nodeSpecs.filter((s) => !roots.has(s.siteId) && s.port).map((s) => Number(s.port)), procs) : new Map();
+  const live = new Set();
+  for (const s of specs) {
+    const disk = s.appDir && path.isAbsolute(s.appDir) ? dirBytes(path.resolve(s.appDir)) : { bytes: null, at: null };
+    const out = { cpu: null, mem: null, procs: 0, source: null, disk: disk.bytes, diskAt: disk.at };
+    base.sites[s.siteId] = out;
+    if ((s.type || "node") !== "node") {
+      out.source = "nginx";
+      continue;
+    }
+    if (!procs) continue;
+    let found = roots.get(s.siteId);
+    if (!found && byPort.get(Number(s.port))?.length) found = { pids: byPort.get(Number(s.port)), source: "port" };
+    if (!found) continue;
+    const pids = withDescendants(found.pids, procs);
+    let ticks = 0;
+    let elapsed = 0;
+    let measured = false;
+    let mem = 0;
+    for (const pid of pids) {
+      const p = procs.get(pid);
+      const key = `${pid}:${p.start}`;
+      live.add(key);
+      const prev = procTicks.get(key);
+      if (prev && now > prev.at) {
+        ticks += p.ticks - prev.ticks;
+        elapsed = Math.max(elapsed, now - prev.at);
+        measured = true;
+      }
+      procTicks.set(key, { ticks: p.ticks, at: now });
+      mem += rssBytes(pid);
+    }
+    Object.assign(out, {
+      cpu: measured && elapsed > 0 ? round1(Math.max(0, (ticks / CLK_TCK / (elapsed / 1000)) * 100)) : null,
+      mem,
+      procs: pids.length,
+      source: found.source,
+    });
+  }
+  for (const k of procTicks.keys()) if (!live.has(k)) procTicks.delete(k);
+  return base;
 }
 
 // ------------------------------------------------------------------ metrics

@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.3.0",
+  version: "3.4.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -176,6 +176,7 @@ Task types handled by `shared/tasks.mjs` (payload → result):
 | `site.script` | `{ spec, script }` | `{ script, code: 0, durationMs }`; `npm run <script>` in appDir, only if the deployed package.json defines it; non-zero exit = failure with the output tail |
 | `server.metrics` | `{}` | `{ cpu, mem, memTotal, disk, diskTotal, load, uptime, hostname, os }` |
 | `server.backup` | `{ include, upload: { url, token } }` | `{ file, size, sha256 }` (worker uploads archive to panel) |
+| `sites.usage` | `{ specs: [{ siteId, type, appDir, port, pm2Name, restart: { mode, service } }] }` | `{ at, cores, memTotal, simulated?, sites: { [siteId]: { cpu, mem, procs, source, disk, diskAt } } }` |
 
 `spec` is produced by `ctx.sites.specFor(site)` — everything the node needs:
 `{ siteId, name, type: "node"|"static"|"php", appDir, port, settings (deployer settings), env, pm2Name }`.
@@ -985,6 +986,31 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     Requests with % vs the previous period, Compare overlays the previous period, "Collecting since …" note; website **Traffic**
     tab (`views/site-traffic.js`; hooks in site.js) with the same card + Top pages + Top referrers. Styles `.tr-*` in app.css;
     `charts.js` shows date-only tooltips for 30d; mock route in mock.js. `/api/dashboard` is unchanged (CPU is still kept 24 h).
+- **USAGE — CPU, memory and disk per website (new module `panel/lib/usage.mjs`, in MODULES after `analytics`; task `sites.usage`).**
+  - **Measuring (TASKS, `shared/tasks.mjs`)**: new task `sites.usage` (timeout 60 s), run in-process on main and through the
+    agent elsewhere (agents pick it up through the usual stale-files self-update; until then the panel shows "agent is out of
+    date" for that server). Specs are minimal — never env values. Node sites: processes found by pm2 name (`pm2 jlist`, every
+    online instance), systemd unit (cgroup v2 `cgroup.procs`, else MainPID) or, failing that, whoever holds the LISTEN socket on
+    the site's port (`/proc/net/tcp{,6}` inode → `/proc/*/fd`); then all their descendants. `cpu` = % of one core from
+    `/proc/<pid>/stat` utime+stime deltas since the previous call (keyed by pid + starttime; null the first time), `mem` = sum of
+    VmRSS. Static / PHP sites (`source: "nginx"`) have no process of their own — nginx and php-fpm are shared — so only disk is
+    measured. `disk` = bytes on disk under appDir (blocks, hard links counted once, ≤ 500k entries), walked in the background
+    at most every 15 min; null until the first walk. Linux only; elsewhere cpu/mem are null. **DRY_RUN** returns simulated
+    values (`simulated: true`).
+  - **Sampling (USAGE)**: every 60 s (first run 20 s after start), one `sites.usage` per online server with the websites it
+    runs (`ctx.sites.targets`). Load-balanced websites are measured on every server and summed.
+  - **Storage**: `dataDir/usage.json` (atomic, every 5 min + on stop): per `<siteId>|<serverId>` minute points `[t, cpu, mem]`
+    (24 h), hourly `[t, cpuAvg, cpuMax, memAvg, memMax, n]` (31 d), latest sample and per-server `{ cores, memTotal }`. Deleted
+    websites are dropped (SSE `site` with `deleted`, and on save).
+  - **Route** (admin): `GET /api/sites/:id/usage?range=1h|24h|7d|30d` → `{ range, step, from, to, type, simulated, cores,
+    memTotal, series: [{ t, cpu, mem }] (summed over servers, null = no sample), perServer (2+ servers), servers: [{ id, name,
+    online, cores, memTotal, cpu, mem, procs, source, disk, diskAt, at, error, stale }], current: { cpu, mem, disk, procs, at },
+    avg, peak }`. Steps: 1h = minute, 24h = 5 min, 7d = hour, 30d = 6 h. `current` only counts samples < 3 min old; `peak`
+    for load-balanced sites is the sum of each server's peak (an upper bound).
+  - **UI**: website **Traffic** tab gains a "Resource usage" card under the traffic chart (`views/site-usage.js`, `usageCard`):
+    CPU / Memory / Disk tiles (now, avg, peak; CPU and Memory switch the chart), line chart, a per-server table for
+    load-balanced websites or when a server has an error / no recent sample; it follows the traffic card's range buttons.
+    Static / PHP websites show disk only with an explanation. Mock route in mock.js.
 - **SITES / TASKS / CLUSTER — build once, ship everywhere (load-balanced sites).** Building a
   release separately on every server gave each server its own Next.js chunk hashes, build ID and
   Server Action IDs, so HTML from one server asked for chunks only it had (`ChunkLoadError`, 404 on
