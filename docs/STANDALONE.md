@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.2.0",
+  version: "3.2.1",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -728,7 +728,9 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   Ported from v2 (`hub/lib/cloudflare.mjs`, `hub/lib/tunnel.mjs`, the cfLogin flow in `hub/server.mjs`).
   - **Delivery per domain.** A website's domain is either *Direct* (DNS A record → main server, nginx :80/:443, certbot) or
     *Cloudflare Tunnel* (Zero Trust public hostname). New site field, owned/shape-checked by SITES (`sanitizeCloudflare` in
-    sites.mjs): `site.cloudflare = { enabled, tunnelId (Cloudflare tunnel UUID), hostnames: [] }`; `hostnames ⊆ domains` are
+    sites.mjs): `site.cloudflare = { enabled, tunnelId (Cloudflare tunnel UUID), hostnames: [], tunnels?: { hostname: tunnelId } }`
+    (`tunnels` = hostnames on another tunnel than `tunnelId`, e.g. a domain in another Cloudflare account; entries for
+    hostnames no longer tunnelled are dropped); `hostnames ⊆ domains` are
     delivered through the tunnel, every other domain stays Direct. Accepted on `POST /api/projects/:id/sites` and
     `PATCH /api/sites/:id` (`cloudflare` key); changing `domains` re-intersects `hostnames` (empty → `enabled: false`). Public site
     view has `cloudflare` (always an object) and `url` is `https://` for tunnel domains. When `enabled`, SITES awaits
@@ -786,7 +788,8 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     account's credentials (`credsForAccount`). Reconcile, `validateSite` and the panel / phpMyAdmin publish only match a hostname
     against zones of the tunnel's account (mismatch → `cloudflare_zone_account`). `options()` adds `accounts`, per-tunnel
     `accountId`/`accountName` and `zoneAccounts: { zoneName: accountId }`; the delivery picker prefers a tunnel in the domains'
-    account and refuses a mismatch. `POST /api/cloudflare/tunnels` takes `accountId`. `GET /api/cloudflare/domains` →
+    account and refuses a mismatch; with more than one tunnel and more than one tunnelled domain, each domain row
+    gets its own tunnel picker (the first domain's tunnel is saved as `tunnelId`, the others' differences as `tunnels`). `POST /api/cloudflare/tunnels` takes `accountId`. `GET /api/cloudflare/domains` →
     `{ items: [{ id, name, status, accountId, accountName, source, sourceLabel, removable, error, routes }], sources, accounts, addSiteUrl }` ·
     `POST /api/cloudflare/domains/login` (a `cloudflared tunnel login` whose cert is stored as a domain credential, in whichever
     account the domain picked in Cloudflare is in; poll with `GET /api/cloudflare/login` → `{ done, purpose: "domain", added, accounts }`) ·

@@ -7,7 +7,7 @@ import { siteUrl } from "./sites.js";
 import { scriptsTab } from "./site-scripts.js";
 import { uptimeTab } from "./monitor.js"; // Uptime tab (monitoring + SMS alerts)
 import { trafficTab } from "./site-traffic.js"; // Traffic tab (visitors, page views — panel/lib/analytics.mjs)
-import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts } from "./cloudflare.js";
+import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts, savedDelivery } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
 const TABS = [
@@ -337,7 +337,7 @@ export default async function site(ctx) {
     const mainHost = servers.find((s) => s.role === "main")?.host || "";
     // Per-domain delivery: Direct (A record → main) or Cloudflare Tunnel (views/cloudflare.js).
     const savedCf = () => (S.cloudflare?.enabled ? S.cloudflare : { enabled: false, tunnelId: "", hostnames: [] });
-    const CF = { domains, hosts: new Set(savedCf().hostnames), tunnelId: savedCf().tunnelId || "", opts: null };
+    const CF = savedDelivery(domains, savedCf());
     let cfRoutes = null;
     const tunnelOnly = () => (S.domains || []).length > 0 && (S.domains || []).every((d) => savedCf().hostnames.includes(d));
     mount(box, html`<div class="grid-2">
@@ -373,7 +373,7 @@ export default async function site(ctx) {
         </div>`); };
     paintSsl();
     ctx.on(["site", "lb"], (d) => { if ((d?.id === S.id || d?.siteId === S.id) && d?.ssl) { S.ssl = d.ssl; paintSsl(); if (d.id) loadConf(); } });
-    const dirty = () => JSON.stringify(domains) !== JSON.stringify(S.domains || []) || JSON.stringify(deliveryPayload(CF)) !== JSON.stringify(deliveryPayload({ domains: S.domains || [], hosts: new Set(savedCf().hostnames), tunnelId: savedCf().tunnelId }));
+    const dirty = () => JSON.stringify(domains) !== JSON.stringify(S.domains || []) || JSON.stringify(deliveryPayload(CF)) !== JSON.stringify(deliveryPayload(savedDelivery(S.domains || [], savedCf())));
     const paintDoms = () => {
       mount($("[data-doms]", box), domainRows(CF, { routes: dirty() ? null : cfRoutes, mainHost }));
       mount($("[data-cf]", box), cfPanel(CF));

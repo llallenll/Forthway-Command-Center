@@ -38,7 +38,7 @@ import { createActivity } from "./lib/core-routes.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 const PUBLIC_DIR = path.join(HERE, "public");
-const VERSION = "3.2.0";
+const VERSION = "3.2.1";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
 const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "analytics"];

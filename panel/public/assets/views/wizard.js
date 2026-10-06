@@ -2,7 +2,7 @@ import { html, raw, mount, $, $$, on, colorOf, slug, plural, fmtBytes, emptyStat
 import { icon } from "../icons.js";
 import { get, post } from "../api.js";
 import { serverPicker, envEditor, METHOD_LABEL, TYPE_LABEL, lbBadge, serverKind, jobStarted } from "../components.js";
-import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts } from "./cloudflare.js";
+import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts, usedTunnels } from "./cloudflare.js";
 
 const TYPES = [
   { id: "node", icon: "node", title: "Node.js", desc: "Next.js, Express, Nuxt, Remix… built and kept running with pm2." },
@@ -59,7 +59,7 @@ export default async function wizard(ctx) {
     delivery: "direct", // "direct" | "cloudflare" — see views/cloudflare.js
   };
   // Cloudflare Tunnel delivery: hosts = domains routed through the tunnel (the rest stay Direct).
-  const CF = { domains: W.domains, hosts: new Set(), tunnelId: "", opts: null };
+  const CF = { domains: W.domains, hosts: new Set(), tunnelId: "", tunnelFor: {}, opts: null };
   let picker = null, envEd = null;
 
   mount(root, html`
@@ -239,7 +239,7 @@ export default async function wizard(ctx) {
           <dt>Project</dt><dd><span class="row" style="gap:8px"><span class="dot" style="background:${colorOf(p?.color)}"></span>${p?.name}</span></dd>
           <dt>Type</dt><dd>${TYPE_LABEL[W.type]}</dd>
           <dt>Domains</dt><dd><div class="chips">${W.domains.map((d) => html`<span class="badge mono">${d}</span>`)}</div></dd>
-          <dt>Delivery</dt><dd>${W.delivery === "cloudflare" && tunnelHosts(CF).length ? html`<span class="row" style="gap:8px;flex-wrap:wrap">${icon("cloud", "sm")}Cloudflare Tunnel <span class="muted small">${(CF.opts?.tunnels || []).find((t) => t.id === CF.tunnelId)?.name || ""} · ${tunnelHosts(CF).join(", ")}${tunnelHosts(CF).length < W.domains.length ? html` · others Direct` : ""}</span></span>` : html`Direct <span class="muted small">(DNS A record → ${mainHost() || "main server"})</span>`}</dd>
+          <dt>Delivery</dt><dd>${W.delivery === "cloudflare" && tunnelHosts(CF).length ? html`<span class="row" style="gap:8px;flex-wrap:wrap">${icon("cloud", "sm")}Cloudflare Tunnel <span class="muted small">${usedTunnels(CF).map((t) => t.name).join(", ")} · ${tunnelHosts(CF).join(", ")}${tunnelHosts(CF).length < W.domains.length ? html` · others Direct` : ""}</span></span>` : html`Direct <span class="muted small">(DNS A record → ${mainHost() || "main server"})</span>`}</dd>
           <dt>Source</dt><dd>${W.source === "github" ? html`<span class="row" style="gap:8px">${icon("github", "sm")}<span class="mono">${W.repo}@${W.branch}</span></span>` : "Zip upload"}</dd>
           <dt>Hosting</dt><dd><div class="stack" style="gap:8px">${lbBadge(fake, sById)}
             ${W.loadBalanced ? html`<span class="muted small">${fake.serverIds.map((i) => sById[i]?.name).join(", ")} · ${METHOD_LABEL[W.lbMethod]}</span>` : html`<span class="muted small">${serverKind(sById[W.single])} · ${sById[W.single]?.host || ""}</span>`}</div></dd>

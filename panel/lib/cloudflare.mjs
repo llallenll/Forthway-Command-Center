@@ -38,8 +38,9 @@
  * manage tunnels there too, because a tunnel only carries hostnames of zones in its
  * own account. Tunnels and zones are listed from every account the panel reaches,
  * each tagged with its accountId, and every tunnel call uses that account's credentials.
- *   site.cloudflare   = { enabled, tunnelId, hostnames: [] }   (owned/validated by SITES,
- *                        hostnames ⊆ site.domains; other domains are Direct)
+ *   site.cloudflare   = { enabled, tunnelId, hostnames: [], tunnels?: { hostname: tunnelId } }
+ *                        (owned/validated by SITES, hostnames ⊆ site.domains; other domains are Direct;
+ *                        `tunnels` = hostnames on another tunnel than `tunnelId`)
  *   cloudflareRoutes  = { id, owner: "site:<id>"|"panel"|"phpmyadmin", siteId, hostname, tunnelId, zoneId,
  *                         zoneName, service, ruleKey, ingress: "created"|"adopted"|null,
  *                         dnsRecordId, dnsCreated, status: "active"|"error"|"manual", error, syncedAt }
@@ -1031,12 +1032,15 @@ function createCloudflare(ctx) {
   const ledger = (owner) => db.list(COLL, (r) => r.owner === owner);
   const siteOwner = (id) => `site:${id}`;
 
+  /** The tunnel a website's hostname goes through: its own pick, else the site's tunnel. */
+  const siteTunnelOf = (cfg, hostname) => cfg?.tunnels?.[hostname] || cfg?.tunnelId || "";
+
   function desiredForSite(site) {
     const c = site?.cloudflare;
     if (!c?.enabled || !c.tunnelId || !Array.isArray(c.hostnames)) return [];
     const doms = new Set(site.domains || []);
     const https = !!site.ssl?.enabled && site.ssl?.status === "active";
-    return c.hostnames.filter((h) => doms.has(h)).map((h) => ({ hostname: h, tunnelId: c.tunnelId, rule: ruleFor(h, "site", { https }) }));
+    return c.hostnames.filter((h) => doms.has(h)).map((h) => ({ hostname: h, tunnelId: siteTunnelOf(c, h), rule: ruleFor(h, "site", { https }) }));
   }
   function desiredForPanel() {
     const p = conf().panel;
@@ -1328,10 +1332,10 @@ function createCloudflare(ctx) {
     if (panelHost && hostnames.includes(panelHost)) throw httpError(409, `${panelHost} is the panel's own Cloudflare hostname.`, { code: "cloudflare_hostname_taken" });
     const pmaHost = conf().phpmyadmin?.hostname;
     if (pmaHost && hostnames.includes(pmaHost)) throw httpError(409, `${pmaHost} is phpMyAdmin's Cloudflare hostname.`, { code: "cloudflare_hostname_taken" });
-    const local = conf().connectors.find((t) => t.cfId === cfg.tunnelId);
+    const tunnelIds = [...new Set(hostnames.map((h) => siteTunnelOf(cfg, h)))];
     const c = creds();
     if (!c) {
-      if (local) return { ok: true, manual: true };
+      if (tunnelIds.every((id) => conf().connectors.some((t) => t.cfId === id))) return { ok: true, manual: true };
       throw httpError(400, "Cloudflare isn't connected. Connect it in Settings → Cloudflare first, or deliver these domains directly.", { code: "cloudflare_not_connected" });
     }
     let tunnels, zoneList;
@@ -1340,9 +1344,11 @@ function createCloudflare(ctx) {
     } catch (err) {
       throw httpError(502, `Couldn't check with Cloudflare: ${err.message}`, { code: "cloudflare_unreachable" });
     }
-    const t = tunnels.find((x) => x.id === cfg.tunnelId);
-    if (!t) throw httpError(400, "That tunnel isn't in a connected Cloudflare account. Pick another one, or create one in Settings → Cloudflare.", { code: "cloudflare_tunnel_missing" });
-    if (!t.remotelyManaged) throw httpError(400, `Tunnel “${t.name}” is configured from a local config file, so the panel can't add routes to it. Pick a dashboard-managed tunnel.`, { code: "cloudflare_tunnel_local" });
+    for (const id of tunnelIds) {
+      const t = tunnels.find((x) => x.id === id);
+      if (!t) throw httpError(400, "That tunnel isn't in a connected Cloudflare account. Pick another one, or create one in Settings → Cloudflare.", { code: "cloudflare_tunnel_missing" });
+      if (!t.remotelyManaged) throw httpError(400, `Tunnel “${t.name}” is configured from a local config file, so the panel can't add routes to it. Pick a dashboard-managed tunnel.`, { code: "cloudflare_tunnel_local" });
+    }
     const missing = hostnames.filter((h) => !zoneForHostname(zoneList, h));
     if (missing.length) {
       throw httpError(400, `${missing.join(", ")} ${missing.length === 1 ? "isn't" : "aren't"} in your Cloudflare account. Add the domain to Cloudflare (or deliver it directly).`, {
@@ -1352,6 +1358,7 @@ function createCloudflare(ctx) {
       });
     }
     for (const h of hostnames) {
+      const t = tunnels.find((x) => x.id === siteTunnelOf(cfg, h));
       if (zoneForHostname(zoneList.filter((z) => z.accountId === t.accountId), h)) continue;
       throw httpError(400, accountMismatch(h, zoneForHostname(zoneList, h), t.accountId), { code: "cloudflare_zone_account", hostnames: [h] });
     }

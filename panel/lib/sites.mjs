@@ -195,7 +195,8 @@ export function sanitizeEnv(input) {
   return out;
 }
 
-// CLOUDFLARE (added by lib/cloudflare.mjs): `site.cloudflare = { enabled, tunnelId, hostnames }`.
+// CLOUDFLARE (added by lib/cloudflare.mjs): `site.cloudflare = { enabled, tunnelId, hostnames, tunnels? }`;
+// `tunnels` maps a hostname to another tunnel than `tunnelId` (a domain in another Cloudflare account needs one there).
 // hostnames ⊆ domains are delivered through a Cloudflare Tunnel; the other domains stay Direct.
 // Shape only here — whether the tunnel/zones exist is checked by ctx.cloudflare.validateSite().
 export function sanitizeCloudflare(input, domains = []) {
@@ -205,7 +206,15 @@ export function sanitizeCloudflare(input, domains = []) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(tunnelId)) throw httpError(400, "Pick which Cloudflare tunnel delivers this website.");
   const list = Array.isArray(input.hostnames) ? input.hostnames : domains;
   const hostnames = normalizeDomains(list).filter((h) => domains.includes(h));
-  return hostnames.length ? { enabled: true, tunnelId, hostnames } : off;
+  if (!hostnames.length) return off;
+  const tunnels = {};
+  for (const [h, id] of Object.entries(input.tunnels && typeof input.tunnels === "object" ? input.tunnels : {})) {
+    const t = String(id || "").trim().toLowerCase();
+    if (!hostnames.includes(h) || t === tunnelId) continue;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(t)) throw httpError(400, `Pick which Cloudflare tunnel delivers ${h}.`);
+    tunnels[h] = t;
+  }
+  return { enabled: true, tunnelId, hostnames, ...(Object.keys(tunnels).length ? { tunnels } : {}) };
 }
 
 function sanitizeHealthPath(v) {
