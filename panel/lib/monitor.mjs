@@ -1,5 +1,5 @@
 /**
- * MONITOR — website uptime monitoring + SMS alerts through Bird (bird.com).
+ * MONITOR — website uptime monitoring + SMS alerts through Twilio (twilio.com).
  *
  * Checks (from the main server, default every 60 s, 10 s timeout):
  *   custom URL (per-site setting) → first domain (https when the site's
@@ -35,7 +35,7 @@
  * recovery (`notifyRecovery`). Never more than one text per recipient per site
  * per 10 minutes, except recovery texts. Every attempt is logged on the incident
  * and in the activity log. Sending never throws into the monitoring loop.
- * FCC_DRY_RUN=1 never calls Bird: sends are logged and recorded as simulated.
+ * FCC_DRY_RUN=1 never calls Twilio: sends are logged and recorded as simulated.
  *
  * Discord (config.json `notifications.discord.webhooks`, see notify-discord.mjs):
  * the same rules and cadence as SMS, per webhook instead of per phone number —
@@ -92,11 +92,10 @@ const DEFAULTS = Object.freeze({
   paused: false,
 });
 
-const NOTIF_DEFAULTS = Object.freeze({ enabled: false, repeatMinutes: 60, notifyRecovery: true, defaults: [], bird: {}, discord: { webhooks: [] } });
+const NOTIF_DEFAULTS = Object.freeze({ enabled: false, repeatMinutes: 60, notifyRecovery: true, defaults: [], twilio: {}, discord: { webhooks: [] } });
 
 export const PHONE_RE = /^\+[1-9]\d{6,14}$/;
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i;
-const ID_RE = /^[A-Za-z0-9-]{1,80}$/;
 const CODE = { none: 46, u: 117, f: 102, d: 100, p: 112 }; // ".", "u", "f", "d", "p"
 const RANK = { 46: 0, 112: 1, 117: 2, 102: 3, 100: 4 };
 
@@ -231,67 +230,56 @@ export function probe(url, { timeoutMs = 10_000, expectMin = 200, expectMax = 39
   });
 }
 
-// --------------------------------------------------------------------- Bird
+// ------------------------------------------------------------------- Twilio
+
+const TWILIO_SID_RE = /^AC[0-9a-f]{32}$/i;
+const TWILIO_MSID_RE = /^MG[0-9a-f]{32}$/i;
 
 /**
- * Builds the HTTP request for one SMS. Two Bird APIs exist and are picked by
- * the key's shape:
- *   - Bird platform API (keys "bk_<region>_…"):
- *       POST https://<region>.platform.bird.com/v1/sms/messages
- *       Authorization: Bearer <key>
- *       { to, from, text, category: "transactional" }
- *   - Channels API (workspace access keys):
- *       POST https://api.bird.com/workspaces/<workspaceId>/channels/<channelId>/messages
- *       Authorization: AccessKey <key>
- *       { receiver: { contacts: [{ identifierValue }] }, body: { type: "text", text: { text } } }
+ * Builds the HTTP request for one SMS through Twilio's Messages API:
+ *   POST https://api.twilio.com/2010-04-01/Accounts/<AccountSid>/Messages.json
+ *   Authorization: Basic base64(<AccountSid>:<AuthToken>)
+ *   form body: To, Body, and From (E.164 number, alphanumeric sender ID or
+ *   short code) — or MessagingServiceSid when the sender is an "MG…" SID.
  * Throws (with a user-facing message) when the configuration is incomplete.
- * The returned headers contain the key — never log them.
+ * The returned headers contain the token — never log them.
  */
-export function birdRequest(cfg, to, text) {
-  const key = String(cfg?.accessKey || "").trim();
-  if (!key) throw new Error("Add the Bird access key in Settings → Notifications.");
-  if (/[\s\r\n]/.test(key)) throw new Error("The Bird access key contains spaces.");
+export function twilioRequest(cfg, to, text) {
+  const sid = String(cfg?.accountSid || "").trim();
+  const token = String(cfg?.authToken || "").trim();
+  const from = String(cfg?.from || "").trim();
+  if (!TWILIO_SID_RE.test(sid)) throw new Error("Add the Twilio Account SID (AC…) in Settings → Notifications.");
+  if (!token) throw new Error("Add the Twilio Auth Token in Settings → Notifications.");
+  if (/[\s\r\n]/.test(token)) throw new Error("The Twilio Auth Token contains spaces.");
+  if (!from) throw new Error("Add a Twilio sender: a number you own on Twilio, an alphanumeric sender ID, a short code or a Messaging Service SID (MG…).");
   if (!PHONE_RE.test(to)) throw new Error(`${to} is not an E.164 phone number.`);
-  const headers = { "Content-Type": "application/json", Accept: "application/json" };
-  const platform = /^bk_([a-z0-9]{2,12})_/i.exec(key);
-  if (platform) {
-    const from = String(cfg.from || "").trim();
-    if (!from) throw new Error("Bird platform keys need a sender (an E.164 number you own or an alphanumeric sender ID).");
-    return {
-      api: "platform",
-      method: "POST",
-      url: `https://${platform[1].toLowerCase()}.platform.bird.com/v1/sms/messages`,
-      headers: { ...headers, Authorization: `Bearer ${key}` },
-      body: { to, from, text, category: "transactional" },
-    };
-  }
-  const ws = String(cfg.workspaceId || "").trim();
-  const ch = String(cfg.channelId || "").trim();
-  if (!ID_RE.test(ws)) throw new Error("Add the Bird workspace ID in Settings → Notifications.");
-  if (!ID_RE.test(ch)) throw new Error("Add the Bird SMS channel ID in Settings → Notifications.");
+  const service = TWILIO_MSID_RE.test(from);
+  const form = new URLSearchParams({ To: to, Body: text });
+  form.set(service ? "MessagingServiceSid" : "From", from);
   return {
-    api: "channels",
+    api: service ? "messaging-service" : "sender",
     method: "POST",
-    url: `https://api.bird.com/workspaces/${encodeURIComponent(ws)}/channels/${encodeURIComponent(ch)}/messages`,
-    headers: { ...headers, Authorization: `AccessKey ${key}` },
-    body: { receiver: { contacts: [{ identifierValue: to }] }, body: { type: "text", text: { text } } },
+    url: `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(sid)}/Messages.json`,
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString("base64")}`,
+    },
+    body: form.toString(),
   };
 }
 
-/** Readable error from a Bird error body (both APIs), without echoing secrets. */
-export function birdError(status, bodyText, key) {
+/** Readable error from a Twilio error body ({ code, message, more_info }), without echoing secrets. */
+export function twilioError(status, bodyText, token) {
   let msg = "";
   try {
     const j = JSON.parse(bodyText);
-    const parts = [j.message, j.error?.message, typeof j.error === "string" ? j.error : "", j.detail, j.title, j.code, j.error?.code]
-      .filter((x) => typeof x === "string" && x);
-    msg = [...new Set(parts)].slice(0, 2).join(" — ");
-    if (!msg && Array.isArray(j.errors)) msg = j.errors.map((e) => e.message || e.description || e.code).filter(Boolean).slice(0, 2).join("; ");
+    msg = [typeof j.message === "string" ? j.message : "", j.code ? `(error ${j.code})` : ""].filter(Boolean).join(" ");
   } catch {
     msg = cleanStr(bodyText, 160);
   }
-  let out = `Bird HTTP ${status}${msg ? `: ${msg}` : ""}`;
-  if (key) out = out.split(key).join("***");
+  let out = `Twilio HTTP ${status}${msg ? `: ${msg}` : ""}`;
+  if (token) out = out.split(token).join("***");
   return cleanStr(out, 300);
 }
 
@@ -483,7 +471,7 @@ function createMonitor(ctx) {
   const rt = new Map(); // siteId -> runtime
   let rate = {}; // `${siteId}|${phone}` -> last non-recovery send (ms)
   let gaps = []; // [{ from, to }] panel offline
-  let lastSend = { bird: null, discord: {} }; // last attempt per channel (badges in Settings → Notifications)
+  let lastSend = { sms: null, discord: {} }; // last attempt per channel (badges in Settings → Notifications)
   const inFlight = new Set();
   const sending = new Set();
   const changed = new Set();
@@ -511,7 +499,7 @@ function createMonitor(ctx) {
 
   function notif() {
     const n = ctx.config.notifications || {};
-    return { ...NOTIF_DEFAULTS, ...n, bird: { ...(n.bird || {}) }, discord: { webhooks: [...(n.discord?.webhooks || [])] } };
+    return { ...NOTIF_DEFAULTS, ...n, twilio: { ...(n.twilio || {}) }, discord: { webhooks: [...(n.discord?.webhooks || [])] } };
   }
 
   /** Panel webhooks with their decrypted target ({ id, token, threadId } or null). Never expose `hook`. */
@@ -537,8 +525,8 @@ function createMonitor(ctx) {
     const skip = new Set(s.discordSkip || []);
     return discordHooks().filter((w) => w.enabled && w.hook && !skip.has(w.id));
   }
-  function birdKey() {
-    const enc = ctx.config.notifications?.bird?.accessKeyEnc;
+  function twilioToken() {
+    const enc = ctx.config.notifications?.twilio?.authTokenEnc;
     if (!enc) return "";
     try {
       return ctx.secrets.decrypt(enc);
@@ -546,17 +534,16 @@ function createMonitor(ctx) {
       return "";
     }
   }
-  function birdConfig() {
+  function twilioConfig() {
     const n = notif();
-    return { accessKey: birdKey(), workspaceId: n.bird.workspaceId || "", channelId: n.bird.channelId || "", from: n.bird.from || "" };
+    return { accountSid: n.twilio.accountSid || "", authToken: twilioToken(), from: n.twilio.from || "" };
   }
-  function birdStatus() {
-    const cfg = birdConfig();
+  function twilioStatus() {
     try {
-      const r = birdRequest(cfg, "+15550000000", "x");
+      const r = twilioRequest(twilioConfig(), "+15550000000", "x");
       return { configured: true, api: r.api, problem: null };
     } catch (err) {
-      return { configured: false, api: /^bk_/i.test(cfg.accessKey) ? "platform" : cfg.accessKey ? "channels" : null, problem: err.message };
+      return { configured: false, api: null, problem: err.message };
     }
   }
 
@@ -646,7 +633,7 @@ function createMonitor(ctx) {
     } catch { /* first boot */ }
     const now = Date.now();
     rate = j?.rate && typeof j.rate === "object" ? j.rate : {};
-    if (j?.lastSend && typeof j.lastSend === "object") lastSend = { bird: j.lastSend.bird || null, discord: { ...(j.lastSend.discord || {}) } };
+    if (j?.lastSend && typeof j.lastSend === "object") lastSend = { sms: j.lastSend.sms || null, discord: { ...(j.lastSend.discord || {}) } };
     gaps = Array.isArray(j?.gaps) ? j.gaps.filter((g) => now - Date.parse(g.to) < KEEP_DAYS * DAY) : [];
     for (const [id, r] of Object.entries(j?.sites || {})) {
       if (!getSite(id)) continue;
@@ -884,17 +871,16 @@ function createMonitor(ctx) {
 
   function notificationsView() {
     const n = notif();
-    const key = birdKey();
-    const st = birdStatus();
+    const token = twilioToken();
+    const st = twilioStatus();
     return {
       enabled: !!n.enabled,
-      provider: "bird",
-      accessKeySet: !!key,
-      accessKeyHint: key ? (key.length <= 10 ? "••••" : `${key.slice(0, key.startsWith("bk_") ? 7 : 3)}…${key.slice(-4)}`) : null,
-      accessKeyUnreadable: !!n.bird.accessKeyEnc && !key,
-      workspaceId: n.bird.workspaceId || "",
-      channelId: n.bird.channelId || "",
-      from: n.bird.from || "",
+      provider: "twilio",
+      accountSid: n.twilio.accountSid || "",
+      authTokenSet: !!token,
+      authTokenHint: token ? (token.length <= 8 ? "••••" : `••••${token.slice(-4)}`) : null,
+      authTokenUnreadable: !!n.twilio.authTokenEnc && !token,
+      from: n.twilio.from || "",
       api: st.api,
       configured: st.configured,
       problem: st.configured ? null : st.problem,
@@ -903,7 +889,7 @@ function createMonitor(ctx) {
       notifyRecovery: n.notifyRecovery !== false,
       minGapMinutes: Math.round(SMS_MIN_GAP_MS / MINUTE * 10) / 10,
       dryRun: sys.DRY_RUN,
-      lastSend: lastSend.bird || null,
+      lastSend: lastSend.sms || null,
       discord: discordView(),
     };
   }
@@ -923,29 +909,29 @@ function createMonitor(ctx) {
   async function sendSms(to, text) {
     if (sys.DRY_RUN) {
       console.log(`[monitor] [dry-run] would text ${to} : ${text}`);
-      return { ok: true, simulated: true, id: null, error: null, api: birdStatus().api || null };
+      return { ok: true, simulated: true, id: null, error: null, api: twilioStatus().api || null };
     }
-    const cfg = birdConfig();
+    const cfg = twilioConfig();
     let req;
     try {
-      req = birdRequest(cfg, to, text);
+      req = twilioRequest(cfg, to, text);
     } catch (err) {
       return { ok: false, simulated: false, error: err.message, api: null };
     }
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), SMS_TIMEOUT_MS);
     try {
-      const res = await fetch(req.url, { method: req.method, headers: req.headers, body: JSON.stringify(req.body), signal: ctrl.signal, redirect: "error" });
+      const res = await fetch(req.url, { method: req.method, headers: req.headers, body: req.body, signal: ctrl.signal, redirect: "error" });
       const body = await res.text().catch(() => "");
-      if (!res.ok) return { ok: false, simulated: false, error: birdError(res.status, body, cfg.accessKey), status: res.status, api: req.api };
+      if (!res.ok) return { ok: false, simulated: false, error: twilioError(res.status, body, cfg.authToken), status: res.status, api: req.api };
       let id = null;
       try {
-        id = JSON.parse(body)?.id || null;
-      } catch { /* 202 without JSON */ }
+        id = JSON.parse(body)?.sid || null;
+      } catch { /* not JSON */ }
       return { ok: true, simulated: false, id, error: null, status: res.status, api: req.api };
     } catch (err) {
-      const msg = err.name === "AbortError" ? "Bird did not answer within 15s" : `Could not reach Bird: ${describeError(err)}`;
-      return { ok: false, simulated: false, error: msg.split(cfg.accessKey || "\u0000").join("***"), api: req.api };
+      const msg = err.name === "AbortError" ? "Twilio did not answer within 15s" : `Could not reach Twilio: ${describeError(err)}`;
+      return { ok: false, simulated: false, error: msg.split(cfg.authToken || "\u0000").join("***"), api: req.api };
     } finally {
       clearTimeout(timer);
     }
@@ -953,7 +939,7 @@ function createMonitor(ctx) {
 
   function logAlert(site, incId, entry) {
     if (!entry.skipped) {
-      lastSend.bird = { at: entry.at, ok: !!entry.ok, simulated: !!entry.simulated, error: entry.error || null };
+      lastSend.sms = { at: entry.at, ok: !!entry.ok, simulated: !!entry.simulated, error: entry.error || null };
       stateDirty = true;
     }
     const inc = db.get("incidents", incId);
@@ -1565,30 +1551,29 @@ function createMonitor(ctx) {
     router.get("/api/notifications/settings", () => notificationsView());
 
     router.put("/api/notifications/settings", (req, res, { body = {}, admin }) => {
-      const n = ctx.config.notifications ? { ...ctx.config.notifications } : { ...NOTIF_DEFAULTS, defaults: [], bird: {} };
-      const bird = { ...(n.bird || {}) };
+      const n = ctx.config.notifications ? { ...ctx.config.notifications } : { ...NOTIF_DEFAULTS, defaults: [], twilio: {} };
+      const twilio = { ...(n.twilio || {}) };
       const fields = [];
       if (body.enabled !== undefined) { n.enabled = !!body.enabled; fields.push("enabled"); }
-      if (body.accessKey !== undefined && String(body.accessKey).trim()) {
-        const key = String(body.accessKey).trim();
-        if (key.length > 400 || /\s/.test(key)) throw httpError(400, "That doesn't look like a Bird access key.");
-        bird.accessKeyEnc = ctx.secrets.encrypt(key);
-        fields.push("accessKey");
+      if (body.accountSid !== undefined) {
+        const v = cleanStr(body.accountSid, 40);
+        if (v && !TWILIO_SID_RE.test(v)) throw httpError(400, "The Account SID starts with AC followed by 32 letters and digits (Twilio Console → Account info).");
+        twilio.accountSid = v;
+        fields.push("accountSid");
       }
-      if (body.clearAccessKey) { delete bird.accessKeyEnc; fields.push("accessKey"); }
-      for (const k of ["workspaceId", "channelId"]) {
-        if (body[k] === undefined) continue;
-        const v = cleanStr(body[k], 80);
-        if (v && !ID_RE.test(v)) throw httpError(400, `The ${k === "workspaceId" ? "workspace" : "channel"} ID can only contain letters, digits and dashes.`);
-        bird[k] = v;
-        fields.push(k);
+      if (body.authToken !== undefined && String(body.authToken).trim()) {
+        const token = String(body.authToken).trim();
+        if (token.length > 200 || /\s/.test(token)) throw httpError(400, "That doesn't look like a Twilio Auth Token.");
+        twilio.authTokenEnc = ctx.secrets.encrypt(token);
+        fields.push("authToken");
       }
+      if (body.clearAuthToken) { delete twilio.authTokenEnc; fields.push("authToken"); }
       if (body.from !== undefined) {
-        const v = cleanStr(body.from, 20);
-        if (v && !normalizePhone(v) && !/^(?=.*[A-Za-z])[A-Za-z0-9 ]{3,11}$/.test(v) && !/^\d{5,6}$/.test(v)) {
-          throw httpError(400, "The sender must be an E.164 number, a 3–11 character alphanumeric sender ID, or a short code.");
+        const v = cleanStr(body.from, 40);
+        if (v && !normalizePhone(v) && !TWILIO_MSID_RE.test(v) && !/^(?=.*[A-Za-z])[A-Za-z0-9 ]{3,11}$/.test(v) && !/^\d{5,6}$/.test(v)) {
+          throw httpError(400, "The sender must be an E.164 number, a 3–11 character alphanumeric sender ID, a short code or a Messaging Service SID (MG…).");
         }
-        bird.from = normalizePhone(v) || v;
+        twilio.from = normalizePhone(v) || v;
         fields.push("from");
       }
       if (body.defaults !== undefined) { n.defaults = sanitizeRecipients(body.defaults, "Default recipients"); fields.push("defaults"); }
@@ -1598,8 +1583,9 @@ function createMonitor(ctx) {
         n.discord = sanitizeDiscord(body.discord, n.discord);
         fields.push("discord");
       }
-      n.bird = bird;
-      n.provider = "bird";
+      n.twilio = twilio;
+      n.provider = "twilio";
+      delete n.bird; // the former provider's settings (its key no longer works here)
       ctx.config.notifications = n;
       ctx.saveConfig();
       if (fields.length) ctx.activity?.(admin, "notifications.settings.update", { type: "settings", id: "notifications", name: "Notifications" }, { fields: [...new Set(fields)] });
@@ -1614,7 +1600,7 @@ function createMonitor(ctx) {
         stateDirty = true;
       }
       const view = notificationsView();
-      return { ...view, warning: view.enabled && !view.configured && !view.dryRun ? `Alerts are on, but Bird isn't fully set up: ${view.problem}` : null };
+      return { ...view, warning: view.enabled && !view.configured && !view.dryRun ? `Alerts are on, but Twilio isn't fully set up: ${view.problem}` : null };
     });
 
     router.post("/api/notifications/test", async (req, res, { body = {}, admin }) => {
@@ -1638,7 +1624,7 @@ function createMonitor(ctx) {
       lastTestAt = Date.now();
       const text = buildMessage("test", { panelName: ctx.config.panelName });
       const r = await sendSms(to, text);
-      lastSend.bird = { at: iso(Date.now()), ok: !!r.ok, simulated: !!r.simulated, error: r.error || null, test: true };
+      lastSend.sms = { at: iso(Date.now()), ok: !!r.ok, simulated: !!r.simulated, error: r.error || null, test: true };
       stateDirty = true;
       ctx.activity?.(admin, "notifications.test", { type: "settings", id: "notifications", name: "Notifications" }, { to, ok: r.ok, simulated: r.simulated || undefined, error: r.error || undefined });
       return { ok: r.ok, simulated: !!r.simulated, error: r.error || null, api: r.api || null, messageId: r.id || null, to, text };

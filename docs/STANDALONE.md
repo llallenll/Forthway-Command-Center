@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.2.1",
+  version: "3.3.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -842,7 +842,7 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     command text, Run buttons, server picker + "run on every server" checkbox for LB sites, confirm (danger for risky),
     output in the standard job log modal, "Recent script runs" (`/api/jobs?siteId&type=site.script`). components.js:
     `site.script` job icon + activity verb. (views/sites.js has no row menu, so nothing was added there.)
-- **MONITOR — uptime monitoring + SMS alerts via Bird (`panel/lib/monitor.mjs`, module `monitor`, new).**
+- **MONITOR — uptime monitoring + SMS alerts via Twilio (`panel/lib/monitor.mjs`, module `monitor`, new).**
   - **Checks** from the main server (default every 60 s, timeout 10 s; `node:http(s)`, no redirects followed, response time = time to
     headers). Target: per-site custom `url` → first domain (`https` when `ssl.status === "active"` or the domain is a Cloudflare tunnel
     hostname) → no domain: first upstream `address:port` from `ctx.lb.upstreams(site)` (main = 127.0.0.1). Path: per-site `path` →
@@ -861,17 +861,17 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     7/30/90 d from cached hourly aggregates. Panel offline (heartbeat older than 90 s at boot) → `{ from, to, reason: "panel offline" }` gap on
     the monitor and on every open incident; minutes in it stay "no data". State and open incidents (incl. `notify.lastAt`) survive restarts.
     Deleting a website (SSE `site` with `deleted`) drops its files, settings and incidents.
-  - **SMS** (`config.json` → `notifications: { enabled, provider: "bird", bird: { accessKeyEnc, workspaceId, channelId, from }, defaults:
-    [{ name, phone }], repeatMinutes: 60, notifyRecovery: true }`; key encrypted with `ctx.secrets`, never returned or logged). Bird API is
-    picked from the key: `bk_<region>_…` → platform API `POST https://<region>.platform.bird.com/v1/sms/messages`, `Authorization: Bearer`,
-    `{ to, from, text, category: "transactional" }` (needs a sender); any other key → Channels API `POST https://api.bird.com/workspaces/
-    <workspaceId>/channels/<channelId>/messages`, `Authorization: AccessKey <key>`, `{ receiver: { contacts: [{ identifierValue }] }, body:
-    { type: "text", text: { text } } }`. Recipients = site `recipients` + `defaults` (if `includeDefaults`, default on), deduplicated by E.164
+  - **SMS** (`config.json` → `notifications: { enabled, provider: "twilio", twilio: { accountSid, authTokenEnc, from }, defaults:
+    [{ name, phone }], repeatMinutes: 60, notifyRecovery: true }`; Auth Token encrypted with `ctx.secrets`, never returned or logged).
+    Twilio Messages API: `POST https://api.twilio.com/2010-04-01/Accounts/<accountSid>/Messages.json`, `Authorization: Basic
+    base64(accountSid:authToken)`, form body `To`, `Body` and `From` (E.164 number, alphanumeric sender ID or short code) — or
+    `MessagingServiceSid` when the sender is an `MG…` SID; the message id is the response's `sid`. Saving the settings drops the old
+    `notifications.bird` block (Bird is no longer supported). Recipients = site `recipients` + `defaults` (if `includeDefaults`, default on), deduplicated by E.164
     number. On DOWN: one text each; while down: again every `repeatMinutes` (site override → panel default 60); on recovery: one "back up after
     X" text to everyone who was texted successfully (`notifyRecovery`). Never more than one non-recovery text per number per site per 10 min
     (`FCC_MONITOR_SMS_MIN_GAP_SEC` overrides, for testing); a first text blocked by that limit is logged as `skipped` and sent when allowed;
     a failed send is retried after the same window. Texts are ≤ 160 GSM-7 chars. Every attempt → incident `alerts` + activity `monitor.sms`
-    (failures also to the console, number masked). Sending runs beside the check loop and never throws into it. **DRY_RUN never calls Bird**:
+    (failures also to the console, number masked). Sending runs beside the check loop and never throws into it. **DRY_RUN never calls Twilio**:
     `[monitor] [dry-run] would text +1… : message` in the log, recorded as `simulated`.
   - **Routes**: `GET /api/monitor` → `{ items: summary[], counts: { total, up, down, paused, pending, unknown, degraded }, notifications }`;
     summary = `{ siteId, name, projectId, domain, state: "up"|"down"|"unknown"|"paused"|"pending", since, degraded, unhealthyServers, servers,
@@ -920,11 +920,11 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   - **Logging**: incident `alerts` entries `{ at, channel: "discord", kind, webhookId, to: <webhook name>, ok, simulated, skipped, error,
     status, attempts, rateLimited, messageId, text: <embed title> }` (SMS entries have no `channel`); incident `discord: { [webhookId]:
     { lastAt, ok } }` (hidden from the API like `notify`); activity `monitor.discord`; SSE `monitor` `{ kind: "sms", channel: "discord", … }`.
-    `state.json` gains `lastSend: { bird: { at, ok, simulated, error, test? }, discord: { [webhookId]: … } }` (drives the row badges).
+    `state.json` gains `lastSend: { sms: { at, ok, simulated, error, test? }, discord: { [webhookId]: … } }` (drives the row badges).
   - **DRY_RUN**: nothing is posted — `[monitor] [dry-run] would post to Discord "<name>": <title>`, recorded as `simulated`. Only under
     DRY_RUN, `FCC_DISCORD_API_BASE=http://127.0.0.1:<port>/api` (loopback hosts only) makes posts go to a local fake Discord over real
     HTTP (for testing 429 handling etc.); production always uses `https://discord.com/api`.
-  - **API**: `GET /api/notifications/settings` adds `lastSend` (Bird) and `discord: { webhooks: [{ id, name, enabled, mention, urlSet,
+  - **API**: `GET /api/notifications/settings` adds `lastSend` (SMS) and `discord: { webhooks: [{ id, name, enabled, mention, urlSet,
     urlHint, urlUnreadable, last }], active, max, testEndpoint }` · `PUT` accepts `discord: { webhooks: [{ id?, name, enabled, url?,
     clearUrl?, mention }] }` = the full list (left out = removed; `url` only when adding/changing; new ones need `url`; duplicates refused)
     · `POST /api/notifications/test { channel: "discord", webhookId }` → `{ channel, webhookId, ok, simulated, error, status, attempts,
@@ -933,9 +933,9 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     /api/sites/:id/monitor` accepts `discordEnabled`, `discordSkip` · summaries add `discord: { enabled, webhooks }` · `GET /api/monitor`
     `notifications.discord` (bool).
   - **UI**: Settings → Notifications is now a "Notification channels" card in the Updates → "Roll back" style: one row per channel
-    (Bird SMS, Discord; icon tile, title, state sub-line, badge Active / Off / Not set up / Error: last send failed, Edit/Set up, chevron).
+    (Twilio SMS, Discord; icon tile, title, state sub-line, badge Active / Off / Not set up / Error: last send failed, Edit/Set up, chevron).
     Each row header is a `<button aria-expanded aria-controls>`; one row open at a time, height animated with `grid-template-rows`
-    (none under reduced motion), closed panels `inert`. Bird panel = the former form (same fields/validation, "Send test SMS"); Discord
+    (none under reduced motion), closed panels `inert`. Twilio panel = Account SID, Auth Token (write-only), sender, default numbers, "Send test SMS"; Discord
     panel = webhook list editor (name, enabled, URL write-only, mention, last result, Send test, add/remove). "Alert rules" card below
     (repeat interval, recovery alerts). Uptime tab: "Discord" line in Checks, a "Discord alerts" card (Post to Discord switch +
     per-webhook checkboxes), incident log rows carry an SMS / Discord channel badge. icons.js: `message`, `discord` (filled mark);

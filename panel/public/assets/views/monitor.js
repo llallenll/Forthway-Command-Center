@@ -1,6 +1,6 @@
 // Uptime monitoring + SMS alerts (server: panel/lib/monitor.mjs).
 //   uptimeTab()              website page → Uptime tab
-//   notificationsSettings()  Settings → Notifications (channels: Bird SMS, Discord webhooks; alert rules)
+//   notificationsSettings()  Settings → Notifications (channels: Twilio SMS, Discord webhooks; alert rules)
 //   bindUptime()             fills [data-uptime="<siteId>"] slots in website rows (Websites list, project page)
 //   downBanner()             dashboard: "N websites down" card (renders nothing while everything is up)
 // Every user-supplied string goes through html``.
@@ -219,7 +219,7 @@ export async function uptimeTab(box, ctx, S) {
         <div class="card-body"><dl class="kv">
           <dt>Last 24 hours</dt><dd>${uptimeStrip(m.bars24h || [], { labels: hourLabels(m.bars24hStart, (m.bars24h || []).length) })}</dd>
           ${servers.length ? html`<dt>${servers.length > 1 ? "Servers" : "Server"}</dt><dd class="row wrap" style="gap:12px">${servers.map((x) => html`<span class="status" title="${x.error || ""}"><span class="dot ${x.down || x.healthy === false ? "err" : !x.online ? "off" : x.healthy ? "ok" : "off"}"></span>${x.name}<span class="muted small">${x.down || x.healthy === false ? " unhealthy" : !x.online ? " offline" : x.healthy ? " healthy" : " not checked"}</span></span>`)}</dd>` : ""}
-          <dt>Text alerts</dt><dd>${!D.notifications.enabled ? html`<span class="muted">Off for the whole panel — </span><a href="#/settings/notifications" style="color:var(--blue-3)">Settings → Notifications</a>` : D.settings.smsEnabled ? html`On · ${plural(D.recipients.length, "number")}${D.notifications.dryRun ? html` <span class="badge">dry run: simulated</span>` : !D.notifications.configured ? html` <span class="badge warn">Bird not set up</span>` : ""}` : html`<span class="muted">Off for this website</span>`}</dd>
+          <dt>Text alerts</dt><dd>${!D.notifications.enabled ? html`<span class="muted">Off for the whole panel — </span><a href="#/settings/notifications" style="color:var(--blue-3)">Settings → Notifications</a>` : D.settings.smsEnabled ? html`On · ${plural(D.recipients.length, "number")}${D.notifications.dryRun ? html` <span class="badge">dry run: simulated</span>` : !D.notifications.configured ? html` <span class="badge warn">Twilio not set up</span>` : ""}` : html`<span class="muted">Off for this website</span>`}</dd>
           <dt>Discord</dt><dd>${discordSummary()}</dd>
         </dl></div></div>`);
   };
@@ -285,7 +285,7 @@ export async function uptimeTab(box, ctx, S) {
         <div class="card-head"><div><h3>Text alerts</h3><div class="sub">A text when it goes down, ${n.repeatMinutes === 60 ? "every hour" : `every ${n.repeatMinutes} min`} while it stays down${n.notifyRecovery ? ", and one when it's back" : ""}</div></div>
           <div class="right"><label class="switch"><input type="checkbox" name="smsEnabled" ${s.smsEnabled ? raw("checked") : ""}/><span class="track"></span><span class="hide-sm">Enabled</span></label></div></div>
         <div class="card-body"><div class="form-stack">
-          ${!n.enabled ? html`<div class="note warn">${icon("info")}<div>Text alerts are turned off for the whole panel. Turn them on in <a href="#/settings/notifications" style="color:var(--text);font-weight:600">Settings → Notifications</a>.</div></div>` : !n.configured && !n.dryRun ? html`<div class="note warn">${icon("info")}<div>Bird isn't fully set up yet — <a href="#/settings/notifications" style="color:var(--text);font-weight:600">finish it in Settings → Notifications</a>.</div></div>` : ""}
+          ${!n.enabled ? html`<div class="note warn">${icon("info")}<div>Text alerts are turned off for the whole panel. Turn them on in <a href="#/settings/notifications" style="color:var(--text);font-weight:600">Settings → Notifications</a>.</div></div>` : !n.configured && !n.dryRun ? html`<div class="note warn">${icon("info")}<div>Twilio isn't fully set up yet — <a href="#/settings/notifications" style="color:var(--text);font-weight:600">finish it in Settings → Notifications</a>.</div></div>` : ""}
           ${field("Numbers for this website", html`<div data-rcp></div>`, "International format (E.164), like +15551234567.")}
           <label class="switch"><input type="checkbox" name="includeDefaults" ${s.includeDefaults !== false ? raw("checked") : ""}/><span class="track"></span>Also text the default numbers ${n.defaults?.length ? html`<span class="muted">(${n.defaults.map((d) => d.name || d.phone).join(", ")})</span>` : html`<span class="muted">(none set)</span>`}</label>
           ${field("Repeat while down", html`<div class="row" style="gap:8px"><input class="input" type="number" name="repeatMinutes" min="1" max="1440" value="${s.repeatMinutes ?? ""}" placeholder="${n.repeatMinutes}" style="max-width:110px"/><span class="muted small">minutes (blank = panel default, ${n.repeatMinutes})</span></div>`, `Each number gets at most one text per ${n.minGapMinutes >= 1 ? `${n.minGapMinutes} minutes` : `${Math.round(n.minGapMinutes * 60)} seconds`} for this website (the "back up" text is always sent).`)}
@@ -391,11 +391,11 @@ const DISCORD_URL_RE = /^https:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/ap
 const MENTION_RE = /^(?:@here|@everyone|<@!?\d{15,25}>|<@&\d{15,25}>)$/;
 
 /** Row status for a channel: { tone, label, sub, ready }. */
-function birdStatusOf(s) {
-  const key = s.accessKeySet ? `key ${s.accessKeyHint}` : "";
+function twilioStatusOf(s) {
+  const key = s.from && s.configured ? `from ${s.from}` : "";
   const nums = plural((s.defaults || []).length, "default number");
-  if (s.enabled && s.lastSend && !s.lastSend.ok) return { tone: "err", label: "Error: last send failed", sub: `${s.lastSend.error || "Bird didn't accept the text"} · ${ago(s.lastSend.at)}`, ready: true };
-  if (!s.configured && !s.dryRun) return { tone: "warn", label: "Not set up", sub: s.accessKeySet ? s.problem || "Finish the Bird settings" : "Text alerts through Bird (bird.com) — add an access key", ready: false };
+  if (s.enabled && s.lastSend && !s.lastSend.ok) return { tone: "err", label: "Error: last send failed", sub: `${s.lastSend.error || "Twilio didn't accept the text"} · ${ago(s.lastSend.at)}`, ready: true };
+  if (!s.configured && !s.dryRun) return { tone: "warn", label: "Not set up", sub: s.accountSid || s.authTokenSet ? s.problem || "Finish the Twilio settings" : "Text alerts through Twilio (twilio.com) — add your Account SID and Auth Token", ready: false };
   if (!s.enabled) return { tone: "off", label: "Off", sub: ["Off", key || (s.dryRun ? "dry run" : ""), nums].filter(Boolean).join(" · "), ready: true };
   return { tone: "ok", label: "Active", sub: ["Active", nums, key || (s.dryRun ? "dry run: texts are simulated" : "")].filter(Boolean).join(" · "), ready: true };
 }
@@ -421,9 +421,9 @@ export async function notificationsSettings(box, ctx) {
   let hookSeq = 0;
   const loadHooks = () => { hooks = (s.discord?.webhooks || []).map((w) => ({ ...w, key: `h${++hookSeq}`, url: "", clearUrl: false })); };
   loadHooks();
-  const apiLabel = (a) => (a === "platform" ? "Bird platform API" : a === "channels" ? "Bird Channels API" : "");
+  const apiLabel = (a) => (a === "messaging-service" ? "Twilio Messaging Service" : "Twilio");
   const CHANNELS = [
-    { id: "bird", title: "Bird SMS", tile: html`<span class="li-ico nch-tile">${icon("message")}</span>`, status: () => birdStatusOf(s) },
+    { id: "twilio", title: "Twilio SMS", tile: html`<span class="li-ico nch-tile">${icon("message")}</span>`, status: () => twilioStatusOf(s) },
     { id: "discord", title: "Discord", tile: html`<span class="li-ico nch-tile discord">${icon("discord")}</span>`, status: () => discordStatusOf(s) },
   ];
 
@@ -470,28 +470,27 @@ export async function notificationsSettings(box, ctx) {
       <div class="error-box span-2" data-err hidden></div></div>`);
   };
 
-  /* Bird — the former "Text message alerts" form, moved here unchanged in behaviour. */
-  const paintBird = () => {
+  /* Twilio — SMS through the Messages API. */
+  const paintTwilio = () => {
     const badge = s.dryRun ? html`<span class="badge">${icon("info")}Dry run — texts are simulated</span>`
       : s.configured ? html`<span class="badge ok">${icon("check")}${apiLabel(s.api)}</span>` : html`<span class="badge warn">Not set up</span>`;
-    mount($('[data-body="bird"]', box), html`
-      <form data-bird novalidate>
+    mount($('[data-body="twilio"]', box), html`
+      <form data-twilio novalidate>
         <div class="nch-row"><label class="switch"><input type="checkbox" name="enabled" ${s.enabled ? raw("checked") : ""}/><span class="track"></span>Send text alerts</label><span class="spacer"></span>${badge}</div>
-        <p class="hint" style="margin:0 0 14px">Websites with text alerts on send an SMS through Bird when they go down, again while they stay down, and when they're back. From <a href="https://bird.com" target="_blank" rel="noopener noreferrer" style="color:var(--blue-3)">bird.com</a>; the key is stored encrypted and never shown again.</p>
+        <p class="hint" style="margin:0 0 14px">Websites with text alerts on send an SMS through Twilio when they go down, again while they stay down, and when they're back. The Account SID and Auth Token are on the <a href="https://console.twilio.com" target="_blank" rel="noopener noreferrer" style="color:var(--blue-3)">Twilio Console</a> home page; the token is stored encrypted and never shown again.</p>
         <div class="form-grid">
-          <div class="span-2">${field(s.accessKeySet ? "Replace access key" : "Access key", html`<div class="row" style="gap:10px;flex-wrap:wrap">
-              ${s.accessKeySet ? html`<span class="row" style="gap:8px"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(148,166,255,.07)">${icon("key", "sm")}</span><span class="mono small">${s.accessKeyHint}</span></span>` : ""}
-              <div class="pw-wrap" style="flex:1 1 260px"><input class="input mono" type="password" name="accessKey" placeholder="${s.accessKeySet ? "Leave blank to keep the saved key" : "bk_us1_… or a workspace access key"}" autocomplete="off" spellcheck="false"/><button type="button" class="icon-btn" data-toggle-pw aria-label="Show key">${icon("eye")}</button></div>
-              ${s.accessKeySet ? html`<button type="button" class="btn btn-sm btn-danger" data-clear-key>${icon("trash")}Remove</button>` : ""}</div>`,
-            html`${s.accessKeyUnreadable ? html`<span style="color:#ff8ea3">The saved key can't be decrypted (the panel key changed) — paste it again. </span>` : ""}A <b>bk_…</b> API key uses Bird's platform SMS API and needs a sender. A workspace <b>access key</b> uses the Channels API and needs the workspace and SMS channel IDs.`)}</div>
-          ${field("Workspace ID", html`<input class="input mono" name="workspaceId" value="${s.workspaceId}" placeholder="Channels API only" autocomplete="off" spellcheck="false"/>`)}
-          ${field("SMS channel ID", html`<input class="input mono" name="channelId" value="${s.channelId}" placeholder="Channels API only" autocomplete="off" spellcheck="false"/>`)}
-          ${field("Sender", html`<input class="input mono" name="from" value="${s.from}" placeholder="+15557654321 or MyBrand" autocomplete="off" spellcheck="false"/>`, "Platform API only: a number you own on Bird, an alphanumeric sender ID or a short code.")}
+          ${field("Account SID", html`<input class="input mono" name="accountSid" value="${s.accountSid}" placeholder="AC…" autocomplete="off" spellcheck="false"/>`)}
+          ${field("Sender", html`<input class="input mono" name="from" value="${s.from}" placeholder="+15557654321 or MG…" autocomplete="off" spellcheck="false"/>`, "A number you own on Twilio, a Messaging Service SID (MG…), an alphanumeric sender ID or a short code.")}
+          <div class="span-2">${field(s.authTokenSet ? "Replace Auth Token" : "Auth Token", html`<div class="row" style="gap:10px;flex-wrap:wrap">
+              ${s.authTokenSet ? html`<span class="row" style="gap:8px"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(148,166,255,.07)">${icon("key", "sm")}</span><span class="mono small">${s.authTokenHint}</span></span>` : ""}
+              <div class="pw-wrap" style="flex:1 1 260px"><input class="input mono" type="password" name="authToken" placeholder="${s.authTokenSet ? "Leave blank to keep the saved token" : "Auth Token from the Twilio Console"}" autocomplete="off" spellcheck="false"/><button type="button" class="icon-btn" data-toggle-pw aria-label="Show token">${icon("eye")}</button></div>
+              ${s.authTokenSet ? html`<button type="button" class="btn btn-sm btn-danger" data-clear-key>${icon("trash")}Remove</button>` : ""}</div>`,
+            s.authTokenUnreadable ? html`<span style="color:#ff8ea3">The saved token can't be decrypted (the panel key changed) — paste it again.</span>` : "")}</div>
           <div class="span-2">${field("Default numbers", html`<div data-defs></div>`, html`Texted for every website with text alerts on (unless the website turns "Also text the default numbers" off).`)}</div>
           <div class="error-box span-2" data-err hidden></div>
-          ${s.problem && !s.dryRun && (s.enabled || s.accessKeySet) ? html`<div class="note warn span-2">${icon("info")}<div>${s.problem}</div></div>` : ""}
+          ${s.problem && !s.dryRun && (s.enabled || s.authTokenSet) ? html`<div class="note warn span-2">${icon("info")}<div>${s.problem}</div></div>` : ""}
         </div>
-        <div class="nch-foot"><span class="muted small" data-state></span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save Bird settings</button></div>
+        <div class="nch-foot"><span class="muted small" data-state></span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save Twilio settings</button></div>
       </form>
       <form class="nch-test" data-test novalidate>
         <div class="nch-sub-h">Send a test text <span class="muted small">${s.dryRun ? "— dry run: nothing is sent, the text is written to the panel log" : "— uses the saved settings (save first)"}</span></div>
@@ -500,7 +499,7 @@ export async function notificationsSettings(box, ctx) {
           <button class="btn" type="submit" data-send>${icon("bell")}Send test SMS</button></div>
         <div data-result class="mt-16" hidden></div>
       </form>`);
-    defEd = recipientsEditor($("[data-defs]", box), s.defaults || [], { onDirty: () => ($("[data-bird] [data-state]", box).textContent = "Unsaved changes") });
+    defEd = recipientsEditor($("[data-defs]", box), s.defaults || [], { onDirty: () => ($("[data-twilio] [data-state]", box).textContent = "Unsaved changes") });
   };
 
   /* Discord — webhooks list editor. */
@@ -538,7 +537,7 @@ export async function notificationsSettings(box, ctx) {
       </form>`);
   };
 
-  paintHeads(); paintRules(); paintBird(); paintDiscord();
+  paintHeads(); paintRules(); paintTwilio(); paintDiscord();
 
   const toggle = (id) => {
     openId = openId === id ? null : id;
@@ -569,34 +568,34 @@ export async function notificationsSettings(box, ctx) {
     } catch (ex) { showErr(err, ex.message); } finally { setBusy(btn, false); }
   });
 
-  /* bird */
-  on(box, "input", "[data-bird]", () => ($("[data-bird] [data-state]", box).textContent = "Unsaved changes"));
+  /* twilio */
+  on(box, "input", "[data-twilio]", () => ($("[data-twilio] [data-state]", box).textContent = "Unsaved changes"));
   on(box, "click", "[data-toggle-pw]", (e, b) => {
     const inp = b.parentElement.querySelector("input");
     inp.type = inp.type === "password" ? "text" : "password";
     mount(b, html`${icon(inp.type === "password" ? "eye" : "eyeOff")}`);
   });
-  on(box, "submit", "[data-bird]", async (e, form) => {
+  on(box, "submit", "[data-twilio]", async (e, form) => {
     e.preventDefault();
     const err = $("[data-err]", form), btn = $("[data-save]", form), f = form.elements;
     showErr(err, "");
     let defaults;
     try { defaults = defEd.value(); } catch (ex) { showErr(err, ex.message); return; }
-    const body = { enabled: f.enabled.checked, defaults, workspaceId: f.workspaceId.value.trim(), channelId: f.channelId.value.trim(), from: f.from.value.trim() };
-    if (f.accessKey.value.trim()) body.accessKey = f.accessKey.value.trim();
+    const body = { enabled: f.enabled.checked, defaults, accountSid: f.accountSid.value.trim(), from: f.from.value.trim() };
+    if (f.authToken.value.trim()) body.authToken = f.authToken.value.trim();
     setBusy(btn, true);
     try {
       s = await put("/api/notifications/settings", body);
-      if (s.warning) toast("Saved — but not ready yet", "warn", { msg: s.warning }); else toast("Bird settings saved", "ok");
-      paintBird(); paintHeads();
+      if (s.warning) toast("Saved — but not ready yet", "warn", { msg: s.warning }); else toast("Twilio settings saved", "ok");
+      paintTwilio(); paintHeads();
     } catch (ex) { showErr(err, ex.message); setBusy(btn, false); }
   });
   on(box, "click", "[data-clear-key]", async (e, b) => {
-    const ok = await confirmDialog({ title: "Remove the Bird access key?", message: "No text messages can be sent until you add a key again.", danger: true, confirmText: "Remove key" });
+    const ok = await confirmDialog({ title: "Remove the Twilio Auth Token?", message: "No text messages can be sent until you add a token again.", danger: true, confirmText: "Remove token" });
     if (!ok) return;
     setBusy(b, true);
-    try { s = await put("/api/notifications/settings", { clearAccessKey: true }); toast("Access key removed", "ok"); paintBird(); paintHeads(); }
-    catch (ex) { toastError(ex, "Couldn't remove the key"); setBusy(b, false); }
+    try { s = await put("/api/notifications/settings", { clearAuthToken: true }); toast("Auth Token removed", "ok"); paintTwilio(); paintHeads(); }
+    catch (ex) { toastError(ex, "Couldn't remove the token"); setBusy(b, false); }
   });
   on(box, "submit", "[data-test]", async (e, form) => {
     e.preventDefault();
@@ -607,8 +606,8 @@ export async function notificationsSettings(box, ctx) {
     try {
       const r = await post("/api/notifications/test", { to });
       out.hidden = false;
-      mount(out, r.ok ? html`<div class="note">${icon("check")}<div>${r.simulated ? html`Simulated (dry run) — the panel log shows: <span class="mono">${r.text}</span>` : html`Bird accepted the text to <span class="mono">${r.to}</span>${r.messageId ? html` (id <span class="mono">${r.messageId}</span>)` : ""}. It should arrive within a minute.`}</div></div>`
-        : html`<div class="error-box">${icon("alert")}<div>${r.error || "Bird didn't accept the text."}</div></div>`);
+      mount(out, r.ok ? html`<div class="note">${icon("check")}<div>${r.simulated ? html`Simulated (dry run) — the panel log shows: <span class="mono">${r.text}</span>` : html`Twilio accepted the text to <span class="mono">${r.to}</span>${r.messageId ? html` (id <span class="mono">${r.messageId}</span>)` : ""}. It should arrive within a minute.`}</div></div>`
+        : html`<div class="error-box">${icon("alert")}<div>${r.error || "Twilio didn't accept the text."}</div></div>`);
       reload();
     } catch (ex) { out.hidden = false; mount(out, html`<div class="error-box">${icon("alert")}<div>${ex.message}</div></div>`); }
     finally { setBusy(btn, false); }

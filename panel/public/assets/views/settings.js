@@ -7,7 +7,7 @@ import { pageHead, openJobLog, serverKind, METHOD_LABEL } from "../components.js
 import { scheduleForm } from "./backups.js";
 import { cloudflareSettings } from "./cloudflare.js"; // Cloudflare section (lives in its own file)
 import { mysqlSettings, phpMyAdminSettings } from "./settings-databases.js"; // Databases + phpMyAdmin sections
-import { notificationsSettings } from "./monitor.js"; // Notifications section (uptime SMS alerts via Bird)
+import { notificationsSettings } from "./monitor.js"; // Notifications section (uptime SMS alerts via Twilio)
 import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliased: avoids clashing with the shared import line)
 import { admins, security, account } from "./settings-auth.js"; // Admins + Security + Account (Sign in with GitHub)
 
