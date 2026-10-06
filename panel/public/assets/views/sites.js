@@ -1,7 +1,7 @@
 import { html, mount, $, on, colorOf, ago, emptyState, errorState, skeletonRows, debounce } from "../util.js";
 import { icon } from "../icons.js";
 import { get } from "../api.js";
-import { pageHead, lbBadge, healthChip, typeIco, TYPE_LABEL } from "../components.js";
+import { pageHead, lbBadge, healthChip, typeIco, TYPE_LABEL, updateBadge } from "../components.js";
 import { bindUptime } from "./monitor.js"; // MONITOR: fills the [data-uptime] slots below
 
 /** Public URL of a site: https only once its certificate is active. */
@@ -20,7 +20,7 @@ export function siteRow(s, { serversById = {}, projectsById = {}, showProject = 
     <div class="site-id">${typeIco(s.type)}
       <div style="min-width:0"><div class="site-name">${s.name}</div>
         <div class="site-dom">${href.startsWith("https:") ? html`<span class="site-https" title="Served over HTTPS${s.ssl?.status === "active" ? " (Let's Encrypt)" : " (Cloudflare)"}">${icon("lock", "xs")}</span>` : ""}${(s.domains || [])[0] || html`<span class="dim">No domain</span>`}${(s.domains || []).length > 1 ? html` <span class="dim">+${s.domains.length - 1}</span>` : ""}</div></div></div>
-    <div class="site-meta">${lbBadge(s, serversById)}
+    <div class="site-meta"><span class="row" style="gap:6px;flex-wrap:wrap">${lbBadge(s, serversById)}${updateBadge(s)}</span>
       <span class="tiny muted row" style="gap:8px">${showProject && p ? html`<span class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(p.color)}"></span>${p.name}</span><span class="dim">·</span>` : ""}${TYPE_LABEL[s.type] || s.type}${ver ? html`<span class="dim">·</span><span class="mono">v${ver}</span>` : ""}<span class="site-health-inline row" style="gap:8px"><span class="dim">·</span>${healthChip(s)}<span data-uptime="${s.id}" data-compact></span></span></span></div>
     <div class="site-health">${healthChip(s)}<div data-uptime="${s.id}"></div></div>
     <div class="site-actions btn-row" style="flex-wrap:nowrap">
@@ -46,9 +46,12 @@ export default async function sites(ctx) {
   bindUptime(list, ctx); // MONITOR: uptime dot + 24h % per row
   let items = [], serversById = {}, projectsById = {};
   const paint = () => {
-    const counts = { all: items.length, lb: items.filter((s) => s.loadBalanced).length, single: items.filter((s) => !s.loadBalanced).length };
-    mount($("[data-filters]", root), html`${[["all", "All"], ["lb", "Load balanced"], ["single", "Single server"]].map(([k, l]) => html`<button class="pill ${filter === k ? "active" : ""}" data-f="${k}">${l}<span class="n">${counts[k]}</span></button>`)}`);
-    const f = items.filter((s) => (filter === "all" || (filter === "lb") === !!s.loadBalanced) && (!q || (s.name + " " + (s.domains || []).join(" ")).toLowerCase().includes(q)));
+    const counts = { all: items.length, lb: items.filter((s) => s.loadBalanced).length, single: items.filter((s) => !s.loadBalanced).length, updates: items.filter((s) => s.update).length };
+    if (filter === "updates" && !counts.updates) filter = "all";
+    const pills = [["all", "All"], ["lb", "Load balanced"], ["single", "Single server"], ...(counts.updates ? [["updates", "Updates available"]] : [])];
+    mount($("[data-filters]", root), html`${pills.map(([k, l]) => html`<button class="pill ${filter === k ? "active" : ""}" data-f="${k}">${l}<span class="n">${counts[k]}</span></button>`)}`);
+    const pick = (s) => filter === "all" || (filter === "updates" ? !!s.update : (filter === "lb") === !!s.loadBalanced);
+    const f = items.filter((s) => pick(s) && (!q || (s.name + " " + (s.domains || []).join(" ")).toLowerCase().includes(q)));
     if (!items.length) return mount(list, html`<div class="card">${emptyState({ ico: "globe", title: "No websites yet", text: "Create a website, point a domain at this server, then deploy from GitHub or a zip upload.", action: html`<a class="btn btn-primary" href="#/sites/new">${icon("plus")}New website</a>` })}</div>`);
     if (!f.length) return mount(list, html`<div class="card">${emptyState({ ico: "search", title: "No matches", text: "Try a different search or filter.", sm: true })}</div>`);
     mount(list, html`<div class="site-list">${f.map((s) => siteRow(s, { serversById, projectsById }))}</div>`);

@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.1.0",
+  version: "3.2.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -476,6 +476,16 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   start/rollback/github/DELETE return the job record. `POST …/rollback { releaseId? }`: with an id →
   redeploy that release; without → snapshot rollback to `previousReleaseId` (falls back to redeploying it).
   `POST …/releases/github { ref?, repo?, deploy? }` (`deploy: true` deploys the new release in the same job).
+  **Updates**: every 15 min (first ~20 s after start, 2 s between sites; paused 30 min after a GitHub rate
+  limit) each site with `github.repo` has its tracked branch (`github.branch`, else the default branch) resolved
+  to its head commit (+ root package.json `version`), kept in memory. Public site `update` is null when up to
+  date or never deployed, else `{ kind: "github" | "release", releaseId, ref, sha, shortSha, message, author,
+  date, htmlUrl, version, currentVersion, checkedAt }`: `github` = the branch head differs from the serving
+  release's commit (pull it), `release` = that commit (or, without GitHub, any newer release) is already a
+  release here (deploy it). A pull of the tracked branch records its head at once. `POST …/update-check` checks
+  now → `{ update, checkedAt }` (502 with GitHub's error). UI: header shows **Update** only when `update` is set
+  (**Deploy** before the first deploy), an update badge in the header and the website list (+ "Updates
+  available" filter), a banner on Overview, and the quick action is **Pull & deploy** (no repo: Upload a release).
   `PUT …/env { env } | { text }` (+ `restart: false` to skip the restart) → `{ env, linked, reserved,
   warnings, job }`; keys provided by linked DBs and `PORT` are dropped with a warning; `GET …/env` masks
   linked passwords. A second mutating operation on a busy site → 409 `{ error, jobId }`. Public site has

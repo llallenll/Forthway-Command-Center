@@ -149,6 +149,34 @@ export async function resolveCommit(repo, ref, token, opts) {
 }
 
 /**
+ * Like resolveCommit, but a failure (rate limit, 404, network) throws with a
+ * readable message instead of resolving null — for the update checker.
+ */
+export async function headCommit(repo, ref, token, opts) {
+  const c = await api(`/repos/${repo}/commits/${encodeURIComponent(ref)}`, token, opts);
+  return {
+    sha: c.sha,
+    shortSha: c.sha?.slice(0, 7) || null,
+    message: (c.commit?.message || "").split("\n")[0].slice(0, 200),
+    author: c.commit?.author?.name || c.author?.login || null,
+    date: c.commit?.author?.date || null,
+    htmlUrl: c.html_url,
+  };
+}
+
+/** The "version" in package.json at the root of the repo at `ref`, or null. */
+export async function packageVersion(repo, ref, token, opts) {
+  try {
+    const f = await api(`/repos/${repo}/contents/package.json?ref=${encodeURIComponent(ref)}`, token, opts);
+    if (f?.encoding !== "base64" || typeof f.content !== "string") return null;
+    const v = JSON.parse(Buffer.from(f.content, "base64").toString("utf8")).version;
+    return typeof v === "string" && v ? v.slice(0, 40) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Download the repository at `ref` as a zip, streamed straight to `file`
  * (never held in memory). Resolves { size, sha256 }.
  *

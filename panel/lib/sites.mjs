@@ -29,6 +29,8 @@ import {
   repoInfo,
   listRefs,
   resolveCommit,
+  headCommit,
+  packageVersion,
   downloadZipballToFile,
 } from "./github.mjs";
 import { inspectZip, readZipFile } from "../../shared/zip.mjs";
@@ -46,6 +48,9 @@ const RESERVED_ENV = new Set(["PORT"]);
 /** Generated per node site, kept by the panel, identical on every server (see managedEnv). */
 const ACTIONS_KEY = "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY";
 const STATUS_EVERY_MS = 120_000;
+// How often each GitHub-backed website's branch is checked for new commits. Unauthenticated
+// GitHub allows 60 requests an hour per IP, so keep this unhurried; a token raises it to 5000.
+const UPDATE_EVERY_MS = 15 * 60_000;
 const STATUS_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TOKEN_TTL_MS = 6 * 60 * 60_000;
 const ENV_EXAMPLE_NAMES = [".env.example", ".env.sample", ".env.template", ".env.dist", "env.example", ".env.local.example"];
@@ -436,6 +441,7 @@ export function register(router, ctx) {
         return { releasesInLine: spread.length <= 1, releaseSpread: spread.length > 1 ? spread : [] };
       })(),
       state: Object.fromEntries(t.map((id) => [id, { ...(site.state?.[id] || {}), serverName: serverName(id), online: isOnline(id) }])),
+      update: updateFor(site),
       busyJobId: busyJob(site.id),
       deleting: !!site.deleting,
       createdAt: site.createdAt,
@@ -1284,6 +1290,110 @@ export function register(router, ctx) {
     return db.list("releases", { siteId }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   }
 
+  // ------------------------------------------------------ update checks
+
+  /**
+   * What the tracked GitHub branch points at, per website, from the last check:
+   * siteId -> { repo, ref, sha, shortSha, message, author, date, htmlUrl, version, checkedAt, error }.
+   * In memory only — the first check after a restart fills it again.
+   */
+  const heads = new Map();
+  let rateLimitedUntil = 0;
+
+  /** The release a website is serving: currentReleaseId, else what its servers report. */
+  function servingRelease(site) {
+    const id = site.currentReleaseId || Object.values(site.state || {}).find((x) => x?.releaseId)?.releaseId;
+    return id ? db.get("releases", id) : null;
+  }
+
+  /**
+   * Is there something newer than what's deployed? null when up to date (or never deployed —
+   * the first deploy isn't an "update"). Otherwise { kind: "github" (pull the branch head),
+   * or "release" (an existing, undeployed release — releaseId), version, shortSha, message, ... }.
+   */
+  function updateFor(site) {
+    const cur = servingRelease(site);
+    if (!cur) return null;
+    const head = site.github?.repo ? heads.get(site.id) : null;
+    const curSha = cur.github?.sha || cur.commit || null;
+    if (head?.sha && curSha && head.repo === normalizeRepo(site.github.repo)) {
+      if (head.sha === curSha) return null;
+      const pulled = listReleases(site.id).find((r) => (r.github?.sha || r.commit) === head.sha && fs.existsSync(releaseFile(r.id)));
+      return {
+        kind: pulled ? "release" : "github",
+        releaseId: pulled?.id || null,
+        ref: head.ref,
+        sha: head.sha,
+        shortSha: head.shortSha,
+        message: head.message,
+        author: head.author,
+        date: head.date,
+        htmlUrl: head.htmlUrl,
+        version: pulled?.version || head.version || null,
+        currentVersion: cur.version || null,
+        checkedAt: head.checkedAt,
+      };
+    }
+    // No GitHub comparison possible: a release newer than the one being served, not yet deployed.
+    const newer = listReleases(site.id).find((r) => r.id !== cur.id && String(r.createdAt) > String(cur.createdAt) && fs.existsSync(releaseFile(r.id)));
+    if (!newer) return null;
+    return {
+      kind: "release",
+      releaseId: newer.id,
+      ref: newer.github?.ref || null,
+      sha: newer.github?.sha || newer.commit || null,
+      shortSha: (newer.github?.sha || newer.commit || "").slice(0, 7) || null,
+      message: newer.github?.message || newer.filename || "",
+      author: newer.github?.author || null,
+      date: newer.createdAt,
+      htmlUrl: newer.github?.htmlUrl || null,
+      version: newer.version || null,
+      currentVersion: cur.version || null,
+      checkedAt: null,
+    };
+  }
+
+  /** Ask GitHub where the tracked branch is now. Never throws; the outcome is kept in `heads`. */
+  async function checkUpdate(siteId, { force = false } = {}) {
+    const site = getSite(siteId);
+    const repo = normalizeRepo(site?.github?.repo);
+    if (!site || !repo || site.deleting) {
+      heads.delete(siteId);
+      return null;
+    }
+    if (!force && Date.now() < rateLimitedUntil) return heads.get(siteId) || null;
+    const prev = heads.get(siteId);
+    const token = githubToken(site);
+    const at = new Date().toISOString();
+    try {
+      let defaultBranch = prev?.repo === repo ? prev.defaultBranch || null : null;
+      let ref = site.github.branch || defaultBranch;
+      if (!ref) {
+        defaultBranch = (await repoInfo(repo, token)).defaultBranch;
+        ref = defaultBranch;
+      }
+      const c = await headCommit(repo, ref, token);
+      const version = prev?.sha === c.sha ? prev.version : await packageVersion(repo, c.sha, token);
+      heads.set(siteId, { repo, ref, defaultBranch, ...c, version, checkedAt: at, error: null });
+    } catch (err) {
+      if (/rate limit/i.test(err.message)) rateLimitedUntil = Date.now() + 30 * 60_000;
+      heads.set(siteId, { ...(prev?.repo === repo ? prev : { repo }), checkedAt: at, error: err.message });
+    }
+    const now = heads.get(siteId);
+    if (!prev || prev.sha !== now.sha || prev.error !== now.error) emit(siteId);
+    return now;
+  }
+
+  /** A pull of the tracked branch saw its head: remember it, so the update badge clears without waiting for a check. */
+  function noteHead(siteId, repo, ref, commit) {
+    if (!commit?.sha) return;
+    const site = getSite(siteId);
+    const prev = heads.get(siteId);
+    const tracked = site?.github?.branch || (prev?.repo === repo ? prev.defaultBranch : null);
+    if (!site || normalizeRepo(site.github?.repo) !== repo || ref !== tracked) return;
+    heads.set(siteId, { ...prev, repo, ref, ...commit, version: prev?.sha === commit.sha ? prev.version : null, checkedAt: new Date().toISOString(), error: null });
+  }
+
   function deleteReleaseRecord(r) {
     fs.rmSync(releaseFile(r.id), { force: true });
     fs.rmSync(releaseFile(builtId(r.id)), { force: true });
@@ -1466,6 +1576,7 @@ export function register(router, ctx) {
       }
     },
     refreshStatus: (id) => refreshStatus(id),
+    checkUpdate: (id, o) => checkUpdate(id, o),
   };
 
   function startEnvJob(site, admin, { restart = true } = {}) {
@@ -2058,6 +2169,14 @@ export function register(router, ctx) {
     return publicRelease(rec);
   });
 
+  router.post("/api/sites/:id/update-check", async (req, res, { params }) => {
+    const site = mustSite(params.id);
+    if (!normalizeRepo(site.github?.repo)) throw httpError(400, "This website has no GitHub repository to check. Set one in its settings.");
+    const head = await checkUpdate(site.id, { force: true });
+    if (head?.error) throw httpError(502, `Couldn't check GitHub: ${head.error}`);
+    return { update: updateFor(getSite(site.id)), checkedAt: head?.checkedAt || null };
+  });
+
   router.post("/api/sites/:id/releases/github", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
     const repo = normalizeRepo(body.repo || site.github?.repo);
@@ -2079,6 +2198,7 @@ export function register(router, ctx) {
           log(`Using the default branch: ${useRef}`);
         }
         const commit = await resolveCommit(repo, useRef, token, { signal });
+        noteHead(site.id, repo, useRef, commit);
         if (commit) log(`${repo}@${useRef} is at ${commit.shortSha}: ${commit.message}${commit.author ? ` — ${commit.author}` : ""}`);
         const part = path.join(releasesDir(), `.github-${crypto.randomBytes(6).toString("hex")}.part`);
         log("Downloading the archive from GitHub…");
@@ -2212,4 +2332,22 @@ export async function start(ctx) {
     }
   }, STATUS_EVERY_MS);
   timer.unref?.();
+
+  // Is a GitHub-backed website's branch ahead of what it serves? Spread the checks out.
+  let checking = false;
+  const checkAll = async () => {
+    if (checking || !ctx.sites?.checkUpdate) return;
+    checking = true;
+    try {
+      for (const s of ctx.sites.list({})) {
+        if (!s.github?.repo || s.deleting) continue;
+        await ctx.sites.checkUpdate(s.id).catch(() => {});
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    } finally {
+      checking = false;
+    }
+  };
+  setTimeout(checkAll, 20_000).unref?.();
+  setInterval(checkAll, UPDATE_EVERY_MS).unref?.();
 }

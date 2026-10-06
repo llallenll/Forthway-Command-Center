@@ -27,6 +27,15 @@ export function lbBadge(site, serversById = {}) {
   return html`<span class="badge badge-single">${icon("server")}Single server · ${name}</span>`;
 }
 
+/** "Update available" — the branch (or a newer release) is ahead of what the website serves. Empty when up to date. */
+export function updateBadge(site) {
+  const u = site.update;
+  if (!u) return html``;
+  const what = u.version && u.version !== u.currentVersion ? `v${u.version}` : u.shortSha || "";
+  const tip = [what && `${what} is available`, u.message, u.author && `by ${u.author}`].filter(Boolean).join(" — ");
+  return html`<span class="badge blue" title="${tip}">${icon("arrowUp")}Update${what ? html` <span class="mono">${what}</span>` : ""}</span>`;
+}
+
 export function siteHealth(site) {
   const ids = site.loadBalanced ? site.serverIds || [] : [(site.serverIds || [])[0] || "main"];
   const st = site.state || {};

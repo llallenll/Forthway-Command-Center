@@ -1,7 +1,7 @@
 import { html, raw, mount, $, $$, on, colorOf, ago, fmtDate, fmtBytes, plural, emptyState, errorState, skeletonRows, toast, toastError, confirmDialog, openMenu, debounce, copyText } from "../util.js";
 import { icon } from "../icons.js";
 import { get, post, patch, put, del, upload, MOCK } from "../api.js";
-import { tabsBar, lbBadge, healthChip, siteHealth, typeIco, TYPE_LABEL, METHOD_LABEL, serverKind, jobItem, bindJobClicks, jobStarted, openJobLog, serverPicker, envEditor, dropzone } from "../components.js";
+import { tabsBar, lbBadge, healthChip, updateBadge, siteHealth, typeIco, TYPE_LABEL, METHOD_LABEL, serverKind, jobItem, bindJobClicks, jobStarted, openJobLog, serverPicker, envEditor, dropzone } from "../components.js";
 import { lbMethodSelect, methodHint } from "./wizard.js";
 import { siteUrl } from "./sites.js";
 import { scriptsTab } from "./site-scripts.js";
@@ -48,10 +48,14 @@ export default async function site(ctx) {
   const head = $("[data-head]", root), box = $("[data-tab]", root);
 
   /* ── header + actions ── */
+  const updateTitle = () => {
+    const u = S.update;
+    return u ? [u.version && u.version !== u.currentVersion ? `v${u.version}` : u.shortSha, u.message].filter(Boolean).join(" — ") : "";
+  };
   const paintHead = () => mount(head, html`<div class="site-head">
       ${typeIco(S.type)}
       <div style="min-width:0;flex:1">
-        <h1>${S.name} ${lbBadge(S, serversById())}</h1>
+        <h1>${S.name} ${lbBadge(S, serversById())} ${updateBadge(S)}</h1>
         <div class="sh-meta">${healthChip(S)}<span class="dim">·</span>
           ${project ? html`<a href="#/projects/${project.id}" class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(project.color)}"></span>${project.name}</a><span class="dim">·</span>` : ""}
           ${(S.domains || []).slice(0, 2).map((d, i) => html`${i ? html`<span class="dim">·</span>` : ""}<a href="${siteUrl(S, d) || "#"}" target="_blank" rel="noopener noreferrer" class="row" style="gap:5px">${d}${icon("external", "xs")}</a>`)}
@@ -60,7 +64,8 @@ export default async function site(ctx) {
       </div>
       ${S.busyJobId ? html`<div class="note" style="width:100%;order:3;align-items:center">${icon("refresh")}<div style="flex:1">An operation is running on this website — other actions wait until it finishes.</div><button class="btn btn-sm" data-job="${S.busyJobId}">View log</button></div>` : ""}
       <div class="right btn-row">
-        <button class="btn btn-primary" data-act="deploy">${icon("rocket")}Deploy</button>
+        ${S.update ? html`<button class="btn btn-primary" data-update title="${updateTitle()}">${icon("arrowUp")}Update</button>`
+          : !deployed() ? html`<button class="btn btn-primary" ${S.github?.repo && !(S.releases || []).length ? raw("data-update") : raw('data-act="deploy"')}>${icon("rocket")}Deploy</button>` : ""}
         <button class="btn" data-act="restart">${icon("restart")}Restart</button>
         <button class="icon-btn" data-more aria-label="More actions">${icon("more")}</button>
       </div></div>`);
@@ -84,10 +89,37 @@ export default async function site(ctx) {
     } catch (e) { toastError(e, `Couldn't ${verbs[act].toLowerCase()}`); }
   };
   on(head, "click", "[data-act]", (e, b) => runAction(b.dataset.act));
+
+  /* ── updates: the tracked branch (or a newer release) is ahead of what's live ── */
+  /** Pull the tracked branch and deploy it (or deploy the newer release that's already here). */
+  const pullDeploy = async (b) => {
+    const u = S.update;
+    if (u?.kind === "release" && u.releaseId) return runAction("deploy", { releaseId: u.releaseId });
+    if (!S.github?.repo) { location.hash = `${base}/deployments`; return; }
+    b?.classList.add("loading");
+    try {
+      const job = await post(`/api/sites/${S.id}/releases/github`, { deploy: true });
+      jobStarted(job, `Pulling ${S.github.branch || "the default branch"} & deploying${S.loadBalanced ? " — rolling, one server at a time" : ""}`);
+    } catch (e) { toastError(e, "Couldn't pull & deploy"); }
+    finally { b?.classList.remove("loading"); }
+  };
+  const checkUpdates = async (b) => {
+    b?.classList.add("loading");
+    try {
+      const r = await post(`/api/sites/${S.id}/update-check`);
+      S.update = r.update;
+      toast(r.update ? "Update available" : "Up to date", r.update ? "info" : "ok", { msg: r.update ? updateTitle() : `${S.name} is on the latest commit of ${S.github.branch || "its branch"}.` });
+      paintHead(); if (tab === "overview") paintOverview();
+    } catch (e) { toastError(e, "Couldn't check for updates"); }
+    finally { b?.classList.remove("loading"); }
+  };
+  on(root, "click", "[data-update]", (e, b) => pullDeploy(b));
+  on(root, "click", "[data-checkupdate]", (e, b) => checkUpdates(b));
   on(head, "click", "[data-more]", (e, b) => openMenu(b, [
     { label: "Start", icon: "play", onClick: () => runAction("start") },
     { label: "Stop", icon: "stop", onClick: () => runAction("stop") },
     { label: "Roll back", icon: "rollback", disabled: !S.previousReleaseId, onClick: () => runAction("rollback") },
+    ...(S.github?.repo ? [{ label: "Check for updates", icon: "refresh", onClick: () => checkUpdates() }] : []),
     { sep: true },
     { label: "Run a script…", icon: "zap", onClick: () => (location.hash = `${base}/scripts`) },
     { label: "Open nginx config", icon: "code", onClick: () => (location.hash = `${base}/domains`) },
@@ -117,25 +149,32 @@ export default async function site(ctx) {
         <div class="card"><div class="card-head"><h3>Recent jobs</h3><div class="right"><a class="btn btn-sm btn-ghost" href="${base}/deployments">Deployments ${icon("arrowRight", "sm")}</a></div></div><div class="list" data-jobs></div></div>
         <div class="card"><div class="card-head"><h3>Quick actions</h3></div><div class="card-body">
           <div class="stack" style="gap:10px">
-            <button class="btn btn-primary btn-block" data-qa="deploy">${icon("rocket")}Deploy current release</button>
+            ${S.github?.repo ? html`<button class="btn btn-primary btn-block" data-qpull>${icon("github")}Pull & deploy</button>`
+              : html`<a class="btn btn-primary btn-block" href="${base}/deployments">${icon("upload")}Upload a release</a>`}
             <div class="grid-2" style="gap:10px"><button class="btn" data-qa="restart">${icon("restart")}Restart</button><button class="btn" data-qa="rollback" ${S.previousReleaseId ? "" : raw("disabled")}>${icon("rollback")}Roll back</button>
             <button class="btn" data-qa="start">${icon("play")}Start</button><button class="btn btn-danger" data-qa="stop">${icon("stop")}Stop</button></div>
             <p class="hint">${S.loadBalanced ? "Load-balanced deploys roll through servers one at a time, so the site stays up." : "Deploys build in a staging folder and swap in only when the health check passes."}</p>
           </div></div></div>
       </div>`);
     on(box, "click", "[data-qa]", (e, b) => runAction(b.dataset.qa));
+    on(box, "click", "[data-qpull]", (e, b) => pullDeploy(b));
     paintOverview = () => {
       const rel = (S.releases || []).find((r) => r.id === S.currentReleaseId) || S.currentRelease || (S.currentVersion ? { version: S.currentVersion } : null);
       const h = siteHealth(S);
       const ups = S.upstreams || [];
       const sById = serversById();
       const spread = S.releasesInLine === false ? S.releaseSpread || [] : [];
+      const u = S.update;
       mount($("[data-ov]", box), html`
+        ${u ? html`<div class="note" style="margin-bottom:16px;align-items:center">${icon("arrowUp")}<div style="flex:1;min-width:0">
+          <strong>Update available${u.version && u.version !== u.currentVersion ? html` — v${u.version}` : ""}</strong>${u.currentVersion ? html` <span class="muted small">(live: v${u.currentVersion})</span>` : ""}
+          <div class="small" style="margin-top:4px">${u.shortSha ? html`${u.htmlUrl ? html`<a class="mono" href="${u.htmlUrl}" target="_blank" rel="noopener noreferrer">${u.shortSha}</a>` : html`<span class="mono">${u.shortSha}</span>`} · ` : ""}${u.message || ""}${u.author ? html` <span class="muted">— ${u.author}</span>` : ""}${u.date ? html` <span class="muted">· ${ago(u.date)}</span>` : ""}${u.ref ? html` <span class="muted">· ${u.ref}</span>` : ""}</div></div>
+          <div class="btn-row" style="flex-wrap:nowrap"><button class="btn btn-sm btn-primary" data-update>${icon("arrowUp")}Update</button></div></div>` : ""}
         ${spread.length ? html`<div class="note warn" style="margin-bottom:16px">${icon("alert")}<div><strong>Servers are on different releases — redeploy to bring them in line.</strong>
           <div class="small" style="margin-top:4px">${spread.map((g) => `${g.servers.map((x) => x.name).join(", ")}: ${g.releaseId ? (g.version ? "v" + g.version : g.releaseId) : "nothing deployed"}`).join(" · ")}</div>
           <div class="row" style="gap:8px;margin-top:10px;flex-wrap:wrap"><button class="btn btn-sm" data-qa="deploy">${icon("rocket")}Deploy the latest release everywhere</button><a class="btn btn-sm btn-ghost" href="${base}/deployments">Pick a release ${icon("arrowRight", "sm")}</a></div></div></div>` : ""}
         <div class="mini-stats">
-          <div class="mini-stat"><div class="ms-l">${icon("rocket", "xs")}Current release</div><div class="ms-v mono">${rel ? "v" + rel.version : "—"}</div><div class="ms-s">${rel ? html`${rel.source === "github" ? "GitHub" : "Upload"}${rel.createdAt ? html` · ${ago(rel.createdAt)}` : ""}` : "Nothing deployed yet"}</div></div>
+          <div class="mini-stat"><div class="ms-l">${icon("rocket", "xs")}Current release</div><div class="ms-v mono">${rel ? (rel.version ? "v" + rel.version : (rel.github?.sha || rel.commit || "").slice(0, 7) || "unversioned") : "—"}</div><div class="ms-s">${rel ? html`${rel.source === "github" ? "GitHub" : "Upload"}${rel.createdAt ? html` · ${ago(rel.createdAt)}` : ""}` : "Nothing deployed yet"}</div></div>
           <div class="mini-stat"><div class="ms-l">${icon("activity", "xs")}Status</div><div class="ms-v row" style="gap:9px"><span class="dot ${h.tone}"></span>${h.text}</div><div class="ms-s">Checked ${ago(Object.values(S.state || {}).map((x) => x?.checkedAt).filter(Boolean).sort().pop())}</div></div>
           <div class="mini-stat"><div class="ms-l">${icon(S.loadBalanced ? "balance" : "server", "xs")}Hosting</div><div class="ms-v">${S.loadBalanced ? `${ups.length} servers` : sById[(S.serverIds || [])[0]]?.name || "main"}</div><div class="ms-s">${S.loadBalanced ? METHOD_LABEL[S.lbMethod] : "Single server"} · port ${S.port || "—"}</div></div>
           <div class="mini-stat"><div class="ms-l">${icon("lock", "xs")}HTTPS</div><div class="ms-v">${S.ssl?.status === "active" ? "Active" : S.ssl?.status === "failed" ? "Failed" : S.ssl?.status === "pending" ? "Pending" : "Not set up"}</div><div class="ms-s">${S.ssl?.expiresAt ? `Renews before ${fmtDate(S.ssl.expiresAt, false)}` : html`<a href="${base}/domains" style="color:var(--blue-3)">Issue a certificate →</a>`}</div></div>
