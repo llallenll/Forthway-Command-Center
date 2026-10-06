@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.0.0",
+  version: "3.1.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -723,7 +723,8 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     `PATCH /api/sites/:id` (`cloudflare` key); changing `domains` re-intersects `hostnames` (empty → `enabled: false`). Public site
     view has `cloudflare` (always an object) and `url` is `https://` for tunnel domains. When `enabled`, SITES awaits
     `ctx.cloudflare.validateSite(cf, { domains, siteId })` before saving: 400 `{ error, code }` with `code` one of
-    `cloudflare_not_connected | cloudflare_tunnel_missing | cloudflare_tunnel_local | cloudflare_zone_missing (+ hostnames, zones)`,
+    `cloudflare_not_connected | cloudflare_tunnel_missing | cloudflare_tunnel_local | cloudflare_zone_missing (+ hostnames, zones) |
+    cloudflare_zone_account` (the domain is in another account than the tunnel),
     409 `cloudflare_hostname_taken` (the panel's own hostname), 502 `cloudflare_unreachable`. After create / a change of
     `cloudflare` or `domains`, SITES calls `ctx.cloudflare.syncSite(site)`; the delete job calls `await ctx.cloudflare.removeSite(site, { log })`.
   - **Routing.** Each tunnel hostname = ingress rule `{ hostname, service: "http://127.0.0.1:80", originRequest: { httpHostHeader: hostname } }`
@@ -737,9 +738,9 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     (`replaceExisting`). All ingress read-modify-writes are serialised.
   - **Ledger** collection `cloudflareRoutes`: `{ id, owner: "site:<id>"|"panel", siteId, hostname, tunnelId, zoneId, zoneName,
     service, ruleKey, ingress: "created"|"adopted"|null, dnsRecordId, dnsCreated, status: "active"|"error"|"manual", error, code, syncedAt }`.
-  - **config.json** `cloudflare: { apiTokenEnc, accountId, accountName, viaLogin, connectors: [{ id, name, tokenEnc, autoStart, cfId }],
+  - **config.json** `cloudflare: { apiTokenEnc, accountId, accountName, viaLogin, connectors: [{ id, name, tokenEnc, autoStart, cfId, accountId }],
     panel: { hostname, tunnelId } | null, phpmyadmin: { hostname, tunnelId } | null, domainCreds: [{ id, tokenEnc, viaLogin, accountId,
-    zones: [{ id, name }], addedAt }] }` — tokens encrypted with `ctx.secrets`. Connecting: (1) *Log in with Cloudflare* —
+    accountName, tunnels, zones: [{ id, name }], addedAt }] }` — tokens encrypted with `ctx.secrets`. Connecting: (1) *Log in with Cloudflare* —
     `cloudflared tunnel login` with `HOME=dataDir/cloudflared-home`, the origin cert carries account + API token;
     (2) API token (Account·Cloudflare Tunnel·Edit, Zone·DNS·Edit, Zone·Zone·Read); (3) connector token only — the connector runs,
     hostnames get `status: "manual"` with dashboard instructions. Connectors run `cloudflared --no-autoupdate tunnel run` with
@@ -764,13 +765,23 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     `POST /api/cloudflare/reset` → `{ removed, remaining, tunnelStopped }` (local only: stops connectors, deletes credentials,
     connector tokens, the login cert under dataDir and the ledger; tunnels, routes and DNS stay in Cloudflare).
   - **Domains**: `cloudflared tunnel login` authorises ONE zone per login, and an API token may be limited to some zones, so
-    further zones of the same account come from extra credentials in `domainCreds`. `zones()` merges the main credentials' zones
-    with each extra credential's (tagged `source: "main" | <cred id>`); DNS reads/writes for a zone use the token of the credential
-    that reaches it (`tokenForZone`); tunnel config always uses the main credentials. `GET /api/cloudflare/domains` →
-    `{ items: [{ id, name, status, source, sourceLabel, removable, error, routes }], sources, addSiteUrl }` ·
-    `POST /api/cloudflare/domains/login` (a `cloudflared tunnel login` whose cert is stored as a domain credential; poll with
-    `GET /api/cloudflare/login` → `{ done, purpose: "domain", added }`; a cert for another account is refused) ·
-    `POST /api/cloudflare/domains { token }` (must add at least one zone not already available) ·
+    further zones come from extra credentials in `domainCreds`. `zones()` merges the main credentials' zones
+    with each extra credential's (tagged `source: "main" | <cred id>` and `accountId`); DNS reads/writes for a zone use the token of
+    the credential that reaches it (`tokenForZone`).
+    **Several accounts**: a domain credential may be in another account (one the user was invited to). It is then also the
+    panel's way into that account's tunnels (`tunnels: true`; refused at add time unless it can list `cfd_tunnel` there), because
+    Cloudflare only lets a tunnel carry hostnames of zones in its own account. `status().managedAccounts` = `[{ id, name, main }]`
+    (main first). `accountTunnels()` lists tunnels in every managed account (tagged `accountId`, `accountName`); a tunnel's account
+    comes from its local connector token (`a`), else that listing (`accountOfTunnel`), and all ingress reads/writes use that
+    account's credentials (`credsForAccount`). Reconcile, `validateSite` and the panel / phpMyAdmin publish only match a hostname
+    against zones of the tunnel's account (mismatch → `cloudflare_zone_account`). `options()` adds `accounts`, per-tunnel
+    `accountId`/`accountName` and `zoneAccounts: { zoneName: accountId }`; the delivery picker prefers a tunnel in the domains'
+    account and refuses a mismatch. `POST /api/cloudflare/tunnels` takes `accountId`. `GET /api/cloudflare/domains` →
+    `{ items: [{ id, name, status, accountId, accountName, source, sourceLabel, removable, error, routes }], sources, accounts, addSiteUrl }` ·
+    `POST /api/cloudflare/domains/login` (a `cloudflared tunnel login` whose cert is stored as a domain credential, in whichever
+    account the domain picked in Cloudflare is in; poll with `GET /api/cloudflare/login` → `{ done, purpose: "domain", added, accounts }`) ·
+    `POST /api/cloudflare/domains { token }` (one credential per account the token reaches; must add at least one zone not already
+    available; → `{ added, accounts, refused }`) ·
     `DELETE /api/cloudflare/domains/:id` (409 while a ledger route sits on a zone only that credential reaches). Disconnect and
     reset forget them. UI: Settings → Cloudflare → Domains (between Connectors and the Publish cards; Routes come after those).
   - **SSE `cloudflare`**: `{ kind: "status", status }` (coalesced), `{ kind: "log", id, line }` (connector output),
@@ -784,7 +795,8 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     `public/assets/views/cloudflare.js`; small hooks in wizard.js, site.js, settings.js, sites.js (`siteUrl`), app.css (`.cf-*`).
   - **Dev**: `FCC_DRY_RUN=1` never spawns or downloads cloudflared (connectors simulated) and never reads a cert from `$HOME`.
     `FCC_DRY_RUN=1 FCC_CLOUDFLARE_FAKE=1` also replaces api.cloudflare.com with an in-memory fake (account "Dev account
-    (simulated)", zones example.com / example.org, any token except `bad`, login completes after ~2 s), persisted in
+    (simulated)", zones example.com / example.org, any token except `bad`, login completes after ~2 s; "Add domain" adds example.net,
+    then example.ca from "Shared account (simulated)", which `shared…` tokens reach), persisted in
     `dataDir/cloudflare-fake.json` — no network.
   - CLUSTER, please: `lb.issueCertificate()` requests every `site.domains` entry; consider skipping tunnel hostnames
     (`ctx.cloudflare?.isTunnelHostname(d)`) — they don't need a certificate (validation would still go through the tunnel).

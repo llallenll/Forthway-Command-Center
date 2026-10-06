@@ -32,7 +32,11 @@ export function zoneOf(zones, host) {
 export function cfUsable(D) { return !!D.opts && !D.opts.unavailable && (D.opts.connected || (D.opts.tunnels || []).length > 0); }
 export function tunnelHosts(D) { return D.domains.filter((d) => D.hosts.has(d)); }
 export function pickDefaultTunnel(D) {
-  const t = D.opts?.tunnels || [];
+  const all = D.opts?.tunnels || [];
+  // A tunnel only carries domains of its own account: prefer one in the tunnelled domains' account.
+  const accts = new Set(tunnelHosts(D).map((h) => zoneAccount(D.opts, h)).filter(Boolean));
+  const fit = accts.size === 1 ? all.filter((x) => x.accountId === [...accts][0]) : [];
+  const t = fit.length ? fit : all;
   if (D.tunnelId && t.some((x) => x.id === D.tunnelId)) return;
   D.tunnelId = (t.find((x) => x.connectedHere) || t.find((x) => x.local) || t[0])?.id || D.tunnelId || "";
 }
@@ -53,11 +57,19 @@ export function validateDelivery(D) {
   if (D.opts.connected) {
     const missing = hosts.filter((h) => !zoneOf(D.opts.zones, h));
     if (missing.length) return `${missing.join(", ")} ${missing.length === 1 ? "isn't" : "aren't"} in your Cloudflare account — add the domain to Cloudflare, or switch ${missing.length === 1 ? "it" : "them"} to Direct.`;
+    const t = D.opts.tunnels.find((x) => x.id === D.tunnelId);
+    const other = t?.accountId ? hosts.filter((h) => zoneAccount(D.opts, h) && zoneAccount(D.opts, h) !== t.accountId) : [];
+    if (other.length) return `${other.join(", ")} ${other.length === 1 ? "is" : "are"} in the Cloudflare account ${accountName(D.opts, zoneAccount(D.opts, other[0]))}, but tunnel “${t.name}” is in ${accountName(D.opts, t.accountId)}. A tunnel only carries domains of its own account — pick a tunnel there, or split the domains across websites.`;
   }
   return null;
 }
 
-const tunnelLabel = (t) => `${t.name}${t.connectedHere ? " — connected on this server" : t.running ? " — starting on this server" : t.local ? " — connector stopped here" : " — not run by this panel"}`;
+/** The account a hostname's zone is in (options.zoneAccounts), or null. */
+export function zoneAccount(o, host) { const z = zoneOf(o?.zones, host); return z ? o.zoneAccounts?.[z] || null : null; }
+const accountName = (o, id) => (o?.accounts || []).find((a) => a.id === id)?.name || "another account";
+const multiAccount = (o) => (o?.accounts || []).length > 1;
+
+const tunnelLabel = (t, o) => `${multiAccount(o) && t.accountName ? `${t.accountName} · ` : ""}${t.name}${t.connectedHere ? " — connected on this server" : t.running ? " — starting on this server" : t.local ? " — connector stopped here" : " — not run by this panel"}`;
 
 /** Connection state + tunnel picker. Empty when no domain uses the tunnel. */
 export function cfPanel(D, { always = false } = {}) {
@@ -78,9 +90,9 @@ export function cfPanel(D, { always = false } = {}) {
   const t = o.tunnels.find((x) => x.id === D.tunnelId);
   return html`<div class="cf-tunnel">
     <div class="field" style="flex:1;min-width:220px"><label>Tunnel</label>
-      ${o.tunnels.length > 1 ? html`<select class="select" data-cftunnel>${o.tunnels.map((x) => html`<option value="${x.id}" ${x.id === D.tunnelId ? raw("selected") : ""}>${tunnelLabel(x)}</option>`)}</select>`
+      ${o.tunnels.length > 1 ? html`<select class="select" data-cftunnel>${o.tunnels.map((x) => html`<option value="${x.id}" ${x.id === D.tunnelId ? raw("selected") : ""}>${tunnelLabel(x, o)}</option>`)}</select>`
         : html`<div class="cf-static">${icon("cloud", "sm")}<span class="strong">${o.tunnels[0].name}</span><span class="muted small">${tunnelLabel(o.tunnels[0]).slice(o.tunnels[0].name.length + 3)}</span></div>`}</div>
-    <div class="cf-acct muted small">${o.connected ? html`${icon("check", "xs")} Account <b>${o.accountName || "connected"}</b> · ${plural(o.zones.length, "zone")}` : html`${icon("alert", "xs")} Connector token only — add the public hostnames in the Cloudflare dashboard`}${o.simulatedApi ? " · simulated" : ""}</div>
+    <div class="cf-acct muted small">${o.connected ? html`${icon("check", "xs")} Account <b>${(t?.accountName) || o.accountName || "connected"}</b> · ${plural(multiAccount(o) && t?.accountId ? o.zones.filter((z) => o.zoneAccounts?.[z] === t.accountId).length : o.zones.length, "zone")}` : html`${icon("alert", "xs")} Connector token only — add the public hostnames in the Cloudflare dashboard`}${o.simulatedApi ? " · simulated" : ""}</div>
   </div>
   ${t && !t.local ? html`<div class="note warn mt-12">${icon("alert")}<div>This panel doesn't run a connector for <b>${t.name}</b>. Routes will be written, but traffic only flows while a connector for this tunnel is running somewhere — start one in <a href="${CF_SETTINGS}" target="_blank" rel="noopener">Settings → Cloudflare</a>.</div></div>` : ""}`;
 }
@@ -90,6 +102,7 @@ export function domainRows(D, { removable = true, routes = null, mainHost = "" }
   if (!D.domains.length) return html`<div class="cf-rows"><div class="list-item"><span class="muted small">No domains yet.</span></div></div>`;
   const usable = cfUsable(D);
   const o = D.opts;
+  const tunnelAcct = o?.tunnels?.find((x) => x.id === D.tunnelId)?.accountId || null;
   return html`<div class="cf-rows">${D.domains.map((d, i) => {
     const tun = D.hosts.has(d);
     const r = routes?.find((x) => x.hostname === d) || null;
@@ -99,6 +112,7 @@ export function domainRows(D, { removable = true, routes = null, mainHost = "" }
     else if (r?.status === "error") sub = html`<span class="cf-err">${icon("alert", "xs")} ${r.error}</span>`;
     else if (r?.status === "manual") sub = html`<span class="cf-warn">${icon("alert", "xs")} Add this public hostname in the Cloudflare dashboard → <span class="mono">http://127.0.0.1:80</span>, HTTP Host Header <span class="mono">${d}</span></span>`;
     else if (o?.connected && !zone) sub = html`<span class="cf-err">${icon("alert", "xs")} Not in your Cloudflare account${o.zones.length ? html` (zones: ${o.zones.slice(0, 4).join(", ")}${o.zones.length > 4 ? "…" : ""})` : ""}</span>`;
+    else if (o?.connected && tunnelAcct && o.zoneAccounts?.[zone] && o.zoneAccounts[zone] !== tunnelAcct) sub = html`<span class="cf-err">${icon("alert", "xs")} In ${accountName(o, o.zoneAccounts[zone])} — pick a tunnel in that account</span>`;
     else if (r?.status === "active") sub = html`<span class="cf-ok">${icon("check", "xs")} Live through the tunnel</span> · zone <span class="mono">${r.zoneName || zone || ""}</span> · HTTPS by Cloudflare`;
     else sub = html`${zone ? html`Zone <span class="mono">${zone}</span> · ` : ""}proxied CNAME → tunnel · HTTPS by Cloudflare`;
     return html`<div class="list-item cf-row">
@@ -171,7 +185,7 @@ export async function cloudflareSettings(box, ctx) {
     const localIds = new Set(S.connectors.map((c) => c.cfId).filter(Boolean));
     const spare = (S.tunnels || []).filter((t) => !localIds.has(t.id) && t.remotelyManaged);
     mount(box, html`
-      ${S.dryRun ? html`<div class="note warn">${icon("alert")}<div><b>Dry run.</b> cloudflared is never started or downloaded — connectors are simulated.${S.simulatedApi ? html` The Cloudflare API is simulated too (zones <span class="mono">example.com</span>, <span class="mono">example.org</span>; “Add domain” adds <span class="mono">example.net</span>); nothing leaves this machine.` : ""}</div></div>` : ""}
+      ${S.dryRun ? html`<div class="note warn">${icon("alert")}<div><b>Dry run.</b> cloudflared is never started or downloaded — connectors are simulated.${S.simulatedApi ? html` The Cloudflare API is simulated too (zones <span class="mono">example.com</span>, <span class="mono">example.org</span>; “Add domain” adds <span class="mono">example.net</span>, then <span class="mono">example.ca</span> from a second, shared account); nothing leaves this machine.` : ""}</div></div>` : ""}
 
       <div class="card">
         <div class="card-head" style="flex-wrap:wrap">
@@ -185,6 +199,7 @@ export async function cloudflareSettings(box, ctx) {
           <dl class="kv">
             <dt>Account</dt><dd>${(S.accounts || []).length > 1 ? html`<select class="select" data-account style="max-width:340px">${S.accounts.map((a) => html`<option value="${a.id}" ${a.id === S.accountId ? raw("selected") : ""}>${a.name}</option>`)}</select>` : html`${S.accountName || S.accountId}`}</dd>
             <dt>Connected with</dt><dd>${via}</dd>
+            ${others().length ? html`<dt>Other accounts</dt><dd>${others().map((a) => a.name).join(", ")} <span class="muted small">— through their domains below</span></dd>` : ""}
             <dt>Domains</dt><dd>${(S.zones || []).length ? html`${plural(S.zones.length, "domain")} — <a href="#" data-godomains>manage below</a>` : html`<span class="muted">None yet — add one under Domains below</span>`}</dd>
           </dl>
           <div class="btn-row mt-20"><button class="btn" data-disconnect>${icon("logout")}Disconnect account</button><span class="muted small">Connectors keep running on their own tokens.</span></div>`
@@ -208,7 +223,7 @@ export async function cloudflareSettings(box, ctx) {
             ${S.connected || S.connectors.length ? html`<button class="btn btn-sm" data-addconn>${icon("token")}Paste connector token</button>` : ""}</div></div>
         ${S.connectors.length ? html`<div class="list">${S.connectors.map((c) => html`<div class="list-item">
             <span class="li-ico">${icon("cloud", "sm")}</span>
-            <div class="li-main"><div class="li-title">${c.name}</div><div class="li-sub">${c.cfId ? html`Tunnel <span class="mono">${c.cfId.slice(0, 8)}</span>` : "Tunnel id unknown"}${c.startedAt ? html` · up since ${ago(c.startedAt)}` : ""}${c.lastError ? html` · <span class="cf-err">${c.lastError}</span>` : ""}</div></div>
+            <div class="li-main"><div class="li-title">${c.name}</div><div class="li-sub">${others().length && c.accountId ? html`${acctName(c.accountId)} · ` : ""}${c.cfId ? html`Tunnel <span class="mono">${c.cfId.slice(0, 8)}</span>` : "Tunnel id unknown"}${c.startedAt ? html` · up since ${ago(c.startedAt)}` : ""}${c.lastError ? html` · <span class="cf-err">${c.lastError}</span>` : ""}</div></div>
             <div class="li-right">
               <label class="switch hide-sm" title="Start this connector whenever the panel starts"><input type="checkbox" data-auto="${c.id}" ${c.autoStart ? raw("checked") : ""}/><span class="track"></span>With panel</label>
               <span class="status"><span class="dot ${STATUS_TONE(c)}"></span>${STATUS_TEXT(c)}</span>
@@ -266,13 +281,13 @@ export async function cloudflareSettings(box, ctx) {
     const tone = (z) => (z.error ? "err" : z.status === "active" ? "ok" : "warn");
     const label = (z) => (z.error ? "Can't reach" : z.status === "active" ? "Active" : z.status === "pending" ? "Pending nameservers" : z.status || "Unknown");
     return html`<div class="card" id="cf-domains">
-      <div class="card-head" style="flex-wrap:wrap"><div style="flex:1 1 240px"><h3>Domains</h3><div class="sub">Domains in ${S.accountName || "this account"} the panel can route through your tunnels. Cloudflare's login authorises one domain at a time — add each one you want to use.</div></div>
+      <div class="card-head" style="flex-wrap:wrap"><div style="flex:1 1 240px"><h3>Domains</h3><div class="sub">Domains the panel can route through your tunnels. Cloudflare's login authorises one domain at a time — add each one you want to use. A domain in another account you belong to works too; route it through a tunnel in that account.</div></div>
         <div class="right btn-row"><button class="btn btn-sm btn-primary" data-adddomain>${icon("plus")}Add domain</button><button class="btn btn-sm" data-domtoken>${icon("key")}Paste API token</button></div></div>
       <div data-domlogin hidden></div>
       ${D.error ? html`<div class="card-body" style="padding-bottom:0"><div class="error-box">${icon("alert")}<div>${D.error}</div></div></div>` : ""}
       ${D.items.length ? html`<div class="list">${D.items.map((z) => html`<div class="list-item">
           <span class="li-ico">${icon("globe", "sm")}</span>
-          <div class="li-main"><div class="li-title mono">${z.name}</div><div class="li-sub">${z.sourceLabel}${z.routes ? html` · ${plural(z.routes, "route")}` : ""}${z.error ? html` · <span class="cf-err">${z.error}</span>` : ""}</div></div>
+          <div class="li-main"><div class="li-title mono">${z.name}</div><div class="li-sub">${others().length ? html`${z.accountName} · ` : ""}${z.sourceLabel}${z.routes ? html` · ${plural(z.routes, "route")}` : ""}${z.error ? html` · <span class="cf-err">${z.error}</span>` : ""}</div></div>
           <div class="li-right">
             <span class="status"><span class="dot ${tone(z)}"></span>${label(z)}</span>
             ${z.removable ? html`<button class="icon-btn ghost sm" data-dommenu="${z.source}" aria-label="More for ${z.name}">${icon("more", "sm")}</button>` : html`<span class="icon-btn ghost sm" style="visibility:hidden"></span>`}
@@ -284,10 +299,14 @@ export async function cloudflareSettings(box, ctx) {
 
   function panelTunnels() {
     const m = new Map();
-    for (const c of S.connectors) if (c.cfId) m.set(c.cfId, { id: c.cfId, name: c.name });
-    for (const t of S.tunnels || []) if (t.remotelyManaged && !m.has(t.id)) m.set(t.id, { id: t.id, name: `${t.name} (not run here)` });
+    const pre = (id) => (others().length && id ? `${acctName(id)} · ` : "");
+    for (const c of S.connectors) if (c.cfId) m.set(c.cfId, { id: c.cfId, name: `${pre(c.accountId)}${c.name}` });
+    for (const t of S.tunnels || []) if (t.remotelyManaged && !m.has(t.id)) m.set(t.id, { id: t.id, name: `${pre(t.accountId)}${t.name} (not run here)` });
     return [...m.values()];
   }
+  /** Accounts other than the main one that the panel reaches (through domain credentials). */
+  function others() { return (S.managedAccounts || []).filter((a) => !a.main); }
+  function acctName(id) { return (S.managedAccounts || []).find((a) => a.id === id)?.name || id.slice(0, 8); }
 
   // A website's tunnel rule points at nginx on this server; nginx then forwards
   // to the site's port (or every server in its pool). Show both hops so ":80"
@@ -306,7 +325,7 @@ export async function cloudflareSettings(box, ctx) {
     const tunnels = routes.tunnels || [];
     if (!tunnels.length && !errs.length) return html`<div class="card-body"><p class="muted small">No routes yet. Choose <b>Cloudflare Tunnel</b> for a domain in a website's Domains step (or its Domains & SSL tab).</p></div>`;
     return html`${errs.length ? html`<div class="card-body" style="padding-bottom:0">${errs.map((r) => html`<div class="${r.status === "manual" ? "note warn" : "error-box"} mt-8">${icon("alert")}<div><b class="mono">${r.hostname}</b>${r.siteName ? html` · <a href="#/sites/${r.siteId}/domains">${r.siteName}</a>` : r.owner === "panel" ? " · panel" : r.owner === "phpmyadmin" ? " · phpMyAdmin" : ""} — ${r.error || r.status}</div></div>`)}</div>` : ""}
-      ${tunnels.map((t) => html`<div class="cf-routes-head"><span class="strong">${t.name}</span> <span class="muted small mono">${t.tunnelId.slice(0, 8)}</span></div>
+      ${tunnels.map((t) => html`<div class="cf-routes-head"><span class="strong">${t.name}</span> <span class="muted small mono">${t.tunnelId.slice(0, 8)}</span>${others().length && t.accountName ? html` <span class="muted small">· ${t.accountName}</span>` : ""}</div>
         ${t.error ? html`<div class="card-body" style="padding-top:0"><span class="muted small">${t.error}</span></div>`
         : html`<div class="list">${t.rules.map((r) => html`<div class="list-item">
             <span class="li-ico">${icon(r.catchAll ? "x" : r.panel ? "dashboard" : r.phpmyadmin ? "database" : r.siteId ? "globe" : "link", "sm")}</span>
@@ -367,7 +386,9 @@ export async function cloudflareSettings(box, ctx) {
 
   // ---- domains
   on(box, "click", "[data-godomains]", (e) => { e.preventDefault(); $("#cf-domains", box)?.scrollIntoView({ behavior: "smooth", block: "start" }); });
-  const domainAdded = (r) => toast(r.added?.length ? `Added ${r.added.join(", ")}` : "Domain added", "ok", { msg: "Its hostnames can now be routed through your tunnels." });
+  const domainAdded = (r) => toast(r.added?.length ? `Added ${r.added.join(", ")}` : "Domain added", "ok", {
+    msg: r.accounts?.length ? `Now linked: ${r.accounts.join(", ")}. Route it through a tunnel in that account — create one under Connectors.` : r.refused?.length ? r.refused.join(" ") : "Its hostnames can now be routed through your tunnels.",
+  });
   on(box, "click", "[data-adddomain]", async (e, b) => {
     busy(b, true);
     try {
@@ -392,7 +413,7 @@ export async function cloudflareSettings(box, ctx) {
   on(box, "click", "[data-domlogincancel]", async () => { clearInterval(domainTimer); await post("/api/cloudflare/login/cancel").catch(() => {}); load(); });
   on(box, "click", "[data-domtoken]", async () => {
     const r = await formDialog({
-      title: "Add domains with an API token", ico: "key", sub: "A token for more domains in the same account — for example one with Zone Resources set to several zones. Needs Zone · DNS · Edit and Zone · Zone · Read. Stored encrypted.",
+      title: "Add domains with an API token", ico: "key", sub: "A token for more domains — for example one with Zone Resources set to several zones. Needs Zone · DNS · Edit and Zone · Zone · Read; for domains in another account you belong to, also Account · Cloudflare Tunnel · Edit on that account. Stored encrypted.",
       fields: [{ name: "token", label: "API token", type: "password", required: true, autocomplete: "off" }],
       submitText: "Add domains", onSubmit: (v) => post("/api/cloudflare/domains", { token: v.token }),
     });
@@ -419,8 +440,11 @@ export async function cloudflareSettings(box, ctx) {
   on(box, "click", "[data-newtunnel]", async () => {
     const r = await formDialog({
       title: "Create a tunnel", ico: "cloud", sub: "Made in your Cloudflare account and run by this server. Its routes are managed from the panel.",
-      fields: [{ name: "name", label: "Name", value: `fcc-${(ctx.state.settings?.hostname || "server").split(".")[0]}`, required: true, attrs: 'maxlength="60"' }],
-      submitText: "Create & start", onSubmit: (v) => post("/api/cloudflare/tunnels", { name: v.name }),
+      fields: [
+        ...(others().length ? [{ name: "accountId", label: "Cloudflare account", type: "select", value: S.accountId, options: S.managedAccounts.map((a) => ({ value: a.id, label: a.name })), hint: "A tunnel carries domains of its own account only." }] : []),
+        { name: "name", label: "Name", value: `fcc-${(ctx.state.settings?.hostname || "server").split(".")[0]}`, required: true, attrs: 'maxlength="60"' },
+      ],
+      submitText: "Create & start", onSubmit: (v) => post("/api/cloudflare/tunnels", { name: v.name, accountId: v.accountId || undefined }),
     });
     if (r) { toast(`Tunnel ${r.tunnel?.name} created`, r.startError ? "warn" : "ok", { msg: r.startError || "The connector is starting." }); load(); }
   });
@@ -429,7 +453,7 @@ export async function cloudflareSettings(box, ctx) {
     const spare = (S.tunnels || []).filter((t) => !localIds.has(t.id) && t.remotelyManaged);
     const r = await formDialog({
       title: "Run an existing tunnel here", ico: "link", sub: "The panel fetches its connector token and starts it on this server.",
-      fields: [{ name: "tunnelId", label: "Tunnel", type: "select", value: spare[0]?.id, options: spare.map((t) => ({ value: t.id, label: `${t.name}${t.status ? ` (${t.status})` : ""}` })) }],
+      fields: [{ name: "tunnelId", label: "Tunnel", type: "select", value: spare[0]?.id, options: spare.map((t) => ({ value: t.id, label: `${others().length ? `${acctName(t.accountId)} · ` : ""}${t.name}${t.status ? ` (${t.status})` : ""}` })) }],
       submitText: "Use this tunnel", onSubmit: (v) => post("/api/cloudflare/tunnels", { tunnelId: v.tunnelId }),
     });
     if (r) { toast(`Running ${r.tunnel?.name}`, r.startError ? "warn" : "ok", { msg: r.startError || "" }); load(); }

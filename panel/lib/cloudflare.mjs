@@ -28,10 +28,16 @@
  *
  * Data:
  *   config.cloudflare = { apiTokenEnc, accountId, accountName, viaLogin,
- *                         connectors: [{ id, name, tokenEnc, autoStart, cfId }],
+ *                         connectors: [{ id, name, tokenEnc, autoStart, cfId, accountId }],
  *                         panel: { hostname, tunnelId } | null,
  *                         phpmyadmin: { hostname, tunnelId } | null,
- *                         domainCreds: [{ id, tokenEnc, viaLogin, accountId, zones: [{ id, name }], addedAt }] }
+ *                         domainCreds: [{ id, tokenEnc, viaLogin, accountId, accountName, tunnels, zones: [{ id, name }], addedAt }] }
+ *
+ * Accounts: the main credentials pick one account (accountId). A domain credential
+ * may belong to another account (one you were invited to); it must then be able to
+ * manage tunnels there too, because a tunnel only carries hostnames of zones in its
+ * own account. Tunnels and zones are listed from every account the panel reaches,
+ * each tagged with its accountId, and every tunnel call uses that account's credentials.
  *   site.cloudflare   = { enabled, tunnelId, hostnames: [] }   (owned/validated by SITES,
  *                        hostnames ⊆ site.domains; other domains are Direct)
  *   cloudflareRoutes  = { id, owner: "site:<id>"|"panel"|"phpmyadmin", siteId, hostname, tunnelId, zoneId,
@@ -137,21 +143,31 @@ async function realCf(token, p, { method = "GET", body, timeoutMs = 20_000 } = {
   return json.result;
 }
 
+// The simulated accounts. The second stands for an account you were invited to: only
+// "shared:" tokens reach it (what a simulated "Add domain" login hands out once
+// example.net is added), so the multi-account paths can be exercised in dev.
+const FAKE_MAIN = { id: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", name: "Dev account (simulated)" };
+const FAKE_SHARED = { id: "1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e", name: "Shared account (simulated)" };
+
 /**
  * A stand-in for api.cloudflare.com, for development only (FCC_DRY_RUN=1 +
  * FCC_CLOUDFLARE_FAKE=1). Implements just the endpoints this module uses.
  */
 function createFakeCf(file) {
-  const ACCOUNT = { id: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", name: "Dev account (simulated)" };
   const ZONES = [
-    { id: "zone0000000000000000000000000001", name: "example.com", status: "active" },
-    { id: "zone0000000000000000000000000002", name: "example.org", status: "active" },
+    { id: "zone0000000000000000000000000001", name: "example.com", status: "active", account: FAKE_MAIN },
+    { id: "zone0000000000000000000000000002", name: "example.org", status: "active", account: FAKE_MAIN },
     // Only visible to a token scoped to it ("zones:example.net" — what a simulated
     // "Add domain" login hands out), like a real one-domain `cloudflared tunnel login`.
-    { id: "zone0000000000000000000000000003", name: "example.net", status: "pending" },
+    { id: "zone0000000000000000000000000003", name: "example.net", status: "pending", account: FAKE_MAIN },
+    { id: "zone0000000000000000000000000004", name: "example.ca", status: "active", account: FAKE_SHARED },
   ];
-  const zonesFor = (token) =>
-    token.startsWith("zones:") ? ZONES.filter((z) => token.slice(6).split(",").includes(z.name)) : ZONES.filter((z) => z.name !== "example.net");
+  const zonesFor = (token) => {
+    if (token.startsWith("zones:")) return ZONES.filter((z) => token.slice(6).split(",").includes(z.name));
+    if (token.startsWith("shared")) return ZONES.filter((z) => z.account === FAKE_SHARED);
+    return ZONES.filter((z) => z.account === FAKE_MAIN && z.name !== "example.net");
+  };
+  const accountsFor = (token) => (token.startsWith("shared") ? [FAKE_SHARED] : [FAKE_MAIN]);
   let st = { tunnels: [], configs: {}, dns: [] };
   try {
     st = { ...st, ...JSON.parse(fs.readFileSync(file, "utf8")) };
@@ -165,35 +181,39 @@ function createFakeCf(file) {
       /* dev only */
     }
   };
-  const tunnelView = ({ secret, ...t }) => ({ ...t, connections: [], remote_config: true, status: "inactive" });
+  const tunnelAccount = (t) => t.accountId || FAKE_MAIN.id;
+  const tunnelView = ({ secret, accountId, ...t }) => ({ ...t, connections: [], remote_config: true, status: "inactive" });
 
   return async function fakeCf(token, p, { method = "GET", body } = {}) {
     await new Promise((r) => setTimeout(r, 40));
     if (!token || token === "bad") throw cfError(10000, "Authentication error", 403);
     const u = new URL(p, "https://fake.local");
-    const parts = u.pathname.split("/").filter(Boolean);
     const q = u.searchParams;
     const m = (re) => u.pathname.match(re);
+    const reach = (accountId) => {
+      if (!accountsFor(token).some((a) => a.id === accountId)) throw cfError(7003, "Could not route to account", 404);
+    };
     let x;
     if (u.pathname === "/user/tokens/verify") return { id: "fake-token", status: "active" };
-    if (u.pathname === "/accounts") return [ACCOUNT];
-    if (u.pathname === "/zones") return zonesFor(token);
+    if (u.pathname === "/accounts") return accountsFor(token);
+    if (u.pathname === "/zones") return zonesFor(token).filter((z) => !q.get("account.id") || z.account.id === q.get("account.id"));
     if ((x = m(/^\/accounts\/([^/]+)\/cfd_tunnel$/))) {
-      if (x[1] !== ACCOUNT.id) throw cfError(7003, "Could not route to account", 404);
+      reach(x[1]);
       if (method === "POST") {
-        const t = { id: crypto.randomUUID(), name: String(body?.name || "tunnel"), created_at: now(), secret: crypto.randomBytes(32).toString("base64") };
+        const t = { id: crypto.randomUUID(), name: String(body?.name || "tunnel"), created_at: now(), accountId: x[1], secret: crypto.randomBytes(32).toString("base64") };
         st.tunnels.push(t);
         st.configs[t.id] = { ingress: [{ service: "http_status:404" }] };
         save();
         return tunnelView(t);
       }
-      return st.tunnels.map(tunnelView);
+      return st.tunnels.filter((t) => tunnelAccount(t) === x[1]).map(tunnelView);
     }
     if ((x = m(/^\/accounts\/([^/]+)\/cfd_tunnel\/([^/]+)(\/[a-z]+)?$/))) {
-      const t = st.tunnels.find((y) => y.id === x[2]);
+      reach(x[1]);
+      const t = st.tunnels.find((y) => y.id === x[2] && tunnelAccount(y) === x[1]);
       if (!t) throw cfError(1003, "Tunnel not found", 404);
       if (!x[3]) return tunnelView(t);
-      if (x[3] === "/token") return Buffer.from(JSON.stringify({ a: ACCOUNT.id, t: t.id, s: t.secret })).toString("base64");
+      if (x[3] === "/token") return Buffer.from(JSON.stringify({ a: tunnelAccount(t), t: t.id, s: t.secret })).toString("base64");
       if (x[3] === "/configurations") {
         if (method === "PUT") {
           const ing = body?.config?.ingress || [];
@@ -208,6 +228,10 @@ function createFakeCf(file) {
     if ((x = m(/^\/zones\/([^/]+)\/dns_records(?:\/([^/]+))?$/))) {
       const zone = zonesFor(token).find((z) => z.id === x[1]);
       if (!zone) throw cfError(7003, "Could not route to zone", 404);
+      if (body?.type === "CNAME" && /\.cfargotunnel\.com$/.test(body.content || "")) {
+        const t = st.tunnels.find((y) => `${y.id}.cfargotunnel.com` === body.content);
+        if (t && tunnelAccount(t) !== zone.account.id) throw cfError(1014, "CNAME Cross-User Banned: the tunnel is in a different account than the zone");
+      }
       if (!x[2] && method === "GET") return st.dns.filter((r) => r.zoneId === zone.id && (!q.get("name") || r.name === q.get("name")));
       if (!x[2] && method === "POST") {
         if (st.dns.some((r) => r.zoneId === zone.id && r.name === body.name && (r.type === "CNAME" || body.type === "CNAME"))) {
@@ -537,6 +561,42 @@ function createCloudflare(ctx) {
     return token && c.accountId ? { token, accountId: c.accountId } : null;
   }
 
+  /**
+   * Accounts other than the main one, reached through domain credentials:
+   * [{ accountId, accountName, token }]. A credential that can manage tunnels wins.
+   */
+  function otherAccounts() {
+    const c = creds();
+    if (!c) return [];
+    const m = new Map();
+    const list = activeDomainCreds().filter((d) => d.accountId !== c.accountId);
+    for (const d of [...list.filter((x) => x.tunnels), ...list.filter((x) => !x.tunnels)]) {
+      const token = reveal(d.tokenEnc);
+      if (!token || m.has(d.accountId)) continue;
+      m.set(d.accountId, { accountId: d.accountId, accountName: d.accountName || "", token });
+    }
+    return [...m.values()];
+  }
+  /** { token, accountId } for tunnel work in an account (the main one by default), or null. */
+  function credsForAccount(accountId) {
+    const c = creds();
+    if (!c || !accountId || accountId === c.accountId) return c;
+    const o = otherAccounts().find((a) => a.accountId === accountId);
+    return o ? { token: o.token, accountId } : null;
+  }
+  function accountLabel(accountId) {
+    if (!accountId || accountId === conf().accountId) return conf().accountName || conf().accountId || "the connected account";
+    return domainCreds().find((d) => d.accountId === accountId && d.accountName)?.accountName || `account ${accountId.slice(0, 8)}`;
+  }
+  /** The account a tunnel lives in: from the connector token run here, else the tunnel listing. */
+  async function accountOfTunnel(tunnelId) {
+    const e = conf().connectors.find((x) => x.cfId === tunnelId);
+    const known = e && (e.accountId || parseConnectorToken(reveal(e.tokenEnc))?.accountTag);
+    if (known) return known;
+    const listed = (await accountTunnels()).find((t) => t.id === tunnelId);
+    return listed?.accountId || conf().accountId;
+  }
+
   // ------------------------------------------------------------ events
 
   let emitTimer = null;
@@ -642,7 +702,7 @@ function createCloudflare(ctx) {
 
   function publicConnector(e) {
     const s = running.get(e.id)?.status() || { running: false, connections: 0, connected: false, startedAt: null, lastError: null, lastExit: null, fatal: false, simulated: false };
-    return { id: e.id, name: e.name || "Cloudflare Tunnel", cfId: e.cfId || "", autoStart: e.autoStart !== false, hasToken: !!e.tokenEnc, tokenHint: hint(reveal(e.tokenEnc)), ...s };
+    return { id: e.id, name: e.name || "Cloudflare Tunnel", cfId: e.cfId || "", accountId: e.accountId || parseConnectorToken(reveal(e.tokenEnc))?.accountTag || "", autoStart: e.autoStart !== false, hasToken: !!e.tokenEnc, tokenHint: hint(reveal(e.tokenEnc)), ...s };
   }
 
   async function startConnector(id) {
@@ -661,7 +721,7 @@ function createCloudflare(ctx) {
     await running.get(id)?.stop();
   }
 
-  function addConnector({ token, name, autoStart, cfId }) {
+  function addConnector({ token, name, autoStart, cfId, accountId }) {
     const c = conf();
     const parsed = parseConnectorToken(token);
     const existing = c.connectors.find((t) => reveal(t.tokenEnc) === token || (parsed && t.cfId === parsed.tunnelId));
@@ -669,6 +729,7 @@ function createCloudflare(ctx) {
     e.name = String(name || e.name || "").trim().slice(0, 60) || "Cloudflare Tunnel";
     e.tokenEnc = ctx.secrets.encrypt(token);
     e.cfId = cfId || parsed?.tunnelId || e.cfId || "";
+    e.accountId = accountId || parsed?.accountTag || e.accountId || "";
     if (typeof autoStart === "boolean") e.autoStart = autoStart;
     if (!existing) c.connectors.push(e);
     save();
@@ -681,11 +742,13 @@ function createCloudflare(ctx) {
   function invalidate() {
     cache.zones = cache.tunnels = null;
   }
+  /** Zones a token reaches, in one account, or (accountId null) in every account it can see. */
   async function listZones(token, accountId) {
     const all = [];
     for (let page = 1; page <= 20; page++) {
-      const r = await cfCall(token, `/zones?account.id=${encodeURIComponent(accountId)}&per_page=50&page=${page}`);
-      all.push(...r.map((z) => ({ id: z.id, name: z.name, status: z.status })));
+      const scope = accountId ? `account.id=${encodeURIComponent(accountId)}&` : "";
+      const r = await cfCall(token, `/zones?${scope}per_page=50&page=${page}`);
+      all.push(...r.map((z) => ({ id: z.id, name: z.name, status: z.status, accountId: z.account?.id || accountId || "", accountName: z.account?.name || "" })));
       if (r.length < 50 || FAKE) break;
     }
     return all;
@@ -693,27 +756,28 @@ function createCloudflare(ctx) {
 
   /**
    * Every domain (zone) the panel can manage, each tagged with the credential that
-   * reaches it: `source` "main" (the account's login / API token) or a domainCreds id.
-   * `cloudflared tunnel login` authorises one domain per login, so further domains
-   * come from "Add domain" (another login, or an API token for more zones).
+   * reaches it: `source` "main" (the account's login / API token) or a domainCreds id,
+   * and with its `accountId`. `cloudflared tunnel login` authorises one domain per
+   * login, so further domains come from "Add domain" (another login, or an API token
+   * for more zones) — in the main account or in another one.
    */
   async function zones({ fresh = false } = {}) {
     const c = creds();
     if (!c) return [];
     if (!fresh && cache.zones && cache.zones.accountId === c.accountId && Date.now() - cache.zones.at < CACHE_MS) return cache.zones.items;
-    const all = (await listZones(c.token, c.accountId)).map((z) => ({ ...z, source: "main" }));
+    const all = (await listZones(c.token, c.accountId)).map((z) => ({ ...z, accountId: c.accountId, source: "main" }));
     const seen = new Set(all.map((z) => z.id));
     let dirty = false;
-    for (const d of accountDomainCreds()) {
+    for (const d of activeDomainCreds()) {
       let list;
       try {
-        list = await listZones(reveal(d.tokenEnc), c.accountId);
+        list = (await listZones(reveal(d.tokenEnc), d.accountId)).map((z) => ({ ...z, accountId: d.accountId }));
         if (d.error) dirty = true;
         delete d.error;
       } catch (err) {
         if (d.error !== err.message) dirty = true;
         d.error = err.message;
-        list = (d.zones || []).map((z) => ({ ...z, status: "unknown" }));
+        list = (d.zones || []).map((z) => ({ ...z, accountId: d.accountId, status: "unknown" }));
       }
       const names = JSON.stringify(list.map((z) => [z.id, z.name]));
       if (!d.error && names !== JSON.stringify((d.zones || []).map((z) => [z.id, z.name]))) {
@@ -738,67 +802,127 @@ function createCloudflare(ctx) {
     if (!Array.isArray(c.domainCreds)) c.domainCreds = [];
     return c.domainCreds;
   }
-  const accountDomainCreds = () => domainCreds().filter((d) => d.accountId === conf().accountId && d.tokenEnc);
+  const activeDomainCreds = () => domainCreds().filter((d) => d.accountId && d.tokenEnc);
 
   /** The API token that can edit DNS in this zone (a zone from zones(), or just its id). */
   function tokenForZone(c, zoneOrId) {
     const id = typeof zoneOrId === "string" ? zoneOrId : zoneOrId?.id;
     const z = typeof zoneOrId === "object" && zoneOrId?.source ? zoneOrId : cache.zones?.items?.find((x) => x.id === id);
-    const src = z ? z.source : accountDomainCreds().find((d) => (d.zones || []).some((x) => x.id === id))?.id;
+    const src = z ? z.source : activeDomainCreds().find((d) => (d.zones || []).some((x) => x.id === id))?.id;
     if (!src || src === "main") return c.token;
-    const d = accountDomainCreds().find((x) => x.id === src);
+    const d = activeDomainCreds().find((x) => x.id === src);
     return (d && reveal(d.tokenEnc)) || c.token;
   }
 
   /**
-   * Remember another credential for more domains of the connected account.
-   * Returns { cred, added: [zone names] }.
+   * Remember another credential for more domains — of the connected account, or of
+   * another account (one you were invited to). A pasted API token may reach several
+   * accounts; each gets a credential of its own. In another account the credential
+   * must also manage tunnels: a tunnel there is what carries that account's domains.
+   * Returns { added: [zone names], accounts: [names of other accounts now linked] }.
    */
   async function addDomainCred(token, { viaLogin = false, accountId = null } = {}) {
     const c = creds();
     if (!c) throw httpError(400, "Connect your Cloudflare account first.", { code: "cloudflare_not_connected" });
-    if (accountId && accountId !== c.accountId) {
-      throw httpError(400, `That domain belongs to a different Cloudflare account than the connected one (${conf().accountName || c.accountId}). Pick a domain in the same account.`);
-    }
-    if (token === c.token || accountDomainCreds().some((d) => reveal(d.tokenEnc) === token)) throw httpError(409, "Those credentials are already connected.");
     let list;
     try {
-      list = await listZones(token, c.accountId);
+      list = await listZones(token, accountId);
     } catch (err) {
       throw httpError(400, `Cloudflare refused those credentials: ${err.message}`);
     }
-    if (!list.length) throw httpError(400, `Those credentials can't see any domain in ${conf().accountName || "the connected account"}.`);
+    if (!list.length) throw httpError(400, "Those credentials can't see any domain.");
+    const byAccount = new Map();
+    for (const z of list) {
+      const acct = accountId || z.accountId || c.accountId;
+      if (!byAccount.has(acct)) byAccount.set(acct, []);
+      byAccount.get(acct).push(z);
+    }
     const have = new Set((await zones({ fresh: true })).map((z) => z.id));
-    const added = list.filter((z) => !have.has(z.id));
-    if (!added.length) throw httpError(409, `Already available: ${list.map((z) => z.name).join(", ")}.`);
-    const cred = {
-      id: `cfd_${crypto.randomBytes(5).toString("hex")}`,
-      tokenEnc: ctx.secrets.encrypt(token),
-      viaLogin: !!viaLogin,
-      accountId: c.accountId,
-      zones: list.map((z) => ({ id: z.id, name: z.name })),
-      addedAt: now(),
-    };
-    domainCreds().push(cred);
+    const known = (acct) => (acct === c.accountId && token === c.token) || activeDomainCreds().some((d) => d.accountId === acct && reveal(d.tokenEnc) === token);
+    const linkedBefore = new Set(otherAccounts().map((o) => o.accountId));
+    const added = [];
+    const linked = [];
+    const refused = [];
+    for (const [acct, zs] of byAccount) {
+      const fresh = zs.filter((z) => !have.has(z.id));
+      if (!fresh.length || known(acct)) continue;
+      let accountName = acct === c.accountId ? conf().accountName || "" : zs.find((z) => z.accountName)?.accountName || "";
+      let tunnels = acct === c.accountId;
+      if (acct !== c.accountId) {
+        const can = await canManage(token, acct);
+        if (!can.ok) {
+          refused.push(`${fresh.map((z) => z.name).join(", ")} ${fresh.length === 1 ? "is" : "are"} in another Cloudflare account${accountName ? ` (${accountName})` : ""}, and these credentials can't manage tunnels there (${String(can.reason).replace(/\.$/, "")}). ` +
+            "A domain in another account needs a tunnel in that account, so the token also needs Account · Cloudflare Tunnel · Edit for it.");
+          continue;
+        }
+        tunnels = true;
+        if (!accountName) {
+          try {
+            accountName = (await cfCall(token, "/accounts?per_page=50")).find((x) => x.id === acct)?.name || "";
+          } catch {
+            /* a nicety */
+          }
+        }
+      }
+      domainCreds().push({
+        id: `cfd_${crypto.randomBytes(5).toString("hex")}`,
+        tokenEnc: ctx.secrets.encrypt(token),
+        viaLogin: !!viaLogin,
+        accountId: acct,
+        accountName,
+        tunnels,
+        zones: zs.map((z) => ({ id: z.id, name: z.name })),
+        addedAt: now(),
+      });
+      added.push(...fresh.map((z) => z.name));
+      if (acct !== c.accountId && !linkedBefore.has(acct)) linked.push(accountName || acct);
+    }
+    if (!added.length) {
+      if (refused.length) throw httpError(400, refused.join(" "));
+      throw httpError(409, `Already available: ${list.map((z) => z.name).join(", ")}.`);
+    }
     save();
     invalidate();
     emitStatusSoon();
-    return { cred, added: added.map((z) => z.name) };
+    return { added, accounts: linked, refused };
   }
+
+  /** Tunnels in every account the panel reaches, each with its accountId / accountName. */
   async function accountTunnels({ fresh = false } = {}) {
     const c = creds();
     if (!c) return [];
-    if (!fresh && cache.tunnels && cache.tunnels.accountId === c.accountId && Date.now() - cache.tunnels.at < CACHE_MS) return cache.tunnels.items;
-    const r = await cfCall(c.token, `/accounts/${c.accountId}/cfd_tunnel?is_deleted=false&per_page=100`);
-    const items = r.map((t) => ({
-      id: t.id,
-      name: t.name,
-      status: t.status || null,
-      createdAt: t.created_at || null,
-      connections: (t.connections || []).length,
-      remotelyManaged: t.remote_config !== false,
-    }));
-    cache.tunnels = { at: Date.now(), accountId: c.accountId, items };
+    const accts = [{ accountId: c.accountId, accountName: conf().accountName || "", token: c.token }, ...otherAccounts()];
+    const key = accts.map((a) => a.accountId).join(",");
+    if (!fresh && cache.tunnels && cache.tunnels.key === key && Date.now() - cache.tunnels.at < CACHE_MS) return cache.tunnels.items;
+    const items = [];
+    const errors = [];
+    await Promise.all(
+      accts.map(async (a, i) => {
+        let r;
+        try {
+          r = await cfCall(a.token, `/accounts/${a.accountId}/cfd_tunnel?is_deleted=false&per_page=100`);
+        } catch (err) {
+          if (i === 0) throw err;
+          errors.push({ accountId: a.accountId, message: `Couldn't list the tunnels in ${a.accountName || a.accountId}: ${err.message}` });
+          return;
+        }
+        for (const t of r) {
+          items.push({
+            id: t.id,
+            name: t.name,
+            status: t.status || null,
+            createdAt: t.created_at || null,
+            connections: (t.connections || []).length,
+            remotelyManaged: t.remote_config !== false,
+            accountId: a.accountId,
+            accountName: a.accountName,
+          });
+        }
+      }),
+    );
+    // The main account first, then the order the accounts were linked in.
+    items.sort((x, y) => accts.findIndex((a) => a.accountId === x.accountId) - accts.findIndex((a) => a.accountId === y.accountId));
+    cache.tunnels = { at: Date.now(), key, items, errors };
     return items;
   }
 
@@ -968,6 +1092,12 @@ function createCloudflare(ctx) {
       (r.originRequest?.noTLSVerify ? ", and No TLS Verify on" : "") + ".";
   }
 
+  /** Why a hostname can't go through a tunnel of another account. */
+  function accountMismatch(hostname, zone, tunnelAccountId) {
+    return `${hostname} is in the Cloudflare account ${accountLabel(zone.accountId)}, but the tunnel is in ${accountLabel(tunnelAccountId)}. ` +
+      `A tunnel only carries domains of its own account — pick a tunnel in ${accountLabel(zone.accountId)} (create one in Settings → Cloudflare).`;
+  }
+
   /**
    * Bring Cloudflare in line with `desired` for one owner (a site, or the
    * panel itself). Removals first, then additions; ingress per tunnel in one
@@ -997,14 +1127,20 @@ function createCloudflare(ctx) {
       return { manual: desired.length };
     }
 
-    // 1. ingress, one GET + at most one PUT per tunnel
+    // 1. ingress, one GET + at most one PUT per tunnel, with the credentials of its account
     const tunnels = [...new Set([...removing.map((e) => e.tunnelId), ...desired.map((d) => d.tunnelId)])];
+    const tunnelAccount = new Map(); // tunnelId -> accountId
     for (const tid of tunnels) {
       const rm = removing.filter((e) => e.tunnelId === tid);
       const add = desired.filter((d) => d.tunnelId === tid);
       let config;
+      let tc;
       try {
-        config = await getConfig(c, tid);
+        const acct = await accountOfTunnel(tid);
+        tunnelAccount.set(tid, acct);
+        tc = credsForAccount(acct);
+        if (!tc) throw new Error(`the panel has no credentials for ${accountLabel(acct)}, the Cloudflare account this tunnel is in. Add one of that account's domains in Settings → Cloudflare → Domains`);
+        config = await getConfig(tc, tid);
       } catch (err) {
         if (rm.length) log(`!! tunnel ${tid}: could not read its routes (${err.message}) — leaving them as they are.`);
         for (const d of add) errors.set(d.hostname, `Could not read the tunnel's routes: ${err.message}`);
@@ -1053,7 +1189,7 @@ function createCloudflare(ctx) {
       }
       if (changed) {
         try {
-          await putConfig(c, tid, config, rules, catchAll);
+          await putConfig(tc, tid, config, rules, catchAll);
         } catch (err) {
           for (const d of add) if (!errors.has(d.hostname)) errors.set(d.hostname, `Saving the tunnel's routes failed: ${err.message}`);
           for (const d of add) outcome.delete(key(d));
@@ -1098,9 +1234,13 @@ function createCloudflare(ctx) {
         upsert(owner, siteId, d, prev, { status: "error", error: errors.get(d.hostname), ingress: outcome.get(key(d))?.ingress ?? prev?.ingress ?? null });
         continue;
       }
-      const zone = zoneForHostname(zoneList, d.hostname);
+      const acct = tunnelAccount.get(d.tunnelId) || c.accountId;
+      const zone = zoneForHostname(zoneList.filter((z) => z.accountId === acct), d.hostname);
       if (!zone) {
-        const msg = `${d.hostname} is not in the connected Cloudflare account (zones: ${zoneList.map((z) => z.name).join(", ") || "none"}).`;
+        const elsewhere = zoneForHostname(zoneList, d.hostname);
+        const msg = elsewhere
+          ? accountMismatch(d.hostname, elsewhere, acct)
+          : `${d.hostname} is not in a connected Cloudflare account (zones: ${zoneList.map((z) => z.name).join(", ") || "none"}).`;
         errors.set(d.hostname, msg);
         upsert(owner, siteId, d, prev, { status: "error", error: msg, ingress: outcome.get(key(d))?.ingress ?? null });
         continue;
@@ -1201,7 +1341,7 @@ function createCloudflare(ctx) {
       throw httpError(502, `Couldn't check with Cloudflare: ${err.message}`, { code: "cloudflare_unreachable" });
     }
     const t = tunnels.find((x) => x.id === cfg.tunnelId);
-    if (!t) throw httpError(400, "That tunnel isn't in the connected Cloudflare account. Pick another one, or create one in Settings → Cloudflare.", { code: "cloudflare_tunnel_missing" });
+    if (!t) throw httpError(400, "That tunnel isn't in a connected Cloudflare account. Pick another one, or create one in Settings → Cloudflare.", { code: "cloudflare_tunnel_missing" });
     if (!t.remotelyManaged) throw httpError(400, `Tunnel “${t.name}” is configured from a local config file, so the panel can't add routes to it. Pick a dashboard-managed tunnel.`, { code: "cloudflare_tunnel_local" });
     const missing = hostnames.filter((h) => !zoneForHostname(zoneList, h));
     if (missing.length) {
@@ -1210,6 +1350,10 @@ function createCloudflare(ctx) {
         hostnames: missing,
         zones: zoneList.map((z) => z.name),
       });
+    }
+    for (const h of hostnames) {
+      if (zoneForHostname(zoneList.filter((z) => z.accountId === t.accountId), h)) continue;
+      throw httpError(400, accountMismatch(h, zoneForHostname(zoneList, h), t.accountId), { code: "cloudflare_zone_account", hostnames: [h] });
     }
     void siteId;
     return { ok: true };
@@ -1242,6 +1386,8 @@ function createCloudflare(ctx) {
       viaLogin: !!c.viaLogin,
       accountId: c.accountId || "",
       accountName: c.accountName || "",
+      // Every account the panel manages tunnels in: the main one, then those reached through domain credentials.
+      managedAccounts: api ? [{ id: c.accountId, name: c.accountName || c.accountId, main: true }, ...otherAccounts().map((a) => ({ id: a.accountId, name: a.accountName || a.accountId, main: false }))] : [],
       connectors,
       running: connectors.filter((x) => x.running).length,
       connectedConnectors: connectors.filter((x) => x.connected).length,
@@ -1261,13 +1407,15 @@ function createCloudflare(ctx) {
   /** Tunnels a website can use: the account's (API) or the local connectors' (connector-only mode). */
   async function options() {
     const s = status();
-    const out = { connected: s.connected, mode: s.mode, accountName: s.accountName, tunnels: [], zones: [], panelHostname: s.panel?.hostname || null, error: null, simulatedApi: FAKE };
+    const out = { connected: s.connected, mode: s.mode, accountName: s.accountName, accounts: [], tunnels: [], zones: [], zoneAccounts: {}, panelHostname: s.panel?.hostname || null, error: null, simulatedApi: FAKE };
     const local = new Map(s.connectors.filter((x) => x.cfId).map((x) => [x.cfId, x]));
     if (s.connected) {
       try {
         const [t, z] = await Promise.all([accountTunnels(), zones()]);
-        out.tunnels = t.filter((x) => x.remotelyManaged).map((x) => ({ id: x.id, name: x.name, status: x.status, local: local.has(x.id), running: !!local.get(x.id)?.running, connectedHere: !!local.get(x.id)?.connected }));
+        out.tunnels = t.filter((x) => x.remotelyManaged).map((x) => ({ id: x.id, name: x.name, status: x.status, accountId: x.accountId, accountName: x.accountName, local: local.has(x.id), running: !!local.get(x.id)?.running, connectedHere: !!local.get(x.id)?.connected }));
         out.zones = z.map((x) => x.name);
+        out.zoneAccounts = Object.fromEntries(z.map((x) => [x.name, x.accountId]));
+        out.accounts = s.managedAccounts;
       } catch (err) {
         out.error = err.message;
       }
@@ -1382,8 +1530,11 @@ function createCloudflare(ctx) {
       if (FAKE && this.fakeUntil) {
         if (Date.now() < this.fakeUntil) return { running: true, url: this.url, done: false, error: "" };
         this.fakeUntil = 0;
-        if (this.purpose === "domain") return this.finishDomain({ apiToken: "zones:example.net", accountId: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" });
-        await storeCreds({ apiToken: "simulated-login-token", accountId: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" }, { viaLogin: true });
+        if (this.purpose === "domain") {
+          const haveNet = domainCreds().some((d) => (d.zones || []).some((z) => z.name === "example.net"));
+          return this.finishDomain(haveNet ? { apiToken: "shared:example.ca", accountId: FAKE_SHARED.id } : { apiToken: "zones:example.net", accountId: FAKE_MAIN.id });
+        }
+        await storeCreds({ apiToken: "simulated-login-token", accountId: FAKE_MAIN.id }, { viaLogin: true });
         return { running: false, url: this.url, done: true, error: "", accountName: conf().accountName };
       }
       const waiting = { running: !!this.proc, url: this.url, done: false, error: this.error };
@@ -1411,8 +1562,8 @@ function createCloudflare(ctx) {
     },
     async finishDomain(cr) {
       try {
-        const { added } = await addDomainCred(cr.apiToken, { viaLogin: true, accountId: cr.accountId });
-        return { running: false, url: this.url, done: true, error: "", purpose: "domain", added };
+        const { added, accounts } = await addDomainCred(cr.apiToken, { viaLogin: true, accountId: cr.accountId });
+        return { running: false, url: this.url, done: true, error: "", purpose: "domain", added, accounts };
       } catch (err) {
         return { running: false, url: this.url, done: false, error: err.message, purpose: "domain" };
       }
@@ -1497,8 +1648,12 @@ function createCloudflare(ctx) {
           out.zones = z;
           const local = new Map(conf().connectors.filter((x) => x.cfId).map((x) => [x.cfId, x.id]));
           out.tunnels = t.map((x) => ({ ...x, connectorId: local.get(x.id) || null }));
-          const gone = conf().connectors.filter((x) => x.cfId && !t.some((y) => y.id === x.cfId));
-          if (gone.length) out.warning = `No longer in this Cloudflare account: ${gone.map((x) => x.name).join(", ")}.`;
+          const failed = cache.tunnels?.errors || [];
+          const acctOf = (x) => x.accountId || parseConnectorToken(reveal(x.tokenEnc))?.accountTag;
+          const gone = conf().connectors.filter((x) => x.cfId && !t.some((y) => y.id === x.cfId) && !failed.some((f) => f.accountId === acctOf(x)));
+          const warn = failed.map((f) => f.message);
+          if (gone.length) warn.push(`No longer in a connected Cloudflare account: ${gone.map((x) => x.name).join(", ")}.`);
+          if (warn.length) out.warning = warn.join(" ");
         }
       } catch (err) {
         out.error = err.message;
@@ -1575,7 +1730,7 @@ function createCloudflare(ctx) {
     });
     router.get("/api/cloudflare/login", async (req, res, { admin }) => {
       const r = await login.poll();
-      if (r.done && r.purpose === "domain") audit(admin, "cloudflare.domain.add", { via: "login", domains: r.added });
+      if (r.done && r.purpose === "domain") audit(admin, "cloudflare.domain.add", { via: "login", domains: r.added, ...(r.accounts?.length ? { accounts: r.accounts } : {}) });
       else if (r.done) audit(admin, "cloudflare.connect", { via: "login", account: r.accountName });
       return r;
     });
@@ -1587,7 +1742,7 @@ function createCloudflare(ctx) {
     // ---- domains: which zones the panel can route, and more of them
     const sourceLabel = (src) => {
       if (src === "main") return conf().viaLogin ? "Account login" : "Account API token";
-      const d = accountDomainCreds().find((x) => x.id === src);
+      const d = activeDomainCreds().find((x) => x.id === src);
       return d ? (d.viaLogin ? "Domain login" : `API token ${hint(reveal(d.tokenEnc)) || ""}`.trim()) : "—";
     };
     router.get("/api/cloudflare/domains", async () => {
@@ -1607,13 +1762,16 @@ function createCloudflare(ctx) {
           id: z.id,
           name: z.name,
           status: z.status,
+          accountId: z.accountId,
+          accountName: accountLabel(z.accountId),
           source: z.source,
           sourceLabel: sourceLabel(z.source),
           removable: z.source !== "main",
           error: z.error || null,
           routes: ledgerAll.filter((r) => r.zoneId === z.id).length,
         })),
-        sources: accountDomainCreds().map((d) => ({ id: d.id, label: sourceLabel(d.id), viaLogin: !!d.viaLogin, zones: (d.zones || []).map((z) => z.name), addedAt: d.addedAt, error: d.error || null })),
+        sources: activeDomainCreds().map((d) => ({ id: d.id, label: sourceLabel(d.id), viaLogin: !!d.viaLogin, accountId: d.accountId, accountName: accountLabel(d.accountId), zones: (d.zones || []).map((z) => z.name), addedAt: d.addedAt, error: d.error || null })),
+        accounts: status().managedAccounts,
         addSiteUrl: `https://dash.cloudflare.com/${encodeURIComponent(conf().accountId || "")}/add-site`,
       };
     });
@@ -1621,8 +1779,8 @@ function createCloudflare(ctx) {
       const token = String(body.token || "").trim();
       if (!token) throw httpError(400, "Paste an API token first.");
       const r = await addDomainCred(token, { viaLogin: false });
-      audit(admin, "cloudflare.domain.add", { via: "token", domains: r.added });
-      return { ok: true, added: r.added };
+      audit(admin, "cloudflare.domain.add", { via: "token", domains: r.added, ...(r.accounts.length ? { accounts: r.accounts } : {}) });
+      return { ok: true, added: r.added, accounts: r.accounts, refused: r.refused };
     });
     router.post("/api/cloudflare/domains/login", async () => {
       needCreds();
@@ -1636,8 +1794,8 @@ function createCloudflare(ctx) {
       const others = await wrap(async () => {
         const c = creds();
         if (!c) return new Set();
-        const ids = new Set((await listZones(c.token, c.accountId).catch(() => [])).map((z) => z.id));
-        for (const o of accountDomainCreds()) if (o.id !== d.id) for (const z of o.zones || []) ids.add(z.id);
+        const ids = new Set((await listZones(c.token, c.accountId).catch(() => [])).map((z) => z.id)); // the main credentials' zones
+        for (const o of activeDomainCreds()) if (o.id !== d.id) for (const z of o.zones || []) ids.add(z.id);
         return ids;
       });
       const lost = (d.zones || []).filter((z) => !others.has(z.id));
@@ -1653,10 +1811,14 @@ function createCloudflare(ctx) {
       return { ok: true, removed: (d.zones || []).map((z) => z.name) };
     });
 
-    // ---- tunnels in the account
+    // ---- tunnels in the account (the main one, or `accountId` of another the panel reaches)
     router.post("/api/cloudflare/tunnels", async (req, res, { body, admin }) => {
-      const c = needCreds();
+      needCreds();
       return wrap(async () => {
+        let acct = String(body.accountId || "");
+        if (!acct && body.tunnelId) acct = (await accountTunnels()).find((t) => t.id === body.tunnelId)?.accountId || "";
+        const c = credsForAccount(acct || conf().accountId);
+        if (!c) throw httpError(400, "The panel has no credentials for that Cloudflare account. Add one of its domains under Domains first.");
         let tun;
         if (body.tunnelId) {
           tun = await cfCall(c.token, `/accounts/${c.accountId}/cfd_tunnel/${encodeURIComponent(body.tunnelId)}`);
@@ -1667,7 +1829,7 @@ function createCloudflare(ctx) {
         if (tun.remote_config === false) throw new Error(`Tunnel “${tun.name}” is configured from a local file, so the panel can't manage its routes.`);
         const token = await cfCall(c.token, `/accounts/${c.accountId}/cfd_tunnel/${tun.id}/token`);
         if (typeof token !== "string" || !token) throw new Error("Cloudflare did not return a connector token for that tunnel.");
-        const { entry: e } = addConnector({ token, name: tun.name, cfId: tun.id, autoStart: body.autoStart !== false });
+        const { entry: e } = addConnector({ token, name: tun.name, cfId: tun.id, accountId: c.accountId, autoStart: body.autoStart !== false });
         invalidate();
         let started = false;
         let startError = null;
@@ -1680,7 +1842,7 @@ function createCloudflare(ctx) {
             startError = err.message;
           }
         }
-        audit(admin, body.tunnelId ? "cloudflare.tunnel.adopt" : "cloudflare.tunnel.create", { tunnel: tun.name, tunnelId: tun.id });
+        audit(admin, body.tunnelId ? "cloudflare.tunnel.adopt" : "cloudflare.tunnel.create", { tunnel: tun.name, tunnelId: tun.id, account: accountLabel(c.accountId) });
         emitStatusSoon();
         return { ok: true, tunnel: { id: tun.id, name: tun.name }, connector: publicConnector(e), started, startError };
       });
@@ -1777,12 +1939,16 @@ function createCloudflare(ctx) {
       const names = new Map(conf().connectors.filter((x) => x.cfId).map((x) => [x.cfId, x.name]));
       const tunnels = [];
       for (const tid of tunnelIds) {
-        const t = { tunnelId: tid, name: names.get(tid) || tid.slice(0, 8), rules: [], error: null };
+        const t = { tunnelId: tid, name: names.get(tid) || tid.slice(0, 8), accountId: null, accountName: null, rules: [], error: null };
         if (!c) {
           t.error = "Connect an API token or log in to read this tunnel's routes.";
         } else {
           try {
-            const cfg = await getConfig(c, tid);
+            t.accountId = await accountOfTunnel(tid);
+            t.accountName = accountLabel(t.accountId);
+            const tc = credsForAccount(t.accountId);
+            if (!tc) throw new Error(`The panel has no credentials for ${t.accountName}, the account this tunnel is in. Add one of its domains under Domains.`);
+            const cfg = await getConfig(tc, tid);
             t.rules = cfg.ingress.map((r) => {
               const mine = all.find((x) => x.tunnelId === tid && x.hostname === r.hostname && !r.path);
               return {
@@ -1836,6 +2002,15 @@ function createCloudflare(ctx) {
       return job || { ok: true, nothing: true };
     });
 
+    /** A hostname a tunnel publishes must be on a zone of the tunnel's own account. */
+    async function checkZone(hostname, tunnelId) {
+      const [z, acct] = await wrap(() => Promise.all([zones(), accountOfTunnel(tunnelId)]));
+      if (zoneForHostname(z.filter((x) => x.accountId === acct), hostname)) return;
+      const elsewhere = zoneForHostname(z, hostname);
+      if (elsewhere) throw httpError(400, accountMismatch(hostname, elsewhere, acct), { code: "cloudflare_zone_account" });
+      throw httpError(400, `${hostname} isn't in a connected Cloudflare account.`, { code: "cloudflare_zone_missing" });
+    }
+
     // ---- the panel itself on a hostname
     router.put("/api/cloudflare/panel", async (req, res, { body, admin }) => {
       const hostname = String(body.hostname || "").trim().toLowerCase().replace(/\.$/, "");
@@ -1847,10 +2022,7 @@ function createCloudflare(ctx) {
         const clash = db.list("sites").find((s) => (s.domains || []).includes(hostname));
         if (clash) throw httpError(409, `${hostname} is a domain of website “${clash.name}”.`);
         if (c.phpmyadmin?.hostname === hostname) throw httpError(409, `${hostname} is phpMyAdmin's hostname — the panel needs a hostname of its own.`);
-        if (creds()) {
-          const z = await wrap(() => zones());
-          if (!zoneForHostname(z, hostname)) throw httpError(400, `${hostname} isn't in your Cloudflare account.`, { code: "cloudflare_zone_missing" });
-        }
+        if (creds()) await checkZone(hostname, tunnelId);
         c.panel = { hostname, tunnelId };
       } else {
         c.panel = null;
@@ -1895,10 +2067,7 @@ function createCloudflare(ctx) {
         if (c.panel?.hostname === hostname) throw httpError(409, `${hostname} is the panel's own hostname — phpMyAdmin needs a hostname of its own (for example pma.${hostname.split(".").slice(1).join(".") || hostname}).`);
         const clash = db.list("sites").find((s) => (s.domains || []).includes(hostname));
         if (clash) throw httpError(409, `${hostname} is a domain of website “${clash.name}”.`);
-        if (creds()) {
-          const z = await wrap(() => zones());
-          if (!zoneForHostname(z, hostname)) throw httpError(400, `${hostname} isn't in your Cloudflare account.`, { code: "cloudflare_zone_missing" });
-        }
+        if (creds()) await checkZone(hostname, tunnelId);
         c.phpmyadmin = { hostname, tunnelId };
       } else {
         c.phpmyadmin = null;

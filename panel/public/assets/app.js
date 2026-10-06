@@ -156,7 +156,7 @@ async function paintSidebarStatus() {
   mount($("#sbStatus"), html`
     ${row("nginx", lb ? (lb.installed || lb.dryRun) && lb.configOk !== false : null, lb ? (lb.installed ? (lb.configOk === false ? "config error" : "running") : lb.dryRun ? "dry run" : "not installed") : "—")}
     ${row("MySQL", my ? my.installed && my.running : null, my ? (my.installed ? (my.running ? "running" : "stopped") : "not installed") : "—")}
-    <div class="ver"><span>${shortName()}</span><span>v${state.version || "3.0.0"}</span></div>`);
+    <div class="ver"><span>${shortName()}</span><span>v${state.version || "3.1.0"}</span></div>`);
 }
 
 /* ───────── panel self-update: top-bar badge + restart watcher ───────── */
