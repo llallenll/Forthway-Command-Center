@@ -4,9 +4,9 @@
 //   bindUptime()             fills [data-uptime="<siteId>"] slots in website rows (Websites list, project page)
 //   downBanner()             dashboard: "N websites down" card (renders nothing while everything is up)
 // Every user-supplied string goes through html``.
-import { html, raw, mount, $, $$, on, ago, fmtDate, fmtTime, fmtDuration, plural, toast, toastError, confirmDialog, debounce, emptyState, skeletonRows } from "../util.js";
+import { html, raw, mount, $, $$, on, ago, fmtDate, fmtTime, fmtDuration, plural, toast, toastError, confirmDialog, debounce, emptyState, skeletonRows, copyText, openModal, openMenu } from "../util.js";
 import { icon } from "../icons.js";
-import { get, put, post } from "../api.js";
+import { get, put, post, del } from "../api.js";
 import { lineChart } from "../charts.js";
 
 /* ───────── shared bits ───────── */
@@ -448,7 +448,16 @@ export async function notificationsSettings(box, ctx) {
       <div class="card-head"><div><h3>Alert rules</h3><div class="sub">Apply to every channel.</div></div></div>
       <div class="card-body" data-rules-body></div>
       <div class="card-foot"><span class="muted small" data-rules-state></span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save rules</button></div>
-    </form>`);
+    </form>
+    <form class="card" data-legal novalidate>
+      <div class="card-head"><div><h3>SMS compliance pages</h3><div class="sub">Public Privacy Policy and Terms &amp; Conditions pages for your Twilio campaign registration. Anyone can open them — no sign-in.</div></div></div>
+      <div class="card-body" data-legal-body></div>
+      <div class="card-foot"><span class="muted small" data-legal-state></span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save</button></div>
+    </form>
+    <div class="card" data-optins>
+      <div class="card-head"><div><h3>SMS sign-ups</h3><div class="sub">People who opted in on the public sign-up page. Approving one adds the number to the default recipients and texts a confirmation.</div></div></div>
+      <div data-optins-body><div class="card-body"><span class="muted small">Loading…</span></div></div>
+    </div>`);
 
   const paintHeads = () => {
     for (const c of CHANNELS) {
@@ -554,6 +563,107 @@ export async function notificationsSettings(box, ctx) {
     try { s = { ...s, ...(await get("/api/notifications/settings")) }; if (ctx.alive()) { paintHeads(); for (const w of hooks) { const f = (s.discord?.webhooks || []).find((x) => x.id === w.id); if (f) { w.last = f.last; const el = $(`[data-hk="${w.key}"] .dwh-last`, box); if (el) mount(el, lastLine(w)); } } } } catch {}
   }, 500);
   ctx.on("monitor", (d) => { if (d?.kind === "notifications" || d?.kind === "sms") reload(); });
+
+  /* SMS compliance pages (server: lib/legal.mjs) */
+  const paintLegal = () => {
+    const l = s.legal || {};
+    const local = /^https?:\/\/(localhost|127\.|\d+\.\d+\.\d+\.\d+|\[)/.test(l.privacyUrl || "");
+    const link = (label, url) => html`<div class="field span-2"><label>${label}</label><div class="input-group"><input class="input mono" value="${url}" readonly/><a class="btn" href="${url}" target="_blank" rel="noopener noreferrer">${icon("external")}Open</a><button class="btn" type="button" data-copy="${url}">${icon("copy")}Copy</button></div></div>`;
+    mount($("[data-legal-body]", box), html`<div class="form-grid">
+      ${field("Brand name", html`<input class="input" name="brandName" value="${l.brandName}" placeholder="${l.brandShown}" maxlength="120" autocomplete="organization"/>`, "Exactly as registered with Twilio (your A2P brand). Empty uses the panel name.")}
+      ${field("Support email", html`<input class="input" name="contactEmail" type="email" value="${l.contactEmail}" placeholder="support@example.com" maxlength="200" autocomplete="email"/>`, "Shown on both pages for questions and help. Optional.")}
+      ${link("Privacy Policy", l.privacyUrl)}
+      ${link("Terms & Conditions", l.termsUrl)}
+      ${link("Opt-in (sign-up) page", l.optInUrl)}
+      <div class="span-2 hint">For Twilio's <b>opt-in method proof</b>, give the sign-up page link (or a screenshot of it). Sample confirmation text: <span class="mono">${l.brandShown}: You're signed up for website alerts. Msg frequency varies. Msg &amp; data rates may apply. Reply HELP for help, STOP to opt out.</span></div>
+      ${local ? html`<div class="note warn span-2">${icon("alert")}<div>These links use a local address, so Twilio can't open them. Publish the panel on a hostname (Settings → Cloudflare → Publish this panel) or set the Panel URL in Settings → General, then copy them again.</div></div>` : ""}
+      <div class="error-box span-2" data-err hidden></div></div>`);
+  };
+  paintLegal();
+  /* SMS sign-ups (opt-ins from the public page) */
+  let optins = null;
+  const OPT_BADGE = { pending: ["warn", "Waiting for approval"], approved: ["ok", "Approved"], declined: ["", "Declined"], "opted-out": ["", "Opted out"] };
+  const paintOptins = () => {
+    const el = $("[data-optins-body]", box);
+    if (!optins) return;
+    if (!optins.length) return mount(el, html`<div class="card-body">${emptyState({ ico: "message", title: "No sign-ups yet", text: "Share the sign-up page link above with the people who should get alert texts.", sm: true })}</div>`);
+    mount(el, html`<div class="list">${optins.map((r) => {
+      const [tone, label] = OPT_BADGE[r.status] || ["", r.status];
+      const conf = r.confirmation;
+      return html`<div class="list-item cf-row">
+        <span class="li-ico">${icon("message", "sm")}</span>
+        <div class="li-main"><div class="li-title">${r.name || "—"} <span class="mono muted small">${r.phone}</span></div>
+          <div class="li-sub">Opted in ${ago(r.consent?.at || r.createdAt)}${r.decidedBy ? html` · ${r.status} by ${r.decidedBy}` : ""}${r.status === "approved" ? (conf?.ok ? html` · confirmation sent${conf.simulated ? " (simulated)" : ""}` : conf ? html` · <span class="cf-err">confirmation failed: ${conf.error}</span>` : "") : ""}${r.status === "approved" && !r.recipient ? " · not a default recipient" : ""}</div></div>
+        <div class="li-right">
+          <span class="badge ${tone}">${label}</span>
+          ${r.status === "pending" ? html`<button class="btn btn-sm btn-primary" data-optapprove="${r.id}">${icon("check")}Approve</button><button class="btn btn-sm" data-optdecline="${r.id}">Decline</button>` : ""}
+          <button class="icon-btn ghost sm" data-optmenu="${r.id}" aria-label="More for ${r.name || r.phone}">${icon("more", "sm")}</button>
+        </div></div>`;
+    })}</div>`);
+  };
+  const loadOptins = async () => {
+    try { const r = await get("/api/notifications/optins"); optins = r.items || []; if (ctx.alive()) paintOptins(); }
+    catch (ex) { mount($("[data-optins-body]", box), html`<div class="card-body"><div class="error-box">${icon("alert")}<div>${ex.message}</div></div></div>`); }
+  };
+  loadOptins();
+  ctx.on("monitor", (d) => { if (d?.kind === "optins") loadOptins(); });
+  const refreshAfterApprove = async () => {
+    try { s = { ...s, ...(await get("/api/notifications/settings")) }; } catch {}
+    paintHeads();
+    if (openId === "twilio" && !$("[data-twilio] [data-state]", box)?.textContent) paintTwilio();
+  };
+  const approve = async (id, b) => {
+    setBusy(b, true);
+    try {
+      const r = await post(`/api/notifications/optins/${id}/approve`, { addToDefaults: true });
+      if (r.warning) toast("Approved — confirmation not sent", "warn", { msg: r.warning }); else toast("Approved", "ok", { msg: `${r.optIn.name || r.optIn.phone} now gets alert texts.` });
+      await loadOptins(); refreshAfterApprove();
+    } catch (ex) { toastError(ex, "Couldn't approve"); setBusy(b, false); }
+  };
+  on(box, "click", "[data-optapprove]", (e, b) => approve(b.dataset.optapprove, b));
+  on(box, "click", "[data-optdecline]", async (e, b) => {
+    setBusy(b, true);
+    try { await post(`/api/notifications/optins/${b.dataset.optdecline}/decline`); toast("Declined", "ok"); loadOptins(); }
+    catch (ex) { toastError(ex, "Couldn't decline"); setBusy(b, false); }
+  });
+  on(box, "click", "[data-optmenu]", (e, b) => {
+    const r = (optins || []).find((x) => x.id === b.dataset.optmenu);
+    if (!r) return;
+    openMenu(b, [
+      { label: "View consent record", icon: "fileText", onClick: () => openModal({ title: "Consent record", ico: "fileText",
+        body: html`<dl class="kv">
+          <dt>Name</dt><dd>${r.name || "—"}</dd><dt>Mobile number</dt><dd class="mono">${r.phone}</dd>
+          <dt>Opted in</dt><dd>${fmtDate(r.consent?.at)} <span class="muted small mono">${r.consent?.at || ""}</span></dd>
+          <dt>Page</dt><dd class="mono">${r.consent?.page || "/sms-alerts"}</dd>
+          <dt>IP address</dt><dd class="mono">${r.consent?.ip || "—"}</dd><dt>Browser</dt><dd class="small">${r.consent?.userAgent || "—"}</dd>
+          <dt>Status</dt><dd>${(OPT_BADGE[r.status] || ["", r.status])[1]}${r.decidedAt ? html` · ${fmtDate(r.decidedAt)}${r.decidedBy ? html` by ${r.decidedBy}` : ""}` : ""}</dd>
+          ${r.confirmation ? html`<dt>Confirmation text</dt><dd>${r.confirmation.ok ? `Sent ${fmtDate(r.confirmation.at)}${r.confirmation.simulated ? " (simulated)" : ""}` : `Failed: ${r.confirmation.error}`}</dd>` : ""}
+        </dl>
+        <div class="label mt-16">They agreed to</div><p class="small" style="margin:6px 0 0">${r.consent?.text || ""}</p>`,
+        foot: html`<button class="btn btn-primary" data-close>Close</button>` }) },
+      ...(r.status !== "pending" && r.status !== "approved" ? [{ label: "Approve", icon: "check", onClick: () => approve(r.id) }] : []),
+      { sep: true },
+      { label: "Remove record", icon: "trash", danger: true, onClick: async () => {
+        const ok = await confirmDialog({ title: `Remove ${r.name || r.phone}'s sign-up?`, danger: true, confirmText: "Remove",
+          message: "Deletes the sign-up and its consent record. It does not remove the number from your recipients — do that in the Twilio SMS settings." });
+        if (!ok) return;
+        try { await del(`/api/notifications/optins/${r.id}`); toast("Sign-up removed", "ok"); loadOptins(); } catch (ex) { toastError(ex, "Couldn't remove it"); }
+      } },
+    ]);
+  });
+
+  on(box, "input", "[data-legal]", () => ($("[data-legal-state]", box).textContent = "Unsaved changes"));
+  on(box, "click", "[data-copy]", async (e, b) => { try { await copyText(b.dataset.copy); toast("Link copied", "ok"); } catch (ex) { toastError(ex, "Couldn't copy"); } });
+  on(box, "submit", "[data-legal]", async (e, form) => {
+    e.preventDefault();
+    const err = $("[data-err]", form), btn = $("[data-save]", form), f = form.elements;
+    showErr(err, ""); setBusy(btn, true);
+    try {
+      s = await put("/api/notifications/settings", { legal: { brandName: f.brandName.value.trim(), contactEmail: f.contactEmail.value.trim() } });
+      toast("Compliance pages updated", "ok");
+      paintLegal(); $("[data-legal-state]", box).textContent = "";
+    } catch (ex) { showErr(err, ex.message); } finally { setBusy(btn, false); }
+  });
 
   /* rules */
   on(box, "input", "[data-rules]", () => ($("[data-rules-state]", box).textContent = "Unsaved changes"));

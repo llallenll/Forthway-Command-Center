@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.4.0",
+  version: "3.5.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -898,6 +898,28 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     (`#/settings/notifications`); Websites list + project page rows get a `[data-uptime]` slot (dot, 24 h %, mini 24 h strip) filled by
     `bindUptime()` — no `.site-row` grid changes; dashboard "N websites down" card (`downBanner`); global toast on down/up (app.js).
     Small hooks in site.js, sites.js, project.js, settings.js, dashboard.js, app.js, events.js, icons.js (`bell`), app.css (`.up-*`, `.inc*`, `.rcp-*`).
+- **LEGAL — public SMS compliance pages (`panel/lib/legal.mjs`, routes registered by `monitor.mjs`).**
+  `GET /privacy` ("Privacy Policy") and `GET /terms` ("Terms & Conditions", with an "SMS Terms" section) — public (no
+  sign-in), server-rendered, self-contained HTML (CSP `default-src 'none'; style-src 'unsafe-inline'`), for Twilio A2P
+  campaign registration: they name the registered brand, describe the data collected and its use, carry the required
+  "We do not sell or share your SMS opt-in data…" statement and the "Message and data rates may apply." disclosure, STOP/
+  HELP and frequency (from `repeatMinutes`). Built from `config.notifications.legal = { brandName, contactEmail,
+  updatedAt }` (brand falls back to `panelName`; `updatedAt` is set when either value changes and shown as "Last
+  updated"); `PUT /api/notifications/settings { legal: { brandName, contactEmail } }`; the settings view adds `legal:
+  { brandName, brandShown, contactEmail, updatedAt, privacyUrl, termsUrl }` (URLs from the Panel URL). UI: Settings →
+  Notifications → "SMS compliance pages" (fields, links with Open / Copy, a warning while the Panel URL is a local address).
+  **Opt-in** (Twilio "opt-in method proof"): `GET /sms-alerts` is a public sign-up form (name, mobile number — 10 digits
+  read as +1 — and an unticked, required consent box with the brand, message types, frequency, "Message and data rates may
+  apply", HELP/STOP, "not a condition of purchase" and links to both pages; CSP adds `form-action 'self'`). `POST
+  /sms-alerts` (urlencoded, ≤ 8 KB, public) validates, drops honeypot (`website`) posts as if accepted, allows 5 posts per
+  IP per hour and at most 200 pending sign-ups, then stores collection `smsOptIns` `{ id, name, phone, status: "pending" |
+  "approved" | "declined" | "opted-out", consent: { text (exact wording), at, ip, userAgent, page }, createdAt, decidedAt,
+  decidedBy, confirmation: { at, ok, simulated, error } }` (a repeat sign-up for the same number updates its record) and
+  redirects to `?sent=1`. Nothing is texted until an admin approves: `GET /api/notifications/optins` → `{ items, pageUrl }`,
+  `POST …/optins/:id/approve { addToDefaults? = true }` (adds to `notifications.defaults`, sends the confirmation SMS
+  `confirmationText(brand)`, ≤ 160 chars) → `{ optIn, warning }`, `POST …/optins/:id/decline`, `DELETE …/optins/:id`.
+  SSE `monitor` `{ kind: "optins" }`. UI: the sign-up link in "SMS compliance pages", and an "SMS sign-ups" card
+  (approve / decline, consent record, remove).
 - **MONITOR — Discord webhook alerts + Settings → Notifications as channel rows (`panel/lib/notify-discord.mjs`, new; `monitor.mjs`).**
   - **Config** (`config.json` → `notifications.discord: { webhooks: [{ id: "dwh_…", name, enabled, urlEnc, mention, createdAt }] }`, ≤ 10).
     A webhook URL is a secret: validated (`https://` + host exactly `discord.com`, `discordapp.com`, `ptb.`/`canary.` of either; no

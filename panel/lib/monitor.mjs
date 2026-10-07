@@ -51,7 +51,9 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 
-import { httpError } from "./http.mjs";
+import { httpError, send, readBody, redirect } from "./http.mjs";
+import { requestIp } from "./auth.mjs";
+import { legalInfo, privacyPage, termsPage, optInPage, consentText, confirmationText } from "./legal.mjs";
 import * as sys from "./sys.mjs";
 import { writeFileAtomic } from "./store.mjs";
 import { parseWebhookUrl, canonicalWebhookUrl, webhookHint, parseMention, buildDiscordPayload, postWebhook, apiBase as discordApiBase, scrubSecret } from "./notify-discord.mjs";
@@ -891,6 +893,22 @@ function createMonitor(ctx) {
       dryRun: sys.DRY_RUN,
       lastSend: lastSend.sms || null,
       discord: discordView(),
+      legal: legalView(),
+    };
+  }
+
+  /** The public SMS compliance pages (lib/legal.mjs) and what they're built from. */
+  function legalView() {
+    const l = notif().legal || {};
+    const base = (() => { try { return String(ctx.panelUrl?.() || "").replace(/\/+$/, ""); } catch { return ""; } })();
+    return {
+      brandName: l.brandName || "",
+      brandShown: legalInfo(ctx.config).brand,
+      contactEmail: l.contactEmail || "",
+      updatedAt: l.updatedAt || null,
+      privacyUrl: `${base}/privacy`,
+      termsUrl: `${base}/terms`,
+      optInUrl: `${base}/sms-alerts`,
     };
   }
 
@@ -1550,6 +1568,107 @@ function createMonitor(ctx) {
 
     router.get("/api/notifications/settings", () => notificationsView());
 
+    // Public SMS compliance pages (Twilio campaign registration): no sign-in, server-rendered.
+    for (const [p, render] of [["/privacy", privacyPage], ["/terms", termsPage]]) {
+      router.get(p, { public: true }, (req, res) => {
+        send(res, 200, req.method === "HEAD" ? "" : render(legalInfo(ctx.config)), {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-cache",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+        });
+      });
+    }
+
+    // ---- SMS opt-in: a public sign-up form (proof of consent for the Twilio campaign).
+    // A sign-up waits for an admin to approve it; approving adds the number to the
+    // default recipients and texts a confirmation. Records keep the consent evidence.
+    const OPTINS = "smsOptIns";
+    const signupHits = new Map(); // ip -> [ms]
+    const htmlHeaders = {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+    };
+    const optInPhone = (v) => {
+      const digits = String(v ?? "").replace(/[^\d+]/g, "");
+      if (/^\d{10}$/.test(digits)) return normalizePhone(`+1${digits}`); // US / Canada
+      if (/^1\d{10}$/.test(digits)) return normalizePhone(`+${digits}`);
+      return normalizePhone(v);
+    };
+    const publicOptIn = (r) => ({
+      id: r.id, name: r.name, phone: r.phone, status: r.status, createdAt: r.createdAt, decidedAt: r.decidedAt || null, decidedBy: r.decidedBy || null,
+      consent: r.consent, confirmation: r.confirmation || null, recipient: (notif().defaults || []).some((d) => d.phone === r.phone),
+    });
+
+    router.get("/sms-alerts", { public: true }, (req, res, { query }) => {
+      send(res, 200, req.method === "HEAD" ? "" : optInPage(legalInfo(ctx.config), { done: query.sent === "1" }), htmlHeaders);
+    });
+    router.post("/sms-alerts", { public: true, raw: true }, async (req, res) => {
+      const form = new URLSearchParams((await readBody(req, 8 * 1024)).toString("utf8"));
+      const info = legalInfo(ctx.config);
+      const values = { name: cleanStr(form.get("name"), 80), phone: cleanStr(form.get("phone"), 24) };
+      const fail = (status, error) => send(res, status, optInPage(info, { values, error }), htmlHeaders);
+      if (form.get("website")) return redirect(res, "/sms-alerts?sent=1"); // honeypot: pretend it worked
+      const ip = requestIp(req);
+      const now = Date.now();
+      const hits = (signupHits.get(ip) || []).filter((t) => now - t < 60 * MINUTE);
+      if (hits.length >= 5) return fail(429, "Too many sign-ups from this connection. Please try again later.");
+      hits.push(now);
+      signupHits.set(ip, hits);
+      if (signupHits.size > 5000) signupHits.clear();
+      const phone = optInPhone(values.phone);
+      if (!values.name) return fail(400, "Please enter your name.");
+      if (!phone) return fail(400, "Please enter a valid mobile number, including the country code (for example +1 555 123 4567).");
+      if (form.get("consent") !== "yes") return fail(400, "Please tick the box to agree to receive text alerts.");
+      if (db.list(OPTINS, (r) => r.status === "pending").length >= 200) return fail(503, "Sign-ups are paused right now. Please try again later.");
+      const consent = { text: consentText(info.brand), at: iso(now), ip, userAgent: cleanStr(req.headers["user-agent"], 300), page: "/sms-alerts" };
+      const prev = db.list(OPTINS, (r) => r.phone === phone && r.status !== "declined")[0];
+      if (prev) db.update(OPTINS, prev.id, { name: values.name, consent, ...(prev.status === "opted-out" ? { status: "pending", decidedAt: null, decidedBy: null } : {}) });
+      else db.insert(OPTINS, { id: db.newId("opt"), name: values.name, phone, status: "pending", consent, createdAt: iso(now) });
+      ctx.activity?.(null, "notifications.optin", { type: "settings", id: "notifications", name: "Notifications" }, { phone: maskPhone(phone), name: values.name, ip });
+      ctx.events?.broadcast("monitor", { kind: "optins" });
+      return redirect(res, "/sms-alerts?sent=1");
+    });
+
+    router.get("/api/notifications/optins", () => ({
+      items: db.list(OPTINS).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map(publicOptIn),
+      pageUrl: legalView().optInUrl,
+    }));
+    router.post("/api/notifications/optins/:id/approve", async (req, res, { params, body = {}, admin }) => {
+      const r = db.get(OPTINS, params.id);
+      if (!r) throw httpError(404, "That sign-up doesn't exist.");
+      const n = ctx.config.notifications ? { ...ctx.config.notifications } : { ...NOTIF_DEFAULTS, defaults: [], twilio: {} };
+      if (body.addToDefaults !== false && !(n.defaults || []).some((d) => d.phone === r.phone)) {
+        n.defaults = [...(n.defaults || []), { name: r.name || "", phone: r.phone }];
+        ctx.config.notifications = n;
+        ctx.saveConfig();
+      }
+      const sms = await sendSms(r.phone, smsText(confirmationText(legalInfo(ctx.config).brand)));
+      const confirmation = { at: iso(Date.now()), ok: !!sms.ok, simulated: !!sms.simulated, error: sms.error || null };
+      db.update(OPTINS, r.id, { status: "approved", decidedAt: iso(Date.now()), decidedBy: admin?.name || admin?.email || null, confirmation });
+      ctx.activity?.(admin, "notifications.optin.approve", { type: "settings", id: "notifications", name: "Notifications" }, { phone: maskPhone(r.phone), name: r.name, confirmed: confirmation.ok });
+      ctx.events?.broadcast("monitor", { kind: "notifications" });
+      ctx.events?.broadcast("monitor", { kind: "optins" });
+      return { optIn: publicOptIn(db.get(OPTINS, r.id)), warning: sms.ok ? null : `Approved, but the confirmation text failed: ${sms.error}` };
+    });
+    router.post("/api/notifications/optins/:id/decline", (req, res, { params, admin }) => {
+      const r = db.get(OPTINS, params.id);
+      if (!r) throw httpError(404, "That sign-up doesn't exist.");
+      db.update(OPTINS, r.id, { status: "declined", decidedAt: iso(Date.now()), decidedBy: admin?.name || admin?.email || null });
+      ctx.activity?.(admin, "notifications.optin.decline", { type: "settings", id: "notifications", name: "Notifications" }, { phone: maskPhone(r.phone), name: r.name });
+      ctx.events?.broadcast("monitor", { kind: "optins" });
+      return { optIn: publicOptIn(db.get(OPTINS, r.id)) };
+    });
+    router.delete("/api/notifications/optins/:id", (req, res, { params, admin }) => {
+      const r = db.get(OPTINS, params.id);
+      if (!r) throw httpError(404, "That sign-up doesn't exist.");
+      db.remove(OPTINS, r.id);
+      ctx.activity?.(admin, "notifications.optin.remove", { type: "settings", id: "notifications", name: "Notifications" }, { phone: maskPhone(r.phone), name: r.name });
+      ctx.events?.broadcast("monitor", { kind: "optins" });
+      return { ok: true };
+    });
+
     router.put("/api/notifications/settings", (req, res, { body = {}, admin }) => {
       const n = ctx.config.notifications ? { ...ctx.config.notifications } : { ...NOTIF_DEFAULTS, defaults: [], twilio: {} };
       const twilio = { ...(n.twilio || {}) };
@@ -1582,6 +1701,16 @@ function createMonitor(ctx) {
       if (body.discord !== undefined) {
         n.discord = sanitizeDiscord(body.discord, n.discord);
         fields.push("discord");
+      }
+      if (body.legal !== undefined) {
+        const brandName = cleanStr(body.legal?.brandName, 120);
+        const contactEmail = cleanStr(body.legal?.contactEmail, 200);
+        if (contactEmail && !/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(contactEmail)) throw httpError(400, "That support email address doesn't look right.");
+        const prev = n.legal || {};
+        if (brandName !== (prev.brandName || "") || contactEmail !== (prev.contactEmail || "") || !prev.updatedAt) {
+          n.legal = { brandName, contactEmail, updatedAt: new Date().toISOString() };
+          fields.push("legal");
+        }
       }
       n.twilio = twilio;
       n.provider = "twilio";
