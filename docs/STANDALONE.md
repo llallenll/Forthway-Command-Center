@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.5.0",
+  version: "3.5.1",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -904,7 +904,7 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   campaign registration: they name the registered brand, describe the data collected and its use, carry the required
   "We do not sell or share your SMS opt-in data…" statement and the "Message and data rates may apply." disclosure, STOP/
   HELP and frequency (from `repeatMinutes`). Built from `config.notifications.legal = { brandName, contactEmail,
-  updatedAt }` (brand falls back to `panelName`; `updatedAt` is set when either value changes and shown as "Last
+  updatedAt }` (brand falls back to `DEFAULT_BRAND` = "NOVA IT LLC", the registered business; `updatedAt` is set when either value changes and shown as "Last
   updated"); `PUT /api/notifications/settings { legal: { brandName, contactEmail } }`; the settings view adds `legal:
   { brandName, brandShown, contactEmail, updatedAt, privacyUrl, termsUrl }` (URLs from the Panel URL). UI: Settings →
   Notifications → "SMS compliance pages" (fields, links with Open / Copy, a warning while the Panel URL is a local address).
