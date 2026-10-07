@@ -570,7 +570,7 @@ export async function notificationsSettings(box, ctx) {
     const local = /^https?:\/\/(localhost|127\.|\d+\.\d+\.\d+\.\d+|\[)/.test(l.privacyUrl || "");
     const link = (label, url) => html`<div class="field span-2"><label>${label}</label><div class="input-group"><input class="input mono" value="${url}" readonly/><a class="btn" href="${url}" target="_blank" rel="noopener noreferrer">${icon("external")}Open</a><button class="btn" type="button" data-copy="${url}">${icon("copy")}Copy</button></div></div>`;
     mount($("[data-legal-body]", box), html`<div class="form-grid">
-      ${field("Brand name", html`<input class="input" name="brandName" value="${l.brandName}" placeholder="${l.brandShown}" maxlength="120" autocomplete="organization"/>`, "Exactly as registered with Twilio (your A2P brand). Empty uses NOVA IT LLC.")}
+      ${field("Brand name", html`<input class="input" name="brandName" value="${l.brandName}" placeholder="${l.brandShown}" maxlength="120" autocomplete="organization"/>`, "Exactly as registered with Twilio (your A2P brand). Empty uses the panel name.")}
       ${field("Support email", html`<input class="input" name="contactEmail" type="email" value="${l.contactEmail}" placeholder="support@example.com" maxlength="200" autocomplete="email"/>`, "Shown on both pages for questions and help. Optional.")}
       ${link("Privacy Policy", l.privacyUrl)}
       ${link("Terms & Conditions", l.termsUrl)}

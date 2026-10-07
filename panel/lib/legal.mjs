@@ -5,19 +5,16 @@
  *
  * Rendered from `config.notifications.legal = { brandName, contactEmail, updatedAt }`
  * (Settings → Notifications → SMS compliance pages); the brand name falls back to
- * DEFAULT_BRAND, the registered business. Public (no sign-in), self-contained HTML (no scripts, no external
+ * the panel name. Public (no sign-in), self-contained HTML (no scripts, no external
  * assets), every configured value escaped.
  */
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-/** The registered business (Twilio A2P brand) the pages name when no brand name is set. */
-export const DEFAULT_BRAND = "NOVA IT LLC";
-
 /** What the pages need, from the panel config. */
 export function legalInfo(config = {}) {
   const l = config.notifications?.legal || {};
-  const brand = String(l.brandName || DEFAULT_BRAND).trim();
+  const brand = String(l.brandName || config.panelName || "Forthway Command Center").trim();
   const email = String(l.contactEmail || "").trim();
   const updated = l.updatedAt ? new Date(l.updatedAt) : null;
   return {
