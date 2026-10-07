@@ -41,6 +41,8 @@ export default async function site(ctx) {
   if (!ctx.alive()) return;
   const serversById = () => Object.fromEntries(servers.map((s) => [s.id, s]));
   const deployed = () => !!S.currentReleaseId || Object.values(S.state || {}).some((x) => x?.releaseId);
+  /** Restart / stop / start one server at a time (more than one server hosts it). */
+  const perServer = () => (S.serverIds || []).length > 1;
   const base = `#/sites/${S.id}`;
   ctx.crumbs([{ label: "Projects", href: "#/projects" }, ...(project ? [{ label: project.name, href: `#/projects/${project.id}` }] : []), { label: S.name, href: base }, ...(tab !== "overview" ? [{ label: TABS.find((t) => t.id === tab).label }] : [])]);
 
@@ -74,7 +76,11 @@ export default async function site(ctx) {
 
   const runAction = async (act, opts = {}) => {
     const verbs = { deploy: "Deploy", restart: "Restart", stop: "Stop", start: "Start", rollback: "Roll back" };
-    if (act === "stop" && !(await confirmDialog({ title: `Stop ${S.name}?`, message: S.loadBalanced ? `The app is stopped on all ${S.serverIds.length} servers. Visitors get an error until you start it again.` : "Visitors get an error until you start it again.", danger: true, confirmText: "Stop website", ico: "stop" }))) return;
+    const one = opts.serverId ? serversById()[opts.serverId]?.name || opts.serverId : null;
+    if (act === "stop" && one) {
+      const others = (S.serverIds || []).filter((id) => id !== opts.serverId && S.state?.[id]?.running).length;
+      if (!(await confirmDialog({ title: `Stop ${S.name} on ${one}?`, message: others ? `nginx stops sending visitors to ${one}; the ${others === 1 ? "other server keeps" : `other ${others} servers keep`} serving the website.` : `No other server is running this website, so visitors get an error until you start it again.`, danger: true, confirmText: `Stop on ${one}`, ico: "stop" }))) return;
+    } else if (act === "stop" && !(await confirmDialog({ title: `Stop ${S.name}?`, message: S.loadBalanced ? `The app is stopped on all ${S.serverIds.length} servers. Visitors get an error until you start it again.` : "Visitors get an error until you start it again.", danger: true, confirmText: "Stop website", ico: "stop" }))) return;
     if (act === "rollback") {
       const prev = (S.releases || []).find((r) => r.id === S.previousReleaseId);
       if (!(await confirmDialog({ title: "Roll back?", message: prev ? `Switch back to v${prev.version} on every server.` : "Switch back to the previous release on every server.", confirmText: "Roll back", ico: "rollback" }))) return;
@@ -84,8 +90,8 @@ export default async function site(ctx) {
       return;
     }
     try {
-      const job = await post(`/api/sites/${S.id}/${act}`, act === "deploy" ? { releaseId: opts.releaseId } : {});
-      jobStarted(job, `${verbs[act]} started${S.loadBalanced && act === "deploy" ? " — rolling, one server at a time" : ""}`);
+      const job = await post(`/api/sites/${S.id}/${act}`, act === "deploy" ? { releaseId: opts.releaseId } : opts.serverId ? { serverId: opts.serverId } : {});
+      jobStarted(job, `${verbs[act]} started${one ? ` on ${one}` : ""}${S.loadBalanced && act === "deploy" ? " — rolling, one server at a time" : ""}`);
     } catch (e) { toastError(e, `Couldn't ${verbs[act].toLowerCase()}`); }
   };
   on(head, "click", "[data-act]", (e, b) => runAction(b.dataset.act));
@@ -182,7 +188,7 @@ export default async function site(ctx) {
         <div class="card">
           <div class="card-head"><h3>${S.loadBalanced ? "Load balancer upstreams" : "Server"}</h3><span class="sub">${S.loadBalanced ? html`${METHOD_LABEL[S.lbMethod]} · health check ${S.healthPath ? html`<span class="mono">${S.healthPath}</span>` : "off"}` : html`health check ${S.healthPath ? html`<span class="mono">${S.healthPath}</span>` : "off"}`}</span>
             <div class="right"><button class="btn btn-sm" data-status>${icon("refresh")}Check now</button></div></div>
-          <div class="table-wrap"><table class="table"><thead><tr><th>Server</th><th class="hide-sm">Upstream</th>${S.loadBalanced ? html`<th class="hide-sm">Weight</th>` : ""}<th>Health</th><th class="hide-sm">Version</th><th class="hide-sm">Checked</th></tr></thead><tbody>
+          <div class="table-wrap"><table class="table"><thead><tr><th>Server</th><th class="hide-sm">Upstream</th>${S.loadBalanced ? html`<th class="hide-sm">Weight</th>` : ""}<th>Health</th><th class="hide-sm">Version</th><th class="hide-sm">Checked</th>${perServer() ? html`<th></th>` : ""}</tr></thead><tbody>
           ${(ups.length ? ups : (S.serverIds || ["main"]).map((id) => ({ serverId: id, name: sById[id]?.name || id, address: "—", port: S.port, online: sById[id]?.online }))).map((u) => {
             const st = (S.state || {})[u.serverId] || {};
             const srv = sById[u.serverId];
@@ -194,11 +200,22 @@ export default async function site(ctx) {
               ${S.loadBalanced ? html`<td class="hide-sm num">${u.weight ?? srv?.weight ?? 1}</td>` : ""}
               <td><span class="status" title="${st.error || ""}"><span class="dot ${tone}"></span>${label}</span>${S.loadBalanced && u.down ? html` <span class="badge warn" style="height:20px;font-size:11px" title="nginx is not sending traffic here">out of rotation</span>` : ""}${st.error ? html`<div class="t-sub" style="color:#ff8ea3;max-width:280px">${st.error}</div>` : ""}</td>
               <td class="hide-sm mono small">${st.version ? "v" + st.version : "—"}</td>
-              <td class="hide-sm muted small">${ago(st.checkedAt)}</td></tr>`;
+              <td class="hide-sm muted small">${ago(st.checkedAt)}</td>
+              ${perServer() ? html`<td style="text-align:right">${u.online !== false && !notDeployed ? html`<button class="icon-btn ghost sm" data-srvmenu="${u.serverId}" aria-label="Actions on ${u.name}">${icon("more", "sm")}</button>` : ""}</td>` : ""}</tr>`;
           })}</tbody></table></div>
         </div>`);
     };
     paintOverview();
+    on(box, "click", "[data-srvmenu]", (e, b) => {
+      const id = b.dataset.srvmenu;
+      const name = serversById()[id]?.name || id;
+      const running = !!S.state?.[id]?.running;
+      openMenu(b, [
+        { label: `Restart on ${name}`, icon: "restart", onClick: () => runAction("restart", { serverId: id }) },
+        running ? { label: `Stop on ${name}`, icon: "stop", danger: true, onClick: () => runAction("stop", { serverId: id }) }
+          : { label: `Start on ${name}`, icon: "play", onClick: () => runAction("start", { serverId: id }) },
+      ]);
+    });
     on(box, "click", "[data-status]", async (e, b) => {
       b.classList.add("loading");
       try { S.state = await get(`/api/sites/${S.id}/status`); paintOverview(); paintHead(); } catch (ex) { toastError(ex, "Status check failed"); } finally { b.classList.remove("loading"); }

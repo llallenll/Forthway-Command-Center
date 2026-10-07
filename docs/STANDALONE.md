@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.5.2",
+  version: "3.6.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -474,7 +474,9 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   public site plus `job` (null, or the job that deploys to added servers → syncs nginx → `site.remove`s
   dropped servers; body may add `removeFilesFromOldServers: true`). `type`/`appDir` are only editable
   before the first deploy. Turning LB off without `serverIds` keeps the first server. Deploy/restart/stop/
-  start/rollback/github/DELETE return the job record. `POST …/rollback { releaseId? }`: with an id →
+  start/rollback/github/DELETE return the job record. `POST …/restart|stop|start { serverId? }`: with a server id, only
+  that one of the site's servers (400 if it doesn't host the site); UI: a ⋯ menu per row of the upstreams table when
+  more than one server hosts the site. `POST …/rollback { releaseId? }`: with an id →
   redeploy that release; without → snapshot rollback to `previousReleaseId` (falls back to redeploying it).
   `POST …/releases/github { ref?, repo?, deploy? }` (`deploy: true` deploys the new release in the same job).
   **Updates**: every 15 min (first ~20 s after start, 2 s between sites; paused 30 min after a GitHub rate

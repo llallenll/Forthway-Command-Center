@@ -1915,14 +1915,18 @@ export function register(router, ctx) {
     return job;
   });
 
+  // `serverId` (optional): only that one of the website's servers, e.g. one upstream of a load-balanced site.
   for (const op of ["restart", "stop", "start"]) {
-    router.post(`/api/sites/:id/${op}`, async (req, res, { params, admin }) => {
+    router.post(`/api/sites/:id/${op}`, async (req, res, { params, body, admin }) => {
       const site = mustSite(params.id);
       const verb = op[0].toUpperCase() + op.slice(1);
-      const job = siteJob(site, admin, { type: `site.${op}`, title: `${verb} ${site.name}` }, ({ log, signal }) =>
-        fanOut(site.id, `site.${op}`, { log, signal, stopOnError: op === "restart" }),
+      const one = body?.serverId ? String(body.serverId) : null;
+      if (one && !targets(site).includes(one)) throw httpError(400, "That server doesn't host this website.");
+      const title = one ? `${verb} ${site.name} on ${serverName(one)}` : `${verb} ${site.name}`;
+      const job = siteJob(site, admin, { type: `site.${op}`, title, serverId: one }, ({ log, signal }) =>
+        fanOut(site.id, `site.${op}`, { log, signal, stopOnError: op === "restart", ...(one ? { servers: [one] } : {}) }),
       );
-      audit(admin, `site.${op}`, site);
+      audit(admin, `site.${op}`, site, one ? { serverId: one, server: serverName(one) } : undefined);
       return job;
     });
   }
