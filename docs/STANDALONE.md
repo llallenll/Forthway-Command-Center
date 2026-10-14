@@ -1157,3 +1157,11 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   `fcc_admin`. panel/lib/cluster-alerts.mjs sends SMS/Discord on panel and database
   failover (`ctx.ha.on("promoted")`, `ctx.ha.beforeFence`). The server dialog uses
   Role / Load balancing / Status menus. Contract in docs/HA.md.
+- **3.9.1 — replica version preflight (agent/tasks 3.3.1).** `mysql.replica.setup` /
+  `mysql.rebuild` read the primary's version first and make the replica run the same or
+  a newer release series (major.minor): distro package when it is new enough, else
+  Oracle's / MariaDB's APT repository (pinned key fingerprint, `signed-by=`,
+  `/etc/apt/sources.list.d/fcc-mysql.list`); an older installed server is replaced only
+  when it holds no databases of its own, and mysqldump's series is checked before the
+  copy. The panel requires agent 3.3.1 on the replica before seeding. Details in
+  docs/HA.md (Changes).
