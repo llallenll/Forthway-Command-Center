@@ -6,7 +6,12 @@
  * Same code on both sides, so a site on main behaves exactly like a site on
  * any other machine.
  *
- *   executeTask(type, payload, { log, signal, dataDir, isMain, uploadFile, authToken, panelUrl, edgeAllow })
+ *   executeTask(type, payload, { log, progress, signal, dataDir, isMain, uploadFile, authToken, panelUrl, edgeAllow })
+ *
+ * `progress(obj)` (optional) receives structured progress from long tasks — today
+ * the database copy of mysql.replica.setup / mysql.rebuild (docs/HA.md, 3.9.2) —
+ * at most once a second (the latest object wins; a task can pass { force: true }
+ * for a final state, which is never dropped).
  *
  * Task types and their payload/result shapes are listed in docs/STANDALONE.md
  * (section 3, "ctx.cluster"). There is deliberately no "run a command" task:
@@ -39,7 +44,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.3.1";
+export const TASKS_VERSION = "3.4.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -67,6 +72,7 @@ export const TASK_TYPES = [
   "mysql.readonly",
   "mysql.users.sync",
   "mysql.rebuild",
+  "mysql.probe", // 3.4.0: the replica's TCP view of the primary (fast failover)
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -98,15 +104,57 @@ export const TASK_TIMEOUTS_MS = {
   "mysql.readonly": 30_000,
   "mysql.users.sync": 2 * 60_000,
   "mysql.rebuild": 6 * 60 * 60_000, // safety dump + full copy
+  "mysql.probe": 10_000,
 };
 
 const NOOP = () => {};
+
+/**
+ * At most one progress call per `minMs`; the latest object in between is kept
+ * and delivered at the end of the window (so the last state always arrives).
+ * `{ force: true }` delivers at once. A failing sink never breaks the task.
+ */
+export function throttleProgress(fn, minMs = 1000) {
+  let last = 0;
+  let pending = null;
+  let timer = null;
+  const deliver = (obj) => {
+    last = Date.now();
+    try {
+      fn(obj);
+    } catch {
+      /* progress is best effort */
+    }
+  };
+  return (obj, { force = false } = {}) => {
+    if (!obj || typeof obj !== "object") return;
+    const wait = minMs - (Date.now() - last);
+    if (force || wait <= 0) {
+      clearTimeout(timer);
+      timer = null;
+      pending = null;
+      deliver(obj);
+      return;
+    }
+    pending = obj;
+    if (!timer) {
+      timer = setTimeout(() => {
+        timer = null;
+        const p = pending;
+        pending = null;
+        if (p) deliver(p);
+      }, wait);
+      timer.unref?.();
+    }
+  };
+}
 
 // ------------------------------------------------------------------ entry
 
 export async function executeTask(type, payload = {}, opts = {}) {
   const o = {
     log: opts.log || NOOP,
+    progress: typeof opts.progress === "function" ? throttleProgress(opts.progress) : NOOP,
     signal: opts.signal || null,
     dataDir: opts.dataDir || defaultDataDir(),
     isMain: !!opts.isMain,
@@ -135,6 +183,7 @@ export async function executeTask(type, payload = {}, opts = {}) {
       return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelRemove(payload, o));
     case "mysql.status":
     case "mysql.readonly":
+    case "mysql.probe":
       // Never queued behind a long setup/rebuild: status is read-only and fencing must be fast.
       return (await import("./mysql-ha.mjs")).runMysqlTask(type, payload, o);
     case "mysql.primary.prepare":

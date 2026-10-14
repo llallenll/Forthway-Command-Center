@@ -16,6 +16,11 @@
  *                         fetch, code-digest follow (+ exit 75)
  *   - POST /ha/vote       every voter's heartbeat; the reply carries our role,
  *                         and a `request` for its vote when we lead or campaign
+ *   - coordinated updates  the leader's update job stages a code target that
+ *                         standbys converge to one at a time (codeTarget,
+ *                         GET /ha/update/<id>, backup + auto-rollback), then the
+ *                         leader restarts inside an announced window and takes
+ *                         its lease back (docs/HA.md "Panel updates in a cluster")
  *   - GET /api/ha, POST /api/ha/handover, SSE "ha" events
  *   - on main: the embedded voter (main has no fcc-node), and while main is a
  *     follower the embedded node agent child process (so the leader can still
@@ -28,16 +33,20 @@
  *     (performance.now()). Nothing a peer sends is ever compared with our
  *     wall clock.
  *  2. A vote is a lease. When we ask for it we hand the voter a `nonce` =
- *     our performance.now() at that moment, and remember the nonces we issued
- *     to that voter. A grant only counts if it echoes one of *our* nonces, and
- *     it counts until `nonce + LEASE_MS - MARGIN_MS` on our clock. The voter
+ *     our performance.now() at that moment and the lease length L we ask for,
+ *     and remember (nonce, L, margin M) per voter. A grant only counts if it
+ *     echoes one of *our* nonces, and it counts until
+ *     `nonce + min(grant.leaseMs ?? 15 s, L) - M` on our clock. The voter
  *     granted strictly after we built the request and keeps the lease for
- *     LEASE_MS on its own clock, so our view of the grant always ends at least
- *     MARGIN_MS before the voter could give the vote to anyone else.
+ *     grant.leaseMs on its own clock (never shortening one it already gave),
+ *     so our view of the grant always ends at least M before the voter could
+ *     give the vote to anyone else — whatever lease lengths either side uses,
+ *     and however config.ha.failoverSeconds changes meanwhile (every grant
+ *     carries its own numbers; shared/ha-timing.mjs derives them).
  *  3. A leader that has ever held a majority ("armed") checks every 250 ms and
  *     fences (flush db.json, stop, exit 75) the moment its valid grants drop
- *     below the majority — i.e. once the majority-th freshest grant is older
- *     than LEASE_MS - MARGIN_MS. It never keeps serving writes without a
+ *     below the majority — i.e. once the majority-th freshest grant has passed
+ *     its end from rule 2. It never keeps serving writes without a
  *     majority lease. An unarmed leader (HA just turned on, the voters not
  *     running yet) does not fence for lack of votes — but it does fence when
  *     a voter reports a live lease for someone else in a newer term.
@@ -70,12 +79,14 @@ import crypto from "node:crypto";
 import dns from "node:dns";
 import { spawn, spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
 
 import { writeFileAtomic } from "./store.mjs";
 import { send, sendJson, readJsonBody, httpError, HttpError } from "./http.mjs";
 import { setTrustedProxies, trustedRequest, requestIp, requestProto, requestHost } from "./auth.mjs";
 import { makeZip } from "../../shared/zipwrite.mjs";
 import { extractZip } from "../../shared/zip.mjs";
+import { haTimings, advertised, timingSummary, checkFailoverSeconds, cleanLeaseMs, LEGACY_LEASE_MS, LEGACY_HEARTBEAT_MS, FAILOVER_SECONDS_MIN, FAILOVER_SECONDS_MAX } from "../../shared/ha-timing.mjs";
 
 // ------------------------------------------------------------- the voter
 
@@ -90,11 +101,17 @@ try {
 }
 
 const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
-/** Timing (docs/HA.md). Taken from shared/ha-voter.mjs; these are only the fallback values. */
-export const HEARTBEAT_MS = num(voterModule?.HEARTBEAT_MS, 3000);
-export const LEASE_MS = num(voterModule?.LEASE_MS, 15000);
-export const MARGIN_MS = num(voterModule?.MARGIN_MS, 3000);
-export const FAILOVER_MS = num(voterModule?.FAILOVER_MS, 20000);
+/**
+ * Timing (docs/HA.md "Failover speed"). The live values are derived from
+ * config.ha.failoverSeconds by shared/ha-timing.mjs (tm() in createHa); these
+ * exports are the defaults (15 s: heartbeat 1 s, lease 6.8 s, margin 1.4 s,
+ * standby silence 5.8 s).
+ */
+const DEFAULT_TIMINGS = haTimings();
+export const HEARTBEAT_MS = num(voterModule?.HEARTBEAT_MS, DEFAULT_TIMINGS.heartbeatMs);
+export const LEASE_MS = num(voterModule?.LEASE_MS, DEFAULT_TIMINGS.leaseMs);
+export const MARGIN_MS = num(voterModule?.MARGIN_MS, DEFAULT_TIMINGS.marginMs);
+export const FAILOVER_MS = num(voterModule?.FAILOVER_MS, DEFAULT_TIMINGS.failoverMs);
 
 // ------------------------------------------------------------- constants
 
@@ -103,16 +120,34 @@ const MAIN = "main";
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const URL_RE = /^https?:\/\/[^\s/?#]+\/?$/i;
 const TICK_MS = 250;
-const POLL_WAIT_S = 5; // follower long-poll; well under FAILOVER_MS so a quiet leader is never mistaken for a dead one
-const CANDIDACY_MS = 10_000;
-const FENCE_HOOKS_MS = 3000; // ctx.ha.beforeFence hooks, all together (docs/HA.md Phase 3, fencing rule 1)
+// Follower long-poll (tm().pollWaitS, well under the standby silence window so a quiet leader is
+// never mistaken for a dead one), candidacy length and beforeFence budget come from tm().
 const HANDOVER_MARK_MS = 5 * 60_000; // a config.ha.handover marker older than this is stale
 const ONLINE_MS = 30_000; // a follower that polled within this is online
-const VOTER_FRESH_MS = HEARTBEAT_MS * 2 + 2000; // a voter message younger than this describes the voter now
 const SLOW_EVERY_MS = 60_000;
 const RELEASE_SYNC_MS = 5 * 60_000;
 const MAX_STATE_BYTES = 512 * 1024 * 1024;
 const MAX_CODE_BYTES = 300 * 1024 * 1024;
+/**
+ * Coordinated panel updates (docs/HA.md "Panel updates in a cluster"). The
+ * leader announces a restart window before it restarts for an update: standbys
+ * do not stand for election inside it, and the restarted leader reclaims its
+ * lease at once. Past the window normal failover applies.
+ */
+export const RESTART_WINDOW_MS = 60_000;
+const RESTART_WINDOW_MAX_MS = 5 * 60_000; // never honour a longer window (bad peer, clock jump)
+const TARGET_REPUSH_MS = 5000; // a released standby that still runs other code is told again at most this often
+const PENDING_MAX_BOOTS = 3; // new code that boots this many times without reaching the leader is rolled back
+const KEEP_UPDATE_BACKUPS = 3; // same as updates.mjs
+const UPDATE_ID_RE = /^[A-Za-z0-9_.-]{1,80}$/;
+const BOOT_ID = crypto.randomBytes(8).toString("hex");
+/**
+ * Before a standby swaps in new code: `node --check` the entry point (it cannot be
+ * imported without booting), then import its boot-time modules in one child
+ * (that parses them and resolves every import/export they need).
+ */
+const SYNTAX_CHECK = ["panel/server.mjs"];
+const IMPORT_CHECK = ["panel/lib/http.mjs", "panel/lib/sys.mjs", "panel/lib/store.mjs", "panel/lib/auth.mjs", "panel/lib/ha.mjs", "panel/lib/secrets.mjs", "panel/lib/jobs.mjs", "panel/lib/core-routes.mjs", "panel/lib/updates.mjs"];
 
 /** Replicated files (relative to dataDir). SLOW ones at most once a minute. */
 const TRACKED = ["db.json", "config.json", "cloudflare-ips.json", "cloudflared-home/cert.pem", "backups/schedule-state.json", "monitor/state.json", "usage.json"];
@@ -350,10 +385,27 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
   let lastLeader = typeof local.lastLeaderId === "string" && ID_RE.test(local.lastLeaderId) ? local.lastLeaderId : haBoot ? null : me;
   let handoverFrom = null; // { id, until } — from a /ha/handover notice
   const fenceHooks = new Set(); // ctx.ha.beforeFence(fn)
+  // Coordinated updates (docs/HA.md "Panel updates in a cluster").
+  let rollout = null; // leader: { updateId, digest, version, commit, dir, released: Set<serverId>, zip }
+  let restartAnnounce = null; // leader: { at, until } (mono) — restarting for an update inside this window
+  let leaderRestart = null; // follower: { id, until } (mono) — the leader said it is restarting for an update
+  let leaderRestartLogged = null;
+  let reclaimUntil = 0; // restarted leader: stand for election at once until then (mono)
 
-  const grants = new Map(); // voterId -> { term, nonce }
-  const issued = new Map(); // voterId -> [{ term, nonce }]
-  const voterMsgs = new Map(); // voterId -> { term, votedFor, leaseLeftMs, knownCommitted, at }
+  const grants = new Map(); // voterId -> { term, nonce, until }
+  const issued = new Map(); // voterId -> [{ term, nonce, leaseMs, marginMs }]
+  const voterMsgs = new Map(); // voterId -> { term, votedFor, leaseLeftMs, knownCommitted, heartbeatMs, at }
+
+  // Failover speed (shared/ha-timing.mjs): the leader uses its config; a follower the
+  // failoverSeconds of the last replicated config.json (its in-memory config is the boot copy).
+  let followerFailoverSeconds = null;
+  const failoverSeconds = () => (role !== "leader" && followerFailoverSeconds != null ? followerFailoverSeconds : config.ha?.failoverSeconds);
+  let tmCache = { key: undefined, value: null };
+  function tm() {
+    const key = failoverSeconds();
+    if (tmCache.key !== key || !tmCache.value) tmCache = { key, value: haTimings(key) };
+    return tmCache.value;
+  }
   const nodes = new Map(); // (leader) serverId -> { lastPollAt, url, codeDigest, have, acked, ackAt, panelVersion }
   const learnedUrls = new Map(); // serverId -> directUrl (from polls / voter lists)
   const listeners = new Map(); // event -> Set<fn>
@@ -490,7 +542,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
   function maybeAnnounce(force = false) {
     const b = brief();
     const nodesOnline = role === "leader" ? panelIds().map((id) => (id === me ? 1 : nodes.get(id) && mono() - nodes.get(id).lastPollAt < ONLINE_MS ? 1 : 0)).join("") : "";
-    const votes = [...voterMsgs].map(([id, m]) => `${id}:${m.votedFor}:${mono() - m.at < VOTER_FRESH_MS ? 1 : 0}`).sort().join(",");
+    const votes = [...voterMsgs].map(([id, m]) => `${id}:${m.votedFor}:${fresh(m) ? 1 : 0}`).sort().join(",");
     const sig = JSON.stringify([b.enabled, b.armed, b.role, b.leaderId, b.term, b.granted, b.majority, b.handoverTo, nodesOnline, votes]);
     if (!force && sig === lastSig) return;
     if (!force && mono() - lastBroadcastAt < 1000) return; // coalesce; the next tick catches up
@@ -533,32 +585,38 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
 
   // ================================================================ voting
 
+  /** The request we issued to `voterId` with this term and nonce, while it could still count; else null. */
   function validIssued(voterId, t, nonce) {
     const now = mono();
-    if (!(nonce <= now) || now - nonce >= LEASE_MS - MARGIN_MS) return false;
-    return (issued.get(voterId) || []).some((e) => e.term === t && e.nonce === nonce);
+    if (!(nonce <= now)) return null;
+    const e = (issued.get(voterId) || []).find((x) => x.term === t && x.nonce === nonce);
+    return e && now < e.nonce + e.leaseMs - e.marginMs ? e : null;
   }
 
-  function recordIssued(voterId, t, nonce) {
+  function recordIssued(voterId, t, nonce, leaseMs, marginMs) {
     const now = mono();
-    const list = (issued.get(voterId) || []).filter((e) => now - e.nonce < LEASE_MS);
-    list.push({ term: t, nonce });
+    const list = (issued.get(voterId) || []).filter((e) => now - e.nonce < e.leaseMs);
+    list.push({ term: t, nonce, leaseMs, marginMs });
     while (list.length > 32) list.shift();
     issued.set(voterId, list);
   }
 
-  /** Grants that count now: for term `t`, from an enabled server, younger than LEASE_MS - MARGIN_MS on OUR clock. */
+  /** Where a grant stops counting on OUR clock: nonce + min(the voter's lease, the one we asked for) - our margin then. */
+  const grantUntil = (e, grantLeaseMs) => e.nonce + Math.min(grantLeaseMs === undefined ? LEGACY_LEASE_MS : cleanLeaseMs(grantLeaseMs), e.leaseMs) - e.marginMs;
+
+  /** Grants that count now: for term `t`, from an enabled server, before their end (grantUntil) on OUR clock. */
   function validGrantCount(t) {
     const enabled = new Set(enabledServers().map((s) => s.id));
     const now = mono();
     let n = 0;
     for (const [id, g] of grants) {
-      if (enabled.has(id) && g.term === t && now < g.nonce + LEASE_MS - MARGIN_MS) n++;
+      if (enabled.has(id) && g.term === t && now < g.until) n++;
     }
     return n;
   }
 
-  const fresh = (m) => mono() - m.at < VOTER_FRESH_MS;
+  /** A voter message younger than this describes the voter now (its own heartbeat, or ours, whichever is slower). */
+  const fresh = (m) => mono() - m.at < 2 * Math.max(tm().heartbeatMs, m.heartbeatMs || LEGACY_HEARTBEAT_MS) + 2000;
   const leaseLeft = (m) => Math.max(0, (Number(m.leaseLeftMs) || 0) - (mono() - m.at));
 
   /** A voter that currently holds a live lease for a node other than us: { voterId, votedFor, term } or null. */
@@ -582,16 +640,20 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       term: replyRole === "follower" ? maxTermSeen : term,
       leaderId: replyRole === "leader" ? me : replyRole === "candidate" ? null : leaderId,
     };
+    r.proto = 2; // requests carry leaseMs, leader replies carry timings (shared/ha-voter.mjs)
     if (replyRole === "leader") {
       r.committed = { ...committed };
       r.panels = panelList();
+      r.timings = advertised(failoverSeconds());
       if (handover) r.handoverTo = handover.to;
+      if (restartAnnounce) r.restarting = { remainingMs: Math.max(0, Math.round(restartAnnounce.until - mono())) }; // informational for voters
     }
     const wantRequest = !omitRequest && ((replyRole === "leader" && haLeading && !handover && !promoting) || (replyRole === "candidate" && candidate));
     if (wantRequest) {
       const nonce = mono();
-      recordIssued(voterId, term, nonce);
-      r.request = { candidate: me, term, nonce, version: myVersion() };
+      const { leaseMs, marginMs } = tm();
+      recordIssued(voterId, term, nonce, leaseMs, marginMs);
+      r.request = { candidate: me, term, nonce, leaseMs, version: myVersion() };
     }
     return r;
   }
@@ -604,7 +666,8 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     const t = Math.max(0, Math.floor(Number(body.term) || 0));
     noteTerm(t);
     const votedFor = typeof body.votedFor === "string" && ID_RE.test(body.votedFor) ? body.votedFor : null;
-    voterMsgs.set(s.id, { term: t, votedFor, leaseLeftMs: Math.max(0, Number(body.leaseLeftMs) || 0), knownCommitted: cleanV(body.knownCommitted), at: mono() });
+    const hb = Number(body.heartbeatMs);
+    voterMsgs.set(s.id, { term: t, votedFor, leaseLeftMs: Math.max(0, Number(body.leaseLeftMs) || 0), knownCommitted: cleanV(body.knownCommitted), heartbeatMs: Number.isFinite(hb) && hb > 0 ? Math.min(hb, 60_000) : null, at: mono() });
 
     // A voter that moved on (newer term, or now voting for someone else) takes its grant with it.
     const had = grants.get(s.id);
@@ -614,9 +677,10 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (g) {
       const gTerm = Math.floor(Number(g.term));
       const nonce = Number(g.nonce);
-      if (g.candidate === me && (role === "leader" || role === "candidate") && !fencing && gTerm === term && validIssued(s.id, gTerm, nonce)) {
+      const e = g.candidate === me && (role === "leader" || role === "candidate") && !fencing && gTerm === term ? validIssued(s.id, gTerm, nonce) : null;
+      if (e) {
         const prev = grants.get(s.id);
-        if (!prev || prev.term !== gTerm || prev.nonce < nonce) grants.set(s.id, { term: gTerm, nonce });
+        if (!prev || prev.term !== gTerm || prev.nonce < nonce) grants.set(s.id, { term: gTerm, nonce, until: grantUntil(e, g.leaseMs) });
       }
     }
     if (handover) handover.notified.add(s.id);
@@ -674,8 +738,9 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     const hooks = [...fenceHooks];
     if (!hooks.length) return exit();
     // ctx.ha.beforeFence hooks (e.g. mysql-ha: local MySQL read_only=ON when main is the
-    // primary) get FENCE_HOOKS_MS in total, never more: the lease runs out MARGIN_MS after
-    // we fence. Flush first and stop writing db.json — nothing is ours to write any more.
+    // primary) get tm().fenceHooksMs in total (margin − 250 ms, 0.75–3 s), never more: the
+    // lease runs out a margin after we fence. Flush first and stop writing db.json.
+    const fenceHooksMs = tm().fenceHooksMs;
     try {
       db.save({ immediate: true });
     } catch (err) {
@@ -689,9 +754,9 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       }),
       new Promise((r) => {
         timer = setTimeout(() => {
-          warn(`beforeFence hooks still running after ${FENCE_HOOKS_MS / 1000} s — fencing anyway`);
+          warn(`beforeFence hooks still running after ${fenceHooksMs / 1000} s — fencing anyway`);
           r();
-        }, FENCE_HOOKS_MS);
+        }, fenceHooksMs);
       }),
     ]).finally(() => {
       clearTimeout(timer);
@@ -748,7 +813,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
         candidate = null;
         backoffUntil = mono() + rand(2000, 6000);
         grants.clear();
-        setRole("follower", `no majority within ${CANDIDACY_MS / 1000} s — backing off`);
+        setRole("follower", `no majority within ${Math.round(tm().candidacyMs / 1000)} s — backing off`);
       }
       return;
     }
@@ -770,8 +835,19 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
   function maybeCandidate() {
     if (mono() < backoffUntil) return;
     const handoverMode = mono() < handoverExpectedUntil;
+    // We led until a moment ago and restarted for an update: take the panel back at once.
+    const reclaim = mono() < reclaimUntil;
     const silentFor = mono() - lastStateOkAt;
-    const ready = handoverMode || (silentFor >= FAILOVER_MS && !otherLease());
+    // The leader announced a restart for an update: give it its window (voters still enforce leases).
+    if (!handoverMode && !reclaim && leaderRestart && mono() < leaderRestart.until) {
+      condSince = 0;
+      if (silentFor >= tm().failoverMs && leaderRestartLogged !== leaderRestart) {
+        leaderRestartLogged = leaderRestart;
+        log(`${leaderRestart.id} is restarting for an update — waiting up to ${Math.round((leaderRestart.until - mono()) / 1000)} s more before standing for election`);
+      }
+      return;
+    }
+    const ready = handoverMode || ((reclaim || silentFor >= tm().failoverMs) && !otherLease());
     if (!ready) {
       condSince = 0;
       return;
@@ -785,12 +861,12 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       return;
     }
     if (!condSince) condSince = mono();
-    if (firstDelay === null) firstDelay = mainIsLocal || handoverMode ? 0 : rand(0, 3000); // main wins ties
+    if (firstDelay === null || reclaim) firstDelay = mainIsLocal || handoverMode || reclaim ? 0 : rand(0, tm().tieBreakMs); // main wins ties
     if (mono() - condSince < firstDelay) return;
-    becomeCandidate(handoverMode);
+    becomeCandidate(handoverMode, reclaim);
   }
 
-  function becomeCandidate(handoverMode) {
+  function becomeCandidate(handoverMode, reclaim = false) {
     const t = Math.max(maxTermSeen, local.term, term) + 1;
     term = t;
     maxTermSeen = t;
@@ -807,11 +883,11 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     candidate = {
       term: t,
       since: mono(),
-      until: mono() + (handoverMode ? Math.max(CANDIDACY_MS, handoverExpectedUntil - mono()) : CANDIDACY_MS),
+      until: mono() + (handoverMode ? Math.max(tm().candidacyMs, handoverExpectedUntil - mono()) : tm().candidacyMs),
       handover: !!handoverMode,
       previousLeaderId: (handoverMode && handoverFrom && mono() < handoverFrom.until ? handoverFrom.id : null) || lastLeader,
     };
-    setRole("candidate", `${handoverMode ? "handover target" : `no active panel for ${Math.round((mono() - lastStateOkAt) / 1000)} s`} — term ${t}, version ${fmtV(local.version)}`);
+    setRole("candidate", `${handoverMode ? "handover target" : reclaim ? "back from a restart for an update, taking the panel back" : `no active panel for ${Math.round((mono() - lastStateOkAt) / 1000)} s`} — term ${t}, version ${fmtV(local.version)}`);
   }
 
   async function promote(votes) {
@@ -824,6 +900,8 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     leaderId = me;
     haLeading = true;
     handoverExpectedUntil = 0;
+    reclaimUntil = 0;
+    leaderRestart = null;
     firstDelay = null;
     switchedAt = new Date().toISOString();
     stopMainAgent();
@@ -931,19 +1009,45 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     return true;
   }
 
-  function stateReply(have) {
+  function stateReply(have, forId = null) {
     const v = tracker.version;
     const full = have.term !== v.term || have.seq > v.seq;
     const files = {};
     for (const [rel, e] of tracker.files) if (full || e.seq > have.seq) files[rel] = e.content;
-    return { leaderId: me, term: v.term, seq: v.seq, electionTerm: term, codeDigest: codeDigest(), committed: { ...committed }, panels: panelList(), files };
+    const out = { leaderId: me, term: v.term, seq: v.seq, electionTerm: term, codeDigest: codeDigest(), committed: { ...committed }, panels: panelList(), files };
+    const target = targetFor(forId);
+    if (target) out.codeTarget = target; // followers converge to this, never to an older codeDigest
+    if (restartAnnounce) out.restarting = { remainingMs: Math.max(0, Math.round(restartAnnounce.until - mono())) };
+    return out;
   }
+
+  /** The update a follower should converge to: only once the leader's update job has released it for that node. */
+  function targetFor(id) {
+    if (!rollout || !id || !rollout.released.has(id)) return null;
+    return { digest: rollout.digest, updateId: rollout.updateId, version: rollout.version || null, commit: rollout.commit || null };
+  }
+
+  /** Answer this follower's poll at once (not after the long-poll wait): it has to hear about a restart or an update. */
+  function mustAnswer(id, n) {
+    if (restartAnnounce && !(n.restartToldAt >= restartAnnounce.at)) return true;
+    const t = targetFor(id);
+    return !!t && n.codeDigest !== t.digest && mono() - n.targetToldAt > TARGET_REPUSH_MS;
+  }
+  const wakePolls = () => {
+    for (const w of [...tracker.waiters]) w();
+  };
 
   const notLeader = () => ({ error: "This panel node is not the active panel.", notLeader: true, leaderId: role === "leader" ? null : leaderId, leaderUrl: role === "leader" || !leaderId ? null : urlOf(leaderId), haSwitching: true });
 
   function noteNode(s, q) {
-    const n = nodes.get(s.id) || { lastPollAt: 0, url: null, codeDigest: null, have: null, acked: null, ackAt: 0, panelVersion: null };
+    const n = nodes.get(s.id) || { lastPollAt: 0, url: null, codeDigest: null, have: null, acked: null, ackAt: 0, panelVersion: null, bootId: null, capable: false, report: null, restartToldAt: -Infinity, targetToldAt: -Infinity };
     n.lastPollAt = mono();
+    if (typeof q.boot === "string" && /^[0-9a-f]{16}$/.test(q.boot)) n.bootId = q.boot;
+    if (q.cap !== undefined) n.capable = String(q.cap).split(",").includes("rollout");
+    if (typeof q.upd === "string" && q.upd) {
+      const [updateId, state, ...msg] = q.upd.slice(0, 400).split("|");
+      if (UPDATE_ID_RE.test(updateId)) n.report = { updateId, state: String(state || "").slice(0, 20), msg: msg.join("|") || null };
+    }
     const u = cleanUrl(q.url);
     if (u) {
       n.url = u;
@@ -979,7 +1083,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     const have = parseV(q.have);
     const wait = Math.max(0, Math.min(30, Number(q.wait) || 0));
     const n = noteNode(s, q);
-    const newer = () => cmpV(tracker.version, have) > 0;
+    const newer = () => cmpV(tracker.version, have) > 0 || mustAnswer(s.id, n);
     if (!newer() && wait > 0) {
       await new Promise((resolve) => {
         const done = () => {
@@ -997,10 +1101,15 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (role !== "leader" || fencing) return sendJson(res, 409, notLeader());
     n.lastPollAt = mono();
     if (!newer()) {
-      res.writeHead(204, { "Cache-Control": "no-store", "X-FCC-Leader-Id": me });
+      const h = { "Cache-Control": "no-store", "X-FCC-Leader-Id": me };
+      if (restartAnnounce) h["X-FCC-Restarting-Ms"] = String(Math.max(0, Math.round(restartAnnounce.until - mono())));
+      res.writeHead(204, h);
       return res.end();
     }
-    return sendJson(res, 200, stateReply(have));
+    const reply = stateReply(have, s.id);
+    if (reply.restarting) n.restartToldAt = mono();
+    if (reply.codeTarget) n.targetToldAt = mono();
+    return sendJson(res, 200, reply);
   }
 
   async function handleAck(req, res) {
@@ -1202,6 +1311,17 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     res.end(buf);
   }
 
+  /**
+   * Why this node must not replace its own code (null = it may). Test hook
+   * (docs/HA.md "Testing panel updates"): FCC_TEST_REAL_CODE_SWAP=1 under
+   * FCC_DRY_RUN lets a code dir that is not a git checkout be replaced for real.
+   */
+  function codeSwapSimulated() {
+    if (fs.existsSync(path.join(rootDir, ".git"))) return ctx.sys?.DRY_RUN ? "dry run" : "git checkout";
+    if (ctx.sys?.DRY_RUN && process.env.FCC_TEST_REAL_CODE_SWAP !== "1") return "dry run";
+    return null;
+  }
+
   let codeBusy = false;
   const codeTried = new Map(); // digest -> mono
   async function followCode(baseUrl, wanted) {
@@ -1209,7 +1329,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     const last = codeTried.get(wanted);
     if (last !== undefined && mono() - last < 10 * 60_000) return;
     codeTried.set(wanted, mono());
-    const simulated = ctx.sys?.DRY_RUN ? "dry run" : fs.existsSync(path.join(rootDir, ".git")) ? "git checkout" : null;
+    const simulated = codeSwapSimulated();
     if (simulated) {
       log(`the active panel runs different code (${wanted.slice(0, 12)} vs ${codeDigest().slice(0, 12)}) — ${simulated}: not replacing the working copy`);
       return;
@@ -1239,16 +1359,25 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     }
   }
 
-  /** Replace each code item present in `stage` by rename (same filesystem); put everything back on failure. */
-  function swapIn(stage) {
+  /**
+   * Replace each code item present in `stage` by rename (same filesystem); put everything back on failure.
+   * removeMissing: code items the stage does not have are removed too (the result is exactly the stage's code set).
+   */
+  function swapIn(stage, { removeMissing = false } = {}) {
     const oldDir = path.join(rootDir, `.ha-old.${Date.now()}`);
     fs.mkdirSync(oldDir, { recursive: true });
     const done = [];
     try {
       for (const item of CODE_ITEMS) {
         const from = path.join(stage, item);
-        if (!fs.existsSync(from)) continue;
         const live = path.join(rootDir, item);
+        if (!fs.existsSync(from)) {
+          if (removeMissing && fs.existsSync(live)) {
+            fs.renameSync(live, path.join(oldDir, item));
+            done.push({ item, had: true });
+          }
+          continue;
+        }
         const had = fs.existsSync(live);
         if (had) fs.renameSync(live, path.join(oldDir, item));
         done.push({ item, had });
@@ -1267,6 +1396,265 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       throw err;
     }
     rmrf(oldDir);
+  }
+
+  // ------------------------------------------- coordinated updates (leader)
+  //
+  // updates.mjs stages an update once on the leader, then calls setCodeTarget()
+  // and releaseCodeTarget(id) for one standby at a time. A released standby is
+  // told (codeTarget in its /ha/state reply), downloads the staged bundle from
+  // GET /ha/update/<updateId>, checks, backs up, swaps and exits 75; the job
+  // waits until it polls again from a new boot on the target digest. Last the
+  // leader swaps itself, prepareRestart() announces the restart window, and it
+  // exits; the restarted process reclaims its lease (reclaimUntil).
+
+  function setCodeTarget({ updateId, digest, version = null, commit = null, dir }) {
+    if (role !== "leader" || fencing) throw httpError(409, "Only the active panel can update the panel servers.");
+    if (!UPDATE_ID_RE.test(String(updateId || "")) || !/^[0-9a-f]{64}$/.test(String(digest || ""))) throw new Error("setCodeTarget: bad updateId or digest");
+    if (!fs.existsSync(path.join(dir, "panel", "server.mjs"))) throw new Error("setCodeTarget: the staged code has no panel/server.mjs");
+    rollout = { updateId, digest, version, commit, dir, released: new Set(), zip: null };
+    log(`update ${updateId}: target v${version || "?"} (${digest.slice(0, 12)}) staged for the standbys`);
+  }
+
+  function releaseCodeTarget(id) {
+    if (!rollout) return;
+    rollout.released.add(id);
+    const n = nodes.get(id);
+    if (n) n.targetToldAt = -Infinity;
+    wakePolls();
+  }
+
+  function clearCodeTarget(why) {
+    if (!rollout) return;
+    log(`update ${rollout.updateId}: target withdrawn${why ? ` (${why})` : ""}`);
+    rollout = null;
+    wakePolls();
+  }
+
+  /** What the leader knows about a standby from its polls. */
+  function peerStatus(id) {
+    const n = nodes.get(id);
+    if (!n) return { online: false, codeDigest: null, version: null, bootId: null, capable: false, report: null, lastPollAgoMs: null };
+    const ago = mono() - n.lastPollAt;
+    return { online: ago < ONLINE_MS, lastPollAgoMs: Math.round(ago), codeDigest: n.codeDigest, version: n.panelVersion, bootId: n.bootId, capable: !!n.capable, report: n.report ? { ...n.report } : null };
+  }
+
+  function rolloutPeers() {
+    return panelIds()
+      .filter((id) => id !== me)
+      .map((id) => {
+        const s = db.get("servers", id);
+        return { serverId: id, name: s?.name || (id === MAIN ? "Main" : id), enabled: s ? s.enabled !== false : true, ...peerStatus(id) };
+      });
+  }
+
+  /**
+   * Leader, right before it exits to restart on new code: announce the restart
+   * window (in /ha/state and vote replies), persist our version and the window
+   * so the restarted process can take the lease back, and give the standbys a
+   * moment to hear it. Returns false when HA is not active (nothing to do).
+   */
+  async function prepareRestart(ms = RESTART_WINDOW_MS) {
+    if (role !== "leader" || fencing || !haActive() || !tracker.started) return false;
+    ms = Math.max(5000, Math.min(RESTART_WINDOW_MAX_MS, Number(ms) || RESTART_WINDOW_MS));
+    restartAnnounce = { at: mono(), until: mono() + ms };
+    local.version = { ...tracker.version };
+    local.restart = { untilWall: Date.now() + ms, term, at: new Date().toISOString() };
+    try {
+      saveLocal();
+    } catch (err) {
+      warn(`could not write ${LOCAL_FILE} before restarting: ${err.message}`);
+    }
+    log(`restarting for an update — the standbys hold off for ${Math.round(ms / 1000)} s while this node takes the panel back`);
+    wakePolls();
+    const waitFor = panelIds().filter((id) => id !== me && nodes.get(id) && mono() - nodes.get(id).lastPollAt < ONLINE_MS);
+    const deadline = mono() + 4000;
+    while (mono() < deadline && waitFor.some((id) => !(nodes.get(id).restartToldAt >= restartAnnounce.at))) await sleep(100);
+    const missed = waitFor.filter((id) => !(nodes.get(id).restartToldAt >= restartAnnounce.at));
+    if (missed.length) warn(`restart window: ${missed.join(", ")} did not poll in time — they may stand for election after ${tm().failoverMs / 1000} s`);
+    return true;
+  }
+
+  /** The update bundle: the staged code set plus version.json, zipped once. */
+  async function handleUpdateBundle(req, res, id) {
+    const s = authNode(req, { panelOnly: true });
+    if (!s) return sendJson(res, 401, { error: "Unknown server token, or the server is not a panel node." });
+    if (role !== "leader" || fencing) return sendJson(res, 409, notLeader());
+    if (!rollout || rollout.updateId !== id) return sendJson(res, 404, { error: "No such update is being rolled out." });
+    if (!rollout.zip) {
+      const entries = walkCode(rollout.dir).map((f) => ({ name: f.rel, data: fs.readFileSync(f.abs), mode: f.st.mode & 0o777 }));
+      const vj = path.join(rollout.dir, "version.json");
+      if (fs.existsSync(vj)) entries.push({ name: "version.json", data: fs.readFileSync(vj), mode: 0o644 });
+      rollout.zip = makeZip(entries);
+    }
+    const buf = rollout.zip;
+    log(`update ${id}: sending the bundle to ${s.id} (${buf.length} bytes)`);
+    res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": buf.length, "X-FCC-Code-Digest": rollout.digest, "X-FCC-Version": rollout.version || "", "Cache-Control": "no-store" });
+    res.end(buf);
+  }
+
+  // ------------------------------------------ coordinated updates (follower)
+
+  function copyTree(src, dst) {
+    const st = fs.lstatSync(src);
+    if (st.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(src), dst);
+    else if (st.isDirectory()) {
+      fs.mkdirSync(dst, { recursive: true, mode: st.mode & 0o777 });
+      for (const name of fs.readdirSync(src)) if (!skipCodeName(name)) copyTree(path.join(src, name), path.join(dst, name));
+    } else if (st.isFile()) {
+      fs.copyFileSync(src, dst);
+      fs.chmodSync(dst, st.mode & 0o777);
+    }
+  }
+
+  const backupsRoot = () => path.join(dataDir, "update-backups");
+
+  /** Same layout as updates.mjs (Settings → Updates lists and restores these once this node leads). */
+  function backupCode({ reason, updatingTo }) {
+    const root = backupsRoot();
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const id = new Date().toISOString().replace(/[:.]/g, "-");
+    const dir = path.join(root, id);
+    const tmp = `${dir}.partial`;
+    rmrf(tmp);
+    fs.mkdirSync(tmp, { recursive: true });
+    const items = [];
+    for (const item of [...CODE_ITEMS, "version.json"]) {
+      const src = path.join(rootDir, item);
+      if (!fs.existsSync(src)) continue;
+      copyTree(src, path.join(tmp, item));
+      items.push(item);
+    }
+    let stamp = null;
+    try {
+      stamp = JSON.parse(fs.readFileSync(path.join(rootDir, "version.json"), "utf8"));
+    } catch { /* none */ }
+    const was = { version: ctx.version || null, commit: stamp?.version === ctx.version ? stamp?.commit || null : null, ref: stamp?.ref || null, repo: stamp?.repo || null };
+    fs.writeFileSync(path.join(tmp, "_backup.json"), JSON.stringify({ id, takenAt: new Date().toISOString(), reason, was, updatingTo, items, simulated: false, via: "standby" }, null, 2) + "\n");
+    fs.renameSync(tmp, dir);
+    try {
+      const names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.endsWith(".partial")).map((d) => d.name).sort().reverse();
+      for (const old of names.slice(KEEP_UPDATE_BACKUPS)) rmrf(path.join(root, old));
+    } catch { /* pruning is best effort */ }
+    return id;
+  }
+
+  /** node --check, then import the boot path's modules in a child: a bundle that cannot boot is never swapped in. */
+  function verifyStaged(stage) {
+    for (const rel of SYNTAX_CHECK) {
+      const file = path.join(stage, rel);
+      if (!fs.existsSync(file)) continue;
+      const chk = spawnSync(process.execPath, ["--check", file], { encoding: "utf8", timeout: 120_000 });
+      if (chk.status !== 0) throw new Error(`node --check ${rel} failed: ${(chk.stderr || chk.error?.message || "").trim().slice(0, 300)}`);
+    }
+    const files = IMPORT_CHECK.map((rel) => path.join(stage, rel)).filter((f) => fs.existsSync(f)).map((f) => pathToFileURL(f).href);
+    const script = `for (const f of ${JSON.stringify(files)}) await import(f); process.exit(0);`;
+    const imp = spawnSync(process.execPath, ["--input-type=module", "-e", script], { cwd: stage, encoding: "utf8", timeout: 60_000, env: { ...process.env, FCC_DRY_RUN: "1" } });
+    if (imp.status !== 0) throw new Error(`the new code does not load: ${(imp.stderr || imp.error?.message || "").trim().split("\n").slice(-4).join(" ").slice(0, 400)}`);
+  }
+
+  function reportUpdate(updateId, state, msg = null) {
+    local.updateReport = { updateId, state, ...(msg ? { msg: String(msg).slice(0, 300) } : {}) };
+    try {
+      saveLocal();
+    } catch (err) {
+      warn(`could not write ${LOCAL_FILE}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Follower: converge to the leader's update target. The target only exists
+   * while the leader's update job runs, so this never moves a node backwards.
+   */
+  async function followTarget(baseUrl, target) {
+    if (codeBusy || stopped || fencing) return;
+    const failed = Array.isArray(local.failedUpdates) ? local.failedUpdates : [];
+    if (failed.includes(target.updateId)) return; // reported; the leader stops the update
+    const key = `update:${target.updateId}`;
+    const last = codeTried.get(key);
+    if (last !== undefined && mono() - last < 60_000) return;
+    codeTried.set(key, mono());
+    const simulated = codeSwapSimulated();
+    if (simulated) {
+      log(`update ${target.updateId} to v${target.version || "?"} — ${simulated}: not replacing the working copy`);
+      reportUpdate(target.updateId, "failed", `${simulated}: this panel node does not replace its code`);
+      return;
+    }
+    codeBusy = true;
+    const stage = path.join(rootDir, `.ha-staging.${Date.now()}`);
+    try {
+      log(`updating to v${target.version || "?"} (${target.digest.slice(0, 12)}, update ${target.updateId}) as the active panel asked`);
+      const r = await httpRequest(`${baseUrl}/ha/update/${encodeURIComponent(target.updateId)}`, { headers: authHeaders(), timeoutMs: 10 * 60_000, maxBytes: MAX_CODE_BYTES });
+      if (r.status !== 200) throw new Error(`download: HTTP ${r.status}`);
+      if (String(r.headers["x-fcc-code-digest"] || "") !== target.digest) throw new Error("the active panel served a different bundle than it announced");
+      extractZip(r.body, stage, { stripRoot: false });
+      if (digestOf(stage) !== target.digest) throw new Error("the unpacked code does not match the announced digest");
+      if (!fs.existsSync(path.join(stage, "panel", "server.mjs"))) throw new Error("the bundle has no panel/server.mjs");
+      verifyStaged(stage);
+      const backupId = backupCode({ reason: "update", updatingTo: { version: target.version, commit: target.commit } });
+      log(`backed up the current code (update-backups/${backupId})`);
+      swapIn(stage, { removeMissing: true });
+      const vj = path.join(stage, "version.json");
+      if (fs.existsSync(vj)) fs.renameSync(vj, path.join(rootDir, "version.json"));
+      else rmrf(path.join(rootDir, "version.json")); // same as the leader (a restore of a backup without one)
+      digestCache.at = -Infinity;
+      local.pendingUpdate = { updateId: target.updateId, digest: target.digest, version: target.version, backupId, at: new Date().toISOString(), boots: 0, swappedBy: BOOT_ID };
+      reportUpdate(target.updateId, "swapped");
+      log(`v${target.version || "?"} installed — restarting (exit 75)`);
+      stopMainAgent();
+      onExit?.(75, `updated to v${target.version || "?"}`);
+    } catch (err) {
+      warn(`update ${target.updateId} failed on this node: ${err.message} — keeping the current code`);
+      local.failedUpdates = [...failed.slice(-4), target.updateId];
+      reportUpdate(target.updateId, "failed", err.message);
+    } finally {
+      rmrf(stage);
+      codeBusy = false;
+    }
+  }
+
+  /** New code that came up and reached the active panel: the update stands. */
+  function confirmPendingUpdate() {
+    const p = local.pendingUpdate;
+    if (!p || typeof p !== "object" || p.swappedBy === BOOT_ID) return; // only a process started on the new code confirms it
+    if (p.digest && codeDigest() !== p.digest) {
+      delete local.pendingUpdate;
+      saveLocalSoon();
+      return;
+    }
+    log(`update ${p.updateId}: running v${p.version || ctx.version} and following the active panel — keeping it`);
+    delete local.pendingUpdate;
+    reportUpdate(p.updateId, "ok");
+  }
+
+  /**
+   * Boot: new code that keeps restarting without ever reaching the active panel
+   * is replaced by the backup taken before the swap (synchronously, then exit 75).
+   */
+  function rollbackPendingUpdate(p, reason) {
+    const dir = path.join(backupsRoot(), String(p.backupId || ""));
+    console.error(`[ha] update ${p.updateId}: ${reason} — restoring the previous code from ${dir}`);
+    const stage = path.join(rootDir, `.ha-staging.rollback.${Date.now()}`);
+    try {
+      if (!UPDATE_ID_RE.test(String(p.backupId || "")) || !fs.existsSync(path.join(dir, "panel", "server.mjs"))) throw new Error("the backup is missing");
+      fs.mkdirSync(stage, { recursive: true });
+      for (const item of CODE_ITEMS) if (fs.existsSync(path.join(dir, item))) copyTree(path.join(dir, item), path.join(stage, item));
+      swapIn(stage, { removeMissing: true });
+      if (fs.existsSync(path.join(dir, "version.json"))) fs.copyFileSync(path.join(dir, "version.json"), path.join(rootDir, "version.json"));
+      else rmrf(path.join(rootDir, "version.json"));
+    } catch (err) {
+      console.error(`[ha] could not restore the previous code: ${err.message} — leaving the new code in place`);
+      delete local.pendingUpdate;
+      reportUpdate(p.updateId, "failed", `${reason}; the automatic rollback failed: ${err.message}`);
+      return false;
+    } finally {
+      rmrf(stage);
+    }
+    delete local.pendingUpdate;
+    local.failedUpdates = [...(Array.isArray(local.failedUpdates) ? local.failedUpdates.slice(-4) : []), p.updateId];
+    reportUpdate(p.updateId, "rolled-back", reason);
+    console.error("[ha] previous code restored — exit 75 to start it");
+    return true;
   }
 
   // ------------------------------------------------------ follower: apply
@@ -1313,6 +1701,13 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
         continue;
       }
       todo.push([rel, rel === "config.json" && content !== null ? mergeLocalConfig(content) : content]);
+      if (rel === "config.json" && content !== null) {
+        // Failover speed in force on the leader (followers keep their boot config object otherwise).
+        try {
+          const fs_ = JSON.parse(content)?.ha?.failoverSeconds;
+          followerFailoverSeconds = fs_ === undefined ? undefined : fs_;
+        } catch { /* mergeLocalConfig already threw on garbage */ }
+      }
     }
     for (const [rel, content] of todo) writeReplicated(rel, content);
     if (dbContent !== undefined) {
@@ -1406,15 +1801,37 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       candidate = null;
       setRole("follower", `${id} answered as the active panel`);
     }
+    if (local.pendingUpdate) confirmPendingUpdate();
+  }
+
+  /** The leader's restart window (docs/HA.md): every reply of a restarting leader carries it; one without it ends it. */
+  function noteLeaderRestart(id, remainingMs) {
+    const ms = Number(remainingMs) || 0;
+    if (ms > 0) {
+      if (!leaderRestart || leaderRestart.id !== id) log(`${id} is restarting for an update — not standing for election for up to ${Math.round(Math.min(ms, RESTART_WINDOW_MAX_MS) / 1000)} s`);
+      leaderRestart = { id, until: mono() + Math.min(ms, RESTART_WINDOW_MAX_MS) };
+    } else if (leaderRestart) {
+      leaderRestart = null;
+    }
+  }
+
+  function cleanTarget(t) {
+    if (!t || typeof t !== "object") return null;
+    if (!/^[0-9a-f]{64}$/.test(String(t.digest || "")) || !UPDATE_ID_RE.test(String(t.updateId || ""))) return null;
+    return { digest: t.digest, updateId: t.updateId, version: typeof t.version === "string" ? t.version.slice(0, 40) : null, commit: typeof t.commit === "string" ? t.commit.slice(0, 64) : null };
   }
 
   async function pullOnce(target) {
-    const q = new URLSearchParams({ have: fmtV(local.version), wait: String(POLL_WAIT_S), node: me, url: localDirectUrl(), code: codeDigest(), v: ctx.version || "" });
-    const r = await httpRequest(`${target.url}/ha/state?${q}`, { headers: authHeaders(), timeoutMs: (POLL_WAIT_S + 10) * 1000, maxBytes: MAX_STATE_BYTES });
+    const pollWaitS = tm().pollWaitS;
+    const q = new URLSearchParams({ have: fmtV(local.version), wait: String(pollWaitS), node: me, url: localDirectUrl(), code: codeDigest(), v: ctx.version || "", boot: BOOT_ID, cap: "rollout" });
+    const rep = local.updateReport;
+    if (rep && typeof rep === "object" && UPDATE_ID_RE.test(String(rep.updateId || ""))) q.set("upd", `${rep.updateId}|${rep.state || ""}|${String(rep.msg || "").slice(0, 300)}`);
+    const r = await httpRequest(`${target.url}/ha/state?${q}`, { headers: authHeaders(), timeoutMs: (pollWaitS + 10) * 1000, maxBytes: MAX_STATE_BYTES });
     if (role === "leader" || fencing || stopped) return true;
     if (r.status === 204) {
       const lid = String(r.headers["x-fcc-leader-id"] || target.id || "");
       if (!ID_RE.test(lid)) return false;
+      noteLeaderRestart(lid, r.headers["x-fcc-restarting-ms"]);
       stateOk(lid, target.url);
       return true;
     }
@@ -1446,10 +1863,18 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     const before = fmtV(local.version);
     const { dbChanged, count } = applyState(st, v);
     if (count) log(`replicated ${before} → ${fmtV(v)} from ${lid} (${count} file${count === 1 ? "" : "s"})`);
+    noteLeaderRestart(lid, st.restarting?.remainingMs);
     stateOk(lid, target.url);
     httpRequest(`${target.url}/ha/ack`, { method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" }, body: v, timeoutMs: 5000 }).catch(() => {});
     if (dbChanged || mono() - relLastAt > RELEASE_SYNC_MS) syncReleases(target.url);
-    if (typeof st.codeDigest === "string" && /^[0-9a-f]{64}$/.test(st.codeDigest) && st.codeDigest !== codeDigest()) {
+    // An update in progress: converge to its target (never to the leader's older running code).
+    const codeTarget = cleanTarget(st.codeTarget);
+    if (codeTarget) {
+      if (codeTarget.digest !== codeDigest()) {
+        digestCache.at = -Infinity; // re-check before deciding
+        if (codeTarget.digest !== codeDigest()) followTarget(target.url, codeTarget);
+      }
+    } else if (typeof st.codeDigest === "string" && /^[0-9a-f]{64}$/.test(st.codeDigest) && st.codeDigest !== codeDigest()) {
       digestCache.at = -Infinity; // re-check before deciding
       if (st.codeDigest !== codeDigest()) followCode(target.url, st.codeDigest);
     }
@@ -1542,12 +1967,12 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (cmpV(want, committed) > 0) committed = { ...want };
     const waitFor = new Set();
     const now = mono();
-    for (const [vid, g] of grants) if (g.term === term && now < g.nonce + LEASE_MS - MARGIN_MS) waitFor.add(vid);
+    for (const [vid, g] of grants) if (g.term === term && now < g.until) waitFor.add(vid);
     handover = { to: id, at: mono(), notified: new Set(), waitFor };
     log(`handover to ${id}: telling the voters, then stepping down`);
     maybeAnnounce(true);
 
-    // Tell the target it should stand right away (best effort; it also notices on its own after FAILOVER_MS).
+    // Tell the target it should stand right away (best effort; it also notices on its own after tm().failoverMs).
     const targetUrl = urlOf(id);
     (async () => {
       for (let i = 0; i < 3 && targetUrl; i++) {
@@ -1561,7 +1986,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
 
     // Step down once every voter that backed us has seen handoverTo (or after ~1.5 heartbeats).
     (async () => {
-      const until = mono() + HEARTBEAT_MS * 1.5 + 1000;
+      const until = mono() + tm().heartbeatMs * 1.5 + 1000;
       while (mono() < until) {
         if ([...handover.waitFor].every((v) => handover.notified.has(v))) break;
         await sleep(100);
@@ -1578,7 +2003,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     const body = await readJsonBody(req, 16 * 1024);
     if (role === "leader") return sendJson(res, 409, { error: "This node is the active panel." });
     if (cmpV(body.version, local.version) > 0) return sendJson(res, 409, { error: "This node does not have that version." });
-    handoverExpectedUntil = mono() + LEASE_MS + FAILOVER_MS;
+    handoverExpectedUntil = mono() + Math.max(LEGACY_LEASE_MS, tm().leaseMs) + tm().failoverMs;
     handoverFrom = { id: s.id, until: handoverExpectedUntil };
     backoffUntil = 0;
     log(`${s.id} is handing the panel over to this node`);
@@ -1611,6 +2036,11 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
         return await handleReleaseFile(req, res, name);
       }
       if (p === "/ha/code" && req.method === "GET") return await handleCode(req, res);
+      if (p.startsWith("/ha/update/") && req.method === "GET") {
+        const id = p.slice("/ha/update/".length);
+        if (!UPDATE_ID_RE.test(id)) return sendJson(res, 400, { error: "Bad update id." });
+        return await handleUpdateBundle(req, res, id);
+      }
       return sendJson(res, 404, { error: "Not found" });
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 500;
@@ -1869,7 +2299,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
         out.push({ ...base, online: !!n && mono() - n.lastPollAt < ONLINE_MS, role: "follower", version: n?.acked || null, lagMs: lagMs(n), codeInSync: n?.codeDigest ? n.codeDigest === codeDigest() : null, panelVersion: n?.panelVersion || null });
       } else {
         const isLeader = id === leaderId;
-        out.push({ ...base, online: isLeader ? mono() - lastStateOkAt < FAILOVER_MS : null, role: isLeader ? "leader" : "follower", version: null, lagMs: null, codeInSync: null });
+        out.push({ ...base, online: isLeader ? mono() - lastStateOkAt < tm().failoverMs : null, role: isLeader ? "leader" : "follower", version: null, lagMs: null, codeInSync: null });
       }
     }
     return out;
@@ -1906,7 +2336,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
         term: m?.term ?? null,
         leaseLeftMs: m ? Math.round(leaseLeft(m)) : 0,
         reachable: !!m && fresh(m),
-        granted: !!g && g.term === term && now < g.nonce + LEASE_MS - MARGIN_MS && role !== "follower",
+        granted: !!g && g.term === term && now < g.until && role !== "follower",
       };
     });
     const nodesList = panelNodes();
@@ -1944,11 +2374,41 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       switchedAt,
       warnings,
       canEnable: canEnable(),
+      failover: timingSummary(failoverSeconds()),
     };
+  }
+
+  /** PATCH /api/ha/settings { failoverSeconds } (leader only; followers proxy). */
+  function saveSettings(body, admin) {
+    if (role !== "leader" || fencing || promoting) throw httpError(409, "Only the active panel can change failover settings.");
+    if (body?.failoverSeconds === undefined) throw httpError(400, "Nothing to change: send { failoverSeconds }.");
+    const v = checkFailoverSeconds(body.failoverSeconds);
+    if (v === null) throw httpError(400, `failoverSeconds must be a whole number of seconds from ${FAILOVER_SECONDS_MIN} to ${FAILOVER_SECONDS_MAX}.`);
+    const before = timingSummary(config.ha?.failoverSeconds).failoverSeconds;
+    if (v !== before || config.ha?.failoverSeconds !== v) {
+      config.ha = { ...(config.ha || {}), failoverSeconds: v };
+      ctx.saveConfig();
+      log(`failover speed: ${before} s → ${v} s (${JSON.stringify(advertised(v))})`);
+      try {
+        ctx.activity?.(admin, "ha.failover-speed", { type: "ha", id: "failover", name: "Failover speed" }, { from: before, to: v });
+      } catch { /* activity is best effort */ }
+      maybeAnnounce(true);
+    }
+    return { ...timingSummary(v) };
   }
 
   function registerRoutes(router) {
     router.get("/api/ha", () => status());
+    // ?failoverSeconds=N previews the breakdown for N (the Servers page, while typing) without saving.
+    router.get("/api/ha/settings", (req, res, { query } = {}) => {
+      if (query?.failoverSeconds !== undefined) {
+        const v = checkFailoverSeconds(query.failoverSeconds);
+        if (v === null) throw httpError(400, `failoverSeconds must be a whole number of seconds from ${FAILOVER_SECONDS_MIN} to ${FAILOVER_SECONDS_MAX}.`);
+        return { ...timingSummary(v), preview: true };
+      }
+      return timingSummary(failoverSeconds());
+    });
+    router.patch("/api/ha/settings", (req, res, { body, admin }) => saveSettings(body, admin));
     router.post("/api/ha/handover", async (req, res, { body, admin }) => {
       const out = await startHandover(body?.serverId);
       try {
@@ -1993,12 +2453,56 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
   }
 
   function stop() {
+    // A leader that stops (restart, update) leaves its exact replicated version on
+    // disk: voters only grant a candidate whose version is >= what was committed.
+    if (role === "leader" && tracker.started && !fencing && !stopped) {
+      local.version = { ...tracker.version };
+      clearTimeout(saveLocalTimer);
+      saveLocalTimer = null;
+      try {
+        saveLocal();
+      } catch (err) {
+        warn(`could not write ${LOCAL_FILE}: ${err.message}`);
+      }
+    }
     stopped = true;
     clearInterval(tickTimer);
     tickTimer = null;
     stopVoter();
     stopMainAgent();
     for (const w of [...tracker.waiters]) w();
+  }
+
+  // ----------------------------------------------------------- boot checks
+
+  {
+    let dirty = false;
+    // We restarted for an update inside the window we announced: take the lease back at once.
+    if (local.restart && typeof local.restart === "object") {
+      const left = Number(local.restart.untilWall) - Date.now();
+      if (haBoot && left > 0 && left <= RESTART_WINDOW_MAX_MS) {
+        reclaimUntil = mono() + left;
+        log(`restarted for an update — taking the panel back (${Math.round(left / 1000)} s left in the restart window)`);
+      }
+      delete local.restart;
+      dirty = true;
+    }
+    // New code from a coordinated update that keeps restarting without reaching the leader: roll back.
+    const p = local.pendingUpdate;
+    if (p && typeof p === "object") {
+      p.boots = (Number(p.boots) || 0) + 1;
+      dirty = true;
+      if (p.boots > PENDING_MAX_BOOTS && !codeSwapSimulated()) {
+        if (rollbackPendingUpdate(p, `the new code started ${p.boots - 1} times without reaching the active panel`)) process.exit(75);
+      }
+    }
+    if (dirty) {
+      try {
+        saveLocal();
+      } catch (err) {
+        warn(`could not write ${LOCAL_FILE}: ${err.message}`);
+      }
+    }
   }
 
   // -------------------------------------------------------------- ctx.ha
@@ -2027,6 +2531,29 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     },
     /** The last active panel this node knew of before itself (or itself), persisted in ha-local.json. */
     lastLeaderId: () => lastLeader,
+    /** ms since server `id`'s voter last sent us a /ha/vote (any role), or null if never (mysql-ha liveness). */
+    voterSeenMs(id) {
+      const m = voterMsgs.get(id);
+      return m ? Math.max(0, mono() - m.at) : null;
+    },
+    /** The failover timings in force here (shared/ha-timing.mjs haTimings). */
+    timings: () => tm(),
+    // Coordinated panel updates (updates.mjs; docs/HA.md "Panel updates in a cluster").
+    codeItems: [...CODE_ITEMS],
+    codeDigest: () => codeDigest(),
+    codeDigestOf: (dir) => digestOf(dir),
+    /** The code on disk changed (we swapped it): recompute the digest now. */
+    codeChanged() {
+      digestCache.at = -Infinity;
+    },
+    setCodeTarget,
+    releaseCodeTarget,
+    clearCodeTarget,
+    codeTarget: () => (rollout ? { updateId: rollout.updateId, digest: rollout.digest, version: rollout.version, released: [...rollout.released] } : null),
+    peers: rolloutPeers,
+    peerStatus,
+    prepareRestart,
+    restartWindowMs: RESTART_WINDOW_MS,
     directUrl: localDirectUrl,
     /** cluster.mjs: give this node (main) its token without racing our own writes of ha-local.json. */
     setLocalToken(token) {

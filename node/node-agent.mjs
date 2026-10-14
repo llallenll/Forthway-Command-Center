@@ -47,7 +47,7 @@ import { edgeStatus, edgeLogSites } from "../shared/edge.mjs";
 import { createVoter, cleanPanels } from "../shared/ha-voter.mjs";
 import { mysqlStatusCached } from "../shared/mysql-ha.mjs";
 
-export const AGENT_VERSION = "3.3.1";
+export const AGENT_VERSION = "3.4.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
@@ -239,9 +239,13 @@ async function withFailover(fn, { once = false } = {}) {
   throw lastErr || new Error("no panel address configured");
 }
 
-async function apiOnce(base, method, p, body, timeoutMs) {
+async function apiOnce(base, method, p, body, timeoutMs, outerSignal = null) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  // The caller may give up early (pollLoop: the votes show a new leader — 3.4.0).
+  const onOuter = () => ctrl.abort();
+  if (outerSignal?.aborted) ctrl.abort();
+  else outerSignal?.addEventListener("abort", onOuter, { once: true });
   try {
     const res = await fetch(base + p, {
       method,
@@ -264,6 +268,11 @@ async function apiOnce(base, method, p, body, timeoutMs) {
     return json;
   } catch (err) {
     if (err.name === "AbortError") {
+      if (outerSignal?.aborted) {
+        const e = new Error(`${method} ${p.split("?")[0]} abandoned: a new active panel was elected`);
+        e.leaderMoved = true; // a failover error (not a timeout): try the new leader at once
+        throw e;
+      }
       const e = new Error(`${method} ${p.split("?")[0]} timed out`);
       e.timedOut = true;
       throw e;
@@ -272,11 +281,12 @@ async function apiOnce(base, method, p, body, timeoutMs) {
     throw err;
   } finally {
     clearTimeout(t);
+    outerSignal?.removeEventListener("abort", onOuter);
   }
 }
 
-function api(method, p, body, { timeoutMs = 30_000, once = false } = {}) {
-  return withFailover((base) => apiOnce(base, method, p, body, timeoutMs), { once });
+function api(method, p, body, { timeoutMs = 30_000, once = false, signal = null } = {}) {
+  return withFailover((base) => apiOnce(base, method, p, body, timeoutMs, signal), { once });
 }
 
 /** Stream a file to the panel (backups can be many GB — never buffered). */
@@ -405,6 +415,7 @@ class TaskLog {
     this.id = taskId;
     this.ctrl = ctrl;
     this.buf = [];
+    this.progressNext = null; // latest structured progress not yet sent (only the newest matters)
     this.flushing = null;
     this.timer = setInterval(() => this.flush(), 700);
   }
@@ -412,11 +423,22 @@ class TaskLog {
     for (const l of String(text ?? "").replace(/\r/g, "").split("\n")) this.buf.push(l);
     if (this.buf.length > 200) this.flush();
   };
+  /** executeTask's `progress` sink: rides along with the next log flush (POST …/log { lines, progress }). */
+  progress = (obj) => {
+    try {
+      const json = JSON.stringify(obj);
+      if (json && json.length <= 4096) this.progressNext = JSON.parse(json);
+    } catch {
+      /* not serialisable — skip */
+    }
+  };
   async flush() {
     if (this.flushing) return this.flushing;
-    if (!this.buf.length) return;
+    if (!this.buf.length && !this.progressNext) return;
     const lines = this.buf.splice(0, this.buf.length);
-    this.flushing = api("POST", `/agent/tasks/${this.id}/log`, { lines }, { timeoutMs: 20_000 })
+    const progress = this.progressNext;
+    this.progressNext = null;
+    this.flushing = api("POST", `/agent/tasks/${this.id}/log`, progress ? { lines, progress } : { lines }, { timeoutMs: 20_000 })
       .then((r) => {
         if (r?.cancel && !this.ctrl.signal.aborted) {
           log(`task ${this.id}: cancelled by the panel`);
@@ -426,6 +448,7 @@ class TaskLog {
       .catch((err) => {
         if (err.status === 404) return; // panel forgot the task (restarted) — drop the lines
         if (lines.length < 2000) this.buf.unshift(...lines); // retry next tick
+        if (progress && !this.progressNext) this.progressNext = progress;
       })
       .finally(() => (this.flushing = null));
     return this.flushing;
@@ -433,7 +456,7 @@ class TaskLog {
   async close() {
     clearInterval(this.timer);
     await this.flush();
-    if (this.buf.length) await this.flush();
+    if (this.buf.length || this.progressNext) await this.flush();
   }
 }
 
@@ -449,6 +472,7 @@ async function runTask(t) {
     if (!TASK_TYPES.includes(t.type)) throw new Error(`This agent (v${AGENT_VERSION}) does not know the task "${t.type}".`);
     const result = await executeTask(t.type, t.payload || {}, {
       log: tl.line,
+      progress: tl.progress,
       signal: ctrl.signal,
       dataDir: cfg.dataDir,
       isMain: cfg.isMain,
@@ -484,6 +508,11 @@ let pollWaitMs = 25_000;
 let metricsIntervalMs = 15_000;
 let stopping = false;
 
+function leaderKeyNow() {
+  const l = haState.on ? voter?.leader() : null;
+  return l ? `${l.serverId}@${l.directUrl}` : null;
+}
+
 /** Sleep, but wake up early when the votes show a new leader (it is ready to take this agent right away). */
 async function sleepUnlessNewLeader(ms) {
   const key = () => {
@@ -514,6 +543,7 @@ async function hello() {
       if (r?.ha === true) {
         if (Array.isArray(r.panels)) setPanels(r.panels, "hello");
         setHa(true);
+        if (r.haTimings) voter?.adopt?.(r.haTimings); // failover speed (3.10): the heartbeat the panel wants
       } else setHa(false);
       leaderChanged(); // remember who leads now
       log(`connected to ${current} as "${r?.name || cfg.serverId}" (panel ${r?.panelVersion || "?"}${haState.on ? `, failover on, ${haState.panels.length} panel node(s)` : ""})`);
@@ -547,7 +577,22 @@ async function pollLoop() {
       // v=2: this agent understands `rehello` (reconnect to pick up newer files).
       const qs = new URLSearchParams({ v: "2", wait: String(Math.round(pollWaitMs / 1000)), running: [...running.keys()].join(",") });
       // Only the best address: on failure the loop says hello to the next one before polling it.
-      const r = await api("GET", `/agent/poll?${qs}`, undefined, { timeoutMs: pollWaitMs + 15_000, once: haState.on });
+      // A parked poll on a panel that just died (power off: no RST) would hang until its
+      // timeout; the votes tell us within a heartbeat that another node leads — give up then.
+      const ctrl = new AbortController();
+      const leaderAtStart = leaderKeyNow();
+      const watch = haState.on
+        ? setInterval(() => {
+            const k = leaderKeyNow();
+            if (k && k !== leaderAtStart) ctrl.abort();
+          }, 250)
+        : null;
+      let r;
+      try {
+        r = await api("GET", `/agent/poll?${qs}`, undefined, { timeoutMs: pollWaitMs + 15_000, once: haState.on, signal: ctrl.signal });
+      } finally {
+        clearInterval(watch);
+      }
       backoff = 1000;
       if (r?.rehello && !running.size) {
         log("the panel has newer agent files — reconnecting to update.");
@@ -557,6 +602,7 @@ async function pollLoop() {
       // The panel repeats the failover state in every poll reply (it may have been turned on after our hello).
       if (r?.ha === true && Array.isArray(r.panels)) setPanels(r.panels, "poll");
       if (typeof r?.ha === "boolean" && r.ha !== haState.on) setHa(r.ha);
+      if (r?.ha === true && r.haTimings) voter?.adopt?.(r.haTimings);
       for (const id of r?.cancel || []) running.get(id)?.ctrl.abort();
       for (const t of r?.tasks || []) runTask(t).catch((err) => log(`task ${t.id} crashed: ${err.message}`));
     } catch (err) {
@@ -570,7 +616,7 @@ async function pollLoop() {
       if (err.failover && haState.on) {
         // That panel node is gone or has no leader: hello (which tries every node) then poll again.
         needHello = true;
-        await sleep(Math.min(backoff, 2000));
+        if (!err.leaderMoved) await sleepUnlessNewLeader(Math.min(backoff, 2000));
         backoff = Math.min(backoff * 2, 5_000);
         continue;
       }

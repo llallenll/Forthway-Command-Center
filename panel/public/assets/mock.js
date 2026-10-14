@@ -633,6 +633,23 @@ function haCanEnable() {
   if (bad) return { ok: false, reason: `${bad.name} must be online and run agent 3.2.0 or newer before you add a panel node.` };
   return { ok: true, reason: null };
 }
+// failover speed (3.10) — the same formula as shared/ha-timing.mjs (that file is not served to the browser)
+let failoverSeconds = 15;
+function foSummary(sec) {
+  const T = sec * 1000, r100 = (n) => Math.round(n / 100) * 100, cl = (n, a, b) => Math.min(b, Math.max(a, n)), s1 = (ms) => Math.round(ms / 100) / 10;
+  const H = cl(r100(T / 15), 1000, 5000), L = cl(r100(0.45 * T), 3000, 180000), M = Math.max(1000, r100(L / 5)), D = Math.max(3000, r100(T / 3));
+  const probe = Math.max(500, Math.round(H / 2)), take = L + H + Math.min(3000, Math.round(H / 2)) + 500;
+  return { failoverSeconds: sec, panelTakeoverSeconds: s1(take), databaseFailoverSeconds: s1(Math.max(take, D) + 2 * probe + 2200), heartbeatSeconds: s1(H),
+    blipToleranceSeconds: s1(Math.max(0, Math.min(L - M - 2 * H, D))), leaseSeconds: s1(L), detectSeconds: s1(D), min: 10, max: 300, default: 15 };
+}
+const foCheck = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 10 && n <= 300 ? n : err(400, "failoverSeconds must be a whole number of seconds from 10 to 300."); };
+R("GET", "/api/ha/settings", (p, b, q) => (q.failoverSeconds !== undefined ? { ...foSummary(foCheck(q.failoverSeconds)), preview: true } : foSummary(failoverSeconds)));
+R("PATCH", "/api/ha/settings", (p, b) => {
+  const v = foCheck(b.failoverSeconds);
+  if (v !== failoverSeconds) { activity("ha.failover-speed", "ha", { id: "failover", name: "Failover speed" }, `${failoverSeconds} s → ${v} s`); failoverSeconds = v; emit("ha", { failoverSeconds: v }); }
+  return foSummary(v);
+});
+
 function haView() {
   const voters = db.servers.filter((x) => x.enabled !== false);
   const majority = Math.floor(voters.length / 2) + 1;
@@ -641,7 +658,7 @@ function haView() {
     version: "3.8.0", lagMs: x.id === ha.leaderId ? 0 : 400, codeInSync: true }));
   const warnings = voters.filter((x) => !x.online).map((x) => `${x.name} is offline, so it can't vote. The panel keeps running while ${majority} of ${voters.length} servers vote.`);
   return { enabled: ha.enabled, armed: ha.armed, leaderId: ha.leaderId, term: ha.term, localServerId: ha.leaderId, majority, voters: voters.length,
-    votes, nodes, committed: { term: ha.term, seq: 4182 }, warnings, canEnable: haCanEnable() };
+    votes, nodes, committed: { term: ha.term, seq: 4182 }, warnings, canEnable: haCanEnable(), failover: foSummary(failoverSeconds) };
 }
 R("GET", "/api/ha", () => haView());
 R("POST", "/api/ha/handover", (p, b) => {
@@ -706,7 +723,8 @@ R("PUT", "/api/mysql/settings", (p, b) => {
 });
 
 /* database replication (docs/HA.md, Phase 3)
-   ?mockrepl=on (default) | off | seeding | broken | promoted | rebuild | down
+   ?mockrepl=on (default) | off | seeding | syncing | broken | promoted | rebuild | down
+   syncing: replication being turned on, live — preparing → copying 5 databases → catching up → in sync, ~40 s from page load
    on: main → fra-agent-1, lag 0 · broken: SQL thread stopped with an error · promoted: fra-agent-1 took over, fcc-main needs a rebuild
    rebuild: like promoted, but fcc-main is back online and can be rebuilt · down: main unreachable for 42 s, failover pending
    Or from the console: fccMock.repl("broken"), then reload the view. */
@@ -733,6 +751,56 @@ if (replFlag === "rebuild") { // promoted, and fcc-main is back online: ready to
   repl.history.unshift({ at: ago(3 * HOUR + 9 * MIN), event: "fenced", detail: "fcc-main set to read-only" }, { at: ago(3 * HOUR + 10 * MIN), event: "promoted", detail: "fcc-main was unreachable for 60 s · fra-agent-1 is the primary" });
 }
 if (replFlag === "down") repl.downMs = 42000;
+
+/* syncing (3.9.2 progress): the whole sequence on a timeline, pushed over SSE `mysql-ha` every 2 s like the panel. */
+const SYNC_T = { prep: 4000, copy: 24000, catchUp: 11000 };
+const SYNC_DBS = [["acme_prod", 1.4 * GB], ["northwind", 640 * MB], ["acme_staging", 221 * MB], ["wp_blog", 96 * MB], ["northwind_queue", 38 * MB]];
+const SYNC_BEHIND = 1480;
+let sync = null, syncTimer = null;
+function syncProgress() {
+  if (!sync) return null;
+  const t = Date.now() - sync.t0, base = { kind: "enable", replicaServerId: sync.replica, replicaName: srvName(sync.replica), startedAt: iso(sync.t0), updatedAt: iso(Date.now()) };
+  if (t < SYNC_T.prep) return { ...base, phase: "preparing", percent: null, etaSeconds: null };
+  if (t < SYNC_T.prep + SYNC_T.copy) {
+    const el = (t - SYNC_T.prep) / 1000, f = el / (SYNC_T.copy / 1000);
+    const total = SYNC_DBS.reduce((a, [, b]) => a + b, 0), done = Math.round(total * (f + 0.03 * Math.sin(el)) * 0.995);
+    let acc = 0, i = 0;
+    for (; i < SYNC_DBS.length - 1; i++) { if (done < acc + SYNC_DBS[i][1]) break; acc += SYNC_DBS[i][1]; }
+    const rate = done / Math.max(1, el), known = el >= 4;
+    return { ...base, phase: "copying", percent: el < 1.5 ? null : Math.min(99, Math.floor((done / total) * 100)), bytesDone: done, bytesEstimate: total, rateBps: known ? Math.round(rate) : null,
+      etaSeconds: known ? Math.max(1, Math.round((total - done) / rate)) : null, database: SYNC_DBS[i][0], databaseIndex: i + 1, databasesDone: i, databasesTotal: SYNC_DBS.length };
+  }
+  if (t < SYNC_T.prep + SYNC_T.copy + SYNC_T.catchUp) {
+    const el = (t - SYNC_T.prep - SYNC_T.copy) / 1000, f = el / (SYNC_T.catchUp / 1000);
+    const behind = Math.max(1, Math.ceil(SYNC_BEHIND * (1 - f) ** 1.25)), shrink = (SYNC_BEHIND - behind) / Math.max(0.5, el);
+    return { ...base, phase: "catching-up", transactionsBehind: el < 1 ? null : behind, lagSeconds: Math.max(1, Math.round(40 * (1 - f))), percent: el < 1 ? null : Math.min(99, Math.floor(((SYNC_BEHIND - behind) / SYNC_BEHIND) * 100)),
+      etaSeconds: el >= 3 && shrink > 0 ? Math.max(1, Math.round(behind / shrink)) : null };
+  }
+  return { ...base, phase: "in-sync", percent: 100, etaSeconds: 0, transactionsBehind: 0, lagSeconds: 0, syncedAt: iso(sync.t0 + SYNC_T.prep + SYNC_T.copy + SYNC_T.catchUp) };
+}
+function syncStep() {
+  const p = syncProgress();
+  if (!p) return;
+  if (p.phase === "preparing") Object.assign(repl, { enabled: false, state: "preparing" });
+  else if (p.phase === "copying") Object.assign(repl, { enabled: false, state: "seeding" });
+  else {
+    if (!repl.enabled) { Object.assign(repl, { enabled: true, replica: sync.replica, state: "replicating", io: true, sql: true, seededAt: iso(Date.now()) }); hist("seeded", `5 databases copied to ${srvName(sync.replica)} (2.4 GB)`); }
+    repl.lag = p.lagSeconds;
+    if (p.phase === "in-sync") { clearInterval(syncTimer); syncTimer = null; }
+  }
+  replChanged();
+}
+function syncStart(replica = "srv_fra1", mode = "auto") {
+  sync = { t0: Date.now(), replica };
+  Object.assign(repl, { enabled: false, mode, state: "preparing", replica: null, lag: null, io: false, sql: false, lastError: null, seededAt: null, needsRebuild: [], downMs: 0 });
+  clearInterval(syncTimer);
+  syncTimer = setInterval(syncStep, 2000);
+  setTimeout(syncStep, 50);
+}
+if (replFlag === "syncing") {
+  repl.history = [{ at: iso(Date.now()), event: "enabled", detail: "Replica fra-agent-1 · automatic failover" }];
+  syncStart();
+}
 try { window.fccMock.repl = (v = "on") => { try { sessionStorage.setItem("fcc.mock.repl", v); } catch {} }; } catch {}
 const replCandidates = () => db.servers.filter((x) => x.role !== "main" && x.id !== repl.primary && x.online && x.enabled !== false && (x.agentVersion || "0") >= "3.3.0")
   .map((x) => ({ serverId: x.id, name: x.name, panelNode: !!x.panel?.enabled, recommended: !!x.panel?.enabled }));
@@ -747,7 +815,9 @@ function replView() {
     needsRebuild: repl.needsRebuild.map((id) => ({ serverId: id, name: srvName(id), online: id === "main" ? !!repl.mainBack : !!db.servers.find((x) => x.id === id)?.online })),
     history: clone(repl.history),
     canEnable: cands.length ? { ok: true, reason: null } : { ok: false, reason: "Add an agent server running agent 3.3.0 or newer to hold the replica." },
-    candidates: cands, detect: repl.downMs ? { primaryDownForMs: repl.downMs } : null,
+    candidates: cands, detect: repl.downMs ? { primaryDownForMs: repl.downMs, detectMs: foSummary(failoverSeconds).detectSeconds * 1000 } : null,
+    failover: { ...foSummary(failoverSeconds), detectMs: foSummary(failoverSeconds).detectSeconds * 1000 },
+    busy: syncTimer && !repl.enabled ? "enable" : null, progress: syncProgress(),
   };
 }
 const replChanged = () => emit("mysql-ha", replView());
@@ -756,6 +826,14 @@ R("GET", "/api/mysql/replication", () => replView());
 R("POST", "/api/mysql/replication", (p, b) => {
   if (repl.enabled) err(409, "Replication is already on.");
   const t = replCandidates().find((x) => x.serverId === b.replicaServerId) || err(400, "That server can't hold the replica.");
+  if (replFlag === "syncing") { // the live sequence, with its job log
+    syncStart(t.serverId, b.mode === "manual" ? "manual" : "auto");
+    return runJob({ type: "mysql.replication.enable", title: `Turn on database replication to ${t.name}`, serverId: t.serverId }, { speed: 3800, lines: [
+      `Step 1/6 — preparing the primary ${srvName(repl.primary)}…`, `Step 2/6 — setting up the replica on ${t.name} and seeding it from the primary…`,
+      `Websites keep working normally while this runs: they keep reading and writing on ${srvName(repl.primary)}.`, "Copying databases · 20% · acme_prod (1 of 5) · 110 MB/s · about 20 s left",
+      "Copying databases · 50% · acme_prod (1 of 5) · 108 MB/s · about 10 s left", "Copying databases · 80% · northwind (2 of 5) · 109 MB/s · about 5 s left", "Replica seeded: 5 database(s).",
+      "Catching up · 1,480 changes behind", "Step 3/6 … 6/6 — users, grants, fcc-mysql.internal, DB_HOST", "In sync — the replica has every change."] });
+  }
   Object.assign(repl, { enabled: true, mode: b.mode === "manual" ? "manual" : "auto", replica: t.serverId, state: "seeding", lag: null, io: false, sql: false, lastError: null, seededAt: null });
   hist("enabled", `Replica ${t.name} · ${repl.mode === "auto" ? "automatic" : "manual"} failover`);
   activity("mysql.replication.enable", "settings", { id: "mysql-ha", name: "Database replication" }, `Replica ${t.name}`);
