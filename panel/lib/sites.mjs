@@ -333,6 +333,9 @@ export function register(router, ctx) {
   const DL_KEY = crypto.randomBytes(32);
 
   const MAIN = () => ctx.cluster?.MAIN_ID || "main";
+  // Panel failover (docs/HA.md Phase 2): a local file path means something to main
+  // only while this process runs on main; otherwise main downloads/uploads like an agent.
+  const localMain = (sid) => sid === MAIN() && (ctx.ha ? ctx.ha.mainIsLocal !== false : true);
   const releasesDir = () => ensureDir(path.join(ctx.dataDir, "releases"));
   const releaseFile = (id) => path.join(releasesDir(), `${id}.zip`);
   // Build once, ship everywhere: the build a load-balanced site's first server
@@ -871,7 +874,7 @@ export function register(router, ctx) {
       version: release.version || null,
       // A build made once on another server: the engine must not rebuild it.
       ...(release.kind === "built" ? { prebuilt: true, builtOn: release.builtOn || null } : {}),
-      ...(serverId === MAIN() ? { file: releaseFile(release.id) } : {}),
+      ...(localMain(serverId) ? { file: releaseFile(release.id) } : {}),
     };
   }
 
@@ -1047,7 +1050,7 @@ export function register(router, ctx) {
         const payload = { spec, release: releasePayload(art || release, sid, base) };
         if (packaging) {
           fs.rmSync(releaseFile(builtId(release.id)), { force: true });
-          payload.package = { releaseId: builtId(release.id), ...(sid === MAIN() ? { file: releaseFile(builtId(release.id)) } : {}) };
+          payload.package = { releaseId: builtId(release.id), ...(localMain(sid) ? { file: releaseFile(builtId(release.id)) } : {}) };
         }
         res = await runTask(sid, "site.deploy", payload, { log: prefixed(log, sid, multi), signal });
         setServerState(siteId, sid, {

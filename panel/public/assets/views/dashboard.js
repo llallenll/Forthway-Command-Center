@@ -18,46 +18,59 @@ function skeleton(name) {
     <div class="section"><div class="skel" style="width:220px;height:22px"></div><div class="skel mt-16" style="height:320px;border-radius:18px"></div></div>`;
 }
 
-/* Availability (docs/HA.md): tunnel replicas, edge nodes, websites that live only on main.
-   Quiet one-liner while all is well; a full card when there is a warning. Hidden on an older
-   panel (GET /api/cluster/ha → 404). */
+/* Availability (docs/HA.md): tunnel replicas, edge nodes, websites that live only on main and,
+   with panel failover (Phase 2), the active panel and its standbys. Quiet one-liner while all is
+   well; a full card when there is a warning. Each part is hidden on an older panel
+   (GET /api/cluster/ha or /api/ha → 404). */
 function haCard(el, ctx) {
   let last = "";
   const siteLinks = (list, max) => html`${list.slice(0, max).map((x, i) => html`${i ? ", " : ""}<a href="#/sites/${x.id}">${x.name}</a>`)}${list.length > max ? html` and ${list.length - max} more` : ""}`;
   const edgeTone = (e) => (!e.online ? "err" : !e.inSync ? (e.applying ? "run" : "warn") : e.tunnelConnected === false ? "warn" : "ok");
   const edgeText = (e) => (!e.online ? "Offline" : !e.inSync ? (e.applying ? "Applying" : "Out of date") : e.tunnelConnected === false ? "In sync · tunnel not connected" : "In sync");
-  const paint = (r) => {
-    const sig = JSON.stringify(r || null);
+  const paint = (r, p) => {
+    const sig = JSON.stringify([r || null, p || null]);
     if (sig === last) return; last = sig;
-    if (!r) { el.hidden = true; mount(el, html``); return; }
+    const panel = p?.enabled ? p : null;
+    if (!r && !panel) { el.hidden = true; mount(el, html``); return; }
     el.hidden = false;
-    const edges = r.edges || [], warns = r.warnings || [], solo = r.mainOnlySites || [];
-    const reps = r.tunnelReplicasOnline ?? 0, conns = r.connectors ?? 0;
+    const edges = r?.edges || [], solo = r?.mainOnlySites || [];
+    const warns = [...(panel && panel.armed === false ? ["Waiting for the servers to vote… Panel failover starts once a majority has voted."] : []), ...(panel?.warnings || []), ...(r?.warnings || [])];
+    const reps = r?.tunnelReplicasOnline ?? 0, conns = r?.connectors ?? 0;
     const repText = conns ? `${plural(reps, "tunnel replica")} online` : "No tunnel connectors";
     const edgeLine = edges.length ? `${plural(edges.length, "edge node")} besides main` : "No edge nodes besides main";
     const soloText = solo.length ? html`${plural(solo.length, "website")} ${solo.length === 1 ? "runs" : "run"} only on the main server` : "";
+    let panelText = "";
+    if (panel) {
+      const leader = (panel.nodes || []).find((n) => n.serverId === panel.leaderId)?.name || panel.leaderId;
+      const sb = (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId).length;
+      panelText = `Active panel: ${leader} · ${sb ? `${sb} ${sb === 1 ? "standby" : "standbys"}` : "no standbys"}`;
+    }
+    const sub = [panelText, r ? repText : "", r ? edgeLine : ""].filter(Boolean).join(" · ");
+    const nodes = panel ? (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId) : [];
     if (!warns.length) {
       mount(el, html`<div class="card ha-quiet">
         <span class="ha-ico ok">${icon("shield", "sm")}</span>
-        <span class="ha-quiet-t"><b>Availability</b><span class="muted"> · ${repText} · ${edgeLine}${solo.length ? html` · ${soloText}: ${siteLinks(solo, 3)}` : ""}</span></span>
+        <span class="ha-quiet-t"><b>Availability</b><span class="muted"> · ${sub}${solo.length ? html` · ${soloText}: ${siteLinks(solo, 3)}` : ""}</span></span>
         <a class="btn btn-sm btn-ghost" href="#/servers">Servers ${icon("arrowRight", "sm")}</a></div>`);
       return;
     }
     mount(el, html`<div class="card ha-alert">
       <div class="card-head"><span class="ha-ico warn">${icon("alert")}</span>
-        <div style="min-width:0;flex:1"><h3>Availability needs attention</h3><div class="sub">${repText} · ${edgeLine}</div></div>
+        <div class="ha-head-t"><h3>Availability needs attention</h3><div class="sub">${sub}</div></div>
         <div class="right"><a class="btn btn-sm" href="#/servers">${icon("server")}Servers</a></div></div>
       <div class="card-body ha-body">
         <ul class="ha-warns">${warns.map((w) => html`<li>${icon("alert", "xs")}<span>${w}</span></li>`)}</ul>
-        ${edges.length ? html`<div class="ha-edges">${edges.map((e) => html`<a class="ha-edge" href="#/servers" title="${e.name}: ${edgeText(e)}"><span class="dot ${edgeTone(e)}"></span>${e.name}<span class="muted">${edgeText(e)}</span></a>`)}</div>` : ""}
+        ${nodes.length || edges.length ? html`<div class="ha-edges">
+          ${nodes.map((n) => html`<a class="ha-edge" href="#/servers" title="${n.name}: standby panel"><span class="dot ${!n.online ? "err" : n.codeInSync === false ? "warn" : "ok"}"></span>${n.name}<span class="muted">${!n.online ? "Standby · offline" : "Standby panel"}</span></a>`)}
+          ${edges.map((e) => html`<a class="ha-edge" href="#/servers" title="${e.name}: ${edgeText(e)}"><span class="dot ${edgeTone(e)}"></span>${e.name}<span class="muted">${edgeText(e)}</span></a>`)}</div>` : ""}
         ${solo.length ? html`<p class="small muted" style="margin:0">${soloText}: ${siteLinks(solo, 5)}. They go down with it — load balance them onto another server to keep them up.</p>` : ""}
       </div></div>`);
   };
   const load = async () => {
-    try { const r = await get("/api/cluster/ha"); if (ctx.alive()) paint(r); }
-    catch { if (ctx.alive()) paint(null); }
+    const [r, p] = await Promise.all([get("/api/cluster/ha").catch(() => null), get("/api/ha").catch(() => null)]);
+    if (ctx.alive()) paint(r, p);
   };
-  ctx.on(["server", "cloudflare", "site"], debounce((d) => { if (d?.kind !== "log") load(); }, 1500));
+  ctx.on(["server", "cloudflare", "site", "ha"], debounce((d) => { if (d?.kind !== "log") load(); }, 1500));
   load();
 }
 
@@ -149,7 +162,7 @@ export default async function dashboard(ctx) {
     </section>`);
 
   downBanner($("[data-down]", root), ctx); // MONITOR: shown only while a website is down
-  haCard($("[data-ha]", root), ctx); // HA: availability (edges, tunnel replicas, main-only websites)
+  haCard($("[data-ha]", root), ctx); // HA: availability (active panel + standbys, edges, tunnel replicas, main-only websites)
   // Hero status line: live website states (GET /api/monitor + SSE `monitor`), then panel services.
   const sysEl = $("[data-sys]", root);
   const paintSys = (m) => {

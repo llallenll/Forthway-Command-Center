@@ -366,7 +366,7 @@ server's copies within seconds. What still goes down with it:
 - **Websites that run only on the main server.** Load balance anything that
   matters across two or more servers; the dashboard lists the websites that
   are main-only.
-- **The panel itself**, until main is back (panel failover is planned next).
+- **The panel itself**, unless you add panel nodes (below).
 - **Databases**, which live on the main server (MySQL replication is planned).
 - **Domains not delivered through a Cloudflare Tunnel.** Their DNS points at
   the main server only.
@@ -377,6 +377,34 @@ agents open those ports to the edges' addresses on their own.
 
 The dashboard's **Availability** card shows how many tunnel replicas are
 online and warns when the tunnel runs only on the main server.
+
+### Panel nodes: the panel survives too
+
+With three or more servers, turn on **Panel node** for one or more edge
+servers. The panel installs a standby copy of itself there and keeps it up to
+date: its database, settings, keys and website releases are copied over
+continuously, and its code follows every panel update.
+
+Exactly one panel is active at a time. It stays active only while a majority
+of your servers — every server votes, main and agents alike — keep confirming
+it. If the active panel's server goes down (or is cut off from most of the
+others), it stops itself, and after about 20–40 seconds the servers elect a
+standby that holds the latest copy of the data. You sign in at the same
+address with the same session; agents follow on their own. Opening the panel
+on a standby simply forwards you to the active one.
+
+- **Why three servers:** with two, neither side of a broken link can tell
+  whether the other is down or just unreachable, so there is no safe way to
+  choose. Two of three always can.
+- **No automatic switch back.** When the old server returns it rejoins as a
+  standby. Move the panel back with **Make active panel** on the Servers page
+  (about 20 seconds of downtime).
+- **While main is not running the panel**, databases, phpMyAdmin and
+  certificates are unavailable (they live on main), and the last few seconds
+  of changes before a failure may be lost. Local backup files are not copied
+  between panels: set an **S3** destination so backups survive a lost server.
+- Every panel node must be able to reach the others' panel port (4000 by
+  default) — opened automatically where `ufw` is active.
 
 ---
 

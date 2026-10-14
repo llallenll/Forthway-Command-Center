@@ -16,6 +16,20 @@
  * each task's log → post its result; metrics pushed every ~15s (with the edge
  * status when this server is an edge node, docs/HA.md). An edge node also
  * ships its front-door access logs to POST /agent/edge/logs every 15s.
+ *
+ * Panel failover (docs/HA.md, Phase 2): when the hello says `ha: true` the
+ * agent also learns the panel nodes (`panels`, kept in <dataDir>/panels.json),
+ * runs this server's voter (shared/ha-voter.mjs, vote state in
+ * <dataDir>/vote.json) and talks to the leader's directUrl when it knows it,
+ * else to the next panel node, else to cfg.panelUrl — every one of them works,
+ * because standbys forward to the active panel. A connection error or a
+ * `503 { haSwitching: true }` moves it on to the next one; after a switch it
+ * says hello again before polling.
+ *
+ * Main's embedded agent (`isMain: true` in its --config file; the panel on main
+ * runs it while another server is the active panel) runs tasks with
+ * isMain, never votes (main votes from its panel process) and never
+ * self-updates (main's code follows the leader's).
  */
 
 import fs from "node:fs";
@@ -29,8 +43,9 @@ import { StringDecoder } from "node:string_decoder";
 
 import { executeTask, collectMetrics, systemInfo, TASK_TYPES } from "../shared/tasks.mjs";
 import { edgeStatus, edgeLogSites } from "../shared/edge.mjs";
+import { createVoter, cleanPanels } from "../shared/ha-voter.mjs";
 
-export const AGENT_VERSION = "3.1.0";
+export const AGENT_VERSION = "3.2.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
@@ -54,6 +69,7 @@ function loadConfig() {
   cfg.panelUrl = String(cfg.panelUrl).replace(/\/+$/, "");
   cfg.dataDir = cfg.dataDir || process.env.FCC_NODE_DATA_DIR || "/var/lib/fcc-node";
   cfg.maxConcurrent = Number(cfg.maxConcurrent) || 4;
+  cfg.isMain = cfg.isMain === true;
   return cfg;
 }
 
@@ -62,6 +78,79 @@ fs.mkdirSync(cfg.dataDir, { recursive: true });
 
 const log = (...a) => console.log(`[fcc-node] ${a.join(" ")}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ------------------------------------------------------------ panel nodes
+//
+// With HA off (or a panel older than 3.8) the only address is cfg.panelUrl and
+// everything behaves exactly as before.
+
+const PANELS_FILE = path.join(cfg.dataDir, "panels.json");
+const VOTE_FILE = path.join(cfg.dataDir, "vote.json");
+const FAILED_COOLDOWN_MS = 30_000;
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(file, obj) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, file);
+}
+
+const haState = (() => {
+  const j = readJsonFile(PANELS_FILE);
+  return { on: j?.ha === true, panels: cleanPanels(j?.panels) };
+})();
+
+function savePanels() {
+  try {
+    writeJsonFile(PANELS_FILE, { ha: haState.on, panels: haState.panels, savedAt: new Date().toISOString() });
+  } catch (err) {
+    log(`could not save ${PANELS_FILE}: ${err.message}`);
+  }
+}
+
+function setPanels(list, source) {
+  const clean = cleanPanels(list);
+  if (JSON.stringify(clean) === JSON.stringify(haState.panels)) return;
+  haState.panels = clean;
+  savePanels();
+  log(`panel nodes (from ${source}): ${clean.map((p) => `${p.serverId}=${p.directUrl}`).join(", ") || "none"}`);
+}
+
+let voter = null;
+function setHa(on) {
+  const was = haState.on;
+  haState.on = !!on;
+  if (was !== haState.on) {
+    savePanels();
+    log(haState.on ? "panel failover is on." : "panel failover is off — talking to the panel address only.");
+  }
+  if (!haState.on) {
+    voter?.stop();
+    current = cfg.panelUrl;
+    return;
+  }
+  if (cfg.isMain) return; // main votes from its own panel process, never twice
+  if (!voter) {
+    voter = createVoter({
+      voterId: cfg.serverId,
+      token: cfg.token,
+      load: () => readJsonFile(VOTE_FILE),
+      save: (st) => writeJsonFile(VOTE_FILE, st),
+      panels: () => haState.panels,
+      onPanels: (list) => setPanels(list, "vote reply"),
+      log,
+    });
+  }
+  voter.start();
+}
 
 // ------------------------------------------------------------- panel client
 
@@ -73,11 +162,86 @@ class PanelError extends Error {
   }
 }
 
-async function api(method, p, body, { timeoutMs = 30_000 } = {}) {
+let current = cfg.panelUrl; // the address that answered last
+const failedAt = new Map(); // base -> Date.now() of its last connection failure
+let needHello = false; // the agent now talks to a different panel (or a new leader): hello before the next poll
+let lastLeaderKey = null;
+
+/** Where to send the next request, best first. */
+function bases() {
+  const list = [];
+  const add = (u) => {
+    if (u && !list.includes(u)) list.push(u);
+  };
+  if (haState.on) add(voter?.leader()?.directUrl);
+  add(current);
+  if (haState.on) for (const p of haState.panels) add(p.directUrl);
+  add(cfg.panelUrl);
+  const cooling = (u) => Date.now() - (failedAt.get(u) || 0) < FAILED_COOLDOWN_MS;
+  return [...list.filter((u) => !cooling(u)), ...list.filter(cooling)];
+}
+
+function noteOk(base) {
+  failedAt.delete(base);
+  if (base === current) return;
+  log(`now talking to the panel through ${base}`);
+  current = base;
+  needHello = true;
+}
+
+function noteFail(base, err) {
+  if (!failedAt.has(base)) log(`panel at ${base} is not answering (${err.message})${haState.on ? " — trying the next panel node" : ""}`);
+  failedAt.set(base, Date.now());
+}
+
+/** Did the leader change since the last hello? (Votes tell us before any request fails.) */
+function leaderChanged() {
+  const l = haState.on ? voter?.leader() : null;
+  const key = l ? `${l.serverId}@${l.directUrl}` : null;
+  if (!key || key === lastLeaderKey) return false;
+  const first = lastLeaderKey === null;
+  lastLeaderKey = key;
+  return !first || current !== l.directUrl;
+}
+
+/** A failure that means "try another panel node": no answer at all, or a standby with no leader to forward to. */
+function failoverError(err) {
+  if (err instanceof PanelError) return err.status === 503 && err.body?.haSwitching === true;
+  return true; // network error or timeout
+}
+
+/**
+ * Run `fn(base)` against the best panel address; on a failover error move on
+ * to the next. `once`: only the first address (the caller retries itself).
+ * Timeouts are not retried elsewhere (the request may have been processed).
+ */
+async function withFailover(fn, { once = false } = {}) {
+  const list = bases();
+  let lastErr = null;
+  for (const base of once ? list.slice(0, 1) : list) {
+    try {
+      const r = await fn(base);
+      noteOk(base);
+      return r;
+    } catch (err) {
+      if (!failoverError(err)) {
+        noteOk(base); // it answered — just not with what we wanted
+        throw err;
+      }
+      noteFail(base, err);
+      lastErr = err;
+      if (err.timedOut) break;
+    }
+  }
+  if (lastErr) lastErr.failover = true;
+  throw lastErr || new Error("no panel address configured");
+}
+
+async function apiOnce(base, method, p, body, timeoutMs) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(cfg.panelUrl + p, {
+    const res = await fetch(base + p, {
       method,
       headers: {
         Authorization: `Bearer ${cfg.token}`,
@@ -97,17 +261,26 @@ async function api(method, p, body, { timeoutMs = 30_000 } = {}) {
     if (!res.ok) throw new PanelError(res.status, json?.error || `HTTP ${res.status}`, json);
     return json;
   } catch (err) {
-    if (err.name === "AbortError") throw new Error(`${method} ${p} timed out`);
+    if (err.name === "AbortError") {
+      const e = new Error(`${method} ${p.split("?")[0]} timed out`);
+      e.timedOut = true;
+      throw e;
+    }
+    if (!(err instanceof PanelError) && err.cause?.code) err.message = `${err.message} (${err.cause.code})`;
     throw err;
   } finally {
     clearTimeout(t);
   }
 }
 
+function api(method, p, body, { timeoutMs = 30_000, once = false } = {}) {
+  return withFailover((base) => apiOnce(base, method, p, body, timeoutMs), { once });
+}
+
 /** Stream a file to the panel (backups can be many GB — never buffered). */
-function uploadTo(urlPath, file, { sha256 } = {}) {
+function uploadOnce(base, urlPath, file, { sha256 } = {}) {
   return new Promise((resolve, reject) => {
-    const url = new URL(urlPath, cfg.panelUrl + "/");
+    const url = new URL(urlPath, base + "/");
     const size = fs.statSync(file).size;
     const mod = url.protocol === "https:" ? https : http;
     const req = mod.request(
@@ -133,13 +306,19 @@ function uploadTo(urlPath, file, { sha256 } = {}) {
             /* not json */
           }
           if (res.statusCode >= 200 && res.statusCode < 300) resolve(json || {});
-          else reject(new Error(`upload failed: ${json?.error || `HTTP ${res.statusCode}`}`));
+          else reject(new PanelError(res.statusCode, `upload failed: ${json?.error || `HTTP ${res.statusCode}`}`, json));
         });
       },
     );
     req.on("error", reject);
     fs.createReadStream(file).on("error", reject).pipe(req);
   });
+}
+
+function uploadTo(urlPath, file, meta) {
+  // An absolute upload URL from the panel is used as given; a path follows the active panel.
+  if (/^https?:\/\//i.test(urlPath)) return uploadOnce(cfg.panelUrl, urlPath, file, meta);
+  return withFailover((base) => uploadOnce(base, urlPath, file, meta));
 }
 
 // ------------------------------------------------------------ self-update
@@ -169,6 +348,10 @@ async function selfUpdate(files) {
     log(`panel has newer agent files (${files.join(", ")}) — self-update disabled, continuing.`);
     return false;
   }
+  if (cfg.isMain) {
+    log(`panel has newer agent files (${files.join(", ")}) — main's embedded agent runs the panel's own code, which follows the active panel; not updating.`);
+    return false;
+  }
   const marker = path.join(cfg.dataDir, "last-update.json");
   try {
     const last = JSON.parse(fs.readFileSync(marker, "utf8"));
@@ -182,10 +365,19 @@ async function selfUpdate(files) {
   const staged = [];
   for (const rel of files) {
     if (!/^(node|shared)\/[\w.-]+\.mjs$/.test(rel) && rel !== "panel/lib/sys.mjs") continue;
-    const res = await fetch(`${cfg.panelUrl}/install/files/${rel}`, { headers: { Authorization: `Bearer ${cfg.token}` } });
-    if (!res.ok) throw new Error(`could not download ${rel}: HTTP ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const want = res.headers.get("x-fcc-sha256");
+    const { buf, want } = await withFailover(async (base) => {
+      const res = await fetch(`${base}/install/files/${rel}`, { headers: { Authorization: `Bearer ${cfg.token}` }, signal: AbortSignal.timeout(120_000) });
+      if (!res.ok) {
+        let body = null;
+        try {
+          body = await res.json();
+        } catch {
+          /* not json */
+        }
+        throw new PanelError(res.status, `could not download ${rel}: HTTP ${res.status}`, body);
+      }
+      return { buf: Buffer.from(await res.arrayBuffer()), want: res.headers.get("x-fcc-sha256") };
+    });
     const got = crypto.createHash("sha256").update(buf).digest("hex");
     if (want && want !== got) throw new Error(`${rel} failed its checksum`);
     staged.push([rel, buf]);
@@ -257,10 +449,10 @@ async function runTask(t) {
       log: tl.line,
       signal: ctrl.signal,
       dataDir: cfg.dataDir,
-      isMain: false,
+      isMain: cfg.isMain,
       serverId: cfg.serverId,
       authToken: cfg.token,
-      panelUrl: cfg.panelUrl,
+      panelUrl: current,
       uploadFile: (file, meta) => uploadTo(t.payload?.upload?.url || `/agent/upload/${t.id}`, file, meta),
     });
     body = { ok: true, result: result ?? null };
@@ -290,6 +482,21 @@ let pollWaitMs = 25_000;
 let metricsIntervalMs = 15_000;
 let stopping = false;
 
+/** Sleep, but wake up early when the votes show a new leader (it is ready to take this agent right away). */
+async function sleepUnlessNewLeader(ms) {
+  const key = () => {
+    const l = haState.on ? voter?.leader() : null;
+    return l ? `${l.serverId}@${l.directUrl}` : null;
+  };
+  const before = key();
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    await sleep(Math.min(250, end - Date.now()));
+    const k = key();
+    if (k && k !== before) return;
+  }
+}
+
 async function hello() {
   let backoff = 1000;
   for (;;) {
@@ -301,7 +508,13 @@ async function hello() {
       });
       pollWaitMs = Number(r?.pollWaitMs) || pollWaitMs;
       metricsIntervalMs = Number(r?.metricsIntervalMs) || metricsIntervalMs;
-      log(`connected to ${cfg.panelUrl} as "${r?.name || cfg.serverId}" (panel ${r?.panelVersion || "?"})`);
+      needHello = false;
+      if (r?.ha === true) {
+        if (Array.isArray(r.panels)) setPanels(r.panels, "hello");
+        setHa(true);
+      } else setHa(false);
+      leaderChanged(); // remember who leads now
+      log(`connected to ${current} as "${r?.name || cfg.serverId}" (panel ${r?.panelVersion || "?"}${haState.on ? `, failover on, ${haState.panels.length} panel node(s)` : ""})`);
       if (Array.isArray(r?.update) && r.update.length) {
         try {
           if (await selfUpdate(r.update)) process.exit(0); // systemd restarts us on the new code
@@ -313,8 +526,9 @@ async function hello() {
     } catch (err) {
       const wait = err.status === 401 ? 60_000 : backoff;
       log(`hello failed: ${err.status === 401 ? "the panel rejected this server's token (re-run the install command)" : err.message} — retrying in ${Math.round(wait / 1000)}s`);
-      await sleep(wait);
-      backoff = Math.min(backoff * 2, 60_000);
+      await sleepUnlessNewLeader(wait);
+      // While panels switch, retry quickly: the new leader is up within seconds of winning.
+      backoff = Math.min(backoff * 2, haState.on ? 5_000 : 60_000);
     }
   }
 }
@@ -323,15 +537,24 @@ async function pollLoop() {
   let backoff = 1000;
   while (!stopping) {
     try {
+      if (leaderChanged()) needHello = true;
+      if (needHello) {
+        log(`saying hello to the panel again (${current}).`);
+        await hello();
+      }
       // v=2: this agent understands `rehello` (reconnect to pick up newer files).
       const qs = new URLSearchParams({ v: "2", wait: String(Math.round(pollWaitMs / 1000)), running: [...running.keys()].join(",") });
-      const r = await api("GET", `/agent/poll?${qs}`, undefined, { timeoutMs: pollWaitMs + 15_000 });
+      // Only the best address: on failure the loop says hello to the next one before polling it.
+      const r = await api("GET", `/agent/poll?${qs}`, undefined, { timeoutMs: pollWaitMs + 15_000, once: haState.on });
       backoff = 1000;
       if (r?.rehello && !running.size) {
         log("the panel has newer agent files — reconnecting to update.");
         await hello(); // exits (and systemd restarts us) when it applied an update
         continue;
       }
+      // The panel repeats the failover state in every poll reply (it may have been turned on after our hello).
+      if (r?.ha === true && Array.isArray(r.panels)) setPanels(r.panels, "poll");
+      if (typeof r?.ha === "boolean" && r.ha !== haState.on) setHa(r.ha);
       for (const id of r?.cancel || []) running.get(id)?.ctrl.abort();
       for (const t of r?.tasks || []) runTask(t).catch((err) => log(`task ${t.id} crashed: ${err.message}`));
     } catch (err) {
@@ -342,9 +565,16 @@ async function pollLoop() {
         await hello();
         continue;
       }
+      if (err.failover && haState.on) {
+        // That panel node is gone or has no leader: hello (which tries every node) then poll again.
+        needHello = true;
+        await sleep(Math.min(backoff, 2000));
+        backoff = Math.min(backoff * 2, 5_000);
+        continue;
+      }
       log(`poll failed: ${err.message} — retrying in ${Math.round(backoff / 1000)}s`);
       await sleep(backoff);
-      backoff = Math.min(backoff * 2, 60_000);
+      backoff = Math.min(backoff * 2, haState.on ? 5_000 : 60_000);
     }
   }
 }
@@ -359,7 +589,7 @@ async function metricsLoop() {
       });
       await api("POST", "/agent/metrics", m, { timeoutMs: 15_000 });
     } catch (err) {
-      if (err.status && err.status !== 401) log(`metrics push failed: ${err.message}`);
+      if (err.status && err.status !== 401 && !err.failover) log(`metrics push failed: ${err.message}`);
     }
     await sleep(metricsIntervalMs);
   }
@@ -495,7 +725,10 @@ async function edgeLogsLoop() {
 }
 
 async function main() {
-  log(`Forthway node agent v${AGENT_VERSION} on ${os.hostname()} · server ${cfg.serverId} · panel ${cfg.panelUrl}`);
+  log(`Forthway node agent v${AGENT_VERSION} on ${os.hostname()} · server ${cfg.serverId} · panel ${cfg.panelUrl}${cfg.isMain ? " · main's embedded agent" : ""}`);
+  // Vote from the start when failover was on last time: if the panel we knew
+  // is the one that died, the others need this vote to take over.
+  if (haState.on) setHa(true);
   await hello();
   metricsLoop();
   edgeLogsLoop().catch((err) => log(`edge log shipping stopped: ${err.message}`));

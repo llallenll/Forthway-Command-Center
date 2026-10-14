@@ -30,6 +30,14 @@
  * and at least every 10 min; main does the equivalent in-process (local vhosts
  * open to edge IPs, ufw, trusted proxies). The connector token only ever leaves
  * the panel inside that task's payload, to the authenticated agent.
+ *
+ * Panel failover (docs/HA.md, Phase 2): "main" no longer means "this machine".
+ * Everything that touches the local machine on main's behalf (in-process tasks,
+ * main's metrics, nginx access-log tailing, main's vhosts/ufw) only happens
+ * when ctx.ha.mainIsLocal; otherwise main is a remote server reached through
+ * its embedded agent (token hash in servers.main.tokenHash) and its front door
+ * goes out as a `frontDoor` cluster.sync. Agent servers can be made panel nodes
+ * (servers[].panel) — panel.install / panel.remove tasks, config.ha.enabled.
  */
 
 import fs from "node:fs";
@@ -67,6 +75,12 @@ const EDGE_UFW_COMMENT = "fcc sites from edge";
 const EDGE_UFW_PORTS = "3000:3999";
 const EDGE_LOG_LIMIT = 2 * 1024 * 1024 + 256 * 1024; // the agent sends ≤ 2 MB of lines; leave room for JSON
 const DNS_CACHE_MS = 5 * MINUTE;
+// Panel failover (docs/HA.md, Phase 2)
+const PANEL_MIN_AGENT = "3.2.0"; // first agent that votes, knows panel.install and the frontDoor sync
+const PANEL_MIN_SERVERS = 3; // a majority must survive any one server going down
+const HA_LOCAL_FILE = "ha-local.json";
+// With no panel/lib/ha.mjs (or HA off) this process is main and the only panel.
+const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
 
 const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const floorMinute = (ms) => Math.floor(ms / MINUTE) * MINUTE;
@@ -148,6 +162,11 @@ function createCluster(ctx) {
   let started = false;
   const timers = [];
   let metricsDirty = false;
+  // Panel failover — read ctx.ha at call time, with HA-off defaults.
+  const ha = () => ctx.ha || HA_OFF;
+  const mainLocal = () => ha().mainIsLocal !== false;
+  const haOn = () => ctx.config?.ha?.enabled === true;
+  let trustKey = null; // JSON of the last set given to setTrustedProxies (null = never)
 
   // ------------------------------------------------------------- events
 
@@ -190,6 +209,17 @@ function createCluster(ctx) {
 
   function ensureMain() {
     const existing = db.get("servers", MAIN_ID);
+    if (!mainLocal()) {
+      // Main is a remote server right now: its agent reports its own version,
+      // info and last-seen time. Only fill in defaults.
+      if (!existing) return;
+      const patch = { role: "main" };
+      if (existing.lbEligible === undefined) patch.lbEligible = true;
+      if (existing.enabled === undefined) patch.enabled = true;
+      if (existing.weight === undefined) patch.weight = 1;
+      if (existing.role !== "main" || Object.keys(patch).length > 1) db.update("servers", MAIN_ID, patch);
+      return;
+    }
     const info = systemInfo();
     if (!existing) {
       db.insert("servers", {
@@ -217,7 +247,7 @@ function createCluster(ctx) {
   }
 
   function lastSeenMs(id) {
-    if (id === MAIN_ID) return Date.now();
+    if (id === MAIN_ID && mainLocal()) return Date.now();
     const mem = seen.get(id);
     if (mem) return mem;
     const s = db.get("servers", id);
@@ -225,13 +255,13 @@ function createCluster(ctx) {
   }
 
   function isOnline(id) {
-    if (id === MAIN_ID) return true;
+    if (id === MAIN_ID && mainLocal()) return true;
     if (!db.get("servers", id)) return false;
     return Date.now() - lastSeenMs(id) < ONLINE_MS;
   }
 
   function address(id) {
-    if (id === MAIN_ID) return "127.0.0.1";
+    if (id === MAIN_ID && mainLocal()) return "127.0.0.1";
     const s = db.get("servers", id);
     if (!s) return null;
     return (s.privateHost || s.host || "").trim() || null;
@@ -296,6 +326,9 @@ function createCluster(ctx) {
       pendingTasks: [...tasks.values()].filter((t) => t.serverId === s.id).length,
       edge: s.id === MAIN_ID ? { enabled: true, implicit: true } : { enabled: !!s.edge?.enabled },
       edgeStatus: publicEdgeStatus(s),
+      panel: publicPanel(s),
+      panelRole: panelRoleOf(s.id),
+      panelCanEnable: s.id === MAIN_ID ? { ok: false, reason: "The main server always runs the panel." } : panelBlockerResult(s),
     };
   }
 
@@ -317,8 +350,10 @@ function createCluster(ctx) {
     const token = bearer(req);
     if (!token || token.length < 16) return null;
     const h = sha256(token);
+    // Main's token (its embedded agent and its voter) only counts while HA is on.
+    const mainOk = haOn();
     for (const s of db.list("servers")) {
-      if (s.id !== MAIN_ID && s.tokenHash && tokenEquals(s.tokenHash, h)) return s;
+      if ((s.id !== MAIN_ID || mainOk) && s.tokenHash && tokenEquals(s.tokenHash, h)) return s;
     }
     return null;
   }
@@ -377,7 +412,9 @@ function createCluster(ctx) {
     if (!server) return Promise.reject(httpError(404, `Server ${serverId} not found`));
     if (!TASK_TYPES.includes(type)) return Promise.reject(new Error(`Unknown task type "${type}"`));
 
-    if (serverId === MAIN_ID) {
+    // Main runs tasks in this process only when this process runs ON main;
+    // otherwise they go to main's embedded agent like any other server's.
+    if (serverId === MAIN_ID && mainLocal()) {
       return executeTask(type, payload, {
         log,
         signal,
@@ -405,7 +442,10 @@ function createCluster(ctx) {
       // server.backup and a site.deploy that packages its build (build once,
       // ship everywhere) send a file back through /agent/upload/:taskId.
       const uploads = type === "server.backup" || (type === "site.deploy" && payload?.package);
-      const p = uploads ? { ...payload, upload: { url: `/agent/upload/${id}` } } : payload;
+      let p = uploads ? { ...payload, upload: { url: `/agent/upload/${id}` } } : payload;
+      // Main's embedded agent (main not running the panel) still needs the edge
+      // allow-list for its local static/php vhosts, like the in-process path above.
+      if (serverId === MAIN_ID && p && typeof p === "object") p = { ...p, edgeAllow: edgeIpList.slice() };
       const task = {
         id,
         serverId,
@@ -642,6 +682,9 @@ function createCluster(ctx) {
   }
 
   function tailAccessLogs() {
+    // Main's nginx logs are only on this disk when this process runs on main;
+    // otherwise main's agent ships them (POST /agent/edge/logs, frontDoor sync).
+    if (!mainLocal()) return;
     const dir = logDir();
     const byAddr = upstreamMap();
     for (const site of allSites()) {
@@ -794,6 +837,7 @@ function createCluster(ctx) {
   }
 
   async function sampleMain() {
+    if (!mainLocal()) return; // main's embedded agent pushes /agent/metrics instead
     try {
       const m = await collectMetrics();
       recordSample(MAIN_ID, m);
@@ -858,7 +902,8 @@ function createCluster(ctx) {
   }
 
   async function mainIps() {
-    const out = new Set(localAddresses());
+    // This machine's interfaces are main's only when this process runs on main.
+    const out = new Set(mainLocal() ? localAddresses() : []);
     const main = db.get("servers", MAIN_ID);
     for (const h of [main?.host, main?.privateHost, ...(ctx.config?.cluster?.mainIps || [])]) {
       if (!h) continue;
@@ -885,6 +930,9 @@ function createCluster(ctx) {
   // never gets the task — the panel does main's part here (see applyMainEdges).
 
   const isEdge = (s) => !!s && s.id !== MAIN_ID && !!s.edge?.enabled;
+  // Main gets a cluster.sync (frontDoor) only while this process is not on main.
+  const isFrontDoor = (s) => !!s && s.id === MAIN_ID && !mainLocal();
+  const isPanelAgent = (s) => !!s && s.id !== MAIN_ID && !!s.panel?.enabled;
   const syncSupported = () => TASK_TYPES.includes("cluster.sync");
   const bracket = (h) => (net.isIP(h) === 6 ? `[${h}]` : h);
   const isLoopback = (ip) => ip.startsWith("127.") || ip === "::1";
@@ -919,10 +967,35 @@ function createCluster(ctx) {
     return m;
   }
 
+  /** serverId -> resolved IPs of every agent panel node (HA on only; main excluded like in edgeIpMap). */
+  async function panelIpMap() {
+    const m = new Map();
+    if (!haOn()) return m;
+    for (const s of db.list("servers")) if (isPanelAgent(s)) m.set(s.id, await serverIps(s));
+    return m;
+  }
+
+  /**
+   * Main's own front door while this process is not on main (docs/HA.md
+   * "frontDoor"): main-style files (Let's Encrypt paths, main as 127.0.0.1)
+   * written over main's fcc-<siteId>.conf set by its embedded agent.
+   */
+  async function buildFrontDoorPayload(s, { ipMap, pIpMap }) {
+    const allow = new Set();
+    for (const m of [ipMap, pIpMap]) for (const [id, ips] of m) if (id !== s.id) for (const ip of ips) allow.add(ip);
+    const allowFrom = [...allow].filter((ip) => net.isIP(ip) && !isLoopback(ip)).sort();
+    const edge = { files: ctx.lb?.mainFiles?.() || {}, connectors: [], shims: [] };
+    const body = { allowFrom, frontDoor: true, edge };
+    return { hash: sha256(JSON.stringify(body)), ...body };
+  }
+
   /** The cluster.sync payload for agent server `s`. Contains the connector tokens: never log or return it. */
-  async function buildEdgePayload(s, { ipMap, mainIpList }) {
+  async function buildEdgePayload(s, { ipMap, mainIpList, pIpMap = new Map() }) {
+    if (isFrontDoor(s)) return buildFrontDoorPayload(s, { ipMap, pIpMap });
     const allow = new Set(mainIpList);
     for (const [id, ips] of ipMap) if (id !== s.id) for (const ip of ips) allow.add(ip);
+    // Panel nodes (edges themselves, so normally already listed) must reach every server.
+    for (const [id, ips] of pIpMap) if (id !== s.id) for (const ip of ips) allow.add(ip);
     const allowFrom = [...allow].filter((ip) => net.isIP(ip) && !isLoopback(ip)).sort();
     let edge = null;
     if (isEdge(s)) {
@@ -942,6 +1015,16 @@ function createCluster(ctx) {
           listenTls: !!x.tls,
           target: `${x.tls ? "https" : "http"}://${mainAddr}:${Number(x.port)}`,
         }));
+        if (haOn()) {
+          // Panel failover: the panel shim fails over across every panel node's
+          // own address (an nginx upstream on the agent); `target` stays the
+          // first one for agents that only know a single target. A panel node
+          // gets no panel shim — the panel listens on that port itself.
+          const urls = panelNodeList().map((n) => n.directUrl).filter(Boolean);
+          shims = shims
+            .filter((x) => !(x.name === "panel" && isPanelAgent(s)))
+            .map((x) => (x.name === "panel" && urls.length ? { ...x, target: urls[0], targets: urls } : x));
+        }
       } catch (err) {
         console.warn("[cluster] edge shims:", err.message);
       }
@@ -989,8 +1072,11 @@ function createCluster(ctx) {
 
   /** Why server `s` cannot take a cluster.sync right now, or null. */
   function edgePushBlocker(s) {
-    if (!s || s.id === MAIN_ID) return "The main server applies its edge configuration itself.";
+    if (!s || (s.id === MAIN_ID && mainLocal())) return "The main server applies its edge configuration itself.";
     if (!syncSupported()) return "This panel's task engine (shared/tasks.mjs) does not know cluster.sync yet — update the panel.";
+    if (s.id === MAIN_ID && !versionAtLeast(s.agentVersion, PANEL_MIN_AGENT)) {
+      return `The main server's agent runs v${s.agentVersion || "?"}; its front door sync needs v${PANEL_MIN_AGENT} or newer.`;
+    }
     if (!versionAtLeast(s.agentVersion, EDGE_MIN_AGENT)) {
       return `${s.name} runs agent v${s.agentVersion || "?"}; edge sync needs v${EDGE_MIN_AGENT} or newer. It updates itself the next time it reconnects to the panel.`;
     }
@@ -1003,12 +1089,14 @@ function createCluster(ctx) {
     if (!s) throw httpError(404, "Server not found");
     const blocked = edgePushBlocker(s);
     if (blocked) throw new Error(blocked);
-    const payload = await buildEdgePayload(s, { ipMap: await edgeIpMap(), mainIpList: await mainIps() });
+    const payload = await buildEdgePayload(s, { ipMap: await edgeIpMap(), mainIpList: await mainIps(), pIpMap: await panelIpMap() });
     edgeDesired.set(s.id, payload.hash);
     if (!force && s.edgeSync?.hash === payload.hash && !s.edgeSync?.error) return { skipped: true, hash: payload.hash };
     edgePushed.set(s.id, { hash: payload.hash, at: Date.now() });
     edgeInflightHash.set(s.id, payload.hash);
-    const what = payload.edge
+    const what = payload.frontDoor
+      ? `front door: ${Object.keys(payload.edge.files).length} nginx file(s)`
+      : payload.edge
       ? `edge: ${Object.keys(payload.edge.files).length} nginx file(s), ${payload.edge.connectors.length} connector(s), ${payload.edge.shims.length} shim(s)`
       : "not an edge";
     console.log(`[cluster] cluster.sync → ${s.name} (${s.id}) ${payload.hash.slice(0, 12)} · ${what} · ${payload.allowFrom.length} allowed IP(s)`);
@@ -1058,7 +1146,9 @@ function createCluster(ctx) {
    */
   async function applyMainEdges(ips) {
     const log = (l) => console.log(`[cluster] main edge access: ${l}`);
-    setTrustedProxies(ips);
+    // Main's vhosts and ufw are on this disk only when this process runs on main;
+    // otherwise main's agent applies allowFrom from its frontDoor cluster.sync.
+    if (!mainLocal()) return;
     if (typeof sharedTasks.refreshLocalVhosts === "function") {
       const specs = [];
       for (const site of allSites()) {
@@ -1119,6 +1209,16 @@ function createCluster(ctx) {
       const ipMap = await edgeIpMap();
       const flat = [...new Set([...ipMap.values()].flat())].sort();
       const key = JSON.stringify(flat);
+      const pIpMap = await panelIpMap();
+      const mainIpList = await mainIps();
+      // auth believes X-Forwarded-* from the edges' shims and from panel nodes
+      // (a follower proxies everything to the leader) — main is one while HA is on.
+      const trust = [...new Set([...flat, ...[...pIpMap.values()].flat(), ...(haOn() ? mainIpList : [])])].sort();
+      const tk = JSON.stringify(trust);
+      if (tk !== trustKey) {
+        trustKey = tk;
+        setTrustedProxies(trust);
+      }
       if (key !== edgeIpKey) {
         const first = edgeIpKey === null;
         edgeIpKey = key;
@@ -1127,22 +1227,21 @@ function createCluster(ctx) {
         await applyMainEdges(flat);
       }
       if (!syncSupported()) return;
-      const mainIpList = await mainIps();
       for (const s of db.list("servers")) {
-        if (s.id === MAIN_ID) continue;
+        if (s.id === MAIN_ID && mainLocal()) continue;
         let payload;
         try {
-          payload = await buildEdgePayload(s, { ipMap, mainIpList });
+          payload = await buildEdgePayload(s, { ipMap, mainIpList, pIpMap });
         } catch (err) {
           console.warn(`[cluster] edge payload for ${s.name}:`, err.message);
           continue;
         }
         edgeDesired.set(s.id, payload.hash);
         if (!isOnline(s.id)) continue;
-        if (!versionAtLeast(s.agentVersion, EDGE_MIN_AGENT)) {
+        if (!versionAtLeast(s.agentVersion, s.id === MAIN_ID ? PANEL_MIN_AGENT : EDGE_MIN_AGENT)) {
           if (edgeOldAgentNoted.get(s.id) !== s.agentVersion) {
             edgeOldAgentNoted.set(s.id, s.agentVersion);
-            console.log(`[cluster] ${s.name} (${s.id}) runs agent v${s.agentVersion || "?"} — no cluster.sync until it updates to v${EDGE_MIN_AGENT}+`);
+            console.log(`[cluster] ${s.name} (${s.id}) runs agent v${s.agentVersion || "?"} — no cluster.sync until it updates to v${s.id === MAIN_ID ? PANEL_MIN_AGENT : EDGE_MIN_AGENT}+`);
           }
           continue;
         }
@@ -1216,9 +1315,9 @@ function createCluster(ctx) {
 
   /** GET /api/servers edgeStatus: null for main and for servers that are not (and do not report being) an edge. */
   function publicEdgeStatus(s) {
-    if (!s || s.id === MAIN_ID) return null;
+    if (!s || (s.id === MAIN_ID && mainLocal())) return null;
     const r = edgeStatus.get(s.id) || null;
-    if (!isEdge(s) && !r) return null;
+    if (!isEdge(s) && !isFrontDoor(s) && !r) return null;
     const desired = edgeDesired.get(s.id) || null;
     const appliedHash = r?.hash || s.edgeSync?.hash || null;
     const error = r?.error || s.edgeSync?.error || null;
@@ -1327,17 +1426,365 @@ function createCluster(ctx) {
         `${mainOnlySites.length === 1 ? "1 website runs" : `${mainOnlySites.length} websites run`} only on the main server and go${mainOnlySites.length === 1 ? "es" : ""} down with it: ${names}. Load balance ${mainOnlySites.length === 1 ? "it" : "them"} across servers to keep ${mainOnlySites.length === 1 ? "it" : "them"} up.`,
       );
     }
+    // Panel failover (Phase 2).
+    const haEnabled = haOn();
+    const nodeInfo = haNodes();
+    const panelNodes = [db.get("servers", MAIN_ID), ...db.list("servers").filter(isPanelAgent)]
+      .filter(Boolean)
+      .map((s) => {
+        const n = nodeInfo.find((x) => x.serverId === s.id) || {};
+        return {
+          serverId: s.id,
+          name: s.name,
+          role: panelRoleOf(s.id),
+          online: n.online ?? isOnline(s.id),
+          directUrl: publicPanel(s).directUrl,
+          version: n.version ?? null,
+          lagMs: n.lagMs ?? null,
+        };
+      });
+    const nServers = enabledServers().length;
+    let leaderId = MAIN_ID;
+    try {
+      leaderId = (haEnabled && ctx.ha?.leaderId?.()) || (mainLocal() ? MAIN_ID : ha().localServerId) || MAIN_ID;
+    } catch {
+      /* ha not ready */
+    }
+    if (edges.length || haEnabled) {
+      if (!haEnabled) {
+        warnings.push(
+          nServers < PANEL_MIN_SERVERS
+            ? `Only one panel node — the panel goes down with the main server. Panel failover needs at least ${PANEL_MIN_SERVERS} servers (you have ${nServers}).`
+            : "Only one panel node — the panel goes down with the main server. Make an edge node a panel node to keep the panel up.",
+        );
+      } else {
+        if (nServers < PANEL_MIN_SERVERS) warnings.push(`Panel failover needs at least ${PANEL_MIN_SERVERS} enabled servers to vote; there are ${nServers}.`);
+        for (const p of panelNodes) if (p.serverId !== MAIN_ID && !p.online) warnings.push(`${p.name} is a standby panel node, but it is offline.`);
+        const old = enabledServers().filter((x) => x.id !== MAIN_ID && !versionAtLeast(x.agentVersion, PANEL_MIN_AGENT));
+        if (old.length) warnings.push(`${old.map((x) => x.name).join(", ")} ${old.length === 1 ? "runs an agent" : "run agents"} older than v${PANEL_MIN_AGENT} and cannot vote on which panel is active.`);
+        if (ctx.config?.ha?.armed !== true) warnings.push("Waiting for the servers to vote — failover starts protecting the panel once a majority has voted.");
+        if (!mainLocal()) {
+          const name = db.get("servers", ha().localServerId)?.name || ha().localServerId;
+          warnings.push(`The active panel runs on ${name}, not on the main server. Databases, phpMyAdmin, database backups and certificates are unavailable until the main server is the active panel again.`);
+        }
+      }
+    }
     return {
       edges,
       tunnelReplicasOnline: (mainConnected ? 1 : 0) + edges.filter((e) => e.tunnelConnected).length,
       connectors: connectorsN,
       mainOnlySites,
       warnings,
+      panel: {
+        enabled: haEnabled,
+        armed: ctx.config?.ha?.armed === true,
+        leaderId,
+        localServerId: ha().localServerId || MAIN_ID,
+        mainIsLocal: mainLocal(),
+        servers: nServers,
+        minServers: PANEL_MIN_SERVERS,
+        nodes: panelNodes,
+      },
     };
   }
 
   /** Resolved edge IPs (as last applied on main). */
   const edgeIps = () => edgeIpList.slice();
+
+  // ------------------------------------------------------- panel nodes
+  //
+  // docs/HA.md Phase 2. Main always runs the panel; an agent server that is an
+  // edge can be made a panel node too (servers[].panel = { enabled, directUrl }).
+  // The first one turns HA on (config.ha.enabled), the last one off. Main then
+  // also needs an agent token of its own (for its voter and its embedded agent):
+  // only sha256 goes in the db, the plaintext only in main's ha-local.json.
+
+  const panelPortOf = () => Number(process.env.FCC_PORT) || Number(ctx.config?.port) || 4000;
+  const panelTls = () => !!((process.env.FCC_TLS_KEY || ctx.config?.tls?.key) && (process.env.FCC_TLS_CERT || ctx.config?.tls?.cert));
+  const haLocalPath = () => path.join(ctx.dataDir, HA_LOCAL_FILE);
+
+  function readHaLocal() {
+    try {
+      const j = JSON.parse(fs.readFileSync(haLocalPath(), "utf8"));
+      return j && typeof j === "object" && !Array.isArray(j) ? j : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Merge `patch` into <dataDir>/ha-local.json (mode 600, atomic). Never replicated. */
+  function writeHaLocal(patch) {
+    const next = { ...readHaLocal(), ...patch };
+    const file = haLocalPath();
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.mkdirSync(ctx.dataDir, { recursive: true });
+    fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+    return next;
+  }
+
+  const validUrl = (u) => {
+    try {
+      const x = new URL(String(u));
+      return /^https?:$/.test(x.protocol) && !!x.hostname && x.pathname === "/" && !x.search ? `${x.protocol}//${x.host}` : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** How other servers reach the panel process on agent server `s` unless it reported otherwise. */
+  function defaultDirectUrl(s, port = panelPortOf()) {
+    const h = String(s?.privateHost || s?.host || "").trim();
+    return h ? `http://${bracket(h)}:${port}` : null;
+  }
+
+  /** Main's panel address: its ha-local.json (when this is main), else the db mirror, else privateHost||host. */
+  function mainDirectUrl() {
+    const main = db.get("servers", MAIN_ID);
+    if (mainLocal()) {
+      let fromHa = null;
+      try {
+        fromHa = typeof ctx.ha?.directUrl === "function" ? ctx.ha.directUrl() : null; // what this node announces
+      } catch {
+        /* ha not ready */
+      }
+      const own = validUrl(fromHa) || validUrl(process.env.FCC_HA_DIRECT_URL) || validUrl(readHaLocal().directUrl);
+      if (own) return own;
+    }
+    const mirrored = validUrl(main?.panel?.directUrl);
+    if (mirrored) return mirrored;
+    const h = String(main?.privateHost || main?.host || "").trim();
+    return h ? `${mainLocal() && panelTls() ? "https" : "http"}://${bracket(h)}:${panelPortOf()}` : null;
+  }
+
+  /** Every panel node, main first: [{ serverId, directUrl }]. Empty while HA is off. */
+  function panelNodeList() {
+    if (!haOn()) return [];
+    const out = [{ serverId: MAIN_ID, directUrl: mainDirectUrl() }];
+    for (const s of db
+      .list("servers")
+      .filter(isPanelAgent)
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)))) {
+      out.push({ serverId: s.id, directUrl: validUrl(s.panel.directUrl) || defaultDirectUrl(s) });
+    }
+    return out.filter((n) => n.directUrl);
+  }
+
+  function haNodes() {
+    try {
+      const l = ctx.ha?.panelNodes?.();
+      return Array.isArray(l) ? l : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function publicPanel(s) {
+    if (s.id === MAIN_ID) return { enabled: true, implicit: true, directUrl: haOn() ? mainDirectUrl() : null };
+    if (!s.panel?.enabled) return { enabled: false, directUrl: null };
+    return { enabled: true, directUrl: validUrl(s.panel.directUrl) || defaultDirectUrl(s) };
+  }
+
+  /** "leader" | "follower" | "candidate" | null — from ctx.ha; with HA off main leads alone. */
+  function panelRoleOf(id) {
+    if (!haOn() || !ctx.ha) return id === MAIN_ID ? "leader" : null;
+    const n = haNodes().find((x) => x.serverId === id);
+    if (n?.role) return n.role;
+    if (id === MAIN_ID || isPanelAgent(db.get("servers", id))) {
+      try {
+        return ctx.ha.leaderId?.() === id ? "leader" : "follower";
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  const enabledServers = () => db.list("servers").filter((s) => s.enabled !== false);
+
+  /** Why agent server `s` cannot be made a panel node right now, or null. */
+  function panelBlocker(s) {
+    if (!s) return "Server not found.";
+    if (s.id === MAIN_ID) return "The main server always runs the panel.";
+    if (!TASK_TYPES.includes("panel.install")) return "This panel's task engine (shared/tasks.mjs) does not know panel.install yet — update the panel.";
+    if (s.enabled === false) return `${s.name} is disabled. Enable it first.`;
+    if (!isEdge(s)) return `Make ${s.name} an edge node first — a panel node also runs the website front door and a Cloudflare Tunnel replica.`;
+    const n = enabledServers().length;
+    if (n < PANEL_MIN_SERVERS) {
+      return `Panel failover needs at least ${PANEL_MIN_SERVERS} servers (the main server and two agent servers) so the servers can always out-vote a broken one. You have ${n}.`;
+    }
+    const lagging = enabledServers().filter((x) => x.id !== MAIN_ID && (!isOnline(x.id) || !versionAtLeast(x.agentVersion, PANEL_MIN_AGENT)));
+    if (lagging.length) {
+      const list = lagging.map((x) => (isOnline(x.id) ? `${x.name} (agent v${x.agentVersion || "?"})` : `${x.name} (offline)`)).join(", ");
+      return `Every server votes on which panel is active, so every enabled agent server must be online and run agent v${PANEL_MIN_AGENT} or newer first: ${list}. Agents update themselves when they reconnect.`;
+    }
+    if (!mainLocal() && !db.get("servers", MAIN_ID)?.tokenHash) return "The main server has no agent token yet. Make the main server the active panel first.";
+    return null;
+  }
+  /**
+   * { ok, reason } — for one server, or (no id) whether any server could be made
+   * a panel node now (for /api/ha canEnable).
+   */
+  function panelCanEnable(serverId = null) {
+    if (serverId) {
+      const s = db.get("servers", serverId);
+      const reason = panelBlocker(s);
+      return { ok: !reason, reason };
+    }
+    const candidates = db.list("servers").filter((x) => x.id !== MAIN_ID && !x.panel?.enabled);
+    if (!candidates.length) return { ok: false, reason: "Add an agent server and make it an edge node first." };
+    const reasons = candidates.map(panelBlocker);
+    const i = reasons.findIndex((r) => !r);
+    if (i !== -1) return { ok: true, reason: null };
+    return { ok: false, reason: reasons[0] };
+  }
+  function panelBlockerResult(s) {
+    if (s.panel?.enabled) return { ok: true, reason: null, enabled: true };
+    const reason = panelBlocker(s);
+    return { ok: !reason, reason };
+  }
+
+  /** Main's agent token: generated when HA turns on. sha256 in the db, plaintext only in main's ha-local.json. */
+  function ensureMainToken(log = () => {}) {
+    const main = db.get("servers", MAIN_ID);
+    if (!main) throw new Error("The main server record is missing.");
+    if (!mainLocal()) {
+      if (main.tokenHash) return false;
+      throw new Error("The main server has no agent token yet, and it can only be created on the main server. Make the main server the active panel first.");
+    }
+    const local = readHaLocal();
+    if (main.tokenHash && local.token && tokenEquals(main.tokenHash, sha256(local.token))) return false;
+    const token = newToken();
+    if (typeof ctx.ha?.setLocalToken === "function") {
+      // ha.mjs keeps ha-local.json in memory too: let it write, so neither overwrites the other.
+      ctx.ha.setLocalToken(token);
+    } else {
+      const patch = { serverId: typeof local.serverId === "string" && local.serverId ? local.serverId : MAIN_ID, token };
+      if (!local.directUrl) {
+        const d = mainDirectUrl();
+        if (d) patch.directUrl = d;
+      }
+      writeHaLocal(patch);
+    }
+    db.update("servers", MAIN_ID, { tokenHash: sha256(token) });
+    db.save({ immediate: true });
+    log("Created the main server's own agent token (stored in its ha-local.json; only its hash is in the database).");
+    return true;
+  }
+
+  function setHaEnabled(on) {
+    const cur = ctx.config.ha && typeof ctx.config.ha === "object" ? ctx.config.ha : {};
+    if (on) {
+      if (cur.enabled === true) return false;
+      ctx.config.ha = { ...cur, enabled: true };
+    } else {
+      if (!cur.enabled && cur.armed === undefined) return false;
+      const { armed, ...rest } = cur;
+      ctx.config.ha = { ...rest, enabled: false };
+    }
+    try {
+      ctx.saveConfig?.();
+    } catch (err) {
+      console.warn("[cluster] could not save config.json:", err.message);
+    }
+    console.log(`[cluster] high availability is now ${on ? "ON (panel failover)" : "OFF"}`);
+    return true;
+  }
+
+  /** Every resolved IP of every server (panel.install opens the panel port to them). */
+  async function allServerIps() {
+    const out = new Set();
+    for (const s of db.list("servers")) {
+      for (const ip of s.id === MAIN_ID ? await mainIps() : await serverIps(s)) out.add(ip);
+    }
+    return [...out].filter((ip) => net.isIP(ip) && !isLoopback(ip)).sort();
+  }
+
+  async function enablePanelNode(serverId, { port, directUrl }, { log, signal }) {
+    let s = db.get("servers", serverId);
+    const blocked = panelBlocker(s);
+    if (blocked) throw httpError(409, blocked);
+    const firstNode = !db.list("servers").some((x) => isPanelAgent(x) && x.id !== serverId);
+    const wasEnabled = !!s.panel?.enabled;
+    const wasHa = haOn();
+    ensureMainToken(log);
+    if (mainLocal()) {
+      const mainRec = db.get("servers", MAIN_ID);
+      const d = mainDirectUrl();
+      if (d && mainRec?.panel?.directUrl !== d) db.update("servers", MAIN_ID, { panel: { ...(mainRec.panel || {}), enabled: true, directUrl: d } });
+    }
+    // Accept the node (replication, votes) before it starts, so it can join at once.
+    s = db.update("servers", serverId, { panel: { enabled: true, directUrl } });
+    if (firstNode || !wasHa) setHaEnabled(true); // also re-asserts it if it was somehow cleared
+    db.save({ immediate: true });
+    serversChanged("panel", serverId);
+    const payload = { codeUrl: "/ha/code", directUrl, port, host: "0.0.0.0", allowFrom: await allServerIps() };
+    log(`Installing the panel on ${s.name}: it will listen on port ${port} and be reached at ${directUrl}.`);
+    log(`The panel port is opened to ${payload.allowFrom.length} server address(es) if ufw is active there.`);
+    try {
+      const r = await runTask(serverId, "panel.install", payload, { log, signal });
+      log(`${s.name} now runs the panel as a standby${r?.version ? ` (v${r.version})` : ""}. It takes over if the active panel goes down.`);
+      return { serverId, enabled: true, directUrl, ha: true, result: r ?? null };
+    } catch (err) {
+      // Put things back the way they were.
+      db.update("servers", serverId, { panel: wasEnabled ? s.panel : { enabled: false, directUrl: null } });
+      if (!wasHa && !db.list("servers").some(isPanelAgent)) setHaEnabled(false);
+      db.save({ immediate: true });
+      serversChanged("panel", serverId);
+      throw err;
+    }
+  }
+
+  async function disablePanelNode(serverId, { log, signal }) {
+    const s = db.get("servers", serverId);
+    if (!s) throw httpError(404, "Server not found");
+    db.update("servers", serverId, { panel: { enabled: false, directUrl: null } });
+    const last = !db.list("servers").some(isPanelAgent);
+    if (last) setHaEnabled(false);
+    db.save({ immediate: true });
+    serversChanged("panel", serverId);
+    log(`${s.name} is no longer a panel node${last ? " — it was the last standby, so panel failover is now off" : ""}. Removing the panel from it…`);
+    let result = null;
+    try {
+      result = await runTask(serverId, "panel.remove", {}, { log, signal });
+    } catch (err) {
+      log(`!! Could not remove the panel from ${s.name}: ${err.message}`);
+      log(`It is no longer accepted as a panel node either way. Run this again once ${s.name} is online to clean it up.`);
+      throw err;
+    }
+    log("The panel was removed. Its data folder was kept and renamed on that server — it holds secrets; delete it when you no longer need it.");
+    return { serverId, enabled: false, ha: haOn(), result: result ?? null };
+  }
+
+  /** Mirror the directUrl each panel node reports (via ctx.ha) into servers[].panel.directUrl. */
+  function recordPanelUrls() {
+    if (!haOn()) return;
+    for (const n of haNodes()) {
+      const url = validUrl(n?.directUrl);
+      if (!url || !n.serverId) continue;
+      const s = db.get("servers", String(n.serverId));
+      if (!s || (s.id !== MAIN_ID && !s.panel?.enabled)) continue;
+      if (s.panel?.directUrl === url) continue;
+      db.update("servers", s.id, { panel: { ...(s.panel || {}), enabled: true, directUrl: url } });
+      console.log(`[cluster] ${s.name} (${s.id}) panel address: ${url}`);
+      edgesChanged(); // shim target lists
+    }
+  }
+
+  /** 409 when a change to `s` would break panel failover. */
+  function guardPanelNodeChange(s, { deleting = false, patch = {} } = {}) {
+    if (!haOn() || s.id === MAIN_ID) return;
+    if (s.panel?.enabled) {
+      if (deleting) throw httpError(409, `${s.name} is a panel node. Turn off “Panel node” on it first.`);
+      if (patch.edge && patch.edge.enabled === false) throw httpError(409, `${s.name} is a panel node, which must stay an edge node. Turn off “Panel node” first.`);
+      if (patch.enabled === false) throw httpError(409, `${s.name} is a panel node. Turn off “Panel node” on it before disabling it.`);
+    }
+    const leaving = deleting || (patch.enabled === false && s.enabled !== false);
+    if (leaving && enabledServers().length - 1 < PANEL_MIN_SERVERS) {
+      throw httpError(409, `Panel failover needs at least ${PANEL_MIN_SERVERS} enabled servers. Turn off “Panel node” on every agent server first.`);
+    }
+  }
 
   // ------------------------------------------------------------- routes
 
@@ -1429,6 +1876,7 @@ function createCluster(ctx) {
       if (patch.host && db.list("servers").some((o) => o.id !== s.id && o.host === patch.host)) {
         throw httpError(409, `A server with the address ${patch.host} already exists.`);
       }
+      guardPanelNodeChange(s, { patch });
       const wasEdge = !!s.edge?.enabled;
       const updated = db.update("servers", s.id, patch);
       const details = { fields: Object.keys(patch) };
@@ -1445,6 +1893,7 @@ function createCluster(ctx) {
     router.delete("/api/servers/:id", (req, res, { params, admin }) => {
       const s = requireServer(params.id);
       if (s.id === MAIN_ID) throw httpError(400, "The main server cannot be removed.");
+      guardPanelNodeChange(s, { deleting: true });
       const using = allSites().filter((site) => siteTargets(site).includes(s.id));
       if (using.length) {
         throw httpError(409, `Move or delete the websites on this server first: ${using.map((x) => x.name).join(", ")}.`, {
@@ -1483,11 +1932,11 @@ function createCluster(ctx) {
 
     router.post("/api/servers/:id/edge/sync", (req, res, { params, admin }) => {
       const s = requireServer(params.id);
-      if (s.id === MAIN_ID) throw httpError(400, "The main server applies its edge configuration itself — there is nothing to send it.");
+      if (s.id === MAIN_ID && mainLocal()) throw httpError(400, "The main server applies its edge configuration itself — there is nothing to send it.");
       const blocked = edgePushBlocker(s);
       if (blocked) throw httpError(409, blocked);
       const job = ctx.jobs.start(
-        { type: "server.edge.sync", title: `Sync ${isEdge(s) ? "edge" : "cluster"} configuration to ${s.name}`, serverId: s.id, adminId: admin?.id, lock: false },
+        { type: "server.edge.sync", title: `Sync ${isEdge(s) ? "edge" : isFrontDoor(s) ? "front door" : "cluster"} configuration to ${s.name}`, serverId: s.id, adminId: admin?.id, lock: false },
         ({ log, signal }) => pushEdge(s.id, { force: true, log, signal }),
       );
       ctx.activity?.(admin, "server.edge.sync", { type: "server", id: s.id, name: s.name }, { edge: isEdge(s) });
@@ -1495,6 +1944,45 @@ function createCluster(ctx) {
     });
 
     router.get("/api/cluster/ha", () => haSummary());
+
+    // Panel failover (docs/HA.md Phase 2): make an agent server a panel node, or stop.
+    router.post("/api/servers/:id/panel", (req, res, { params, body, admin }) => {
+      const s = requireServer(params.id);
+      if (s.id === MAIN_ID) throw httpError(400, "The main server always runs the panel — there is nothing to switch.");
+      if (typeof body?.enabled !== "boolean") throw httpError(400, "Panel node must be true or false.");
+      if (!ha().isLeader?.()) throw httpError(409, "Only the active panel can change panel nodes.");
+      if (body.enabled) {
+        const blocked = panelBlocker(s);
+        if (blocked) throw httpError(409, blocked);
+        let port = panelPortOf();
+        if (body.port !== undefined) {
+          port = Number(body.port);
+          if (!Number.isInteger(port) || port < 1 || port > 65535) throw httpError(400, "The panel port must be a number from 1 to 65535.");
+        }
+        let directUrl = defaultDirectUrl(s, port);
+        if (body.directUrl) {
+          directUrl = validUrl(body.directUrl);
+          if (!directUrl) throw httpError(400, "The panel address must look like http://10.0.0.5:4000.");
+        }
+        if (!directUrl) throw httpError(400, `${s.name} has no address to reach its panel on.`);
+        const job = ctx.jobs.start(
+          { type: "server.panel.enable", title: `Make ${s.name} a panel node`, serverId: s.id, adminId: admin?.id, lock: `panel-node` },
+          ({ log, signal }) => enablePanelNode(s.id, { port, directUrl }, { log, signal }),
+        );
+        ctx.activity?.(admin, "server.panel.enable", { type: "server", id: s.id, name: s.name }, { directUrl });
+        return job;
+      }
+      if (!s.panel?.enabled) throw httpError(409, `${s.name} is not a panel node.`);
+      if (ha().localServerId === s.id || panelRoleOf(s.id) === "leader") {
+        throw httpError(409, `${s.name} runs the active panel right now. Make another server the active panel first.`);
+      }
+      const job = ctx.jobs.start(
+        { type: "server.panel.disable", title: `Remove the panel from ${s.name}`, serverId: s.id, adminId: admin?.id, lock: `panel-node` },
+        ({ log, signal }) => disablePanelNode(s.id, { log, signal }),
+      );
+      ctx.activity?.(admin, "server.panel.disable", { type: "server", id: s.id, name: s.name });
+      return job;
+    });
 
     router.get("/api/servers/:id/metrics", (req, res, { params, query }) => {
       const s = requireServer(params.id);
@@ -1576,7 +2064,8 @@ function createCluster(ctx) {
           node: String(info.node || "").slice(0, 20),
         };
       }
-      db.update("servers", s.id, patch);
+      // Main's own record is kept by ensureMain() while this process runs on main.
+      if (!(s.id === MAIN_ID && mainLocal())) db.update("servers", s.id, patch);
       const have = body.files && typeof body.files === "object" ? body.files : {};
       const update = [];
       for (const [rel, h] of agentFiles()) if (have[rel] !== h) update.push(rel);
@@ -1593,11 +2082,17 @@ function createCluster(ctx) {
         pollWaitMs: POLL_WAIT_MS,
         metricsIntervalMs: METRICS_INTERVAL_MS,
         update: body.files ? update : [],
+        // Panel failover: run the voter when HA is on; every panel node, main first.
+        ha: haOn(),
+        panels: panelNodeList(),
       };
     });
 
     router.get("/agent/poll", { agent: true }, (req, res, { query }) => {
       const s = node(req);
+      // Every reply carries the failover state, so an agent that connected
+      // before HA was turned on (or off) starts (or stops) voting without a reconnect.
+      const withHa = (r) => (r && typeof r === "object" ? { ...r, ha: haOn(), panels: haOn() ? panelNodeList() : [] } : r);
       const running = new Set(String(query.running || "").split(",").filter(Boolean));
       reconcile(s.id, running);
       // Out of date and idle: have it reconnect (which updates it) before it
@@ -1610,9 +2105,9 @@ function createCluster(ctx) {
         throw httpError(401, "This agent is out of date — reconnect to fetch the panel's newer files.");
       };
       const stale = staleReply();
-      if (stale) return stale;
+      if (stale) return withHa(stale);
       const first = takeWork(s.id);
-      if (first.tasks.length || first.cancel.length) return first;
+      if (first.tasks.length || first.cancel.length) return withHa(first);
       const wait = Math.max(0, Math.min(POLL_WAIT_MS, Number(query.wait) * 1000 || POLL_WAIT_MS));
       // Only one parked poll per server; a newer one replaces it.
       parked.get(s.id)?.finish(true);
@@ -1623,11 +2118,11 @@ function createCluster(ctx) {
           settled = true;
           clearTimeout(timer);
           if (parked.get(s.id)?.finish === finish) parked.delete(s.id);
-          if (empty) return resolve({ tasks: [], cancel: [] });
+          if (empty) return resolve(withHa({ tasks: [], cancel: [] }));
           // The panel's files can change while this poll is parked: check
           // again, so work that arrives now still waits for the update.
           try {
-            resolve(staleReply() || takeWork(s.id));
+            resolve(withHa(staleReply() || takeWork(s.id)));
           } catch (err) {
             reject(err);
           }
@@ -1677,6 +2172,7 @@ function createCluster(ctx) {
 
     router.post("/agent/metrics", { agent: true, limit: 256 * 1024 }, (req, res, { body }) => {
       const s = node(req);
+      if (s.id === MAIN_ID && mainLocal()) return { ok: true }; // sampled in-process
       const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
       recordSample(s.id, {
         cpu: n(body.cpu),
@@ -1696,7 +2192,8 @@ function createCluster(ctx) {
     // meaning that edge. Only for websites that exist, only from edge nodes.
     router.post("/agent/edge/logs", { agent: true, limit: EDGE_LOG_LIMIT }, (req, res, { body }) => {
       const s = node(req);
-      if (!isEdge(db.get("servers", s.id))) return { ok: true, accepted: 0, ignored: "This server is not an edge node." };
+      const rec = db.get("servers", s.id);
+      if (!isEdge(rec) && !isFrontDoor(rec)) return { ok: true, accepted: 0, ignored: "This server is not an edge node." };
       const sites = body?.sites && typeof body.sites === "object" && !Array.isArray(body.sites) ? body.sites : {};
       const byId = new Map(allSites().map((x) => [x.id, x]));
       const byAddr = upstreamMap(s.id);
@@ -1812,6 +2309,7 @@ function createCluster(ctx) {
     every(5_000, () => {
       checkOnline();
       sweepTasks();
+      recordPanelUrls();
     });
     every(2 * MINUTE, saveMetrics);
     // Edge nodes: payloads follow every change to servers (and agents coming online).
@@ -1858,6 +2356,10 @@ function createCluster(ctx) {
     edgeReplicas,
     edgeIps,
     haSummary,
+    // panel failover (docs/HA.md Phase 2)
+    panelNodes: () => panelNodeList(),
+    panelCanEnable,
+    mainDirectUrl: () => mainDirectUrl(),
     _routes: routes,
     _start,
     _stop,

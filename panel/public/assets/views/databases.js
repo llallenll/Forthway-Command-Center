@@ -3,6 +3,20 @@ import { icon } from "../icons.js";
 import { get, post } from "../api.js";
 import { pageHead, databasesTable, dbMenu, revealCredentials, createDatabase, openPhpMyAdmin } from "../components.js";
 
+/* Panel failover (docs/HA.md): databases live on the main server. While main doesn't run the active
+   panel, status endpoints answer { available: false, reason } and operations 503 with the reason.
+   Show that reason calmly instead of errors. (A 503 { haSwitching } is retried by api.js instead.) */
+export const DB_UNAVAILABLE = "Databases live on the main server, which is not running the active panel right now.";
+export function dbUnavailable(x) {
+  if (!x || typeof x !== "object") return null;
+  if (!(x instanceof Error) && x.available === false) return x.reason || DB_UNAVAILABLE;
+  if (x instanceof Error && x.status === 503 && x.body && typeof x.body === "object" && !x.body.haSwitching) return x.message || DB_UNAVAILABLE;
+  return null;
+}
+export function unavailableState(reason, { title = "Databases are unavailable right now", ico = "database" } = {}) {
+  return html`<div class="card db-unavailable">${emptyState({ ico, title, text: html`${reason} <span class="muted">They come back on their own when the main server runs the active panel again.</span>` })}</div>`;
+}
+
 export default async function databases(ctx) {
   const { root } = ctx;
   ctx.crumbs([{ label: "Databases" }]);
@@ -12,7 +26,7 @@ export default async function databases(ctx) {
     <div class="toolbar"><select class="select" data-proj style="width:auto;height:34px;font-size:13px"><option value="">All projects</option></select><span class="grow"></span><div class="search">${icon("search")}<input placeholder="Search databases" data-q/></div></div>
     <div data-list>${skeletonRows(4, 60)}</div>`);
   const list = $("[data-list]", root);
-  let items = [], projects = [], projectsById = {}, mysql = null;
+  let items = [], projects = [], projectsById = {}, mysql = null, unavailable = null;
 
   const paintMysql = () => {
     const box = $("[data-mysql]", root);
@@ -27,6 +41,9 @@ export default async function databases(ctx) {
       <span class="badge">${icon("database")}${items.length} database${items.length === 1 ? "" : "s"}</span><span class="badge">${icon("hardDrive")}${fmtBytes(items.reduce((a, d) => a + (d.sizeBytes || 0), 0))} total</span></div>`);
   };
   const paint = () => {
+    $(".toolbar", root).hidden = !!unavailable;
+    $(".page-head [data-new]", root)?.toggleAttribute("disabled", !!unavailable);
+    if (unavailable) { mount($("[data-mysql]", root), html``); return mount(list, unavailableState(unavailable)); }
     paintMysql();
     const f = items.filter((d) => (!projectFilter || d.projectId === projectFilter) && (!q || (d.name + " " + d.user).toLowerCase().includes(q)));
     if (!items.length) return mount(list, html`<div class="card">${emptyState({ ico: "database", title: "No databases yet", text: "Create a MySQL database inside a project, then link it to a website — credentials are injected as environment variables.", action: html`<button class="btn btn-primary" data-new>${icon("plus")}New database</button>` })}</div>`);
@@ -35,8 +52,11 @@ export default async function databases(ctx) {
   };
   const load = async () => {
     try {
-      const [d, p, m] = await Promise.all([get("/api/databases"), get("/api/projects").catch(() => ({ items: [] })), get("/api/mysql/status").catch(() => null)]);
+      const [d, p, m] = await Promise.all([
+        get("/api/databases").catch((e) => { const why = dbUnavailable(e); if (why) return { items: [], unavailable: why }; throw e; }),
+        get("/api/projects").catch(() => ({ items: [] })), get("/api/mysql/status").catch((e) => (dbUnavailable(e) ? { available: false, reason: dbUnavailable(e) } : null))]);
       items = d.items || []; projects = p.items || []; mysql = m;
+      unavailable = d.unavailable || dbUnavailable(d) || dbUnavailable(m);
       projectsById = Object.fromEntries(projects.map((x) => [x.id, x]));
       if (!ctx.alive()) return;
       const sel = $("[data-proj]", root);

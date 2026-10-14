@@ -1142,3 +1142,10 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   `/api/cluster/ha`, `ctx.cluster.edgesChanged/edgeReplicas/edgeIps`,
   `ctx.lb.edgeFiles`, `ctx.cloudflare.edgeConnectors/edgeShims`,
   `auth.setTrustedProxies`. Full contract in docs/HA.md.
+- **3.8.0 — panel failover (high availability, phase 2).** Edge agent servers can be
+  made panel nodes (`servers[].panel`); one leader holds a majority lease from every
+  enabled server (shared/ha-voter.mjs), followers replicate dataDir and proxy every
+  request to it (panel/lib/ha.mjs), a leader without a majority exits 75. "main" no
+  longer means "this machine": modules check `ctx.ha.mainIsLocal`. New tasks
+  `panel.install` / `panel.remove`, `cluster.sync frontDoor`, `/ha/*`, `/api/ha`,
+  `/api/ha/handover`, `POST /api/servers/:id/panel`. Contract in docs/HA.md.

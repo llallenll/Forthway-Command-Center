@@ -13,7 +13,9 @@
  * site.script runs only `npm run <name>` for a script the deployed package.json defines.
  *
  * cluster.sync (edge nodes, docs/HA.md) lives in shared/edge.mjs and is only
- * ever sent to Agent servers; main does the equivalent in-process.
+ * ever sent to Agent servers — and, with `frontDoor: true`, to main's embedded
+ * agent while another server runs the active panel. panel.install /
+ * panel.remove (panel nodes, docs/HA.md Phase 2) live there too.
  *
  * Everything that shells out goes through panel/lib/sys.mjs, so FCC_DRY_RUN=1
  * logs what would run instead of running it. The deploy engine spawns its own
@@ -34,7 +36,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.1.0";
+export const TASKS_VERSION = "3.2.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -52,6 +54,8 @@ export const TASK_TYPES = [
   "server.backup",
   "sites.usage",
   "cluster.sync",
+  "panel.install",
+  "panel.remove",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -74,6 +78,8 @@ export const TASK_TIMEOUTS_MS = {
   "server.backup": 6 * 60 * 60_000,
   "sites.usage": 60_000,
   "cluster.sync": 10 * 60_000,
+  "panel.install": 15 * 60_000,
+  "panel.remove": 5 * 60_000,
 };
 
 const NOOP = () => {};
@@ -90,7 +96,8 @@ export async function executeTask(type, payload = {}, opts = {}) {
     authToken: opts.authToken || null,
     panelUrl: opts.panelUrl || null,
     serverId: opts.serverId || null,
-    edgeAllow: edgeAllowOf(opts.edgeAllow),
+    // In-process on main the panel passes it as an option; main's embedded agent gets it in the payload.
+    edgeAllow: edgeAllowOf(opts.edgeAllow ?? (opts.isMain ? payload?.edgeAllow : undefined)),
   };
   if (o.signal?.aborted) throw abortError();
   switch (type) {
@@ -103,6 +110,11 @@ export async function executeTask(type, payload = {}, opts = {}) {
     case "cluster.sync":
       // Loaded on demand: main never runs it. One at a time per server.
       return withSiteLock("cluster:sync", async () => (await import("./edge.mjs")).clusterSync(payload, o));
+    case "panel.install":
+      // Panel nodes (docs/HA.md, Phase 2) — agent servers only; one panel change at a time.
+      return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelInstall(payload, o));
+    case "panel.remove":
+      return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelRemove(payload, o));
     case "site.status":
       return siteStatus(payload, o);
     case "site.logs":

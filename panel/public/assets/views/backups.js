@@ -2,6 +2,7 @@ import { html, raw, mount, $, $$, on, fmtBytes, ago, emptyState, errorState, ske
 import { icon } from "../icons.js";
 import { get, post, put } from "../api.js";
 import { pageHead, tabsBar, backupsTable, bindBackupActions, jobStarted, serverKind } from "../components.js";
+import { dbUnavailable, unavailableState } from "./databases.js";
 
 const INCLUDES = [
   ["sites", "Website files", "Every app directory on the server"],
@@ -52,8 +53,11 @@ const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
 export async function scheduleForm(box, ctx) {
   mount(box, skeletonRows(3, 120));
   let s, servers = [];
-  try { [s, servers] = await Promise.all([get("/api/backups/settings"), get("/api/servers").then((r) => r.items || []).catch(() => [])]); } catch (e) { mount(box, errorState(e)); return; }
+  try { [s, servers] = await Promise.all([get("/api/backups/settings"), get("/api/servers").then((r) => r.items || []).catch(() => [])]); }
+  catch (e) { mount(box, dbUnavailable(e) ? unavailableState(dbUnavailable(e), { title: "Backups are unavailable right now", ico: "archive" }) : errorState(e)); return; }
   if (ctx && !ctx.alive()) return;
+  if (dbUnavailable(s)) { mount(box, unavailableState(dbUnavailable(s), { title: "Backups are unavailable right now", ico: "archive" })); return; }
+  const dbWhy = dbUnavailable(s.database) || dbUnavailable(s.databases);
   const dbS = s.database || {}, srvS = s.server || {}, dest = s.destination || { type: "local" };
   const smb = dest.smb || {}, smbTool = s.smbclient || { installed: true };
   const srvIds = srvS.serverIds || ["main"];
@@ -73,7 +77,8 @@ export async function scheduleForm(box, ctx) {
           <div class="field"><label data-at-label="database">${dbS.every === "hourly" ? "At minute" : "At"}</label><input class="input mono" type="time" data-f="database.at" value="${dbS.at || "03:00"}"/></div>
           ${daySel("database", dbS.day)}
           <div class="field"><label>Keep the last</label><input class="input" type="number" min="0" data-f="database.keep" value="${dbS.keep ?? 14}"/></div>
-        </div><p class="hint mt-12">Per database. 0 keeps everything. Pinned backups are never removed.</p>${runInfo("database")}</div></div>
+        </div><p class="hint mt-12">Per database. 0 keeps everything. Pinned backups are never removed.</p>${runInfo("database")}
+        ${dbWhy ? html`<div class="note warn mt-12">${icon("alert")}<div>Paused: ${dbWhy}</div></div>` : ""}</div></div>
       <div class="card"><div class="card-head"><h3>Server backups</h3><div class="right"><label class="switch"><input type="checkbox" data-f="server.enabled" ${srvS.enabled ? raw("checked") : ""}/><span class="track"></span></label></div></div>
         <div class="card-body"><div class="form-grid">
           <div class="field"><label>Frequency</label><select class="select" data-f="server.every">${every(srvS.every || "weekly")}</select></div>
@@ -213,12 +218,15 @@ export default async function backups(ctx) {
     ${tabsBar([{ id: "database", label: "Database", icon: "database" }, { id: "server", label: "Server", icon: "hardDrive" }, { id: "schedule", label: "Schedule & destination", icon: "calendar" }], tab, "#/backups")}
     <div data-tab></div>`);
   const box = $("[data-tab]", root);
-  let servers = [], dbs = [];
-  const meta = Promise.all([get("/api/servers").then((r) => (servers = r.items || [])).catch(() => {}), get("/api/databases").then((r) => (dbs = r.items || [])).catch(() => {})]);
+  let servers = [], dbs = [], dbWhy = null;
+  const meta = Promise.all([get("/api/servers").then((r) => (servers = r.items || [])).catch(() => {}), get("/api/databases").then((r) => (dbs = r.items || [])).catch(() => {}),
+    get("/api/mysql/status").then((m) => (dbWhy = dbUnavailable(m))).catch((e) => (dbWhy = dbUnavailable(e)))]);
+  meta.then(() => { const b = $(".page-head [data-dbnow]", root); if (b && dbWhy && ctx.alive()) { b.disabled = true; b.title = dbWhy; } });
 
   on(root, "click", "[data-srvnow]", async () => { await meta; serverBackupDialog(servers); });
   on(root, "click", "[data-dbnow]", async () => {
     await meta;
+    if (dbWhy) { toast("Database backups are unavailable right now", "warn", { msg: dbWhy }); return; }
     if (!dbs.length) { toast("No databases to back up", "warn"); return; }
     openModal({ title: "Back up a database", ico: "database", body: html`<div class="field"><label>Database</label><select class="select" data-db>${dbs.map((d) => html`<option value="${d.id}" ${d.id === query.databaseId ? raw("selected") : ""}>${d.name} — ${fmtBytes(d.sizeBytes)}${d.lastBackup ? ` · last ${ago(d.lastBackup.createdAt)}` : ""}</option>`)}</select></div>`,
       foot: html`<button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok>${icon("archive")}Back up now</button>`,
@@ -233,14 +241,17 @@ export default async function backups(ctx) {
     try {
       await meta;
       const qs = new URLSearchParams({ kind: tab }); if (tab === "database" && filterDb) qs.set("databaseId", filterDb);
-      items = (await get(`/api/backups?${qs}`)).items || [];
+      const r = await get(`/api/backups?${qs}`).catch((e) => { if (dbUnavailable(e)) return { available: false, reason: dbUnavailable(e) }; throw e; });
       if (!ctx.alive()) return;
+      if (dbUnavailable(r)) { items = []; mount(box, unavailableState(dbUnavailable(r), { title: "Backups are unavailable right now", ico: "archive" })); return; }
+      items = r.items || [];
       const dbsById = Object.fromEntries(dbs.map((d) => [d.id, d])), serversById = Object.fromEntries(servers.map((s) => [s.id, s]));
       const total = items.reduce((a, b) => a + (b.status === "ok" ? b.size || 0 : 0), 0);
       mount(box, html`<div class="toolbar">
         ${filterDb ? html`<span class="badge blue">${icon("filter")}${dbsById[filterDb]?.name || "database"}</span><a class="btn btn-sm btn-ghost" href="#/backups/database">Clear filter</a>` : ""}
         <span class="muted small">${items.length} backup${items.length === 1 ? "" : "s"} · ${fmtBytes(total)}</span><span class="grow"></span>
         <a class="btn btn-sm btn-ghost" href="#/backups/schedule">${icon("calendar")}Schedule</a></div>
+        ${tab === "database" && dbWhy ? html`<div class="note warn" style="margin-bottom:14px">${icon("alert")}<div>New database backups and restores are paused. ${dbWhy}</div></div>` : ""}
         ${items.length ? backupsTable(items, { dbsById, serversById, kind: tab })
           : html`<div class="card">${emptyState({ ico: tab === "server" ? "hardDrive" : "archive", title: tab === "server" ? "No server backups yet" : "No database backups yet",
             text: tab === "server" ? "Archive site files, nginx config and panel data for any server." : "Back up a database now, or turn on the daily schedule.",

@@ -66,6 +66,10 @@ const CACHE_MS = 60_000;
 const HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const now = () => new Date().toISOString();
+// Panel failover (docs/HA.md Phase 2): connectors run in this process only on main.
+const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
+const CONNECTORS_REMOTE =
+  "The main server is not running the active panel, so no tunnel connector runs inside the panel process. The tunnels keep running as replicas on the edge nodes (systemd services there) — use “Sync now” on a server to resend them.";
 const exists = (p) => {
   try {
     return fs.existsSync(p);
@@ -536,6 +540,8 @@ function createCloudflare(ctx) {
   const cfCall = FAKE ? createFakeCf(path.join(ctx.dataDir, "cloudflare-fake.json")) : realCf;
 
   const panelPort = () => Number(process.env.FCC_PORT) || Number(ctx.config.port) || 4000;
+  // In-process connectors only when this process runs on main (an agent leader is an edge: its replicas already run).
+  const mainLocal = () => (ctx.ha || HA_OFF).mainIsLocal !== false;
   const panelTls = () => !!((process.env.FCC_TLS_KEY || ctx.config.tls?.key) && (process.env.FCC_TLS_CERT || ctx.config.tls?.cert));
 
   // ---------------------------------------------------------------- config
@@ -707,6 +713,7 @@ function createCloudflare(ctx) {
   }
 
   async function startConnector(id) {
+    if (!mainLocal()) throw httpError(409, CONNECTORS_REMOTE);
     const e = entry(id);
     if (!e) throw httpError(404, "No such connector.");
     const token = reveal(e.tokenEnc);
@@ -788,7 +795,8 @@ function createCloudflare(ctx) {
   function replicasOf(e) {
     const main = db.get("servers", "main");
     const st = running.get(e.id)?.status();
-    const out = [{ serverId: "main", serverName: main?.name || "Main", running: !!st?.running, connections: st?.connections || 0 }];
+    // Not on main: main runs no connector now; the leader's own replica is among the edges.
+    const out = mainLocal() ? [{ serverId: "main", serverName: main?.name || "Main", running: !!st?.running, connections: st?.connections || 0 }] : [];
     try {
       const more = ctx.cluster?.edgeReplicas?.(e.id);
       if (Array.isArray(more)) out.push(...more);
@@ -1901,7 +1909,7 @@ function createCloudflare(ctx) {
         invalidate();
         let started = false;
         let startError = null;
-        if (body.start !== false) {
+        if (body.start !== false && mainLocal()) {
           try {
             await stopConnector(e.id);
             await startConnector(e.id);
@@ -1924,7 +1932,7 @@ function createCloudflare(ctx) {
       if (!token || token.length < 40) throw httpError(400, "Paste the connector token from the Cloudflare dashboard (Zero Trust → Networks → Tunnels → Configure).");
       const { entry: e, existing } = addConnector({ token, name: body.name, autoStart: typeof body.autoStart === "boolean" ? body.autoStart : undefined });
       let startError = null;
-      if (e.autoStart !== false) {
+      if (e.autoStart !== false && mainLocal()) {
         try {
           if (existing) await stopConnector(e.id);
           await startConnector(e.id);
@@ -1966,6 +1974,7 @@ function createCloudflare(ctx) {
       router.post(`/api/cloudflare/connectors/:id/${verb}`, async (req, res, { params, admin }) => {
         const e = entry(params.id);
         if (!e) throw httpError(404, "No such connector.");
+        if (!mainLocal()) throw httpError(409, CONNECTORS_REMOTE);
         if (verb !== "start") await stopConnector(e.id);
         if (verb !== "stop") await startConnector(e.id);
         audit(admin, `cloudflare.connector.${verb}`, { name: e.name });
@@ -2210,7 +2219,10 @@ function createCloudflare(ctx) {
   async function startModule() {
     conf();
     readVersion().catch(() => {});
-    for (const e of conf().connectors) {
+    if (!mainLocal()) {
+      if (conf().connectors.length) console.log("[cloudflare] Not on the main server — tunnel connectors are not started in the panel process; they run as replicas on the edge nodes.");
+    }
+    for (const e of mainLocal() ? conf().connectors : []) {
       if (e.autoStart === false || !e.tokenEnc) continue;
       try {
         await startConnector(e.id);
