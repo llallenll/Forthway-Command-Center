@@ -228,6 +228,15 @@ export function bindDelivery(root, D, { repaint, onChange } = {}) {
 /* ───────── Settings → Cloudflare ───────── */
 
 const STATUS_TONE = (c) => (c.fatal || c.lastError ? "err" : c.connected ? "ok" : c.running ? "warn" : "off");
+// Where a connector runs: main plus every edge node (docs/HA.md). An older panel sends no `replicas`.
+const replicaTone = (r) => (r.running && r.connections > 0 ? "ok" : r.running ? "warn" : "off");
+function replicasRow(c) {
+  if (!Array.isArray(c.replicas) || !c.replicas.length) return "";
+  return html`<div class="cf-replicas">${c.replicas.map((r) => html`<span class="cf-replica" title="${r.serverName || r.serverId}: ${!r.running ? "not running" : r.connections > 0 ? plural(r.connections, "connection") : "starting"}"><span class="dot ${replicaTone(r)}"></span>${r.serverName || r.serverId}<span class="muted">${r.running ? ` · ${r.connections || 0}` : " · off"}</span></span>`)}</div>`;
+}
+/** Connectors whose only replica is the main server. */
+const mainOnly = (list) => list.filter((c) => Array.isArray(c.replicas) && c.replicas.length && c.replicas.every((r) => r.serverId === "main"));
+
 const STATUS_TEXT = (c) => (c.fatal ? "Stopped — token rejected" : c.connected ? `Connected · ${plural(c.connections, "edge connection")}` : c.running ? "Starting…" : c.lastError ? "Error" : "Stopped");
 
 export async function cloudflareSettings(box, ctx) {
@@ -287,7 +296,7 @@ export async function cloudflareSettings(box, ctx) {
             ${S.connected || S.connectors.length ? html`<button class="btn btn-sm" data-addconn>${icon("token")}Paste connector token</button>` : ""}</div></div>
         ${S.connectors.length ? html`<div class="list">${S.connectors.map((c) => html`<div class="list-item">
             <span class="li-ico">${icon("cloud", "sm")}</span>
-            <div class="li-main"><div class="li-title">${c.name}</div><div class="li-sub">${others().length && c.accountId ? html`${acctName(c.accountId)} · ` : ""}${c.cfId ? html`Tunnel <span class="mono">${c.cfId.slice(0, 8)}</span>` : "Tunnel id unknown"}${c.startedAt ? html` · up since ${ago(c.startedAt)}` : ""}${c.lastError ? html` · <span class="cf-err">${c.lastError}</span>` : ""}</div></div>
+            <div class="li-main"><div class="li-title">${c.name}</div><div class="li-sub">${others().length && c.accountId ? html`${acctName(c.accountId)} · ` : ""}${c.cfId ? html`Tunnel <span class="mono">${c.cfId.slice(0, 8)}</span>` : "Tunnel id unknown"}${c.startedAt ? html` · up since ${ago(c.startedAt)}` : ""}${c.lastError ? html` · <span class="cf-err">${c.lastError}</span>` : ""}</div>${replicasRow(c)}</div>
             <div class="li-right">
               <label class="switch hide-sm" title="Start this connector whenever the panel starts"><input type="checkbox" data-auto="${c.id}" ${c.autoStart ? raw("checked") : ""}/><span class="track"></span>With panel</label>
               <span class="status"><span class="dot ${STATUS_TONE(c)}"></span>${STATUS_TEXT(c)}</span>
@@ -295,6 +304,8 @@ export async function cloudflareSettings(box, ctx) {
               <button class="icon-btn ghost sm" data-cmenu="${c.id}" aria-label="More for ${c.name}">${icon("more", "sm")}</button>
             </div></div>`)}</div>`
           : html`<div class="card-body">${emptyState({ ico: "cloud", title: "No connectors yet", text: S.connected ? "Create a tunnel — the panel takes its connector token and runs it here." : "Connect your Cloudflare account above, or paste a connector token.", sm: true })}</div>`}
+        ${mainOnly(S.connectors).length ? html`<div class="card-body" style="padding-top:0"><div class="note warn cf-mainonly">${icon("alert")}<div style="flex:1;min-width:0"><b>${mainOnly(S.connectors).length === S.connectors.length ? (S.connectors.length === 1 ? "The tunnel runs" : "Every tunnel runs") : html`${mainOnly(S.connectors).map((c) => c.name).join(", ")} ${mainOnly(S.connectors).length === 1 ? "runs" : "run"}`} only on the main server.</b> If main goes down, every website behind ${mainOnly(S.connectors).length === 1 ? "it" : "them"} goes down too. Mark an agent server as an edge node and it runs a replica, so the tunnel stays up without main.</div>
+          <a class="btn btn-sm" href="#/servers">${icon("server")}Add an edge node</a></div></div>` : ""}
       </div>
 
       ${S.connected ? domainsCard() : ""}
@@ -607,4 +618,13 @@ export async function cloudflareSettings(box, ctx) {
   });
 
   ctx.on(["cloudflare"], debounce((d) => { if (d?.kind !== "log" && alive()) load().catch(() => {}); }, 500));
+  // Edge replicas come and go with the servers: reload only when an edge's tunnel state changes.
+  const edgeSig = {};
+  const reloadSoon = debounce(() => { if (alive()) load().catch(() => {}); }, 800);
+  ctx.on("server", (d) => {
+    if (!d?.id || !S?.connectors?.some((c) => Array.isArray(c.replicas))) return;
+    const sig = d.deleted ? "x" : JSON.stringify([d.online, d.edge?.enabled, (d.edgeStatus?.connectors || []).map((c) => [c.id, c.active, c.readyConnections])]);
+    if (d.id in edgeSig && edgeSig[d.id] !== sig) reloadSoon();
+    edgeSig[d.id] = sig;
+  });
 }

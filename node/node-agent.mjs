@@ -13,7 +13,9 @@
  * Optional: dataDir (default /var/lib/fcc-node), maxConcurrent (default 4).
  *
  * Protocol (see panel/lib/cluster.mjs): hello → long-poll for tasks → stream
- * each task's log → post its result; metrics pushed every ~15s.
+ * each task's log → post its result; metrics pushed every ~15s (with the edge
+ * status when this server is an edge node, docs/HA.md). An edge node also
+ * ships its front-door access logs to POST /agent/edge/logs every 15s.
  */
 
 import fs from "node:fs";
@@ -23,10 +25,12 @@ import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { StringDecoder } from "node:string_decoder";
 
 import { executeTask, collectMetrics, systemInfo, TASK_TYPES } from "../shared/tasks.mjs";
+import { edgeStatus, edgeLogSites } from "../shared/edge.mjs";
 
-export const AGENT_VERSION = "3.0.0";
+export const AGENT_VERSION = "3.1.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
@@ -349,6 +353,10 @@ async function metricsLoop() {
   while (!stopping) {
     try {
       const m = await collectMetrics();
+      m.edge = await edgeStatus(cfg.dataDir).catch((err) => {
+        log(`edge status failed: ${err.message}`);
+        return null;
+      });
       await api("POST", "/agent/metrics", m, { timeoutMs: 15_000 });
     } catch (err) {
       if (err.status && err.status !== 401) log(`metrics push failed: ${err.message}`);
@@ -357,10 +365,140 @@ async function metricsLoop() {
   }
 }
 
+// --------------------------------------------------------- edge access logs
+//
+// An edge node's front door writes /var/log/nginx/fcc-<siteId>.access.log for
+// every website, like main does. The panel only sees main's own files, so new
+// lines are shipped to it every 15s and counted into the same analytics.
+// Only for sites whose fcc-<siteId>.conf the last cluster.sync wrote here.
+
+const EDGE_LOG_EVERY_MS = 15_000;
+const EDGE_LOG_MAX_BYTES = 1536 * 1024; // raw bytes per post — stays under the panel's 2 MB limit once JSON-encoded
+const EDGE_LOG_MAX_LINE = 16 * 1024;
+const edgeLogDir = () => process.env.FCC_NGINX_LOG_DIR || "/var/log/nginx";
+const tails = new Map(); // siteId -> { file, fd, ino, pos, partial, dec }
+
+function closeTail(t) {
+  try {
+    fs.closeSync(t.fd);
+  } catch {
+    /* already closed */
+  }
+}
+
+/** Read up to `budget` bytes of complete lines from a tail; advances it. */
+function readTail(t, budget, out) {
+  let size;
+  try {
+    size = fs.fstatSync(t.fd).size;
+  } catch {
+    return 0;
+  }
+  if (size < t.pos) {
+    // truncated in place (copytruncate): start over
+    t.pos = 0;
+    t.partial = "";
+    t.dec = new StringDecoder("utf8");
+  }
+  let used = 0;
+  while (t.pos < size && used < budget) {
+    const len = Math.min(64 * 1024, size - t.pos, budget - used);
+    const buf = Buffer.alloc(len);
+    let n;
+    try {
+      n = fs.readSync(t.fd, buf, 0, len, t.pos);
+    } catch {
+      break;
+    }
+    if (!n) break;
+    t.pos += n;
+    used += n;
+    const parts = (t.partial + t.dec.write(buf.subarray(0, n))).split("\n");
+    t.partial = parts.pop();
+    if (t.partial.length > EDGE_LOG_MAX_LINE) t.partial = ""; // not a log line — drop it
+    for (const l of parts) if (l) out.push(l);
+  }
+  return used;
+}
+
+function collectEdgeLogs() {
+  const want = new Set(edgeLogSites(cfg.dataDir));
+  for (const [id, t] of tails) {
+    if (!want.has(id)) {
+      closeTail(t);
+      tails.delete(id);
+    }
+  }
+  const sites = {};
+  let budget = EDGE_LOG_MAX_BYTES;
+  for (const id of want) {
+    const file = path.join(edgeLogDir(), `fcc-${id}.access.log`);
+    let st = null;
+    try {
+      st = fs.statSync(file);
+    } catch {
+      /* not there yet (or rotated away) */
+    }
+    let t = tails.get(id);
+    if (!t) {
+      if (!st) continue;
+      try {
+        // First sight: start at the end, the past is not ours to count.
+        tails.set(id, { file, fd: fs.openSync(file, "r"), ino: st.ino, pos: st.size, partial: "", dec: new StringDecoder("utf8") });
+      } catch {
+        /* unreadable */
+      }
+      continue;
+    }
+    const lines = [];
+    if (budget > 0) budget -= readTail(t, budget, lines);
+    if (st && st.ino !== t.ino && budget > 0) {
+      // Rotated: the old file is drained above (nginx writes to it until it reopens), then follow the new one from its start.
+      if (t.pos >= (fs.fstatSync(t.fd).size || 0)) {
+        closeTail(t);
+        try {
+          t = { file, fd: fs.openSync(file, "r"), ino: st.ino, pos: 0, partial: "", dec: new StringDecoder("utf8") };
+          tails.set(id, t);
+          budget -= readTail(t, budget, lines);
+        } catch {
+          tails.delete(id);
+        }
+      }
+    }
+    if (lines.length) sites[id] = lines;
+  }
+  return sites;
+}
+
+let edgeLogsWarned = false;
+async function edgeLogsLoop() {
+  while (!stopping) {
+    await sleep(EDGE_LOG_EVERY_MS);
+    let sites;
+    try {
+      sites = collectEdgeLogs();
+    } catch (err) {
+      log(`edge logs: ${err.message}`);
+      continue;
+    }
+    if (!Object.keys(sites).length) continue;
+    try {
+      await api("POST", "/agent/edge/logs", { sites }, { timeoutMs: 20_000 });
+      edgeLogsWarned = false;
+    } catch (err) {
+      // 404: a panel older than 3.7.0 — the lines are simply dropped.
+      if (err.status === 404 || err.status === 401) continue;
+      if (!edgeLogsWarned) log(`edge logs not delivered (${err.message}) — those lines are dropped; will keep trying.`);
+      edgeLogsWarned = true;
+    }
+  }
+}
+
 async function main() {
   log(`Forthway node agent v${AGENT_VERSION} on ${os.hostname()} · server ${cfg.serverId} · panel ${cfg.panelUrl}`);
   await hello();
   metricsLoop();
+  edgeLogsLoop().catch((err) => log(`edge log shipping stopped: ${err.message}`));
   await pollLoop();
 }
 

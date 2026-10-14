@@ -21,15 +21,19 @@ const db = {
   settings: { panelName: "Forthway", panelUrl: "https://panel.forthway.dev", githubTokenSet: true, githubTokenHint: "ghp_••••a91F" },
   servers: [
     { id: "main", name: "fcc-main", role: "main", host: "203.0.113.10", privateHost: "10.0.0.10", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.0.0",
+      edge: { enabled: true, implicit: true }, edgeStatus: null,
       lastSeenAt: ago(4e3), online: true, info: { hostname: "fcc-main", os: "Ubuntu 24.04 LTS", cpus: 8, memTotal: 16 * GB, diskTotal: 320 * GB }, createdAt: iso(NOW - 90 * DAY),
       metrics: { cpu: 23, mem: 6.2 * GB, memTotal: 16 * GB, disk: 118 * GB, diskTotal: 320 * GB, load: 0.84, uptime: 38 * DAY, at: ago(4e3) } },
     { id: "srv_fra1", name: "fra-agent-1", role: "worker", host: "203.0.113.21", privateHost: "10.0.0.21", weight: 2, enabled: true, lbEligible: true, agentVersion: "3.0.0",
+      edge: { enabled: true }, edgeStatus: null, // filled in below (edge nodes)
       lastSeenAt: ago(6e3), online: true, info: { hostname: "fra-agent-1", os: "Debian 12", cpus: 4, memTotal: 8 * GB, diskTotal: 160 * GB }, createdAt: iso(NOW - 60 * DAY),
       metrics: { cpu: 31, mem: 3.1 * GB, memTotal: 8 * GB, disk: 61 * GB, diskTotal: 160 * GB, load: 1.12, uptime: 21 * DAY, at: ago(6e3) } },
     { id: "srv_fra2", name: "fra-agent-2", role: "worker", host: "203.0.113.22", privateHost: "10.0.0.22", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.0.0",
+      edge: { enabled: false }, edgeStatus: null,
       lastSeenAt: ago(3e3), online: true, info: { hostname: "fra-agent-2", os: "Ubuntu 22.04 LTS", cpus: 4, memTotal: 8 * GB, diskTotal: 160 * GB }, createdAt: iso(NOW - 45 * DAY),
       metrics: { cpu: 58, mem: 6.5 * GB, memTotal: 8 * GB, disk: 146 * GB, diskTotal: 160 * GB, load: 2.31, uptime: 9 * DAY, at: ago(3e3) } },
     { id: "srv_nyc1", name: "nyc-agent-1", role: "worker", host: "198.51.100.40", privateHost: null, weight: 1, enabled: true, lbEligible: false, agentVersion: "2.11.0",
+      edge: { enabled: false }, edgeStatus: null,
       lastSeenAt: ago(3 * HOUR + 12 * MIN), online: false, info: { hostname: "nyc-agent-1", os: "Ubuntu 22.04 LTS", cpus: 2, memTotal: 4 * GB, diskTotal: 80 * GB }, createdAt: iso(NOW - 20 * DAY),
       metrics: { cpu: 12, mem: 1.9 * GB, memTotal: 4 * GB, disk: 31 * GB, diskTotal: 80 * GB, load: 0.2, uptime: 2 * DAY, at: ago(3 * HOUR + 12 * MIN) } },
   ],
@@ -196,6 +200,7 @@ setInterval(() => {
     m.mem = Math.max(0.2 * m.memTotal, Math.min(0.97 * m.memTotal, m.mem + (Math.random() - 0.5) * 0.08 * GB));
     m.load = Math.max(0.05, +(m.load + (Math.random() - 0.5) * 0.3).toFixed(2));
     m.at = iso(Date.now()); s.lastSeenAt = m.at;
+    if (s.edgeStatus) s.edgeStatus.reportedAt = m.at;
     emit("server", serverView(s));
   }
 }, 5000);
@@ -512,18 +517,114 @@ R("GET", "/api/github/refs", (p, b, q) => {
   return { branches: ["main", "develop", "release/2.15", "feat/checkout-v2"], tags: ["v2.14.0", "v2.13.2", "v2.13.1"] };
 });
 
+// edge nodes + Cloudflare connectors (docs/HA.md)
+const EDGE_HASH = hex(64);
+const cf = {
+  connectors: [
+    { id: "cfc_main", name: "Cloudflare Tunnel", cfId: "6f1c2b9e-7a1d-4c3e-9b55-2d8e0f3a4c11", autoStart: true, running: true, connections: 4, startedAt: ago(38 * DAY) },
+    { id: "cfc_api", name: "Northwind tunnel", cfId: "a24e9d07-3b6c-4f8a-8e12-c5d7b9f0e6a2", autoStart: true, running: true, connections: 4, startedAt: ago(9 * DAY) },
+    { id: "cfc_old", name: "Legacy tunnel", cfId: "0d7b3e51-9c2a-4b6f-a1e8-74f2c6d9b830", autoStart: false, running: true, connections: 2, startedAt: ago(2 * DAY) },
+  ],
+};
+const edgeConnectors = () => cf.connectors.filter((c) => c.autoStart);
+const edgeServers = () => db.servers.filter((s) => s.role !== "main" && s.edge?.enabled);
+function appliedEdge(s, { shimError = null } = {}) {
+  return { inSync: true, hash: EDGE_HASH, appliedHash: EDGE_HASH, appliedAt: iso(Date.now()), error: null, nginx: true, reportedAt: iso(Date.now()),
+    connectors: edgeConnectors().map((c) => ({ id: c.id, name: c.name, active: true, readyConnections: 4 })),
+    shims: [{ name: "panel", listenPort: 4000, ok: true, error: null }, { name: "phpmyadmin", listenPort: 8081, ok: !shimError, error: shimError }] };
+}
+// fra-agent-1: an edge in sync, both tunnels connected, phpMyAdmin shim failing (→ one warning on the dashboard)
+db.servers.find((x) => x.id === "srv_fra1").edgeStatus = { ...appliedEdge(null, { shimError: "connect ECONNREFUSED 10.0.0.10:8081" }), appliedAt: ago(7 * MIN) };
+function edgeSync(s) {
+  if (s.edgeStatus) { s.edgeStatus.inSync = false; s.edgeStatus.hash = EDGE_HASH; }
+  emit("server", serverView(s));
+  const files = db.sites.length + 2;
+  return runJob({ type: "cluster.sync", title: `Sync edge ${s.name}`, serverId: s.id }, {
+    lines: ["▸ Sending cluster.sync to " + s.name, `  ufw: allow 3000:3999 from ${db.servers.filter((x) => x.id !== s.id && (x.role === "main" || x.edge?.enabled)).map((x) => x.privateHost || x.host).join(", ")}`,
+      `▸ Writing ${files} nginx files`, "  nginx -t: syntax is ok", "  nginx reloaded", ...edgeConnectors().map((c) => `▸ ${c.name}: fcc-cloudflared-${c.id}.service active · 4 connections`),
+      "▸ Port shims: panel :4000, phpmyadmin :8081", "✓ Edge in sync"],
+    onDone() { if (s.edge?.enabled) { s.edgeStatus = appliedEdge(s); emit("server", serverView(s)); emit("cloudflare", { kind: "status" }); } return { hash: EDGE_HASH }; },
+  });
+}
+function cfConnectorView(c) {
+  const main = db.servers.find((x) => x.id === "main");
+  const replicas = [{ serverId: "main", serverName: main.name, running: c.running, connections: c.running ? c.connections : 0 }];
+  if (c.autoStart) for (const s of edgeServers()) {
+    const e = (s.edgeStatus?.connectors || []).find((x) => x.id === c.id);
+    if (e) replicas.push({ serverId: s.id, serverName: s.name, running: !!(s.online && e.active), connections: s.online ? e.readyConnections : 0 });
+  }
+  return { id: c.id, name: c.name, cfId: c.cfId, accountId: "", autoStart: c.autoStart, hasToken: true, tokenHint: "eyJh••••" + c.id.slice(-3), running: c.running, connections: c.running ? c.connections : 0,
+    connected: c.running && c.connections > 0, startedAt: c.running ? c.startedAt : null, lastError: null, lastExit: null, fatal: false, simulated: false, replicas };
+}
+function cfStatus() {
+  const connectors = cf.connectors.map(cfConnectorView);
+  return { connected: false, mode: "connector", configured: true, hasToken: false, tokenHint: "", viaLogin: false, accountId: "", accountName: "", managedAccounts: [], connectors,
+    running: connectors.filter((x) => x.running).length, connectedConnectors: connectors.filter((x) => x.connected).length, panel: null, panelService: "http://127.0.0.1:4000",
+    phpmyadmin: null, phpmyadminService: "http://127.0.0.1:8081", routes: 0, routeErrors: 0,
+    binary: { installed: true, simulated: false, supported: true, version: "2026.9.1", path: "/var/lib/fcc/bin/cloudflared" }, login: { running: false, url: "" }, dryRun: false, simulatedApi: false };
+}
+R("GET", "/api/cloudflare", () => ({ ...cfStatus(), accounts: [], zones: [], tunnels: [], error: null }));
+R("GET", "/api/cloudflare/status", () => cfStatus());
+R("GET", "/api/cloudflare/routes", () => ({ items: [], tunnels: [] }));
+R("GET", "/api/cloudflare/domains", () => ({ items: [], sources: [] }));
+R("GET", "/api/cloudflare/connectors/:id/logs", (p) => { const c = cf.connectors.find((x) => x.id === p.id) || err(404, "No such connector.");
+  return { lines: c.running ? [`${iso(Date.now() - 60e3)} INF Starting tunnel tunnelID=${c.cfId}`, ...[0, 1, 2, 3].slice(0, c.connections).map((i) => `${iso(Date.now() - 50e3 + i * 1e3)} INF Registered tunnel connection connIndex=${i} location=fra0${i + 1} protocol=quic`)] : [] }; });
+R("POST", "/api/cloudflare/connectors/:id/:act", (p) => {
+  const c = cf.connectors.find((x) => x.id === p.id) || err(404, "No such connector.");
+  if (p.act === "stop") c.running = false;
+  else if (p.act === "start" || p.act === "restart") { c.running = true; c.connections = 4; c.startedAt = iso(Date.now()); }
+  else err(404, "Unknown action.");
+  emit("cloudflare", { kind: "status" }); return cfConnectorView(c);
+});
+R("PATCH", "/api/cloudflare/connectors/:id", (p, b) => {
+  const c = Object.assign(cf.connectors.find((x) => x.id === p.id) || err(404, "No such connector."), pick(b, ["name", "autoStart"]));
+  for (const s of edgeServers()) if (s.online) setTimeout(() => edgeSync(s), 300); // the edge set of connectors changed
+  emit("cloudflare", { kind: "status" }); return cfConnectorView(c);
+});
+R("GET", "/api/cluster/ha", () => {
+  const conns = edgeConnectors();
+  const mainUp = conns.some((c) => c.running && c.connections > 0);
+  const edges = edgeServers().map((s) => ({ serverId: s.id, name: s.name, online: !!s.online, inSync: !!s.edgeStatus?.inSync,
+    tunnelConnected: !!(s.online && (s.edgeStatus?.connectors || []).some((c) => c.active && c.readyConnections > 0)) }));
+  const warnings = [];
+  if (conns.length && !edges.some((e) => e.online && e.tunnelConnected)) warnings.push("The Cloudflare Tunnel runs only on the main server.");
+  for (const s of edgeServers()) {
+    if (!s.online) warnings.push(`Edge node ${s.name} is offline.`);
+    else if (s.edgeStatus?.error) warnings.push(`Edge node ${s.name} couldn't apply its configuration: ${s.edgeStatus.error}`);
+    for (const x of s.edgeStatus?.shims || []) if (!x.ok) warnings.push(`On ${s.name}, the ${x.name} shim can't reach the main server (${x.error || "no answer"}).`);
+  }
+  return { edges, tunnelReplicasOnline: (mainUp ? 1 : 0) + edges.filter((e) => e.online && e.tunnelConnected).length, connectors: conns.length,
+    mainOnlySites: db.sites.filter((x) => targets(x).length === 1 && targets(x)[0] === "main").map((x) => ({ id: x.id, name: x.name })), warnings };
+});
+
 // cluster
 R("GET", "/api/servers", () => ({ items: db.servers.map(serverView) }));
 R("POST", "/api/servers", (p, b) => {
   if (!b.name || !b.host) err(400, "Name and host are required.");
   const s = { id: nid("srv"), name: b.name, role: "worker", host: b.host, privateHost: b.privateHost || null, weight: b.weight || 1, enabled: true, lbEligible: b.lbEligible !== false, agentVersion: null, lastSeenAt: null,
-    online: false, info: null, metrics: null, createdAt: iso(Date.now()) };
+    online: false, info: null, metrics: null, createdAt: iso(Date.now()), edge: { enabled: !!b.edge }, edgeStatus: null };
   db.servers.push(s); activity("server.add", "server", s); emit("server", serverView(s));
   return { server: serverView(s), installCommand: installCmd(s) };
 });
 const installCmd = (s) => `curl -fsSL '${db.settings.panelUrl}/install/node.sh?server=${s.id}&token=fcc_${hex(40)}' | sudo bash`;
 R("GET", "/api/servers/:id", (p) => serverView(find("servers", p.id)));
-R("PATCH", "/api/servers/:id", (p, b) => { const s = Object.assign(find("servers", p.id), pick(b, ["name", "host", "privateHost", "weight", "enabled", "lbEligible"])); activity("server.update", "server", s); emit("server", serverView(s)); return serverView(s); });
+R("PATCH", "/api/servers/:id", (p, b) => {
+  const s0 = find("servers", p.id);
+  if ("edge" in b && s0.role === "main") err(400, "The main server is always an edge.");
+  const s = Object.assign(s0, pick(b, ["name", "host", "privateHost", "weight", "enabled", "lbEligible"]));
+  if ("edge" in b && !!b.edge !== !!s.edge?.enabled) {
+    s.edge = { enabled: !!b.edge };
+    s.edgeStatus = null;
+    if (s.edge.enabled && s.online) setTimeout(() => edgeSync(s), 400);
+  }
+  activity("server.update", "server", s); emit("server", serverView(s)); return serverView(s);
+});
+R("POST", "/api/servers/:id/edge/sync", (p) => {
+  const s = find("servers", p.id);
+  if (s.role === "main") err(400, "The main server applies its configuration itself.");
+  if (!s.online) err(409, `${s.name} is offline.`);
+  return edgeSync(s);
+});
 R("DELETE", "/api/servers/:id", (p) => {
   const s = find("servers", p.id);
   if (s.id === "main") err(409, "The main server can't be removed.");

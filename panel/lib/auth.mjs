@@ -129,8 +129,20 @@ function fromLoopback(req) {
   return ip === "::1" || /^127\./.test(ip);
 }
 
+// Edge nodes (docs/HA.md): their port shim on 127.0.0.1:<panelPort> receives the
+// panel hostname's tunnel traffic there and forwards it here with the visitor's
+// headers (CF-Connecting-IP, X-Forwarded-*). CLUSTER tells us their resolved
+// addresses whenever the edge set changes; only those exact socket addresses are
+// believed — a header alone never is.
+let trustedProxies = new Set();
+
+/** Socket addresses (edge nodes) whose forwarded headers are believed, like loopback's. */
+export function setTrustedProxies(ips) {
+  trustedProxies = new Set((Array.isArray(ips) ? ips : []).map((ip) => String(ip).trim().replace(/^::ffff:/, "")).filter(Boolean));
+}
+
 function trusted(req) {
-  return TRUST_PROXY || fromLoopback(req);
+  return TRUST_PROXY || fromLoopback(req) || (trustedProxies.size > 0 && trustedProxies.has(socketIp(req)));
 }
 
 /** Client IP for throttling/audit: socket address unless the proxy is trusted. */

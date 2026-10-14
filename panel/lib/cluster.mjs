@@ -10,7 +10,8 @@
  *   GET  /agent/poll?running=a,b      long-poll (25s) → { tasks: [...], cancel: [...] }
  *   POST /agent/tasks/:id/log         { lines } → { ok, cancel }
  *   POST /agent/tasks/:id/result      { ok, result, error, aborted }
- *   POST /agent/metrics               latest server.metrics sample
+ *   POST /agent/metrics               latest server.metrics sample (+ `edge` status on edge nodes)
+ *   POST /agent/edge/logs             { sites: { <siteId>: [access log lines] } } from an edge's nginx
  *   POST /agent/upload/:taskId        raw body: a server.backup archive, or the
  *                                     packaged build of a site.deploy (build once, ship everywhere)
  *
@@ -21,6 +22,14 @@
  * Metrics: per-server samples (agents push every ~15s, main is sampled
  * in-process) and per-site request counts tailed from nginx access logs, kept
  * as 1-minute buckets for 24h and saved lightly to dataDir/metrics.json.
+ *
+ * Edge nodes (docs/HA.md): an agent server with `edge.enabled` also runs the
+ * nginx front door and a replica of every Cloudflare Tunnel connector, so
+ * tunnelled websites survive main going down. Every agent (edge or not) gets a
+ * `cluster.sync` task whenever its payload hash changes, when it comes online,
+ * and at least every 10 min; main does the equivalent in-process (local vhosts
+ * open to edge IPs, ufw, trusted proxies). The connector token only ever leaves
+ * the panel inside that task's payload, to the authenticated agent.
  */
 
 import fs from "node:fs";
@@ -31,6 +40,9 @@ import crypto from "node:crypto";
 import dns from "node:dns";
 
 import { httpError, send } from "./http.mjs";
+import * as sys from "./sys.mjs";
+import { setTrustedProxies } from "./auth.mjs";
+import * as sharedTasks from "../../shared/tasks.mjs";
 import { executeTask, collectMetrics, systemInfo, TASK_TIMEOUTS_MS, TASK_TYPES } from "../../shared/tasks.mjs";
 
 export const MAIN_ID = "main";
@@ -46,6 +58,15 @@ const MINUTE = 60_000;
 const KEEP_MS = 24 * 60 * MINUTE;
 const MAX_BATCH = 8;
 const DEFAULT_MAX_UPLOAD = 50 * 1024 ** 3; // 50 GiB
+// Edge nodes (docs/HA.md)
+const EDGE_MIN_AGENT = "3.1.0"; // first agent that knows cluster.sync; older ones self-update on hello
+const EDGE_DEBOUNCE_MS = 2_000;
+const EDGE_RECONCILE_MS = 60_000;
+const EDGE_RESEND_MS = 10 * MINUTE;
+const EDGE_UFW_COMMENT = "fcc sites from edge";
+const EDGE_UFW_PORTS = "3000:3999";
+const EDGE_LOG_LIMIT = 2 * 1024 * 1024 + 256 * 1024; // the agent sends ≤ 2 MB of lines; leave room for JSON
+const DNS_CACHE_MS = 5 * MINUTE;
 
 const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const floorMinute = (ms) => Math.floor(ms / MINUTE) * MINUTE;
@@ -54,6 +75,18 @@ const nowIso = () => new Date().toISOString();
 function tokenEquals(hashA, hashB) {
   if (!hashA || !hashB || hashA.length !== hashB.length) return false;
   return crypto.timingSafeEqual(Buffer.from(hashA), Buffer.from(hashB));
+}
+
+/** "3.1.0" >= "3.0.12"? Missing / unparsable versions are never new enough. */
+function versionAtLeast(v, min) {
+  const a = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v || ""));
+  if (!a) return false;
+  const b = min.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const x = Number(a[i + 1]);
+    if (x !== b[i]) return x > b[i];
+  }
+  return true;
 }
 
 function bearer(req) {
@@ -99,6 +132,20 @@ function createCluster(ctx) {
   const series = new Map(); // serverId -> [{ t, cpu, mem, memTotal, disk, diskTotal, load, n }]
   const reqSeries = new Map(); // key ("site:<id>" | "srv:<id>") -> [{ t, count, errors }]
   const tails = new Map(); // siteId -> { ino, pos }
+  // Edge nodes — in memory only (edgeSync, the last task result, is persisted on the record).
+  const edgeStatus = new Map(); // serverId -> sanitised `edge` from /agent/metrics + reportedAt
+  const edgeDesired = new Map(); // serverId -> payload hash the panel wants it to have
+  const edgePushed = new Map(); // serverId -> { hash, at } of the last cluster.sync sent
+  const edgeInflight = new Map(); // serverId -> Promise of the push chain
+  const edgeInflightHash = new Map(); // serverId -> hash being applied right now
+  const edgeQueued = new Set(); // serverIds with a push waiting behind the current one
+  const edgeConnectorNames = new Map(); // connectorId -> name (from the last payload build)
+  const edgeOldAgentNoted = new Map(); // serverId -> agentVersion we already logged as too old
+  let edgeIpList = []; // resolved addresses of every enabled edge (sorted)
+  let edgeIpKey = null; // JSON of edgeIpList at the last main-side apply (null = never)
+  let edgeTimer = null;
+  const edgeForce = new Set();
+  let started = false;
   const timers = [];
   let metricsDirty = false;
 
@@ -247,6 +294,8 @@ function createCluster(ctx) {
       metrics: latestMetrics(s.id),
       siteCount: counts ? counts.get(s.id) || 0 : siteCount(s.id),
       pendingTasks: [...tasks.values()].filter((t) => t.serverId === s.id).length,
+      edge: s.id === MAIN_ID ? { enabled: true, implicit: true } : { enabled: !!s.edge?.enabled },
+      edgeStatus: publicEdgeStatus(s),
     };
   }
 
@@ -336,6 +385,8 @@ function createCluster(ctx) {
         isMain: true,
         serverId: MAIN_ID,
         panelUrl: safePanelUrl(),
+        // Main's local static/php vhosts must also answer the edge nodes' nginx.
+        edgeAllow: edgeIpList.slice(),
       });
     }
 
@@ -538,13 +589,61 @@ function createCluster(ctx) {
     return process.env.FCC_NGINX_LOG_DIR || "/var/log/nginx";
   }
 
-  function tailAccessLogs() {
-    const dir = logDir();
+  /**
+   * Upstream address → serverId, for "$upstream_addr" in an access log line.
+   * Main's own nginx dials main as 127.0.0.1; an edge's nginx (edgeId) dials
+   * itself as 127.0.0.1 and main on its privateHost || host (loadbalancer.mjs).
+   */
+  function upstreamMap(edgeId = null) {
     const byAddr = new Map();
     for (const s of db.list("servers")) {
       const a = address(s.id);
       if (a) byAddr.set(a, s.id);
     }
+    if (edgeId) {
+      const main = db.get("servers", MAIN_ID);
+      const ma = String(main?.privateHost || main?.host || "").trim();
+      if (ma && !byAddr.has(ma)) byAddr.set(ma, MAIN_ID);
+      byAddr.set("127.0.0.1", edgeId);
+      byAddr.set("::1", edgeId);
+    }
+    return byAddr;
+  }
+
+  /** Count a batch of one site's access log lines (main's own, or shipped by an edge). */
+  function ingestLines(site, lines, byAddr) {
+    if (!lines.length) return;
+    const counts = new Map(); // key|t -> { count, errors }
+    const bump = (key, t, err) => {
+      const k = `${key}|${t}`;
+      const c = counts.get(k) || { key, t, count: 0, errors: 0 };
+      c.count++;
+      if (err) c.errors++;
+      counts.set(k, c);
+    };
+    try {
+      ctx.analytics?.ingest?.(site, lines); // visitors / page views (panel/lib/analytics.mjs)
+    } catch (err) {
+      console.warn("[cluster] analytics ingest:", err.message);
+    }
+    for (const line of lines) {
+      const r = parseLogLine(line);
+      if (!r) continue;
+      const t = floorMinute(r.t);
+      const err = r.status >= 500;
+      bump(`site:${site.id}`, t, err);
+      // "$upstream_addr" can list several attempts: "10.0.0.2:3001, 127.0.0.1:3001" — the last one answered.
+      const up = r.upstream.split(",").pop().trim();
+      const host = up.replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
+      const sid = byAddr.get(host);
+      if (sid) bump(`srv:${sid}`, t, err);
+    }
+    for (const c of counts.values()) addRequests(c.key, c.t, c.count, c.errors);
+  }
+
+  function tailAccessLogs() {
+    const dir = logDir();
+    const byAddr = upstreamMap();
     for (const site of allSites()) {
       const file = path.join(dir, `fcc-${site.id}.access.log`);
       let st;
@@ -582,33 +681,7 @@ function createCluster(ctx) {
       }
       tail.pos += lastNl + 1;
       tails.set(site.id, tail);
-      const counts = new Map(); // key|t -> { count, errors }
-      const bump = (key, t, err) => {
-        const k = `${key}|${t}`;
-        const c = counts.get(k) || { key, t, count: 0, errors: 0 };
-        c.count++;
-        if (err) c.errors++;
-        counts.set(k, c);
-      };
-      const lines = buf.subarray(0, lastNl).toString("utf8").split("\n");
-      try {
-        ctx.analytics?.ingest?.(site, lines); // visitors / page views (panel/lib/analytics.mjs)
-      } catch (err) {
-        console.warn("[cluster] analytics ingest:", err.message);
-      }
-      for (const line of lines) {
-        const r = parseLogLine(line);
-        if (!r) continue;
-        const t = floorMinute(r.t);
-        const err = r.status >= 500;
-        bump(`site:${site.id}`, t, err);
-        // "$upstream_addr" can list several attempts: "10.0.0.2:3001, 127.0.0.1:3001" — the last one answered.
-        const up = r.upstream.split(",").pop().trim();
-        const host = up.replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
-        const sid = byAddr.get(host);
-        if (sid) bump(`srv:${sid}`, t, err);
-      }
-      for (const c of counts.values()) addRequests(c.key, c.t, c.count, c.errors);
+      ingestLines(site, buf.subarray(0, lastNl).toString("utf8").split("\n"), byAddr);
     }
   }
 
@@ -801,6 +874,471 @@ function createCluster(ctx) {
     return [...out].filter((ip) => net.isIP(ip) && !ip.startsWith("127.") && ip !== "::1");
   }
 
+  // -------------------------------------------------------------- edges
+  //
+  // docs/HA.md. Every agent server gets a cluster.sync payload:
+  //   { hash, allowFrom: [edge + main IPs that must reach its site ports],
+  //     edge: null | { files, connectors: [{ id, name, token }], shims } }
+  // pushed (debounced 2 s) on edgesChanged(), servers-changed and hello, and
+  // re-checked every 60 s (pushed when its hash differs from what the agent
+  // last applied; every 10 min regardless). Main is implicitly an edge and
+  // never gets the task — the panel does main's part here (see applyMainEdges).
+
+  const isEdge = (s) => !!s && s.id !== MAIN_ID && !!s.edge?.enabled;
+  const syncSupported = () => TASK_TYPES.includes("cluster.sync");
+  const bracket = (h) => (net.isIP(h) === 6 ? `[${h}]` : h);
+  const isLoopback = (ip) => ip.startsWith("127.") || ip === "::1";
+
+  const dnsCache = new Map(); // host -> { at, ips }
+  async function resolveHost(h) {
+    const v = String(h || "").trim();
+    if (!v) return [];
+    if (net.isIP(v)) return [v];
+    const c = dnsCache.get(v);
+    if (c && Date.now() - c.at < DNS_CACHE_MS) return c.ips;
+    let ips = c?.ips || [];
+    try {
+      ips = [...new Set((await dns.promises.lookup(v, { all: true })).map((r) => r.address))];
+    } catch {
+      /* unresolvable right now — keep what we had */
+    }
+    dnsCache.set(v, { at: Date.now(), ips });
+    return ips;
+  }
+
+  async function serverIps(s) {
+    const out = new Set();
+    for (const h of [s?.host, s?.privateHost]) for (const ip of await resolveHost(h)) if (!isLoopback(ip)) out.add(ip);
+    return [...out];
+  }
+
+  /** serverId -> resolved IPs, for every enabled edge (main excluded — it is handled apart). */
+  async function edgeIpMap() {
+    const m = new Map();
+    for (const s of db.list("servers")) if (isEdge(s)) m.set(s.id, await serverIps(s));
+    return m;
+  }
+
+  /** The cluster.sync payload for agent server `s`. Contains the connector tokens: never log or return it. */
+  async function buildEdgePayload(s, { ipMap, mainIpList }) {
+    const allow = new Set(mainIpList);
+    for (const [id, ips] of ipMap) if (id !== s.id) for (const ip of ips) allow.add(ip);
+    const allowFrom = [...allow].filter((ip) => net.isIP(ip) && !isLoopback(ip)).sort();
+    let edge = null;
+    if (isEdge(s)) {
+      const main = db.get("servers", MAIN_ID);
+      const mainAddr = bracket(String(main?.privateHost || main?.host || "").trim() || "127.0.0.1");
+      let connectors = [];
+      let shims = [];
+      try {
+        connectors = (ctx.cloudflare?.edgeConnectors?.() || []).map((c) => ({ id: c.id, name: c.name, token: c.token }));
+      } catch (err) {
+        console.warn("[cluster] edge connectors:", err.message);
+      }
+      try {
+        shims = (ctx.cloudflare?.edgeShims?.() || []).map((x) => ({
+          name: x.name,
+          listenPort: Number(x.port),
+          listenTls: !!x.tls,
+          target: `${x.tls ? "https" : "http"}://${mainAddr}:${Number(x.port)}`,
+        }));
+      } catch (err) {
+        console.warn("[cluster] edge shims:", err.message);
+      }
+      for (const c of connectors) edgeConnectorNames.set(c.id, c.name);
+      edge = { files: ctx.lb?.edgeFiles?.(s.id) || {}, connectors, shims };
+    }
+    const body = { allowFrom, edge };
+    return { hash: sha256(JSON.stringify(body)), ...body };
+  }
+
+  /** Persist what the agent reported for a cluster.sync (or why it failed) and tell the UI. */
+  function recordEdgeSync(serverId, sync) {
+    if (!db.get("servers", serverId)) return;
+    const updated = db.update("servers", serverId, { edgeSync: sync });
+    try {
+      ctx.events?.broadcast("server", publicServer(updated)); // not servers-changed: nothing for nginx to redo
+    } catch {
+      /* no SSE yet */
+    }
+  }
+
+  /** The agent's cluster.sync result without anything it should not have sent back. */
+  function cleanSyncResult(r) {
+    const o = r && typeof r === "object" ? r : {};
+    const str = (v, n) => (v == null ? null : String(v).slice(0, n));
+    return {
+      hash: /^[a-f0-9]{64}$/.test(String(o.hash || "")) ? o.hash : null,
+      appliedAt: str(o.appliedAt, 40),
+      nginx: o.nginx === undefined ? null : !!o.nginx,
+      error: str(o.error, 2000),
+      connectors: (Array.isArray(o.connectors) ? o.connectors : []).slice(0, 50).map((c) => ({
+        id: str(c?.id, 60),
+        name: edgeConnectorNames.get(String(c?.id)) || str(c?.name, 60),
+        active: c?.active === undefined ? null : !!c.active,
+        error: str(c?.error, 300),
+      })),
+      shims: (Array.isArray(o.shims) ? o.shims : []).slice(0, 20).map((x) => ({
+        name: str(x?.name, 40),
+        listenPort: Number(x?.listenPort) || null,
+        ok: x?.ok === undefined ? null : !!x.ok,
+        error: str(x?.error, 300),
+      })),
+    };
+  }
+
+  /** Why server `s` cannot take a cluster.sync right now, or null. */
+  function edgePushBlocker(s) {
+    if (!s || s.id === MAIN_ID) return "The main server applies its edge configuration itself.";
+    if (!syncSupported()) return "This panel's task engine (shared/tasks.mjs) does not know cluster.sync yet — update the panel.";
+    if (!versionAtLeast(s.agentVersion, EDGE_MIN_AGENT)) {
+      return `${s.name} runs agent v${s.agentVersion || "?"}; edge sync needs v${EDGE_MIN_AGENT} or newer. It updates itself the next time it reconnects to the panel.`;
+    }
+    if (!isOnline(s.id)) return `${s.name} is offline.`;
+    return null;
+  }
+
+  async function pushEdgeOnce(serverId, { force = false, log = () => {}, signal = null } = {}) {
+    const s = db.get("servers", serverId);
+    if (!s) throw httpError(404, "Server not found");
+    const blocked = edgePushBlocker(s);
+    if (blocked) throw new Error(blocked);
+    const payload = await buildEdgePayload(s, { ipMap: await edgeIpMap(), mainIpList: await mainIps() });
+    edgeDesired.set(s.id, payload.hash);
+    if (!force && s.edgeSync?.hash === payload.hash && !s.edgeSync?.error) return { skipped: true, hash: payload.hash };
+    edgePushed.set(s.id, { hash: payload.hash, at: Date.now() });
+    edgeInflightHash.set(s.id, payload.hash);
+    const what = payload.edge
+      ? `edge: ${Object.keys(payload.edge.files).length} nginx file(s), ${payload.edge.connectors.length} connector(s), ${payload.edge.shims.length} shim(s)`
+      : "not an edge";
+    console.log(`[cluster] cluster.sync → ${s.name} (${s.id}) ${payload.hash.slice(0, 12)} · ${what} · ${payload.allowFrom.length} allowed IP(s)`);
+    log(`Sending the cluster configuration to ${s.name} (${what}; ${payload.allowFrom.length} peer address(es) allowed to reach its websites)…`);
+    let recorded = false;
+    try {
+      const raw = await runTask(s.id, "cluster.sync", payload, { log, signal });
+      const r = cleanSyncResult(raw);
+      recordEdgeSync(s.id, { hash: r.hash || payload.hash, appliedAt: r.appliedAt || nowIso(), error: r.error });
+      recorded = true;
+      if (r.error) throw Object.assign(new Error(`${s.name} could not apply the edge configuration: ${r.error}`), { result: r });
+      log(`${s.name} applied configuration ${payload.hash.slice(0, 12)}.`);
+      return r;
+    } catch (err) {
+      if (!recorded) {
+        const r = err.result ? cleanSyncResult(err.result) : null;
+        // The agent ran it and failed: that hash was attempted (retried by the 10 min resend or "Sync now").
+        if (r?.hash) recordEdgeSync(s.id, { hash: r.hash, appliedAt: r.appliedAt, error: r.error || err.message });
+        // Never reached / lost the agent: keep the old hash so the next round tries again.
+        else recordEdgeSync(s.id, { hash: s.edgeSync?.hash || null, appliedAt: s.edgeSync?.appliedAt || null, error: err.message });
+      }
+      throw err;
+    } finally {
+      if (edgeInflightHash.get(s.id) === payload.hash) edgeInflightHash.delete(s.id);
+    }
+  }
+
+  /** One push at a time per server; a newer request runs after the current one (and is skipped if nothing changed). */
+  function pushEdge(serverId, opts = {}) {
+    const prev = edgeInflight.get(serverId) || Promise.resolve();
+    edgeQueued.add(serverId);
+    const p = prev.catch(() => {}).then(() => {
+      edgeQueued.delete(serverId);
+      return pushEdgeOnce(serverId, opts);
+    });
+    edgeInflight.set(serverId, p);
+    p.catch(() => {}).finally(() => {
+      if (edgeInflight.get(serverId) === p) edgeInflight.delete(serverId);
+    });
+    return p;
+  }
+
+  /**
+   * Main's half: main's local static/php vhosts and ufw must let the edges'
+   * nginx reach main's site ports, and auth must believe the edges' shims.
+   * Runs when the edge IP set changes (and once at start, to clean up).
+   */
+  async function applyMainEdges(ips) {
+    const log = (l) => console.log(`[cluster] main edge access: ${l}`);
+    setTrustedProxies(ips);
+    if (typeof sharedTasks.refreshLocalVhosts === "function") {
+      const specs = [];
+      for (const site of allSites()) {
+        if (!["static", "php"].includes(site.type) || !siteTargets(site).includes(MAIN_ID)) continue;
+        try {
+          const spec = ctx.sites?.specFor?.(site, MAIN_ID);
+          if (spec) specs.push(spec);
+        } catch (err) {
+          console.warn(`[cluster] spec for ${site.id}:`, err.message);
+        }
+      }
+      try {
+        await sharedTasks.refreshLocalVhosts(specs, { log, dataDir: ctx.dataDir, isMain: true, serverId: MAIN_ID, edgeAllow: ips.slice() });
+      } catch (err) {
+        console.warn("[cluster] could not refresh main's local vhosts for the edge nodes:", err.message);
+      }
+    } else if (ips.length) {
+      console.warn("[cluster] shared/tasks.mjs has no refreshLocalVhosts yet — main's static/php vhosts are not opened to edge nodes.");
+    }
+    await mainUfw(ips, log).catch((err) => console.warn("[cluster] ufw on main:", err.message));
+  }
+
+  /** ufw on main (when active): allow 3000:3999 from each edge IP, drop our rules for IPs no longer edges. */
+  async function mainUfw(ips, log) {
+    if (process.env.FCC_SKIP_UFW === "1") return;
+    let existing = [];
+    if (!sys.DRY_RUN) {
+      if (!sys.which("ufw")) return;
+      const st = await sys.run("ufw", ["status"], { allowFail: true, timeoutMs: 20_000 });
+      if (st.code !== 0 || !/^Status:\s*active/im.test(st.stdout)) return;
+      const re = new RegExp(`^${EDGE_UFW_PORTS}/tcp(?: \\(v6\\))?\\s+ALLOW(?: IN)?\\s+(\\S+).*#\\s*${EDGE_UFW_COMMENT}\\s*$`, "i");
+      existing = [...new Set(st.stdout.split("\n").map((l) => re.exec(l.trim())?.[1]).filter((ip) => ip && net.isIP(ip)))];
+    }
+    const want = new Set(ips);
+    for (const ip of ips) {
+      if (existing.includes(ip)) continue;
+      await sys.run("ufw", ["allow", "from", ip, "to", "any", "port", EDGE_UFW_PORTS, "proto", "tcp", "comment", EDGE_UFW_COMMENT], { log, allowFail: true, timeoutMs: 20_000 });
+    }
+    for (const ip of existing) {
+      if (want.has(ip)) continue;
+      await sys.run("ufw", ["delete", "allow", "from", ip, "to", "any", "port", EDGE_UFW_PORTS, "proto", "tcp"], { log, allowFail: true, timeoutMs: 20_000 });
+    }
+  }
+
+  let roundChain = Promise.resolve();
+  /**
+   * Recompute every agent's payload; push where it changed, where `forced`, or
+   * (resend) where the last push is older than 10 min. Also keeps main's side
+   * and the trusted proxies in step with the edge IP set.
+   */
+  function edgeRound(opts) {
+    const p = roundChain.catch(() => {}).then(() => edgeRoundOnce(opts));
+    roundChain = p.catch(() => {});
+    return p;
+  }
+  async function edgeRoundOnce({ forced = new Set(), resend = false } = {}) {
+    {
+      const ipMap = await edgeIpMap();
+      const flat = [...new Set([...ipMap.values()].flat())].sort();
+      const key = JSON.stringify(flat);
+      if (key !== edgeIpKey) {
+        const first = edgeIpKey === null;
+        edgeIpKey = key;
+        edgeIpList = flat;
+        if (!first) console.log(`[cluster] edge node addresses now: ${flat.join(", ") || "(none)"}`);
+        await applyMainEdges(flat);
+      }
+      if (!syncSupported()) return;
+      const mainIpList = await mainIps();
+      for (const s of db.list("servers")) {
+        if (s.id === MAIN_ID) continue;
+        let payload;
+        try {
+          payload = await buildEdgePayload(s, { ipMap, mainIpList });
+        } catch (err) {
+          console.warn(`[cluster] edge payload for ${s.name}:`, err.message);
+          continue;
+        }
+        edgeDesired.set(s.id, payload.hash);
+        if (!isOnline(s.id)) continue;
+        if (!versionAtLeast(s.agentVersion, EDGE_MIN_AGENT)) {
+          if (edgeOldAgentNoted.get(s.id) !== s.agentVersion) {
+            edgeOldAgentNoted.set(s.id, s.agentVersion);
+            console.log(`[cluster] ${s.name} (${s.id}) runs agent v${s.agentVersion || "?"} — no cluster.sync until it updates to v${EDGE_MIN_AGENT}+`);
+          }
+          continue;
+        }
+        if (edgeInflightHash.get(s.id) === payload.hash) continue;
+        // One already waits behind the running push; it rebuilds the payload when its turn comes.
+        if (edgeQueued.has(s.id)) continue;
+        const pushed = edgePushed.get(s.id);
+        const lastAt = Math.max(pushed?.at || 0, Date.parse(s.edgeSync?.appliedAt || "") || 0);
+        const reported = edgeStatus.get(s.id);
+        const differs = s.edgeSync?.hash !== payload.hash;
+        // The agent says it runs something else (it lost its state): resend, at most every 2 min.
+        const drifted = reported?.hash && reported.hash !== payload.hash && Date.now() - (pushed?.at || 0) > 2 * MINUTE;
+        const due = resend && Date.now() - lastAt > EDGE_RESEND_MS;
+        if (!(forced.has(s.id) || differs || drifted || due)) continue;
+        // Only "it differs" may be dropped when its turn comes and the agent has meanwhile applied it.
+        pushEdge(s.id, { force: forced.has(s.id) || !!drifted || due }).catch((err) => console.warn(`[cluster] cluster.sync on ${s.name} failed: ${err.message}`));
+      }
+    }
+  }
+
+  /** Something that goes into the edge payloads changed: re-check every agent in 2 s. */
+  function edgesChanged(forceServerId = null) {
+    if (forceServerId) edgeForce.add(forceServerId);
+    if (!started || edgeTimer) return;
+    edgeTimer = setTimeout(() => {
+      edgeTimer = null;
+      const forced = new Set(edgeForce);
+      edgeForce.clear();
+      edgeRound({ forced }).catch((err) => console.warn("[cluster] edge sync round:", err.message));
+    }, EDGE_DEBOUNCE_MS);
+    edgeTimer.unref?.();
+  }
+
+  /** Sanitise the `edge` object an agent sends with its metrics. */
+  function cleanEdgeReport(e) {
+    if (!e || typeof e !== "object") return null;
+    const str = (v, n) => (v == null ? null : String(v).slice(0, n));
+    return {
+      hash: /^[a-f0-9]{64}$/.test(String(e.hash || "")) ? e.hash : null,
+      appliedAt: str(e.appliedAt, 40),
+      error: str(e.error, 2000),
+      nginx: !!e.nginx,
+      connectors: (Array.isArray(e.connectors) ? e.connectors : []).slice(0, 50).map((c) => ({
+        id: str(c?.id, 60),
+        active: !!c?.active,
+        readyConnections: Math.max(0, Math.min(1000, Number(c?.readyConnections) || 0)),
+      })),
+      shims: (Array.isArray(e.shims) ? e.shims : []).slice(0, 20).map((x) => ({
+        name: str(x?.name, 40),
+        listenPort: Number(x?.listenPort) || null,
+        ok: !!x?.ok,
+        error: str(x?.error, 300),
+      })),
+    };
+  }
+
+  function ingestEdgeReport(s, edge) {
+    const next = cleanEdgeReport(edge);
+    const prev = edgeStatus.get(s.id) || null;
+    const changed = JSON.stringify(next) !== JSON.stringify(prev ? { ...prev, reportedAt: undefined } : null);
+    if (next) edgeStatus.set(s.id, { ...next, reportedAt: nowIso() });
+    else edgeStatus.delete(s.id);
+    if (changed) {
+      try {
+        ctx.events?.broadcast("server", publicServer(db.get("servers", s.id)));
+      } catch {
+        /* no SSE yet */
+      }
+    }
+  }
+
+  /** GET /api/servers edgeStatus: null for main and for servers that are not (and do not report being) an edge. */
+  function publicEdgeStatus(s) {
+    if (!s || s.id === MAIN_ID) return null;
+    const r = edgeStatus.get(s.id) || null;
+    if (!isEdge(s) && !r) return null;
+    const desired = edgeDesired.get(s.id) || null;
+    const appliedHash = r?.hash || s.edgeSync?.hash || null;
+    const error = r?.error || s.edgeSync?.error || null;
+    return {
+      inSync: !!desired && appliedHash === desired && !error,
+      hash: desired,
+      appliedHash,
+      appliedAt: r?.appliedAt || s.edgeSync?.appliedAt || null,
+      applying: edgeInflightHash.has(s.id),
+      error,
+      nginx: r ? r.nginx : null,
+      connectors: (r?.connectors || []).map((c) => ({ id: c.id, name: edgeConnectorNames.get(c.id) || c.id, active: c.active, readyConnections: c.readyConnections })),
+      shims: r?.shims || [],
+      reportedAt: r?.reportedAt || null,
+    };
+  }
+
+  /** Where connector `connectorId` runs on edge nodes (cloudflare.mjs adds main's own). */
+  function edgeReplicas(connectorId) {
+    const out = [];
+    for (const s of db.list("servers")) {
+      if (!isEdge(s)) continue;
+      const online = isOnline(s.id);
+      const r = edgeStatus.get(s.id);
+      const c = r?.connectors?.find((x) => x.id === connectorId);
+      out.push({
+        serverId: s.id,
+        serverName: s.name,
+        running: online && !!c?.active,
+        connections: online && c ? c.readyConnections : 0,
+        online,
+        reportedAt: r?.reportedAt || null,
+      });
+    }
+    return out.sort((a, b) => String(a.serverName).localeCompare(String(b.serverName)));
+  }
+
+  /** GET /api/cluster/ha — how much of the front door survives main going down. */
+  function haSummary() {
+    const edgesList = db
+      .list("servers")
+      .filter(isEdge)
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    const edges = edgesList.map((s) => {
+      const st = publicEdgeStatus(s);
+      const online = isOnline(s.id);
+      return {
+        serverId: s.id,
+        name: s.name,
+        online,
+        inSync: !!st?.inSync,
+        tunnelConnected: online && !!st?.connectors?.some((c) => c.active && c.readyConnections > 0),
+        applying: !!st?.applying,
+        error: st?.error || null,
+        agentVersion: s.agentVersion || null,
+      };
+    });
+    let connectorsN = 0;
+    let mainConnected = false;
+    try {
+      const cf = ctx.cloudflare?.status?.();
+      const list = Array.isArray(cf?.connectors) ? cf.connectors : [];
+      connectorsN = list.filter((c) => c.autoStart !== false && c.hasToken).length;
+      mainConnected = list.some((c) => c.connected);
+    } catch {
+      /* no Cloudflare module */
+    }
+    const mainOnlySites = allSites()
+      .filter((site) => {
+        const t = [...new Set(siteTargets(site))];
+        return t.length === 1 && t[0] === MAIN_ID;
+      })
+      .map((site) => ({ id: site.id, name: site.name }));
+
+    const warnings = [];
+    const tunnel = connectorsN === 1 ? "The Cloudflare Tunnel" : "The Cloudflare Tunnels";
+    if (edges.length && !syncSupported()) {
+      warnings.push("This panel's task engine does not include cluster.sync yet, so edge nodes cannot be configured. Update the panel.");
+    }
+    if (connectorsN && !edges.length) {
+      warnings.push(`${tunnel} ${connectorsN === 1 ? "runs" : "run"} only on the main server. Mark an agent server as an edge node so tunnelled websites stay up if the main server goes down.`);
+    } else if (connectorsN && !edges.some((e) => e.tunnelConnected)) {
+      warnings.push(`No edge node has a connected Cloudflare Tunnel replica right now — if the main server goes down, every tunnelled website goes down with it.`);
+    }
+    if (!connectorsN && edges.length) {
+      warnings.push("Edge nodes are set up, but the panel runs no Cloudflare Tunnel connector. Failover only covers tunnelled websites — domains on direct DNS still point at the main server.");
+    }
+    for (const e of edges) {
+      const s = db.get("servers", e.serverId);
+      if (!e.online) {
+        const ago = lastSeenMs(e.serverId);
+        warnings.push(`${e.name} is an edge node, but its agent is offline${ago ? ` (last seen ${new Date(ago).toISOString().replace("T", " ").slice(0, 16)} UTC)` : " and has never checked in"}.`);
+      } else if (!versionAtLeast(s?.agentVersion, EDGE_MIN_AGENT)) {
+        warnings.push(`${e.name} runs agent v${s?.agentVersion || "?"} — edge nodes need v${EDGE_MIN_AGENT} or newer. It updates itself the next time it reconnects.`);
+      } else if (e.error) {
+        warnings.push(`${e.name} could not apply the edge configuration: ${e.error}`);
+      } else if (!e.inSync) {
+        warnings.push(e.applying ? `${e.name} is applying the latest edge configuration.` : `${e.name} has not applied the latest edge configuration yet. Use “Sync now” on the server if it stays this way.`);
+      } else if (connectorsN && !e.tunnelConnected) {
+        warnings.push(`${e.name} is in sync, but its Cloudflare Tunnel replica is not connected.`);
+      }
+    }
+    if (edges.length && mainOnlySites.length) {
+      const names = mainOnlySites.slice(0, 5).map((x) => x.name).join(", ") + (mainOnlySites.length > 5 ? ` and ${mainOnlySites.length - 5} more` : "");
+      warnings.push(
+        `${mainOnlySites.length === 1 ? "1 website runs" : `${mainOnlySites.length} websites run`} only on the main server and go${mainOnlySites.length === 1 ? "es" : ""} down with it: ${names}. Load balance ${mainOnlySites.length === 1 ? "it" : "them"} across servers to keep ${mainOnlySites.length === 1 ? "it" : "them"} up.`,
+      );
+    }
+    return {
+      edges,
+      tunnelReplicasOnline: (mainConnected ? 1 : 0) + edges.filter((e) => e.tunnelConnected).length,
+      connectors: connectorsN,
+      mainOnlySites,
+      warnings,
+    };
+  }
+
+  /** Resolved edge IPs (as last applied on main). */
+  const edgeIps = () => edgeIpList.slice();
+
   // ------------------------------------------------------------- routes
 
   function requireServer(id) {
@@ -837,6 +1375,11 @@ function createCluster(ctx) {
     } else if (creating) patch.enabled = true;
     if (body.lbEligible !== undefined) patch.lbEligible = !!body.lbEligible;
     else if (creating) patch.lbEligible = true;
+    if (body.edge !== undefined) {
+      if (isMain) throw httpError(400, "The main server is always an edge node — there is nothing to switch.");
+      if (typeof body.edge !== "boolean") throw httpError(400, "Edge node must be true or false.");
+      patch.edge = { enabled: body.edge };
+    } else if (creating) patch.edge = { enabled: false };
     return patch;
   }
 
@@ -861,7 +1404,7 @@ function createCluster(ctx) {
         info: null,
       });
       db.save({ immediate: true });
-      ctx.activity?.(admin, "server.create", { type: "server", id: server.id, name: server.name }, { host: server.host });
+      ctx.activity?.(admin, "server.create", { type: "server", id: server.id, name: server.name }, { host: server.host, edge: !!server.edge?.enabled });
       serversChanged("created", server.id);
       return {
         server: publicServer(server),
@@ -886,8 +1429,15 @@ function createCluster(ctx) {
       if (patch.host && db.list("servers").some((o) => o.id !== s.id && o.host === patch.host)) {
         throw httpError(409, `A server with the address ${patch.host} already exists.`);
       }
+      const wasEdge = !!s.edge?.enabled;
       const updated = db.update("servers", s.id, patch);
-      ctx.activity?.(admin, "server.update", { type: "server", id: s.id, name: updated.name }, { fields: Object.keys(patch) });
+      const details = { fields: Object.keys(patch) };
+      if (patch.edge) details.edge = patch.edge.enabled;
+      ctx.activity?.(admin, "server.update", { type: "server", id: s.id, name: updated.name }, details);
+      if (patch.edge && patch.edge.enabled !== wasEdge) {
+        console.log(`[cluster] ${updated.name} (${s.id}) is ${patch.edge.enabled ? "now an edge node" : "no longer an edge node"}`);
+        edgesChanged(s.id); // push right away (debounced), even if its hash happened to match
+      }
       serversChanged("updated", s.id);
       return publicServer(updated);
     });
@@ -910,6 +1460,10 @@ function createCluster(ctx) {
       series.delete(s.id);
       reqSeries.delete(`srv:${s.id}`);
       onlineWas.delete(s.id);
+      edgeStatus.delete(s.id);
+      edgeDesired.delete(s.id);
+      edgePushed.delete(s.id);
+      edgeOldAgentNoted.delete(s.id);
       ctx.activity?.(admin, "server.delete", { type: "server", id: s.id, name: s.name });
       serversChanged("deleted", s.id);
       return { ok: true };
@@ -926,6 +1480,21 @@ function createCluster(ctx) {
       serversChanged("token", s.id);
       return { installCommand: installCommand(req, s.id, token), warning: installWarning(req) };
     });
+
+    router.post("/api/servers/:id/edge/sync", (req, res, { params, admin }) => {
+      const s = requireServer(params.id);
+      if (s.id === MAIN_ID) throw httpError(400, "The main server applies its edge configuration itself — there is nothing to send it.");
+      const blocked = edgePushBlocker(s);
+      if (blocked) throw httpError(409, blocked);
+      const job = ctx.jobs.start(
+        { type: "server.edge.sync", title: `Sync ${isEdge(s) ? "edge" : "cluster"} configuration to ${s.name}`, serverId: s.id, adminId: admin?.id, lock: false },
+        ({ log, signal }) => pushEdge(s.id, { force: true, log, signal }),
+      );
+      ctx.activity?.(admin, "server.edge.sync", { type: "server", id: s.id, name: s.name }, { edge: isEdge(s) });
+      return job;
+    });
+
+    router.get("/api/cluster/ha", () => haSummary());
 
     router.get("/api/servers/:id/metrics", (req, res, { params, query }) => {
       const s = requireServer(params.id);
@@ -1016,6 +1585,7 @@ function createCluster(ctx) {
       console.log(`[cluster] agent hello from ${s.name} (${s.id}) v${patch.agentVersion || "?"}${update.length ? ` — ${update.length} file(s) to update` : ""}`);
       serversChanged("hello", s.id);
       checkOnline();
+      edgesChanged(s.id); // (re)connected: make sure it runs the current cluster configuration
       return {
         serverId: s.id,
         name: s.name,
@@ -1117,7 +1687,31 @@ function createCluster(ctx) {
         load: n(body.load),
         uptime: n(body.uptime),
       });
+      if (body.edge !== undefined) ingestEdgeReport(s, body.edge);
       return { ok: true };
+    });
+
+    // An edge's nginx access log lines (the agent tails fcc-<siteId>.access.log
+    // every 15 s). Counted exactly like main's own, with 127.0.0.1 upstreams
+    // meaning that edge. Only for websites that exist, only from edge nodes.
+    router.post("/agent/edge/logs", { agent: true, limit: EDGE_LOG_LIMIT }, (req, res, { body }) => {
+      const s = node(req);
+      if (!isEdge(db.get("servers", s.id))) return { ok: true, accepted: 0, ignored: "This server is not an edge node." };
+      const sites = body?.sites && typeof body.sites === "object" && !Array.isArray(body.sites) ? body.sites : {};
+      const byId = new Map(allSites().map((x) => [x.id, x]));
+      const byAddr = upstreamMap(s.id);
+      let accepted = 0;
+      for (const [siteId, lines] of Object.entries(sites).slice(0, 5000)) {
+        const site = byId.get(siteId);
+        if (!site || !Array.isArray(lines)) continue;
+        const clean = lines
+          .slice(0, 50_000)
+          .filter((l) => typeof l === "string" && l.trim())
+          .map((l) => l.slice(0, 16_384));
+        ingestLines(site, clean, byAddr);
+        accepted += clean.length;
+      }
+      return { ok: true, accepted };
     });
 
     router.post("/agent/upload/:taskId", { agent: true, raw: true }, async (req, res, { params }) => {
@@ -1220,9 +1814,24 @@ function createCluster(ctx) {
       sweepTasks();
     });
     every(2 * MINUTE, saveMetrics);
+    // Edge nodes: payloads follow every change to servers (and agents coming online).
+    on("servers-changed", (e) => {
+      if (e?.reason === "online" && e.serverId) return edgesChanged(e.serverId);
+      if (e?.reason === "hello") return; // the hello route already asked for a forced push
+      edgesChanged();
+    });
+    started = true;
+    every(EDGE_RECONCILE_MS, () => edgeRound({ resend: true }));
+    // First round once loadbalancer.mjs has rendered (its initial apply runs at +3 s).
+    const firstEdge = setTimeout(() => edgeRound({ resend: true }).catch((err) => console.warn("[cluster] edge sync round:", err.message)), 5_000);
+    firstEdge.unref?.();
+    timers.push(firstEdge);
+    if (!syncSupported()) console.warn("[cluster] shared/tasks.mjs has no cluster.sync task yet — edge nodes are not configured until it does.");
   }
 
   async function _stop() {
+    started = false;
+    if (edgeTimer) clearTimeout(edgeTimer);
     for (const t of timers) clearInterval(t);
     for (const p of [...parked.values()]) p.finish(true);
     saveMetrics();
@@ -1244,6 +1853,11 @@ function createCluster(ctx) {
     off: (event, fn) => listeners.get(event)?.delete(fn),
     // extras (documented under "Changes")
     agentFiles: () => Object.fromEntries(agentFiles()),
+    // edge nodes (docs/HA.md)
+    edgesChanged: () => edgesChanged(),
+    edgeReplicas,
+    edgeIps,
+    haSummary,
     _routes: routes,
     _start,
     _stop,
