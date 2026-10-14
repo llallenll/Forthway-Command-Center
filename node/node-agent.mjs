@@ -47,7 +47,7 @@ import { edgeStatus, edgeLogSites } from "../shared/edge.mjs";
 import { createVoter, cleanPanels } from "../shared/ha-voter.mjs";
 import { mysqlStatusCached } from "../shared/mysql-ha.mjs";
 
-export const AGENT_VERSION = "3.3.0";
+export const AGENT_VERSION = "3.3.1";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 

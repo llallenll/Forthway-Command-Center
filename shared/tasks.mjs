@@ -39,7 +39,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.3.0";
+export const TASKS_VERSION = "3.3.1";
 
 export const TASK_TYPES = [
   "site.deploy",

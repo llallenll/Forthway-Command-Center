@@ -45,6 +45,9 @@ export const DETECT_MS = 60_000;
 export const BROKEN_MS = 2 * 60_000;
 export const REPL_USER = "fcc_repl";
 export const MIN_AGENT = "3.3.0";
+// Seeding a replica (enable / rebuild) needs the version preflight of agent 3.3.1:
+// an older agent copies with whatever mysqldump it has and fails against a newer primary.
+export const SEED_MIN_AGENT = "3.3.1";
 const TICK_MS = 10_000;
 const HISTORY_MAX = 50;
 const MAIN_ID = "main";
@@ -241,6 +244,14 @@ function createMysqlHa(ctx) {
   function agentOk(id) {
     if (id === MAIN_ID && ha().mainIsLocal !== false) return true; // in-process tasks
     return versionAtLeast(server(id)?.agentVersion, MIN_AGENT);
+  }
+
+  function requireSeedAgent(id) {
+    if (id === MAIN_ID && ha().mainIsLocal !== false) return;
+    const s = server(id);
+    if (!versionAtLeast(s?.agentVersion, SEED_MIN_AGENT)) {
+      throw httpError(409, `${s?.name || id} runs agent v${s?.agentVersion || "?"}; copying the databases to it needs v${SEED_MIN_AGENT} or newer (it updates itself within a minute of reconnecting — try again shortly).`);
+    }
   }
 
   /** Network address of a server as other servers see it (privateHost || host), no port. */
@@ -603,6 +614,7 @@ function createMysqlHa(ctx) {
     if (replica === primary) throw httpError(400, "The replica must be a different server from the primary.");
     if (replica === MAIN_ID) throw httpError(400, "Pick an agent server for the replica.");
     requireAgent(replica, "a database replica");
+    requireSeedAgent(replica);
     if (primary !== MAIN_ID || ha().mainIsLocal === false) requireAgent(primary, "the database primary");
     const disk = diskCheck(replica);
     if (!disk.ok) throw httpError(409, `${nameOf(replica)} has ${gb(disk.free)} free; the databases need about ${gb(disk.need)}.`);
@@ -673,6 +685,7 @@ function createMysqlHa(ctx) {
         c.replica = null;
         save();
         history("enable-failed", err.message);
+        if (!err?.aborted && !signal?.aborted) log("Replication stays off. Fix the problem described below, then press Turn on replication again — it is safe to retry.");
         throw err;
       }
     });
@@ -848,6 +861,7 @@ function createMysqlHa(ctx) {
     if (id === c.primary) throw httpError(400, "That server is the primary.");
     if (c.replica && c.replica !== id) throw httpError(409, `${nameOf(c.replica)} is already the replica (one replica in this version).`);
     requireAgent(id, "a database rebuild");
+    requireSeedAgent(id);
     const primary = c.primary;
     if (!serverOnline(primary)) throw httpError(409, `The primary ${nameOf(primary)} is offline.`);
 
@@ -926,10 +940,17 @@ function createMysqlHa(ctx) {
   // ------------------------------------------------------------ fencing
 
   /** ha.mjs beforeFence hook (≤ 3 s): this panel is about to fence itself; if its machine is the primary, stop writes. */
-  async function onFence() {
+  async function onFence({ handoverTo = null } = {}) {
     try {
       const c = cfg();
       if (!c.enabled || c.primary !== localServerId()) return { fenced: false };
+      // A planned panel handover never promotes the database (that needs this server to be
+      // unreachable), so making MySQL read-only would only block websites' writes until the
+      // new leader's next pass turned them back on. Fence only when the lease was lost.
+      if (handoverTo) {
+        console.log(`[mysql-ha] panel handover to ${handoverTo}: local MySQL stays writable (still the database primary)`);
+        return { fenced: false, handover: true };
+      }
       if (!taskTypes().includes("mysql.readonly")) return { fenced: false };
       const isMain = localServerId() === MAIN_ID;
       await withTimeout(

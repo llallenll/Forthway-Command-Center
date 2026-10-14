@@ -6,7 +6,9 @@
  * validated inputs; there is no "run this SQL" task.
  *
  *   mysql.primary.prepare  binlog + GTID + server_id + bind 0.0.0.0, fcc_repl / fcc_admin accounts, ufw 3306
- *   mysql.replica.setup    install the same flavor, replica settings, seed from the primary, start replication
+ *   mysql.replica.setup    version preflight, install / upgrade the same flavor (same or newer series than the
+ *                          primary; vendor APT repository when the distro's is too old), replica settings,
+ *                          seed from the primary, start replication
  *   mysql.status           flavor, version, read_only, role, replica threads / lag / GTIDs
  *   mysql.replica.promote  drain the relay log, drop the replica settings, read_only OFF
  *   mysql.readonly         fence / unfence (runtime + managed config file), fast
@@ -35,6 +37,22 @@
  * state is simulated in <dataDir>/mysql-ha-dry.json, so prepare / setup /
  * promote / readonly change what mysql.status reports.
  *
+ * Dry-run simulation hook (read ONLY when FCC_DRY_RUN=1, ignored otherwise):
+ * FCC_MYSQL_DRY_SIM is inline JSON or the path of a JSON file describing the
+ * facts the version preflight would read from the machine and the primary:
+ *   { "primary": "8.4.3",                  // primary's VERSION() (default: same as a fresh dry install)
+ *     "primaryComment": "MySQL Community Server - GPL",
+ *     "os": { "id": "ubuntu", "codename": "noble" },   "arch": "amd64",
+ *     "distro": { "mysql-server": "8.0.39-0ubuntu0.24.04.2" },  // apt candidates before any repo is added
+ *     "vendorCandidate": { "mysql-server": "8.4.3-1ubuntu24.04" }, // after the vendor repo (default: its series)
+ *     "repoSuites": ["jammy", "noble", "bookworm"],   // codenames the vendor repo publishes
+ *     "repoComponents": ["mysql-8.0", "mysql-8.4-lts", "mysql-9.7-lts", "mysql-innovation"],
+ *     "installedPackages": ["mysql-community-server"], // dpkg answers
+ *     "dump": "8.0.39" }                             // mysqldump --version (default: the server's)
+ * The local server itself is the simulated one in mysql-ha-dry.json (write
+ * { "installed": true, "flavor", "version", "databases": [] } there first to
+ * simulate an installed server).
+ *
  * Test hook (inert in production): when FCC_MYSQL_TEST_DEFAULTS names a JSON
  * file and FCC_DRY_RUN is not set, "the local server" is whatever that file
  * says — used only to run these tasks against throwaway mysqld instances:
@@ -51,6 +69,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import zlib from "node:zlib";
+import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -544,6 +563,7 @@ function ctxOf(o, task) {
     dataDir: o.dataDir || process.env.FCC_DATA_DIR || "/var/lib/fcc",
     dry: sys.DRY_RUN,
     hook: testHook(),
+    sim: simOf(),
   };
   if (M.hook) M.log(`TEST HOOK: FCC_MYSQL_TEST_DEFAULTS is set — the local server is ${M.hook.client.join(" ")}.`);
   return M;
@@ -831,38 +851,594 @@ function setCnfReadOnly(M, flavor, on) {
 
 // ---- install
 
-async function aptInstall(M, pkgs) {
+async function aptInstall(M, pkgs, { confNew = false } = {}) {
   const env = { DEBIAN_FRONTEND: "noninteractive" };
-  const args = ["install", "-y", "-q", "-o", "DPkg::Lock::Timeout=300", ...pkgs];
+  // Never stop at a conffile question. A fresh install keeps any local file
+  // (confold). Replacing the distro's server with a vendor's takes the vendor's
+  // files (confnew), because the distro's leftovers describe the old server.
+  const conf = confNew ? ["-o", "Dpkg::Options::=--force-confnew"] : ["-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"];
+  const args = ["install", "-y", "-q", "-o", "DPkg::Lock::Timeout=300", ...conf, ...pkgs];
   const r = await sys.run("apt-get", args, { log: M.log, env, timeoutMs: 30 * 60_000, allowFail: true, signal: M.signal });
   if (r.code === 0) return;
   await sys.run("apt-get", ["update", "-q", "-o", "DPkg::Lock::Timeout=300"], { log: M.log, env, timeoutMs: 15 * 60_000, signal: M.signal });
   await sys.run("apt-get", args, { log: M.log, env, timeoutMs: 30 * 60_000, signal: M.signal });
 }
 
-async function ensureServerInstalled(M, flavor) {
-  if (M.hook) return { installedNow: false };
+// =================================================================== version preflight (replica ≥ primary)
+//
+// MySQL and MariaDB support a replica that runs the same or a NEWER release
+// series (major.minor) than its source — never an older one. An older
+// mysqldump also cannot copy from a newer server (an 8.0 client sends
+// SHOW MASTER STATUS, which 8.4 removed → error 1064). So before anything is
+// changed on this server, mysql.replica.setup / mysql.rebuild:
+//   1. read the primary's version (MySQL handshake over TCP, which needs no
+//      client and no password; then SELECT VERSION(), @@version_comment as the
+//      replication user when a client is installed here);
+//   2. decide where a new enough server comes from: the distro when its
+//      candidate (apt-cache policy) is the same series or newer, else the
+//      vendor's APT repository (Oracle's for MySQL, MariaDB's for MariaDB) —
+//      key downloaded over HTTPS, fingerprint checked against the one pinned
+//      below, stored under /usr/share/keyrings/, used with signed-by=;
+//   3. an installed server that is older is replaced only when it holds no
+//      databases except ones an earlier, unfinished seed of this task created
+//      (recorded in mysql-ha.json as `seeding`); otherwise refuse, unchanged.
+//      Moving from the distro's MySQL to Oracle's packages puts the old data
+//      directory aside (/var/lib/mysql.fcc-before-upgrade-<stamp>, kept) so
+//      Oracle's package initialises a fresh one with root on auth_socket —
+//      also the only safe route for series an in-place upgrade cannot skip.
+//   4. after installing: the server's series and mysqldump's series must both
+//      be ≥ the primary's, or the task stops with a plain explanation.
+//
+// Verified 2026-10-14 against repo.mysql.com / dlm.mariadb.com:
+//   - Oracle: RPM-GPG-KEY-mysql-2025 = key BCA4 3417 C3B4 85DD 128E C6D4 B7B3 B788 A8D3 785C
+//     ("MySQL Release Engineering", created 2023-10-23, self-signature valid until
+//     2027-10-23); it signs dists/{jammy,noble,bookworm}/InRelease directly. Suites:
+//     apt/ubuntu/dists/{jammy,noble}, apt/debian/dists/bookworm; architectures
+//     i386 + amd64 only; components mysql-8.0, mysql-8.4-lts, mysql-9.7-lts,
+//     mysql-innovation (26.x) … mysql-community-server's postinst initialises an
+//     EMPTY /var/lib/mysql on a fresh install and, with the root-pass question left
+//     blank, sets root@localhost to auth_socket.
+//   - MariaDB: mariadb-keyring-2019.gpg holds 5 keys; the repository is signed by
+//     177F 4010 FE56 CA33 3630 0305 F165 6F24 C74C D1D8 ("MariaDB Signing Key"), the
+//     only one written to our keyring. Layout dlm.mariadb.com/repo/mariadb-server/
+//     <series>/repo/<ubuntu|debian> <codename> main; amd64 + arm64. Its postinst
+//     always runs mariadb-install-db (root via unix_socket on a new data directory).
+
+const MYSQL_DATADIR = "/var/lib/mysql";
+const APT_LIST = "/etc/apt/sources.list.d/fcc-mysql.list";
+export const VENDOR_REPOS = Object.freeze({
+  mysql: Object.freeze({
+    name: "Oracle's MySQL APT repository",
+    keyUrl: "https://repo.mysql.com/RPM-GPG-KEY-mysql-2025",
+    fingerprint: "BCA43417C3B485DD128EC6D4B7B3B788A8D3785C",
+    keyring: "/usr/share/keyrings/fcc-mysql-repo.gpg",
+    base: "https://repo.mysql.com/apt",
+    arches: ["amd64"],
+  }),
+  mariadb: Object.freeze({
+    name: "MariaDB's APT repository",
+    keyUrl: "https://supplychain.mariadb.com/mariadb-keyring-2019.gpg",
+    fingerprint: "177F4010FE56CA3336300305F1656F24C74CD1D8",
+    keyring: "/usr/share/keyrings/fcc-mariadb-repo.gpg",
+    base: "https://dlm.mariadb.com/repo/mariadb-server",
+    arches: ["amd64", "arm64"],
+  }),
+});
+const DRY_DEFAULT_MYSQL_COMPONENTS = ["mysql-8.0", "mysql-8.4-lts", "mysql-9.7-lts", "mysql-innovation"];
+const DRY_DEFAULT_SUITES = ["jammy", "noble", "bookworm"];
+const FLAVOR_NAME = { mysql: "MySQL", mariadb: "MariaDB" };
+
+/** [major, minor] of a version string (distro / vendor / server forms), or null. */
+export function seriesOf(v) {
+  const p = parseVersion(String(v ?? "").replace(/^5\.5\.5-/, ""));
+  return p ? [p[0], p[1]] : null;
+}
+
+export function cmpSeries(a, b) {
+  return a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1];
+}
+
+/** Version from `mysqldump --version` / `mariadb-dump --version`. */
+export function parseClientVersion(text) {
+  const t = String(text || "");
+  const m = /Distrib\s+(\d+\.\d+\.\d+)/.exec(t) || /\bfrom\s+(\d+\.\d+\.\d+)/.exec(t) || /\bVer\s+(\d+\.\d+\.\d+)/.exec(t);
+  return m ? m[1] : null;
+}
+
+/**
+ * Oracle component for a primary's version: the same series if the repository
+ * carries it; else the next LTS series (innovation releases are dropped from
+ * the repository once superseded, and the next LTS is their supported upgrade
+ * and replica); else mysql-innovation (newer than every LTS). Null if none.
+ */
+export function pickMysqlComponent(primaryVersion, components) {
+  const s = seriesOf(primaryVersion);
+  if (!s) return null;
+  const series = (components || [])
+    .map((c) => {
+      const m = /^mysql-(\d+)\.(\d+)(-lts)?$/.exec(c);
+      return m ? { component: c, v: [Number(m[1]), Number(m[2])], lts: !!m[3] } : null;
+    })
+    .filter(Boolean);
+  const exact = series.find((x) => cmpSeries(x.v, s) === 0);
+  if (exact) return { component: exact.component, series: exact.v.join("."), why: `the ${exact.v.join(".")} series, like the primary` };
+  const next = series.filter((x) => x.lts && cmpSeries(x.v, s) > 0).sort((a, b) => cmpSeries(a.v, b.v))[0];
+  if (next) return { component: next.component, series: next.v.join("."), why: `${s.join(".")} is not in the repository any more; ${next.v.join(".")} LTS is the next long-term series, a supported replica of it` };
+  if ((components || []).includes("mysql-innovation")) return { component: "mysql-innovation", series: null, why: `${s.join(".")} is newer than every LTS series` };
+  return null;
+}
+
+// ---- OpenPGP (just enough to check a repository key's fingerprint; v4 keys)
+
+/** ASCII armor → binary packets. */
+export function dearmorPgp(text) {
+  const lines = String(text).replace(/\r/g, "").split("\n");
+  let i = lines.findIndex((l) => l.startsWith("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+  if (i < 0) throw new Error("not an armored OpenPGP public key");
+  i++;
+  while (i < lines.length && /^[A-Za-z-]+: /.test(lines[i])) i++;
+  const b64 = [];
+  for (; i < lines.length && !lines[i].startsWith("-----END"); i++) {
+    const l = lines[i].trim();
+    if (l && !l.startsWith("=")) b64.push(l);
+  }
+  return Buffer.from(b64.join(""), "base64");
+}
+
+function pgpPackets(buf) {
+  const out = [];
+  let i = 0;
+  while (i < buf.length) {
+    const start = i;
+    const h = buf[i++];
+    if (!(h & 0x80)) throw new Error("malformed OpenPGP data");
+    let tag;
+    let len;
+    if (h & 0x40) {
+      tag = h & 0x3f;
+      const o = buf[i++];
+      if (o < 192) len = o;
+      else if (o < 224) len = ((o - 192) << 8) + buf[i++] + 192;
+      else if (o === 255) {
+        len = buf.readUInt32BE(i);
+        i += 4;
+      } else throw new Error("unsupported OpenPGP packet length");
+    } else {
+      tag = (h >> 2) & 0x0f;
+      const lt = h & 3;
+      if (lt === 0) len = buf[i++];
+      else if (lt === 1) {
+        len = buf.readUInt16BE(i);
+        i += 2;
+      } else if (lt === 2) {
+        len = buf.readUInt32BE(i);
+        i += 4;
+      } else throw new Error("unsupported OpenPGP packet length");
+    }
+    if (i + len > buf.length) throw new Error("truncated OpenPGP data");
+    out.push({ tag, start, end: i + len, body: buf.subarray(i, i + len) });
+    i += len;
+  }
+  return out;
+}
+
+function pgpFingerprint(body) {
+  if (body[0] !== 4) return null;
+  const h = crypto.createHash("sha1");
+  h.update(Buffer.from([0x99, (body.length >> 8) & 0xff, body.length & 0xff]));
+  h.update(body);
+  return h.digest("hex").toUpperCase();
+}
+
+/**
+ * The key with `fingerprint` (its packets up to the next primary key) out of a
+ * downloaded key file. Throws, naming what was found, when it is not there.
+ */
+export function extractRepoKey(bytes, fingerprint) {
+  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const raw = buf.subarray(0, 64).toString("latin1").includes("-----BEGIN PGP") ? dearmorPgp(buf.toString("utf8")) : buf;
+  const packets = pgpPackets(raw);
+  const found = [];
+  let from = -1;
+  let to = raw.length;
+  for (const p of packets) {
+    if (p.tag !== 6) continue;
+    const fp = pgpFingerprint(p.body);
+    found.push(fp || "(not a v4 key)");
+    if (from >= 0 && to === raw.length) to = p.start;
+    if (fp === fingerprint && from < 0) from = p.start;
+  }
+  if (from < 0) throw new Error(`the downloaded key file holds ${found.join(", ") || "no key"}, not the expected ${fingerprint}`);
+  return { keyring: Buffer.from(raw.subarray(from, to)), found };
+}
+
+// ---- facts about this machine (simulated under FCC_DRY_RUN with FCC_MYSQL_DRY_SIM)
+
+function dryVersionDefault(flavor) {
+  return flavor === "mariadb" ? "10.11.6-MariaDB-dry-run" : "8.0.36-dry-run";
+}
+
+function simOf() {
+  const v = process.env.FCC_MYSQL_DRY_SIM;
+  if (!v || !sys.DRY_RUN) return {};
+  const j = JSON.parse(v.trim().startsWith("{") ? v : fs.readFileSync(v, "utf8"));
+  return j && typeof j === "object" ? j : {};
+}
+
+async function osRelease(M) {
+  if (M.dry) {
+    const o = { id: "ubuntu", codename: "noble", ...(M.sim.os || {}) };
+    M.log(`[dry-run] /etc/os-release → simulated ${o.id} ${o.codename}`);
+    return o;
+  }
+  const t = readText("/etc/os-release") || "";
+  const get = (k) => (new RegExp(`^${k}="?([^"\\n]*)"?`, "m").exec(t) || [])[1] || "";
+  const id = get("ID").toLowerCase();
+  const like = get("ID_LIKE").toLowerCase();
+  return { id: id === "ubuntu" || id === "debian" ? id : /ubuntu/.test(like) ? "ubuntu" : /debian/.test(like) ? "debian" : id, codename: get("VERSION_CODENAME") || get("UBUNTU_CODENAME"), pretty: get("PRETTY_NAME") };
+}
+
+async function dpkgArch(M) {
+  if (M.dry) return M.sim.arch || "amd64";
+  const r = await sys.run("dpkg", ["--print-architecture"], { allowFail: true, timeoutMs: 15_000 }).catch(() => null);
+  return (r?.stdout || "").trim() || os.arch();
+}
+
+async function pkgInstalled(M, pkg) {
+  if (M.dry) return (M.sim.installedPackages || []).includes(pkg);
+  const r = await sys.run("dpkg-query", ["-W", "-f=${Status}", pkg], { allowFail: true, timeoutMs: 15_000 }).catch(() => null);
+  return /install ok installed/.test(r?.stdout || "");
+}
+
+/** apt's candidate version for a package, or null. */
+async function aptCandidate(M, pkg, { which = "distro" } = {}) {
+  if (M.dry) {
+    const def = { "mysql-server": "8.0.36-0ubuntu0.24.04.1", "mariadb-server": "1:10.11.6-0ubuntu0.24.04.1" };
+    const table = which === "vendor" ? M.sim.vendorCandidate : M.sim.distro;
+    let v = table && typeof table === "object" ? table[pkg] : undefined;
+    if (v === undefined && which === "vendor") v = M.vendorExpect || null;
+    if (v === undefined) v = def[pkg] ?? null;
+    M.log(`[dry-run] apt-cache policy ${pkg} → simulated candidate ${v || "(none)"}`);
+    return v || null;
+  }
+  const r = await sys.run("apt-cache", ["policy", pkg], { allowFail: true, timeoutMs: 60_000 }).catch(() => null);
+  const m = /Candidate:\s*(\S+)/.exec(r?.stdout || "");
+  return m && m[1] !== "(none)" ? m[1] : null;
+}
+
+async function httpGet(url, { binary = false, timeoutMs = 60_000 } = {}) {
+  const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": "fcc-node mysql-ha" } });
+  if (!res.ok) {
+    const e = new Error(`${url} answered HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return binary ? Buffer.from(await res.arrayBuffer()) : res.text();
+}
+
+/** The primary's MySQL handshake: its version, with no client and no sign-in. */
+export function handshakeVersion(host, port, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    let done = false;
+    const sock = net.connect({ host, port });
+    const finish = (err, v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sock.destroy();
+      if (err) reject(err);
+      else resolve(v);
+    };
+    const timer = setTimeout(() => finish(new Error(`no answer within ${Math.round(timeoutMs / 1000)} s`)), timeoutMs);
+    sock.on("error", (e) => finish(new Error(e.code === "ECONNREFUSED" ? "connection refused" : e.code === "EHOSTUNREACH" ? "host unreachable" : e.message)));
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (buf.length < 4) return;
+      const len = buf.readUIntLE(0, 3);
+      if (buf.length < 4 + Math.min(len, 64)) return;
+      const p = buf.subarray(4, 4 + len);
+      if (p[0] === 0xff) return finish(new Error(`the server refused the connection: ${p.subarray(3).toString("utf8").replace(/^#\w{5}/, "")} (${p.readUInt16LE(1)})`));
+      if (p[0] !== 0x0a) return finish(new Error("not a MySQL server (unexpected greeting)"));
+      const end = p.indexOf(0, 1);
+      if (end < 0) return buf.length >= 4 + len ? finish(new Error("malformed MySQL greeting")) : undefined;
+      finish(null, p.subarray(1, end).toString("latin1").replace(/^5\.5\.5-/, ""));
+    });
+  });
+}
+
+/** Non-system databases on the local server (running). */
+async function localUserDbs(M) {
+  if (M.dry) return [...(dryState(M).databases || [])];
+  return (await sqlLocal(M, "SHOW DATABASES;\n", { timeoutMs: 30_000 })).map((r) => r[0]).filter((n) => n && !SYSTEM_DBS.has(n.toLowerCase()));
+}
+
+async function dumpVersion(M) {
+  if (M.dry) {
+    const v = M.sim.dump || dryState(M).version;
+    M.log(`[dry-run] ${path.basename(dumpBin())} --version → simulated ${v}`);
+    return v;
+  }
+  const bin = dumpBin();
+  const r = await sys.run(bin, ["--version"], { allowFail: true, timeoutMs: 15_000 }).catch((e) => ({ stdout: "", stderr: e.message }));
+  return parseClientVersion(`${r.stdout}\n${r.stderr}`);
+}
+
+// ---- 1. the primary's version
+
+async function primaryVersionOf(M, p) {
+  const where = `${p.primaryHost}:${p.primaryPort}`;
+  const conn = { host: p.primaryHost, port: p.primaryPort, user: p.replUser, password: p.replPassword, extra: dialect(p.flavor, null).clientExtra };
+  let version = null;
+  let comment = null;
+  let lowerCaseTableNames = null;
+  if (M.dry) {
+    version = M.sim.primary || dryVersionDefault(p.flavor);
+    comment = M.sim.primaryComment || null;
+    await sqlRemote(M, conn, "SELECT VERSION(), @@version_comment, @@lower_case_table_names;\n");
+    M.log(`[dry-run] simulated primary version: ${version}${comment ? ` (${comment})` : ""}`);
+  } else {
+    let hsErr = null;
+    try {
+      version = await handshakeVersion(p.primaryHost, p.primaryPort);
+    } catch (e) {
+      hsErr = e;
+    }
+    if (sys.which("mysql") || sys.which("mariadb")) {
+      try {
+        const row = (await sqlRemote(M, conn, "SELECT VERSION(), @@version_comment, @@lower_case_table_names;\n", { timeoutMs: 30_000 }))[0] || [];
+        if (row[0]) [version, comment, lowerCaseTableNames] = [row[0], row[1] || null, row[2] ?? null];
+      } catch (e) {
+        M.log(`(Signing in to the primary as ${p.replUser} to read its version failed: ${e.message.split("\n").pop()})`);
+      }
+    }
+    if (!version) {
+      throw new Error(
+        `Cannot reach the database on the primary at ${where} to read its version (${hsErr?.message || "no answer"}). Check that MySQL there listens on 0.0.0.0 and that port ${p.primaryPort} is open to this server. Nothing was changed on ${os.hostname()}.`,
+      );
+    }
+  }
+  const s = seriesOf(version);
+  if (!s) throw new Error(`The primary reported an unreadable version (${JSON.stringify(String(version).slice(0, 60))}). Nothing was changed on ${os.hostname()}.`);
+  const flavor = flavorOf(version);
+  if (flavor !== p.flavor) throw new Error(`The primary runs ${FLAVOR_NAME[flavor]} ${version}, but this task was asked to set up ${FLAVOR_NAME[p.flavor]}. Nothing was changed on ${os.hostname()}.`);
+  M.log(`Primary ${where}: ${FLAVOR_NAME[flavor]} ${version}${comment ? ` (${comment})` : ""} → this server needs ${FLAVOR_NAME[flavor]} ${s.join(".")} or a newer series.`);
+  return { version, comment, series: s, lowerCaseTableNames: lowerCaseTableNames == null ? null : Number(lowerCaseTableNames) };
+}
+
+// ---- 2. the plan
+
+function tooOldMessage(flavor, req, what, ver) {
+  return `${what} is ${FLAVOR_NAME[flavor]} ${ver} — older than the primary's ${req.join(".")} series`;
+}
+
+/** Where a new enough server comes from. → { source: "distro"|"vendor", … } (throws a plain message when nowhere). */
+async function resolveSource(M, flavor, primary) {
+  const req = primary.series;
+  const pkg = PACKAGES[flavor].server[0];
+  let cand = await aptCandidate(M, pkg);
+  if (!cand && !M.dry) {
+    await sys.run("apt-get", ["update", "-q", "-o", "DPkg::Lock::Timeout=300"], { log: M.log, env: { DEBIAN_FRONTEND: "noninteractive" }, timeoutMs: 15 * 60_000, allowFail: true, signal: M.signal });
+    cand = await aptCandidate(M, pkg);
+  }
+  if (cand && cmpSeries(seriesOf(cand) || [0, 0], req) >= 0) {
+    M.log(`apt offers ${pkg} ${cand} — the same series or newer: installing from the configured repositories.`);
+    return { source: "distro", candidate: cand };
+  }
+  M.log(cand ? `apt offers ${pkg} ${cand} — too old for a replica of ${req.join(".")}.` : `apt has no ${pkg} package here.`);
+
+  const V = VENDOR_REPOS[flavor];
+  const osr = await osRelease(M);
+  const arch = await dpkgArch(M);
+  const hint = `Install ${FLAVOR_NAME[flavor]} ${req.join(".")} or newer on this server by hand (it must keep root signing in over the unix socket), then press Turn on replication again.`;
+  if (osr.id !== "ubuntu" && osr.id !== "debian") throw new Error(`This server runs ${osr.pretty || osr.id || "an unknown OS"}; ${V.name} is only set up automatically on Ubuntu or Debian. ${hint}`);
+  if (!osr.codename) throw new Error(`/etc/os-release names no release codename, so ${V.name} cannot be chosen. ${hint}`);
+  if (!V.arches.includes(arch)) throw new Error(`${V.name} has no packages for ${arch} (only ${V.arches.join(", ")}). ${hint}`);
+
+  if (flavor === "mysql") {
+    const releaseUrl = `${V.base}/${osr.id}/dists/${osr.codename}/Release`;
+    let components;
+    if (M.dry) {
+      const suites = M.sim.repoSuites || DRY_DEFAULT_SUITES;
+      M.log(`[dry-run] GET ${releaseUrl} → simulated`);
+      if (!suites.includes(osr.codename)) throw new Error(`${V.name} has no packages for ${osr.id} ${osr.codename} (no ${releaseUrl}). ${hint}`);
+      components = M.sim.repoComponents || DRY_DEFAULT_MYSQL_COMPONENTS;
+    } else {
+      let text;
+      try {
+        text = await httpGet(releaseUrl);
+      } catch (e) {
+        if (e.status === 404) throw new Error(`${V.name} has no packages for ${osr.id} ${osr.codename} (no ${releaseUrl}). ${hint}`);
+        throw new Error(`Could not read ${releaseUrl}: ${e.message}. Nothing was changed on ${os.hostname()}.`);
+      }
+      components = ((/^Components:\s*(.*)$/m.exec(text) || [])[1] || "").trim().split(/\s+/).filter(Boolean);
+    }
+    const pick = pickMysqlComponent(primary.version, components);
+    if (!pick) throw new Error(`${V.name} for ${osr.codename} has no series that can replicate from MySQL ${primary.version} (components: ${components.join(", ") || "none"}). ${hint}`);
+    M.log(`Using ${V.name}, component ${pick.component} (${pick.why}).`);
+    return {
+      source: "vendor",
+      os: osr,
+      arch,
+      component: pick.component,
+      line: `deb [arch=${arch} signed-by=${V.keyring}] ${V.base}/${osr.id} ${osr.codename} ${pick.component}`,
+      expect: pick.series && pick.series !== req.join(".") ? `${pick.series}.0` : primary.version,
+    };
+  }
+  // MariaDB: exactly the primary's series from MariaDB's own repository.
+  const series = req.join(".");
+  const releaseUrl = `${V.base}/${series}/repo/${osr.id}/dists/${osr.codename}/Release`;
+  if (M.dry) {
+    M.log(`[dry-run] GET ${releaseUrl} → simulated`);
+    if (!(M.sim.repoSuites || DRY_DEFAULT_SUITES).includes(osr.codename)) throw new Error(`${V.name} has no MariaDB ${series} for ${osr.id} ${osr.codename} (no ${releaseUrl}). ${hint}`);
+  } else {
+    try {
+      await httpGet(releaseUrl);
+    } catch (e) {
+      if (e.status === 404 || e.status === 403) throw new Error(`${V.name} has no MariaDB ${series} for ${osr.id} ${osr.codename} (no ${releaseUrl}). ${hint}`);
+      throw new Error(`Could not read ${releaseUrl}: ${e.message}. Nothing was changed on ${os.hostname()}.`);
+    }
+  }
+  M.log(`Using ${V.name}, MariaDB ${series}.`);
+  return { source: "vendor", os: osr, arch, series, line: `deb [arch=${arch} signed-by=${V.keyring}] ${V.base}/${series}/repo/${osr.id} ${osr.codename} main`, expect: primary.version };
+}
+
+/**
+ * Decide, changing nothing: keep the installed server, install one, or replace
+ * an older one (only when it holds nothing but leftovers of an unfinished
+ * seed — or, for mysql.rebuild, data that is safety-dumped and dropped first).
+ */
+async function planServer(M, p, primary, { rebuild = false } = {}) {
+  const req = primary.series;
+  if (M.hook) {
+    const info = await serverInfo(M);
+    if (cmpSeries(seriesOf(info.version) || [0, 0], req) < 0) throw new Error(`TEST HOOK: ${tooOldMessage(p.flavor, req, "the local test server", info.version)}; nothing is installed under the test hook.`);
+    return { action: "keep", version: info.version };
+  }
   const have = await installedFlavor(M);
-  if (have && have !== flavor) {
-    throw new Error(`This server already runs ${have === "mariadb" ? "MariaDB" : "MySQL"}, but the primary runs ${flavor === "mariadb" ? "MariaDB" : "MySQL"}. Remove it first or pick another server.`);
+  if (have && have !== p.flavor) {
+    throw new Error(`This server already runs ${FLAVOR_NAME[have]}, but the primary runs ${FLAVOR_NAME[p.flavor]}. Remove it first or pick another server. Nothing was changed.`);
   }
   if (have) {
-    M.log(`${flavor === "mariadb" ? "MariaDB" : "MySQL"} is already installed.`);
-    return { installedNow: false };
+    const info = await requireRunning(M);
+    const local = seriesOf(info.version) || [0, 0];
+    if (cmpSeries(local, req) >= 0) {
+      M.log(`This server runs ${FLAVOR_NAME[p.flavor]} ${info.version} — the ${local.join(".")} series, same as or newer than the primary's ${req.join(".")}: no install needed.`);
+      return { action: "keep", version: info.version };
+    }
+    M.log(`!! ${tooOldMessage(p.flavor, req, "This server", info.version)} — a replica must run the same series or a newer one.`);
+    const dbs = await localUserDbs(M);
+    const seeding = readHaState(M.dataDir).seeding;
+    const disposable = dbs.filter((d) => Array.isArray(seeding?.databases) && seeding.databases.includes(d));
+    const keep = dbs.filter((d) => !disposable.includes(d));
+    if (keep.length && !rebuild) {
+      throw new Error(
+        `This server runs ${FLAVOR_NAME[p.flavor]} ${info.version}, older than the primary's ${primary.version}, and it holds databases of its own (${keep.join(", ")}). ` +
+          `It is not upgraded automatically while it holds data. Back up and remove those databases (or upgrade ${FLAVOR_NAME[p.flavor]} to ${req.join(".")} or newer yourself), then press Turn on replication again. Nothing was changed on ${os.hostname()}.`,
+      );
+    }
+    if (disposable.length) M.log(`Databases left by an unfinished copy from the primary (safe to discard): ${disposable.join(", ")}.`);
+    if (rebuild && keep.length) M.log(`Its databases (${keep.join(", ")}) are saved to a safety dump and dropped first, then it is upgraded.`);
+    else if (!dbs.length) M.log("It holds no databases of its own, so it can be upgraded.");
+    const src = await resolveSource(M, p.flavor, primary);
+    return { action: "replace", version: info.version, ...src };
   }
-  if (!M.dry && !sys.which("apt-get")) throw new Error("apt-get is not available — install the database server by hand.");
-  M.log(`Installing ${PACKAGES[flavor].server.join(" ")}…`);
+  M.log(`${FLAVOR_NAME[p.flavor]} is not installed on this server.`);
+  const src = await resolveSource(M, p.flavor, primary);
+  return { action: "install", ...src };
+}
+
+// ---- 3. carrying it out
+
+async function addVendorRepo(M, flavor, plan) {
+  const V = VENDOR_REPOS[flavor];
+  M.log(`── ${V.name} ──`);
+  if (M.dry) {
+    M.log(`[dry-run] GET ${V.keyUrl}; require key ${V.fingerprint}; write it to ${V.keyring} (0644)`);
+    M.log(`[dry-run] write ${APT_LIST}: ${plan.line}`);
+  } else {
+    let bytes;
+    try {
+      bytes = await httpGet(V.keyUrl, { binary: true });
+    } catch (e) {
+      throw new Error(`Downloading the signing key of ${V.name} failed (${e.message}). Nothing was changed on ${os.hostname()}.`);
+    }
+    let key;
+    try {
+      key = extractRepoKey(bytes, V.fingerprint);
+    } catch (e) {
+      throw new Error(`Refusing ${V.name}: ${e.message}. Nothing was changed on ${os.hostname()}.`);
+    }
+    writeAtomic(V.keyring, key.keyring, 0o644);
+    M.log(`Signing key ${V.fingerprint.replace(/(.{4})/g, "$1 ").trim()} verified and stored in ${V.keyring}.`);
+    writeAtomic(APT_LIST, `# Added by Forthway Command Center (database replication): ${FLAVOR_NAME[flavor]} ≥ the primary's series.\n${plan.line}\n`, 0o644);
+    M.log(`${APT_LIST}: ${plan.line}`);
+  }
+  const env = { DEBIAN_FRONTEND: "noninteractive" };
+  const up = await sys.run("apt-get", ["update", "-q", "-o", "DPkg::Lock::Timeout=300"], { log: M.log, env, timeoutMs: 15 * 60_000, allowFail: true, signal: M.signal });
+  const pkg = PACKAGES[flavor].server[0];
+  M.vendorExpect = plan.expect;
+  const cand = await aptCandidate(M, pkg, { which: "vendor" });
+  const req = seriesOf(plan.expect) && plan.component !== "mysql-innovation" ? seriesOf(plan.expect) : null;
+  const okCand = cand && (!req || cmpSeries(seriesOf(cand) || [0, 0], req) >= 0);
+  if (up.code !== 0 || !okCand) {
+    if (!M.dry) {
+      fs.rmSync(APT_LIST, { force: true });
+      fs.rmSync(V.keyring, { force: true });
+      await sys.run("apt-get", ["update", "-q", "-o", "DPkg::Lock::Timeout=300"], { env, timeoutMs: 15 * 60_000, allowFail: true });
+    }
+    throw new Error(
+      up.code !== 0
+        ? `apt-get update failed after adding ${V.name} (exit ${up.code}); the repository was removed again. Nothing else was changed on ${os.hostname()}.`
+        : `${V.name} offers ${pkg} ${cand || "(nothing)"}, not the expected series; the repository was removed again. Nothing else was changed on ${os.hostname()}.`,
+    );
+  }
+  M.log(`apt now offers ${pkg} ${cand}.`);
+  return cand;
+}
+
+async function preseed(M, flavor, plan, primary) {
+  if (flavor !== "mysql" || plan.source !== "vendor") return;
+  // Oracle's package asks for a root password: leaving it blank makes root@localhost
+  // use auth_socket, exactly like Ubuntu's package (and how these tasks sign in).
+  const lctn = primary.lowerCaseTableNames === 1 ? "Enabled" : "Disabled";
+  const lines = [
+    "mysql-community-server mysql-community-server/root-pass password ",
+    "mysql-community-server mysql-community-server/re-root-pass password ",
+    `mysql-community-server mysql-server/lowercase-table-names select ${lctn}`,
+    "mysql-community-server mysql-community-server/remove-data-dir boolean false",
+  ];
+  if (M.dry) for (const l of lines) M.log(`[dry-run]   debconf: ${l.trim()}`);
+  await sys.run("debconf-set-selections", [], { input: lines.join("\n") + "\n", log: M.log, timeoutMs: 60_000 });
+}
+
+/** Run the plan. → { installedNow, replaced, oldDataDir } */
+async function applyServerPlan(M, p, plan, primary) {
+  if (plan.action === "keep") return { installedNow: false };
+  if (!M.dry && !sys.which("apt-get")) throw new Error(`apt-get is not available — install ${FLAVOR_NAME[p.flavor]} ${primary.series.join(".")} or newer by hand. Nothing was changed.`);
+  if (plan.source === "vendor") await addVendorRepo(M, p.flavor, plan);
+  checkAbort(M);
+  await preseed(M, p.flavor, plan, primary);
+
+  let oldDataDir = null;
+  let confNew = false;
+  if (plan.action === "replace") {
+    M.log(`── Replacing ${FLAVOR_NAME[p.flavor]} ${plan.version} ──`);
+    await sys.run("systemctl", ["stop", SERVICE[p.flavor]], { log: M.log, timeoutMs: RESTART_TIMEOUT_MS, allowFail: true });
+    // Oracle's packages replacing the distro's: give them an empty data directory so
+    // they initialise it themselves (root on auth_socket). The old one is kept.
+    const fresh = p.flavor === "mysql" && plan.source === "vendor" && !(await pkgInstalled(M, "mysql-community-server"));
+    if (fresh) {
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+      oldDataDir = `${MYSQL_DATADIR}.fcc-before-upgrade-${stamp}`;
+      if (M.dry) M.log(`[dry-run] mv ${MYSQL_DATADIR} ${oldDataDir}`);
+      else if (exists(MYSQL_DATADIR)) fs.renameSync(MYSQL_DATADIR, oldDataDir);
+      M.log(`The old data directory (no databases of its own) is kept at ${oldDataDir}.`);
+      confNew = true;
+    }
+    // The managed file is rewritten for the new version right after this.
+    const cnf = cnfPath(M, p.flavor);
+    if (exists(cnf)) fs.rmSync(cnf, { force: true });
+  }
+
+  const pkgs = PACKAGES[p.flavor].server;
+  M.log(`Installing ${pkgs.join(" ")}${plan.source === "vendor" ? ` from ${VENDOR_REPOS[p.flavor].name}` : ""}…`);
   try {
-    await aptInstall(M, PACKAGES[flavor].server);
+    await aptInstall(M, pkgs, { confNew });
   } catch (err) {
     if (err.aborted || M.signal?.aborted) throw abortError();
-    throw new Error(`Installing ${flavor === "mariadb" ? "MariaDB" : "MySQL"} failed: ${err.message}${flavor === "mysql" ? " (Debian 12 has no mysql-server package; use MariaDB on the primary or add Oracle's repository)" : ""}`);
+    throw new Error(
+      `Installing ${FLAVOR_NAME[p.flavor]} failed: ${err.message}${oldDataDir ? ` (the old data directory is at ${oldDataDir})` : ""}. Fix the apt problem above, then press Turn on replication again.`,
+    );
   }
   sys.forgetWhich();
-  await sys.run("systemctl", ["enable", "--now", SERVICE[flavor]], { log: M.log, timeoutMs: RESTART_TIMEOUT_MS, allowFail: true });
-  if (M.dry) saveDry(M, { installed: true, flavor, version: flavor === "mariadb" ? "10.11.6-MariaDB-dry-run" : "8.0.36-dry-run" });
+  await sys.run("systemctl", ["enable", "--now", SERVICE[p.flavor]], { log: M.log, timeoutMs: RESTART_TIMEOUT_MS, allowFail: true });
+  if (M.dry) {
+    const v = plan.source === "vendor" ? M.sim.vendorCandidate?.[pkgs[0]] || plan.expect : M.sim.distro?.[pkgs[0]] || (plan.candidate ? plan.candidate : dryVersionDefault(p.flavor));
+    saveDry(M, { installed: true, running: true, flavor: p.flavor, version: v, ...(oldDataDir ? { databases: [] } : {}) });
+  }
   await waitReady(M);
-  return { installedNow: true };
+  return { installedNow: true, replaced: plan.action === "replace", oldDataDir };
 }
 
 /** panel.install helper: the client of the cluster's flavor, for remote admin and dumps. Never throws. */
@@ -996,17 +1572,32 @@ export async function primaryPrepare(payload, o) {
 
 // ---- mysql.replica.setup
 
-async function replicaSetupInner(M, p) {
+async function replicaSetupInner(M, p, pre = null) {
+  // Version preflight — decides everything before anything on this server changes.
+  M.log("── Versions ──");
+  const primaryV = pre?.primary || (await primaryVersionOf(M, p));
+  const plan = await planServer(M, p, primaryV);
+  checkAbort(M);
+
   M.log("── MySQL server ──");
-  const inst = await ensureServerInstalled(M, p.flavor);
-  if (M.dry && !inst.installedNow) {
-    const s = dryState(M);
-    if (s.flavor !== p.flavor) saveDry(M, { flavor: p.flavor, version: p.flavor === "mariadb" ? "10.11.6-MariaDB-dry-run" : "8.0.36-dry-run" });
-  }
+  const inst = await applyServerPlan(M, p, plan, primaryV);
   const info = await requireRunning(M);
   if (info.flavor !== p.flavor) throw new Error(`This server runs ${info.flavor} ${info.version}, but the primary runs ${p.flavor}.`);
+  if (cmpSeries(seriesOf(info.version) || [0, 0], primaryV.series) < 0) {
+    throw new Error(`After installing, this server still runs ${FLAVOR_NAME[info.flavor]} ${info.version}, older than the primary's ${primaryV.version}. Install ${FLAVOR_NAME[info.flavor]} ${primaryV.series.join(".")} or newer here by hand, then press Turn on replication again.`);
+  }
   const d = dialect(info.flavor, info.version);
   M.log(`${info.flavor === "mariadb" ? "MariaDB" : "MySQL"} ${info.version} · server_id ${info.serverId} → ${p.serverId}`);
+  if (p.seed) {
+    // An older mysqldump cannot copy from a newer server (8.0's sends SHOW MASTER STATUS, gone in 8.4).
+    const dv = await dumpVersion(M);
+    const ds = seriesOf(dv);
+    if (!ds) throw new Error(`${path.basename(dumpBin())} is missing or did not report its version — install the ${FLAVOR_NAME[p.flavor]} client (${PACKAGES[p.flavor].client.join(" ")}) ${primaryV.series.join(".")} or newer, then press Turn on replication again.`);
+    if (cmpSeries(ds, primaryV.series) < 0) {
+      throw new Error(`This server's ${path.basename(dumpBin())} is ${dv}, older than the primary's ${FLAVOR_NAME[p.flavor]} ${primaryV.version}; it cannot copy the databases from it. Install the ${FLAVOR_NAME[p.flavor]} ${primaryV.series.join(".")} client (${PACKAGES[p.flavor].client.join(" ")}), then press Turn on replication again.`);
+    }
+    M.log(`${path.basename(dumpBin())} ${dv}: new enough to copy from ${primaryV.version}.`);
+  }
   checkAbort(M);
 
   M.log("── Replica settings ──");
@@ -1017,7 +1608,7 @@ async function replicaSetupInner(M, p) {
   // The primary: reachable, same flavor, GTIDs on, a different server_id; TLS when it offers it.
   M.log("── Primary ──");
   const conn = { host: p.primaryHost, port: p.primaryPort, user: p.replUser, password: p.replPassword, extra: d.clientExtra };
-  let primary = { version: info.version, serverId: 0, ssl: false, gtid: "" };
+  let primary = { version: primaryV.version, serverId: 0, ssl: false, gtid: "" };
   let databases = [];
   if (M.dry) {
     databases = p.databases ?? DRY_PRIMARY_DBS;
@@ -1032,10 +1623,9 @@ async function replicaSetupInner(M, p) {
     if (primary.serverId === p.serverId) throw new Error(`The primary already uses server_id ${p.serverId}; every server needs its own.`);
     if (!primary.logBin) throw new Error("The primary has no binary log — run mysql.primary.prepare on it first.");
     if (info.flavor === "mysql" && primary.gtidMode !== "ON") throw new Error(`The primary's gtid_mode is ${primary.gtidMode} — run mysql.primary.prepare on it first.`);
-    const pv = parseVersion(primary.version);
-    const lv = parseVersion(info.version);
-    if (pv && lv && (lv[0] < pv[0] || (lv[0] === pv[0] && lv[1] < pv[1]))) {
-      M.log(`!! This server (${info.version}) is older than the primary (${primary.version}); replication from a newer server is not supported by ${info.flavor}.`);
+    const ps = seriesOf(primary.version);
+    if (ps && cmpSeries(seriesOf(info.version) || [0, 0], ps) < 0) {
+      throw new Error(`This server (${info.version}) is older than the primary (${primary.version}); ${FLAVOR_NAME[info.flavor]} cannot replicate from a newer series.`);
     }
     const all = (await sqlRemote(M, conn, "SHOW DATABASES;\n")).map((r) => r[0]).filter((n) => n && !SYSTEM_DBS.has(n.toLowerCase()));
     const unsafe = all.filter((n) => !ANY_DB_RE.test(n));
@@ -1073,6 +1663,9 @@ async function replicaSetupInner(M, p) {
       if (pos) await sqlLocal(M, `${d.setSeedGtid(pos)};\n`, { timeoutMs: 60_000 });
     } else {
       M.log(`Databases: ${databases.join(", ")}`);
+      // Remembered until the copy finishes: if it does not, these databases are known
+      // to be partial copies of the primary's, which a later run may discard.
+      saveState(M, { seeding: { at: new Date().toISOString(), primaryHost: p.primaryHost, databases } });
       const r = await seedFromPrimary(M, d, conn, databases);
       M.log(`Copied ${fmtBytes(r.bytes)} in ${Math.round(r.ms / 1000)} s.`);
     }
@@ -1104,13 +1697,16 @@ async function replicaSetupInner(M, p) {
   const st = await waitReplicating(M, d);
   M.log(`Replicating from ${p.primaryHost}: IO ${st.ioState}, SQL ${st.sqlRunning ? "Yes" : "No"}, ${st.lagSeconds ?? "?"} s behind.`);
 
-  saveState(M, { role: "replica", flavor: info.flavor, serverId: p.serverId, primaryHost: p.primaryHost, primaryPort: p.primaryPort, ...(seededAt ? { seededAt } : {}) });
+  saveState(M, { role: "replica", flavor: info.flavor, serverId: p.serverId, primaryHost: p.primaryHost, primaryPort: p.primaryPort, seeding: null, ...(seededAt ? { seededAt } : {}) });
   return {
     flavor: info.flavor,
     version: info.version,
+    primaryVersion: primaryV.version,
     serverId: p.serverId,
     restarted: cnf.restarted,
     installed: inst.installedNow,
+    ...(inst.replaced ? { replacedVersion: plan.version, oldDataDir: inst.oldDataDir } : {}),
+    ...(plan.source === "vendor" ? { repository: plan.line } : {}),
     seeded: p.seed,
     seededAt,
     databases,
@@ -1154,11 +1750,18 @@ async function seedFromPrimary(M, d, conn, databases) {
   const loadArgs = [...localArgs(M), "--batch", "--default-character-set=utf8mb4", "--max-allowed-packet=1073741824"];
   // The copy never goes into this server's binary log (no GTIDs of its own).
   const prelude = PRELUDE + "SET SESSION sql_log_bin = 0;\n";
-  return streamPipe(M, {
-    from: { bin: dumpBin(), args: dumpArgs, env: { MYSQL_PWD: conn.password }, secrets: [conn.password] },
-    to: { bin: loadBin, args: loadArgs, prelude },
-    label: "copied",
-  });
+  try {
+    return await streamPipe(M, {
+      from: { bin: dumpBin(), args: dumpArgs, env: { MYSQL_PWD: conn.password }, secrets: [conn.password] },
+      to: { bin: loadBin, args: loadArgs, prelude },
+      label: "copied",
+    });
+  } catch (err) {
+    if (/MASTER STATUS|BINARY LOG STATUS/.test(err.message) && /1064|syntax/.test(err.message)) {
+      throw new Error(`${err.message} — this server's ${path.basename(dumpBin())} speaks an older MySQL dialect than the primary; install the client of the primary's series here, then press Turn on replication again.`);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -1551,6 +2154,11 @@ export async function rebuild(payload, o) {
   const p = checkSetupPayload(payload, "mysql.rebuild");
   p.seed = true; // a rebuild always copies everything again
   forgetStatus();
+  // Versions first: refuse an impossible upgrade before any database is dumped or dropped.
+  M.log("── Versions ──");
+  const primaryV = await primaryVersionOf(M, p);
+  const plan = await planServer(M, p, primaryV, { rebuild: true });
+  checkAbort(M);
   M.log("── Safety copy of this server's databases ──");
   const info = await requireRunning(M);
   const d = dialect(info.flavor, info.version);
@@ -1593,7 +2201,7 @@ export async function rebuild(payload, o) {
   }
   if (M.dry) saveDry(M, { databases: [] });
   checkAbort(M);
-  const r = await replicaSetupInner(M, p);
+  const r = await replicaSetupInner(M, p, { primary: primaryV });
   return { safetyDump, droppedDatabases: dbs, ...r };
 }
 

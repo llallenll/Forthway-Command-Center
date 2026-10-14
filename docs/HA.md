@@ -518,7 +518,7 @@ its embedded agent while it is a standby).
 
 All SQL through the `mysql` CLI with stdin scripts and `MYSQL_PWD` env (never argv),
 socket root locally. Under FCC_DRY_RUN: log, simulate, write nothing outside dataDir.
-`TASKS_VERSION 3.3.0`, `AGENT_VERSION 3.3.0`.
+`TASKS_VERSION 3.3.1`, `AGENT_VERSION 3.3.1` (3.3.0 in v3.9.0).
 
 - `mysql.primary.prepare { serverId, replUser, replPassword, adminPassword, replicaIps, adminIps, allowFrom }`
   Ensures binlog (ROW), `server_id`, GTID (MySQL: `gtid_mode=ON`,
@@ -632,3 +632,20 @@ Main shows Role as "Main (front door, panel)" read-only.
 ## Changes
 
 - 3.9.0 — database replication, cluster alerts, server dialog menus (this section).
+- 3.9.1 — version preflight for `mysql.replica.setup` / `mysql.rebuild` (TASKS/AGENT 3.3.1).
+  Before touching the replica the task reads the primary's version (handshake, then
+  `SELECT VERSION(), @@version_comment` as `fcc_repl`) and requires the replica's
+  release series (major.minor; patch levels never matter) to be the same or newer. If the
+  distro's candidate is older it adds the vendor repository — Oracle's (`repo.mysql.com/apt`,
+  key BCA4 3417 C3B4 85DD 128E C6D4 B7B3 B788 A8D3 785C, component = the primary's series,
+  else the next LTS, else `mysql-innovation`; amd64 only) or MariaDB's (`dlm.mariadb.com`,
+  key 177F 4010 FE56 CA33 3630 0305 F165 6F24 C74C D1D8, the primary's series) — with the
+  key fingerprint checked, `signed-by=` and `/etc/apt/sources.list.d/fcc-mysql.list`; a
+  codename the repository does not publish gets a plain "install it by hand" message. An
+  older installed server is replaced only when it holds no databases (or only partial
+  copies from an unfinished seed, recorded as `seeding` in mysql-ha.json); Ubuntu's MySQL →
+  Oracle's keeps the old data directory at `/var/lib/mysql.fcc-before-upgrade-<stamp>` and
+  lets Oracle's package initialise a fresh one (root on auth_socket). mysqldump's series is
+  checked before the copy, so the 8.0-client-vs-8.4-server `SHOW MASTER STATUS` (1064)
+  failure is reported in plain words. The panel needs agent ≥ 3.3.1 on the replica to
+  enable or rebuild; a failed enable leaves replication off and can simply be retried.
