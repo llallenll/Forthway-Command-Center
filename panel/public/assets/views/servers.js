@@ -4,6 +4,7 @@ import { get, post, patch, del, MOCK } from "../api.js";
 import { sparkline } from "../charts.js";
 import { pageHead, serverKind, jobStarted, openJobLog, METHOD_LABEL, ubar } from "../components.js";
 import { serverBackupDialog } from "./backups.js";
+import { getReplication, replSummary, replicaBroken, syncBar, syncActive, fmtLagS } from "./databases.js";
 
 function installBlock(cmd, warning) {
   return html`${warning ? html`<div class="note warn" style="margin-bottom:14px">${icon("alert")}<div>${warning} <a href="#/settings/general" style="color:var(--blue-3)">Set the panel URL →</a></div></div>` : ""}<ol class="small" style="margin:0 0 14px;padding-left:18px;color:var(--text-2);line-height:1.8">
@@ -91,6 +92,16 @@ const panelSupported = (ha, items) => !!ha || items.some((x) => "panel" in x || 
 const isPanelNode = (s, ha) => !!s?.panel?.enabled || !!s?.panelRole || (s?.role === "main" && !!ha?.enabled);
 const nodeName = (ha, items, id) => (ha?.nodes || []).find((n) => n.serverId === id)?.name || items.find((x) => x.id === id)?.name || id;
 const fmtLag = (ms) => (ms == null ? "—" : ms < 1000 ? `${(ms / 1000).toFixed(1)} s` : ms < 60_000 ? `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s` : `${Math.round(ms / 60_000)} min`);
+
+/** Database replication badge: DB primary / DB replica (with its state), only while replication is on or being set up. */
+function dbBadge(s, repl) {
+  if (!repl || !(repl.enabled || syncActive(repl.progress))) return "";
+  if (repl.primary?.serverId === s.id) return html`<span class="badge" title="Holds the main copy of the databases; changes are replicated to ${repl.replica?.name || "the replica"}.">${icon("database")}DB primary</span>`;
+  if (repl.replica?.serverId !== s.id) return "";
+  const broken = replicaBroken(repl), seeding = syncActive(repl.progress);
+  const lag = repl.replica.lagSeconds;
+  return html`<span class="badge ${broken ? "err" : seeding ? "blue" : "ok"}" title="Keeps a live copy of the databases from ${repl.primary?.name || "the primary"}${lag != null ? ` · ${lag} s behind` : ""}.">${icon("database")}${broken ? "DB replica · stopped" : seeding ? "DB replica · syncing" : "DB replica"}</span>`;
+}
 
 /** Role badge for a panel node: Active panel / Standby. */
 function panelBadge(s, ha) {
@@ -223,9 +234,25 @@ function failoverBox(f) {
   </div>`;
 }
 
-function haStrip(ha, items) {
+/** Database replication row in the HA strip: primary → replica, state and lag (null when replication is off). */
+function dbRow(repl) {
+  const sum = replSummary(repl);
+  if (!sum) return "";
+  const rep_ = repl?.replica, prog = repl?.progress;
+  const lag = !rep_ || replicaBroken(repl) || syncActive(prog) ? "" : `lag ${fmtLagS(rep_.lagSeconds)}`;
+  return html`<div class="ha-dbrow">
+    <span class="dot ${sum.tone}"></span>
+    <span class="ha-dbrow-t"><b>Databases</b><span class="muted"> · primary ${sum.primary}${rep_ ? ` → replica ${rep_.name}` : ""}${repl.mode ? ` · ${repl.mode === "auto" ? "automatic" : "manual"} failover` : ""}</span>
+      ${sum.warns.length ? html`<div class="small ha-short">${sum.warns[0]}</div>` : ""}</span>
+    <span class="ha-node-meta muted small">${lag ? html`<span title="How far the replica's copy of the databases is behind (seconds behind the primary)">${lag}</span>` : html`<span>${sum.text}</span>`}${rep_?.sqlRunning != null ? html`<span>${rep_.ioRunning && rep_.sqlRunning ? "threads running" : "threads stopped"}</span>` : ""}</span>
+    <a class="btn btn-sm" href="#/settings/databases">Replication</a>
+    ${syncActive(prog) ? html`<span class="ha-db-bar">${syncBar(prog, { size: "sm" })}</span>` : ""}
+  </div>`;
+}
+
+function haStrip(ha, items, repl) {
   // Panel failover off: the speed still sets how fast the database fails over (shown once there is a second server).
-  if (!ha?.enabled) return ha?.failover && (items || []).length >= 2 ? html`<div class="card ha-strip ha-strip-solo">${failoverBox(ha.failover)}</div>` : html``;
+  if (!ha?.enabled) return (ha?.failover && (items || []).length >= 2) || replSummary(repl) ? html`<div class="card ha-strip ha-strip-solo">${dbRow(repl)}${ha?.failover && (items || []).length >= 2 ? failoverBox(ha.failover) : ""}</div>` : html``;
   const leader = nodeName(ha, items, ha.leaderId);
   const standbys = (ha.nodes || []).filter((n) => n.serverId !== ha.leaderId);
   const votes = (ha.votes || []).filter((v) => v.votedFor === ha.leaderId && v.reachable !== false && (v.leaseLeftMs == null || v.leaseLeftMs > 0)).length;
@@ -244,11 +271,12 @@ function haStrip(ha, items) {
       const can = n.online && ha.armed !== false;
       return html`<div class="edge-row ha-node">
         <span class="dot ${!n.online ? "err" : n.role === "candidate" ? "warn" : "ok"}"></span>
-        <span class="edge-row-name">${n.name}<span class="muted small"> · ${!n.online ? "offline" : n.role === "candidate" ? "electing" : "standby"}${n.version ? ` · v${n.version}` : ""}</span></span>
-        <span class="ha-node-meta muted small"><span title="How far its copy of the panel data is behind">lag ${n.online ? fmtLag(n.lagMs) : "—"}</span><span class="${n.codeInSync === false ? "ha-short" : ""}">${n.codeInSync === false ? "code updating" : "code in sync"}</span></span>
+        <span class="edge-row-name">${n.name}<span class="muted small"> · ${!n.online ? "offline" : n.role === "candidate" ? "electing" : "standby"}${n.panelVersion ? ` · v${n.panelVersion}` : ""}</span></span>
+        <span class="ha-node-meta muted small"><span title="${n.version?.seq != null ? `Has panel data change #${n.version.seq}. ` : ""}Panel data is copied to standbys as it changes; this is how far behind its copy is.">${!n.online ? "lag —" : n.lagMs === 0 ? "data in sync" : `data lag ${fmtLag(n.lagMs)}`}</span><span class="${n.codeInSync === false ? "ha-short" : ""}">${n.codeInSync === false ? "code updating" : "code in sync"}</span></span>
         <button class="btn btn-sm" type="button" data-ha-active="${n.serverId}" ${can ? "" : raw("disabled")} title="${!n.online ? `${n.name} is offline.` : ha.armed === false ? "Wait until the servers have voted." : "Hand the active panel over to this server."}">Make active panel</button>
       </div>`;
     })}</div>` : ""}
+    ${dbRow(repl)}
     ${failoverBox(ha.failover)}
   </div>`;
 }
@@ -391,7 +419,7 @@ async function serverForm(s, { edgeSupported = true, panel = null } = {}) {
   return result;
 }
 
-function serverCard(s, ha) {
+function serverCard(s, ha, repl) {
   const m = s.metrics || {};
   const memT = m.memTotal || s.info?.memTotal, diskT = m.diskTotal || s.info?.diskTotal;
   return html`<div class="ecard server-card ${s.online ? "" : "is-offline"}" data-server="${s.id}" style="--c:${s.online ? "#4a72ff" : "#46507a"}">
@@ -409,6 +437,7 @@ function serverCard(s, ha) {
       ${s.lbEligible !== false ? html`<span class="badge badge-lb">${icon("balance")}LB pool</span>` : ""}
       ${isEdge(s) && s.edge ? html`<span class="badge blue" title="${s.role === "main" ? "Always an edge (front door)" : EDGE_HELP}">${icon("shield")}Edge</span>` : ""}
       ${panelBadge(s, ha)}
+      ${dbBadge(s, repl)}
     </div>
     ${s.role !== "main" && s.edge?.enabled ? edgeStrip(s) : ""}
     <div class="srv-meters ubars">
@@ -443,8 +472,8 @@ export default async function servers(ctx) {
     <div class="section-head mt-24"><div><h2>Servers</h2><p data-sum>Loading…</p></div></div>
     <div data-list><div class="cards">${[1, 2, 3].map(() => html`<div class="skel" style="height:290px;border-radius:18px"></div>`)}</div></div>`);
   const list = $("[data-list]", root), lbBox = $("[data-lb]", root), haBox = $("[data-ha]", root);
-  let items = [], lb = null, ha = null;
-  const paintHa = () => mount(haBox, haStrip(ha, items));
+  let items = [], lb = null, ha = null, repl = null;
+  const paintHa = () => mount(haBox, haStrip(ha, items, repl));
   // GET /api/ha: null on an older panel (404) — then nothing about panel nodes shows.
   const getHa = () => get("/api/ha").catch(() => null);
   const sparks = {};
@@ -484,7 +513,7 @@ export default async function servers(ctx) {
     const on_ = items.filter((s) => s.online).length;
     const edges = items.filter((s) => s.role !== "main" && s.edge?.enabled).length;
     $("[data-sum]", root).textContent = `${on_} of ${items.length} online · ${items.filter((s) => s.lbEligible !== false).length} available for load balancing${items.some((s) => s.edge) ? ` · ${edges ? plural(edges, "edge node") : "no edge nodes besides main"}` : ""}`;
-    mount(list, items.length ? html`<div class="cards">${items.map((x) => serverCard(x, ha))}
+    mount(list, items.length ? html`<div class="cards">${items.map((x) => serverCard(x, ha, repl))}
       <button class="ecard" data-add style="align-items:center;justify-content:center;gap:10px;border-style:dashed;cursor:pointer;min-height:240px;color:var(--muted);font:inherit">
         <span class="e-ico" style="width:46px;height:46px;border-radius:14px;display:grid;place-items:center;background:rgba(74,114,255,.12);color:var(--blue-3)">${icon("plus")}</span>
         <b style="color:var(--text)">Add an agent server</b><span class="small" style="max-width:220px;text-align:center">One command on any Ubuntu or Debian box.</span></button></div>`
@@ -493,8 +522,8 @@ export default async function servers(ctx) {
   };
   const load = async () => {
     try {
-      const [s, l, h] = await Promise.all([get("/api/servers"), get("/api/loadbalancer").catch(() => null), getHa()]);
-      items = s.items || []; lb = l; ha = h && typeof h === "object" ? h : null;
+      const [s, l, h, d] = await Promise.all([get("/api/servers"), get("/api/loadbalancer").catch(() => null), getHa(), getReplication()]);
+      items = s.items || []; lb = l; ha = h && typeof h === "object" ? h : null; repl = d;
       if (!ctx.alive()) return;
       paintHa(); paintLb(); paint();
     } catch (e) { if (ctx.alive()) { mount(list, errorState(e)); $("[data-retry]", list)?.addEventListener("click", load); } }
@@ -547,7 +576,7 @@ export default async function servers(ctx) {
     const i = items.findIndex((x) => x.id === d.id);
     items[i] = { ...items[i], ...d };
     const el = $(`[data-server="${d.id}"]`, list);
-    if (el) { el.replaceWith(frag(serverCard(items[i], ha))); paintSpark(d.id); }
+    if (el) { el.replaceWith(frag(serverCard(items[i], ha, repl))); paintSpark(d.id); }
   });
   ctx.on("ha", debounce(async () => {
     const h = await getHa();
@@ -557,6 +586,30 @@ export default async function servers(ctx) {
     const fresh = await get("/api/servers").catch(() => null);
     if (fresh?.items && ctx.alive()) { items = fresh.items; paint(); }
   }, 500));
+  // Background repaints of the strip skip while someone is changing the failover speed (it would reset the box).
+  const quietPaintHa = () => {
+    const fo = $("[data-fo-save]", haBox);
+    if ((fo && !fo.disabled) || $("[data-fo-input]", haBox) === document.activeElement) return;
+    paintHa();
+  };
+  // Database replication: the SSE payload is the full status view (same as GET /api/mysql/replication).
+  ctx.on("mysql-ha", debounce(async (d) => {
+    const r = d && typeof d === "object" && "enabled" in d ? d : await getReplication();
+    if (!ctx.alive()) return;
+    const roles = (x) => JSON.stringify([x?.enabled, x?.primary?.serverId, x?.replica?.serverId, x?.replica?.state, syncActive(x?.progress)]);
+    const moved = roles(r) !== roles(repl);
+    repl = r; quietPaintHa();
+    if (moved) paint(); // card badges
+  }, 500));
+  // Lag numbers: refresh the strip while the page is open (standby lag isn't pushed on its own).
+  const lagTimer = setInterval(async () => {
+    if (document.hidden || !ctx.alive()) return;
+    const [h, d] = await Promise.all([getHa(), getReplication()]);
+    if (!ctx.alive()) return;
+    if (h) ha = h;
+    repl = d; quietPaintHa();
+  }, 10_000);
+  ctx.cleanup?.(() => clearInterval(lagTimer));
   // Failover speed: preview the breakdown while typing (GET /api/ha/settings?failoverSeconds=N), save with PATCH.
   const foSaved = () => ha?.failover?.failoverSeconds;
   const foState = (v, f) => {

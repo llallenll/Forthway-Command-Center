@@ -655,7 +655,7 @@ function haView() {
   const majority = Math.floor(voters.length / 2) + 1;
   const votes = voters.map((x) => ({ serverId: x.id, name: x.name, votedFor: x.online ? ha.leaderId : null, leaseLeftMs: x.online ? 9000 + Math.round(Math.random() * 3000) : 0, reachable: !!x.online }));
   const nodes = panelNodes().map((x) => ({ serverId: x.id, name: x.name, role: x.id === ha.leaderId ? "leader" : "follower", directUrl: x.panel.directUrl, online: !!x.online,
-    version: "3.8.0", lagMs: x.id === ha.leaderId ? 0 : 400, codeInSync: true }));
+    version: { term: ha.term, seq: 4182 }, panelVersion: "3.10.0", lagMs: x.id === ha.leaderId ? 0 : 400, codeInSync: true }));
   const warnings = voters.filter((x) => !x.online).map((x) => `${x.name} is offline, so it can't vote. The panel keeps running while ${majority} of ${voters.length} servers vote.`);
   return { enabled: ha.enabled, armed: ha.armed, leaderId: ha.leaderId, term: ha.term, localServerId: ha.leaderId, majority, voters: voters.length,
     votes, nodes, committed: { term: ha.term, seq: 4182 }, warnings, canEnable: haCanEnable(), failover: foSummary(failoverSeconds) };

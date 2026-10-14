@@ -47,20 +47,27 @@ function haCard(el, ctx) {
       const sb = (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId).length;
       panelText = `Active panel: ${leader} · ${sb ? `${sb} ${sb === 1 ? "standby" : "standbys"}` : "no standbys"}`;
     }
-    const dbText = dbs ? (syncActive(dbs.progress) ? dbs.text : `Databases: ${dbs.text}`) : "";
     const dbBar = syncActive(dbs?.progress) ? html`<span class="ha-db-bar">${syncBar(dbs.progress, { size: "sm" })}</span>` : "";
-    const sub = [panelText, r ? repText : "", r ? edgeLine : ""].filter(Boolean).join(" · ");
-    const nodes = panel ? (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId) : [];
+    // One bullet per layer: panels, edge nodes, databases (each only when this panel knows about it).
+    const standbyNodes = panel ? (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId) : [];
+    const panelTone = !panel ? "" : panel.armed === false || (panel.warnings || []).length ? "warn" : standbyNodes.some((n) => !n.online) ? "warn" : standbyNodes.length ? "ok" : "warn";
+    const edgeTone_ = !r ? "" : edges.some((e) => !e.online) ? "err" : (r.warnings || []).length || (conns && !reps) ? "warn" : edges.length ? "ok" : "off";
+    const bullets = (withSolo) => html`<ul class="ha-bullets">
+      ${panel ? html`<li><span class="dot ${panelTone}"></span><span><b>Panels</b><span class="muted"> · ${panelText}${standbyNodes.length ? ` (${standbyNodes.map((n) => n.name).join(", ")})` : ""}</span></span></li>` : ""}
+      ${r ? html`<li><span class="dot ${edgeTone_}"></span><span><b>Edge nodes</b><span class="muted"> · ${edgeLine}${edges.length ? ` (${edges.map((e) => e.name).join(", ")})` : ""} · ${repText}${withSolo && solo.length ? html` · ${soloText}: ${siteLinks(solo, 3)}` : ""}</span></span></li>` : ""}
+      ${dbs ? html`<li class="ha-db"><span class="dot ${dbs.tone}"></span><span><b>Databases</b><span class="muted"> · </span><a href="#/settings/databases">${dbs.text}</a></span>${dbBar}</li>` : ""}
+    </ul>`;
+    const nodes = standbyNodes;
     if (!warns.length) {
       mount(el, html`<div class="card ha-quiet">
         <span class="ha-ico ok">${icon("shield", "sm")}</span>
-        <span class="ha-quiet-t"><b>Availability</b><span class="muted"> · ${sub}${solo.length ? html` · ${soloText}: ${siteLinks(solo, 3)}` : ""}</span>${dbs ? html`<span class="ha-db"><span class="dot ${dbs.tone}"></span><a href="#/settings/databases">${dbText}</a>${dbBar}</span>` : ""}</span>
+        <span class="ha-quiet-t"><b>Availability</b>${bullets(true)}</span>
         <a class="btn btn-sm btn-ghost" href="#/servers">Servers ${icon("arrowRight", "sm")}</a></div>`);
       return;
     }
     mount(el, html`<div class="card ha-alert">
       <div class="card-head"><span class="ha-ico warn">${icon("alert")}</span>
-        <div class="ha-head-t"><h3>Availability needs attention</h3><div class="sub">${sub}</div>${dbs ? html`<div class="ha-db"><span class="dot ${dbs.tone}"></span><a href="#/settings/databases">${dbText}</a>${dbBar}</div>` : ""}</div>
+        <div class="ha-head-t"><h3>Availability needs attention</h3>${bullets(false)}</div>
         <div class="right"><a class="btn btn-sm" href="#/servers">${icon("server")}Servers</a></div></div>
       <div class="card-body ha-body">
         <ul class="ha-warns">${warns.map((w) => html`<li>${icon("alert", "xs")}<span>${w}</span></li>`)}</ul>
