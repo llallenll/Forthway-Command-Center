@@ -48,7 +48,9 @@
  *     "repoSuites": ["jammy", "noble", "bookworm"],   // codenames the vendor repo publishes
  *     "repoComponents": ["mysql-8.0", "mysql-8.4-lts", "mysql-9.7-lts", "mysql-innovation"],
  *     "installedPackages": ["mysql-community-server"], // dpkg answers
- *     "dump": "8.0.39" }                             // mysqldump --version (default: the server's)
+ *     "dump": "8.0.39",                              // mysqldump --version (default: the server's)
+     "seedBytes": 2576980378, "seedSeconds": 24,     // the simulated copy (progress bar, 3.9.2)
+     "catchUpChanges": 1480, "catchUpSeconds": 14 }  // then the simulated replica catching up
  * The local server itself is the simulated one in mysql-ha-dry.json (write
  * { "installed": true, "flavor", "version", "databases": [] } there first to
  * simulate an installed server).
@@ -219,6 +221,268 @@ export function cleanGtid(flavor, s) {
   const ok = flavor === "mariadb" ? /^[0-9,-]*$/.test(t) : /^[A-Za-z0-9_:,-]*$/.test(t);
   if (!ok || t.length > 65_000) throw new Error("Refusing an unexpected GTID value from the server.");
   return t;
+}
+
+// =================================================================== sync progress (pure; unit-testable)
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Parse a GTID set into Map<key, [[from, to], …]> (sorted, merged, inclusive).
+ *   MySQL    "uuid:1-5:7-9,uuid2:1-3"   (8.3+ tagged: "uuid:tag:1-5" — key "uuid:tag")
+ *   MariaDB  "0-1-100,1-2-50"            (domain-server-seq — key "d<domain>", interval [1, seq])
+ * MariaDB positions are per replication domain: everything up to `seq` in that domain.
+ * Returns null for anything that is not a GTID set ("" → empty map).
+ */
+export function parseGtidSet(s) {
+  const text = String(s ?? "").replace(/\s+/g, "");
+  const out = new Map();
+  if (!text) return out;
+  const add = (key, a, b) => {
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a < 1 || b < a) return false;
+    if (!out.has(key)) out.set(key, []);
+    out.get(key).push([a, b]);
+    return true;
+  };
+  for (const part of text.split(",")) {
+    if (!part) continue;
+    const maria = /^(\d+)-(\d+)-(\d+)$/.exec(part);
+    if (maria) {
+      const key = `d${Number(maria[1])}`;
+      const seq = Number(maria[3]);
+      if (seq === 0) continue;
+      // Several entries for one domain (different server ids): the highest seq wins.
+      const prev = out.get(key);
+      if (prev) prev[0][1] = Math.max(prev[0][1], seq);
+      else if (!add(key, 1, seq)) return null;
+      continue;
+    }
+    const segs = part.split(":");
+    if (!UUID_RE.test(segs[0])) return null;
+    let key = segs[0].toLowerCase();
+    for (const seg of segs.slice(1)) {
+      const m = /^(\d+)(?:-(\d+))?$/.exec(seg);
+      if (!m) {
+        if (!/^[a-z_][a-z0-9_]{0,31}$/i.test(seg)) return null;
+        key = `${segs[0].toLowerCase()}:${seg.toLowerCase()}`; // a tag: the ranges after it belong to uuid:tag
+        continue;
+      }
+      if (!add(key, Number(m[1]), Number(m[2] ?? m[1]))) return null;
+    }
+  }
+  for (const [k, list] of out) {
+    list.sort((x, y) => x[0] - y[0]);
+    const merged = [];
+    for (const [a, b] of list) {
+      const last = merged[merged.length - 1];
+      if (last && a <= last[1] + 1) last[1] = Math.max(last[1], b);
+      else merged.push([a, b]);
+    }
+    out.set(k, merged);
+  }
+  return out;
+}
+
+/** Number of transactions in a GTID set (null when it can't be parsed). */
+export function gtidCount(s) {
+  const m = parseGtidSet(s);
+  if (!m) return null;
+  let n = 0;
+  for (const list of m.values()) for (const [a, b] of list) n += b - a + 1;
+  return n;
+}
+
+/** |A − B|: transactions in set `a` that are not in set `b` (null when either can't be parsed). */
+export function gtidDiffCount(a, b) {
+  const A = parseGtidSet(a);
+  const B = parseGtidSet(b);
+  if (!A || !B) return null;
+  let n = 0;
+  for (const [k, list] of A) {
+    const sub = B.get(k) || [];
+    for (const [a0, a1] of list) {
+      let covered = 0;
+      for (const [b0, b1] of sub) {
+        if (b1 < a0) continue;
+        if (b0 > a1) break;
+        covered += Math.min(a1, b1) - Math.max(a0, b0) + 1;
+      }
+      n += a1 - a0 + 1 - covered;
+    }
+  }
+  return n;
+}
+
+const DB_MARKER = Buffer.from("\n-- Current Database: `");
+const DB_MARKER_SPAN = DB_MARKER.length + 66; // marker + a database name (≤ 64) + closing backtick
+
+/**
+ * Finds mysqldump's "-- Current Database: `name`" comments in a stream of
+ * chunks without copying them (Buffer.indexOf; only the last few dozen bytes
+ * of a chunk are kept to catch a marker split across two chunks). Calls
+ * onDatabase(name, offset) once per marker, offset = where it starts in the stream.
+ */
+export class DumpScanner {
+  constructor(onDatabase) {
+    this.onDatabase = onDatabase;
+    this.offset = 0; // stream bytes before the current chunk
+    this.carry = Buffer.alloc(0);
+    this.lastAt = -1;
+  }
+  /** Bytes that passed without being scanned (simulation). */
+  skip(n) {
+    this.offset += n;
+    this.carry = Buffer.alloc(0);
+  }
+  push(chunk) {
+    const base = this.offset;
+    if (this.carry.length) {
+      // A marker that starts in the carried tail and ends in this chunk.
+      const head = Buffer.concat([this.carry, chunk.subarray(0, DB_MARKER_SPAN)]);
+      this.#scan(head, base - this.carry.length, this.carry.length);
+    }
+    this.#scan(chunk, base, chunk.length);
+    this.offset += chunk.length;
+    // The last DB_MARKER_SPAN bytes of the stream so far — a copy: never pin a whole chunk.
+    this.carry =
+      chunk.length >= DB_MARKER_SPAN
+        ? Buffer.from(chunk.subarray(chunk.length - DB_MARKER_SPAN))
+        : Buffer.from(Buffer.concat([this.carry, chunk]).subarray(-DB_MARKER_SPAN));
+  }
+  #scan(buf, at, startBefore) {
+    let i = buf.indexOf(DB_MARKER);
+    while (i !== -1 && i < startBefore) {
+      const nameStart = i + DB_MARKER.length;
+      const end = buf.indexOf(0x60, nameStart); // closing backtick
+      if (end === -1 || end - nameStart > 64) {
+        if (end === -1) return; // split: the next chunk's head scan finds it
+      } else if (at + i > this.lastAt) {
+        this.lastAt = at + i;
+        this.onDatabase(buf.toString("utf8", nameStart, end), at + i);
+      }
+      i = buf.indexOf(DB_MARKER, i + 1);
+    }
+  }
+}
+
+/**
+ * Seed copy progress: bytes streamed through mysqldump | mysql against an
+ * estimate from the primary's information_schema. A SQL dump is not the size
+ * of the data on disk (no index pages, text numbers, hex blobs, page slack), so
+ * the estimate starts from data_length × PRIOR and is recalibrated with the
+ * observed dump-bytes-per-data-byte ratio as each database finishes. Never
+ * reports more than 99 % — 100 % comes from done() once the import has exited.
+ *
+ * sizes: { [db]: { data, index, rows } } or null (no estimate → percent null).
+ */
+export class SeedEstimator {
+  static PRIOR = 1.0;
+  constructor({ databases = [], sizes = null, startedAt = Date.now() } = {}) {
+    this.databases = databases.slice();
+    this.sizes = sizes;
+    this.startedAt = startedAt;
+    this.bytes = 0;
+    this.cur = null;
+    this.curStart = 0;
+    this.done = new Set();
+    this.doneBytes = 0;
+    this.doneBasis = 0;
+    this.rate = null; // smoothed bytes/s
+    this.rateAt = startedAt;
+    this.rateBytes = 0;
+    this.finished = false;
+  }
+  basisOf(db) {
+    const s = this.sizes?.[db];
+    return s ? Math.max(0, Number(s.data) || 0) : 0;
+  }
+  get totalBasis() {
+    return this.databases.reduce((n, d) => n + this.basisOf(d), 0);
+  }
+  onDatabase(name, offset) {
+    if (this.cur && !this.done.has(this.cur)) {
+      this.done.add(this.cur);
+      this.doneBytes += Math.max(0, offset - this.curStart);
+      this.doneBasis += this.basisOf(this.cur);
+    }
+    this.cur = name;
+    this.curStart = offset;
+  }
+  add(n, now = Date.now()) {
+    this.bytes += n;
+    this.#tickRate(now);
+  }
+  #tickRate(now) {
+    const dt = (now - this.rateAt) / 1000;
+    if (dt < 1) return;
+    const inst = (this.bytes - this.rateBytes) / dt;
+    // Exponential smoothing with a ~10 s time constant, whatever the sampling interval.
+    const a = 1 - Math.exp(-dt / 10);
+    this.rate = this.rate == null ? inst : this.rate + a * (inst - this.rate);
+    this.rateAt = now;
+    this.rateBytes = this.bytes;
+  }
+  /** Observed dump bytes per byte of data_length, once enough finished databases back it up. */
+  ratio() {
+    const total = this.totalBasis;
+    if (this.doneBasis >= 8 * 1024 * 1024 || (total && this.doneBasis >= total * 0.1 && this.doneBytes >= 1024 * 1024)) {
+      return Math.min(6, Math.max(0.15, this.doneBytes / Math.max(1, this.doneBasis)));
+    }
+    return SeedEstimator.PRIOR;
+  }
+  estimate() {
+    if (!this.sizes || !this.totalBasis) return null;
+    const r = this.ratio();
+    let est = this.doneBytes;
+    for (const d of this.databases) {
+      if (this.done.has(d)) continue;
+      const guess = this.basisOf(d) * r;
+      if (d === this.cur) {
+        const streamed = this.bytes - this.curStart;
+        // Past its estimate: assume it is nearly done rather than jumping back.
+        est += streamed > guess ? streamed * 1.03 + 65536 : guess;
+      } else {
+        est += guess + 2048; // DDL, routines, comments of an empty database
+      }
+    }
+    return Math.max(Math.round(est), Math.round(this.bytes * 1.01) + 1);
+  }
+  snapshot(now = Date.now()) {
+    this.#tickRate(now);
+    const elapsed = (now - this.startedAt) / 1000;
+    const enough = elapsed >= 4 && this.bytes >= 256 * 1024 && this.rate != null;
+    const est = this.estimate();
+    const idx = this.cur ? this.databases.indexOf(this.cur) : -1;
+    const databasesDone = this.finished ? this.databases.length : this.done.size;
+    let percent = null;
+    let etaSeconds = null;
+    if (this.finished) {
+      percent = 100;
+      etaSeconds = 0;
+    } else if (est) {
+      percent = Math.min(99, Math.floor((this.bytes / est) * 100));
+      if (enough && this.rate > 0) etaSeconds = Math.max(1, Math.round((est - this.bytes) / this.rate));
+    }
+    return {
+      phase: "copying",
+      bytesDone: this.bytes,
+      bytesEstimate: est,
+      percent,
+      rateBps: enough || this.finished ? Math.round(this.finished ? this.bytes / Math.max(0.001, elapsed) : this.rate) : null,
+      etaSeconds,
+      database: this.cur,
+      databaseIndex: idx === -1 ? null : idx + 1,
+      databasesDone,
+      databasesTotal: this.databases.length,
+      startedAt: new Date(this.startedAt).toISOString(),
+    };
+  }
+  finish(now = Date.now()) {
+    if (this.cur) this.onDatabase(null, this.bytes);
+    this.cur = null;
+    this.finished = true;
+    return this.snapshot(now);
+  }
 }
 
 // =================================================================== pure helpers (mirrors of panel/lib/mysql.mjs)
@@ -559,6 +823,7 @@ function ctxOf(o, task) {
     task,
     o,
     log: o.log || NOOP,
+    progress: typeof o.progress === "function" ? o.progress : NOOP, // structured progress (executeTask throttles it)
     signal: o.signal || null,
     dataDir: o.dataDir || process.env.FCC_DATA_DIR || "/var/lib/fcc",
     dry: sys.DRY_RUN,
@@ -595,7 +860,7 @@ function saveState(M, patch) {
 }
 
 function dryState(M) {
-  const blank = { installed: true, running: true, flavor: "mysql", version: "8.0.36-dry-run", readOnly: false, serverId: 1, role: "standalone", replica: null, uuid: "3e11fa47-71ca-11e1-9e33-c80aa9429562", seq: 120, databases: ["acme_shop", "acme_blog"] };
+  const blank = { installed: true, running: true, flavor: "mysql", version: "8.0.36-dry-run", readOnly: false, serverId: 1, role: "standalone", replica: null, uuid: "3e11fa47-71ca-11e1-9e33-c80aa9429562", seq: 48120, databases: ["acme_shop", "acme_blog"] };
   try {
     return { ...blank, ...JSON.parse(fs.readFileSync(path.join(M.dataDir, DRY_STATE_FILE), "utf8")) };
   } catch {
@@ -611,6 +876,25 @@ function saveDry(M, patch) {
 
 function dryGtid(s) {
   return s.flavor === "mariadb" ? `0-${s.serverId}-${s.seq}` : `${s.uuid}:1-${s.seq}`;
+}
+
+/**
+ * The simulated replica's status. Right after a simulated seed it "catches up":
+ * `catchUp { at, total, ms }` (FCC_MYSQL_DRY_SIM catchUpChanges / catchUpSeconds)
+ * makes executedGtid trail the primary's default position and shrink to it.
+ */
+function dryReplicaNow(s) {
+  if (!s.replica) return null;
+  const r = { ...s.replica };
+  const cu = s.catchUp;
+  if (cu && cu.total > 0 && cu.ms > 0) {
+    const f = Math.min(1, Math.max(0, (Date.now() - cu.at) / cu.ms));
+    const remaining = f >= 1 ? 0 : Math.ceil(cu.total * (1 - f) ** 1.25);
+    const done = Math.max(1, s.seq - remaining);
+    r.executedGtid = s.flavor === "mariadb" ? `0-${s.serverId}-${done}` : `${s.uuid}:1-${done}`;
+    r.lagSeconds = remaining ? Math.max(1, Math.round((cu.lagMax || 40) * (1 - f))) : 0;
+  }
+  return r;
 }
 
 // ---- clients
@@ -720,7 +1004,7 @@ async function executedGtid(M, d) {
 async function replicaStatus(M, d) {
   if (M.dry) {
     const s = dryState(M);
-    return s.role === "replica" && s.replica ? { ...s.replica } : null;
+    return s.role === "replica" && s.replica ? dryReplicaNow(s) : null;
   }
   const rows = await sqlLocal(M, `${d.showReplicaStatus};\n`, { names: true, timeoutMs: 15_000 });
   const r = rows[0];
@@ -1692,6 +1976,10 @@ async function replicaSetupInner(M, p, pre = null) {
       serverId: p.serverId,
       databases,
       replica: { ioRunning: true, ioState: "Yes", sqlRunning: true, lagSeconds: 0, lastError: null, sqlError: null, ioError: null, sourceHost: p.primaryHost, retrievedGtid: dryGtid(s), executedGtid: dryGtid(s) },
+      // Writes that reached the primary during the copy, applied after it (see dryReplicaNow).
+      catchUp: p.seed
+        ? { at: Date.now(), total: Math.min(s.seq - 1, Math.max(0, Number(M.sim?.catchUpChanges ?? 1480) || 0)), ms: Math.max(1, Number(M.sim?.catchUpSeconds) || 14) * 1000, lagMax: 40 }
+        : null,
     });
   }
   const st = await waitReplicating(M, d);
@@ -1750,12 +2038,32 @@ async function seedFromPrimary(M, d, conn, databases) {
   const loadArgs = [...localArgs(M), "--batch", "--default-character-set=utf8mb4", "--max-allowed-packet=1073741824"];
   // The copy never goes into this server's binary log (no GTIDs of its own).
   const prelude = PRELUDE + "SET SESSION sql_log_bin = 0;\n";
+  const sizes = await seedSizes(M, d, conn, databases);
+  const est = new SeedEstimator({ databases, sizes });
+  const scanner = new DumpScanner((name, at) => est.onDatabase(name, at));
+  M.progress(est.snapshot());
+  if (M.dry) return drySeedCopy(M, d, conn, databases, { est, scanner, dumpArgs, loadBin, loadArgs });
+  let lastEmit = 0;
+  const onChunk = (chunk) => {
+    scanner.push(chunk);
+    const now = Date.now();
+    est.add(chunk.length, now);
+    if (now - lastEmit >= 1000) {
+      lastEmit = now;
+      M.progress(est.snapshot(now));
+    }
+  };
   try {
-    return await streamPipe(M, {
+    const r = await streamPipe(M, {
       from: { bin: dumpBin(), args: dumpArgs, env: { MYSQL_PWD: conn.password }, secrets: [conn.password] },
       to: { bin: loadBin, args: loadArgs, prelude },
       label: "copied",
+      onChunk,
+      describe: () => progressWords(est.snapshot()),
     });
+    // Only now — mysql has exited 0 — is the copy complete.
+    M.progress(est.finish(), { force: true });
+    return r;
   } catch (err) {
     if (/MASTER STATUS|BINARY LOG STATUS/.test(err.message) && /1064|syntax/.test(err.message)) {
       throw new Error(`${err.message} — this server's ${path.basename(dumpBin())} speaks an older MySQL dialect than the primary; install the client of the primary's series here, then press Turn on replication again.`);
@@ -1765,10 +2073,117 @@ async function seedFromPrimary(M, d, conn, databases) {
 }
 
 /**
- * Spawn `from` and pipe its stdout into `to` (a process, or a file via
- * `toFile` with optional gzip). Resolves { bytes, ms }.
+ * Size of each database on the primary (information_schema, as fcc_repl —
+ * SELECT on *.*), the basis of the copy's progress estimate. null when it
+ * can't be read: the copy still runs, the progress bar is indeterminate.
  */
-function streamPipe(M, { from, to, toFile, label }) {
+async function seedSizes(M, d, conn, databases) {
+  if (!databases.length) return null;
+  if (M.dry) {
+    const sim = drySeedPlan(M, databases);
+    // The simulated on-disk figures are deliberately off from the dump size, like real ones.
+    return Object.fromEntries(sim.map((x) => [x.name, { data: Math.round(x.bytes * x.diskFactor), index: Math.round(x.bytes * 0.3), rows: Math.round(x.bytes / 180) }]));
+  }
+  try {
+    // MySQL 8 caches table statistics for a day by default; ask for current ones.
+    const fresh = d.flavor === "mysql" ? "SET SESSION information_schema_stats_expiry = 0;\n" : "";
+    const rows = await sqlRemote(
+      M,
+      conn,
+      `${fresh}SELECT table_schema, COALESCE(SUM(data_length), 0), COALESCE(SUM(index_length), 0), COALESCE(SUM(table_rows), 0) FROM information_schema.tables WHERE table_schema IN (${databases.map(sqlString).join(", ")}) GROUP BY table_schema;\n`,
+      { timeoutMs: 120_000 },
+    );
+    const sizes = {};
+    for (const r of rows) if (databases.includes(r[0])) sizes[r[0]] = { data: Number(r[1]) || 0, index: Number(r[2]) || 0, rows: Number(r[3]) || 0 };
+    for (const n of databases) sizes[n] ||= { data: 0, index: 0, rows: 0 };
+    const data = Object.values(sizes).reduce((a, x) => a + x.data, 0);
+    const index = Object.values(sizes).reduce((a, x) => a + x.index, 0);
+    M.log(`On the primary: ${fmtBytes(data)} of table data (+ ${fmtBytes(index)} of indexes, which are rebuilt here, not copied).`);
+    return data > 0 ? sizes : null;
+  } catch (err) {
+    M.log(`(Could not read the databases' sizes from the primary — no time estimate: ${err.message.split("\n").pop()})`);
+    return null;
+  }
+}
+
+/** "42% · forthway (3 of 8) · 18 MB/s · about 4 min left" — for the 15 s log lines. */
+function progressWords(p) {
+  const bits = [];
+  if (p.percent != null) bits.push(`${p.percent}%`);
+  if (p.database) bits.push(`${p.database}${p.databaseIndex ? ` (${p.databaseIndex} of ${p.databasesTotal})` : ""}`);
+  if (p.etaSeconds != null) bits.push(`about ${fmtEta(p.etaSeconds)} left`);
+  return bits.join(" · ");
+}
+
+export function fmtEta(s) {
+  if (s == null) return "";
+  if (s < 45) return `${Math.max(5, Math.round(s / 5) * 5)} s`;
+  if (s < 90) return "1 min";
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return m ? `${h} h ${m} min` : `${h} h`;
+}
+
+/** Simulated databases for a dry-run copy: FCC_MYSQL_DRY_SIM { seedBytes, seedSeconds }. */
+function drySeedPlan(M, databases) {
+  const total = Number(M.sim?.seedBytes) > 0 ? Number(M.sim.seedBytes) : 2.4 * 1024 ** 3;
+  const weights = databases.map((_, i) => [0.58, 0.27, 0.09, 0.04, 0.02][i] ?? 0.01);
+  const sum = weights.reduce((a, b) => a + b, 0);
+  return databases.map((name, i) => ({ name, bytes: Math.round((total * weights[i]) / sum), diskFactor: 1.35 }));
+}
+
+/**
+ * FCC_DRY_RUN: a believable copy (default 2.4 GB over ~24 s; FCC_MYSQL_DRY_SIM
+ * seedSeconds / seedBytes) through the same scanner + estimator as a real one,
+ * so the progress bar can be exercised end to end.
+ */
+async function drySeedCopy(M, d, conn, databases, { est, scanner, dumpArgs, loadBin, loadArgs }) {
+  M.log(`[dry-run] ${path.basename(dumpBin())} ${dumpArgs.join(" ")} (password in MYSQL_PWD)`);
+  M.log(`[dry-run]   | ${path.basename(loadBin)} ${loadArgs.join(" ")}  (stdin starts with: SET SESSION sql_log_bin = 0)`);
+  const plan = drySeedPlan(M, databases);
+  const total = plan.reduce((a, x) => a + x.bytes, 0);
+  const seconds = Math.min(600, Math.max(2, Number(M.sim?.seedSeconds) || 24));
+  const started = Date.now();
+  const stepMs = 250;
+  const perStep = total / ((seconds * 1000) / stepMs);
+  let lastLog = started;
+  let lastEmit = 0;
+  for (const db of plan) {
+    const marker = Buffer.from(`\n--\n-- Current Database: \`${db.name}\`\n--\n`);
+    scanner.push(marker);
+    est.add(marker.length);
+    let left = db.bytes;
+    while (left > 0) {
+      checkAbort(M);
+      await sleep(stepMs, M.signal);
+      checkAbort(M);
+      // Uneven, like a real import: big tables crawl, small ones fly.
+      const n = Math.min(left, Math.round(perStep * (0.6 + Math.random() * 0.8)));
+      left -= n;
+      scanner.skip(n); // the bytes "went through" the pipe
+      const now = Date.now();
+      est.add(n, now);
+      if (now - lastEmit >= 1000) {
+        lastEmit = now;
+        M.progress(est.snapshot(now));
+      }
+      if (now - lastLog >= PROGRESS_EVERY_MS) {
+        lastLog = now;
+        M.log(`[dry-run] … ${fmtBytes(est.bytes)} copied · ${progressWords(est.snapshot(now))}`);
+      }
+    }
+  }
+  M.progress(est.finish(), { force: true });
+  return { bytes: est.bytes, ms: Date.now() - started, dryRun: true };
+}
+
+/**
+ * Spawn `from` and pipe its stdout into `to` (a process, or a file via
+ * `toFile` with optional gzip). Resolves { bytes, ms }. `onChunk(chunk)` sees
+ * every chunk (progress); `describe()` adds words to the 15 s log lines.
+ */
+function streamPipe(M, { from, to, toFile, label, onChunk, describe }) {
   const fromShown = `${path.basename(from.bin)} ${from.args.join(" ")}`;
   if (M.dry) {
     M.log(`[dry-run] ${fromShown}${from.env?.MYSQL_PWD ? " (password in MYSQL_PWD)" : ""}`);
@@ -1791,9 +2206,22 @@ function streamPipe(M, { from, to, toFile, label }) {
     const counter = new Transform({
       transform(chunk, _e, cb) {
         bytes += chunk.length;
+        if (onChunk) {
+          try {
+            onChunk(chunk);
+          } catch {
+            /* progress must never break the copy */
+          }
+        }
         if (Date.now() - lastLog >= PROGRESS_EVERY_MS) {
           lastLog = Date.now();
-          M.log(`… ${fmtBytes(bytes)} ${label} (${fmtBytes(Math.round(bytes / Math.max(1, (Date.now() - started) / 1000)))}/s)`);
+          let more = "";
+          try {
+            more = describe ? describe() : "";
+          } catch {
+            more = "";
+          }
+          M.log(`… ${fmtBytes(bytes)} ${label} (${fmtBytes(Math.round(bytes / Math.max(1, (Date.now() - started) / 1000)))}/s)${more ? ` · ${more}` : ""}`);
         }
         cb(null, chunk);
       },
@@ -1908,7 +2336,7 @@ export async function mysqlStatus(_payload, o) {
       serverId: s.serverId,
       role,
       gtidExecuted: dryGtid(s),
-      replica: role === "replica" ? { ...s.replica } : null,
+      replica: role === "replica" ? dryReplicaNow(s) : null,
       managed: exists(cnfPath(M, s.flavor)),
       dryRun: true,
     };
@@ -2205,6 +2633,48 @@ export async function rebuild(payload, o) {
   return { safetyDump, droppedDatabases: dbs, ...r };
 }
 
+// ---- mysql.probe (3.10, fast failover: the replica's view of the primary)
+
+/**
+ * mysql.probe { host, port = 3306, timeoutMs = 800 } → { reachable, ms, error }
+ * One TCP connect from this server to host:port, closed as soon as the MySQL
+ * greeting (or anything) arrives — no sign-in, nothing sent. Used by the panel
+ * to confirm "the primary is down" from the replica's side of the network
+ * (the IO thread can take a minute to notice a primary that vanished without a
+ * reset). Dry run: reachable unless this server is a simulated replica whose
+ * IO thread is not running (mysql-ha-dry.json replica.ioRunning === false).
+ */
+export async function mysqlProbe(payload, o) {
+  const host = String(payload?.host ?? "").trim();
+  if (!validHost(host)) throw new Error("mysql.probe: host must be an IP address or host name");
+  const port = payload?.port === undefined ? 3306 : Number(payload.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("mysql.probe: port is not a valid port");
+  const timeoutMs = Math.min(5000, Math.max(200, Number(payload?.timeoutMs) || 800));
+  const t0 = Date.now();
+  if (sys.DRY_RUN) {
+    const s = dryState({ dataDir: (o || {}).dataDir || process.env.FCC_DATA_DIR || "/var/lib/fcc" });
+    const reachable = !(s.role === "replica" && s.replica && s.replica.ioRunning === false);
+    return { reachable, ms: 1, host, port, dryRun: true, ...(reachable ? {} : { error: "simulated: the replica's IO thread is not running" }) };
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    const sock = net.connect({ host, port });
+    const finish = (reachable, error = null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sock.destroy();
+      resolve({ reachable, ms: Date.now() - t0, host, port, ...(error ? { error } : {}) });
+    };
+    const timer = setTimeout(() => finish(false, `no answer within ${timeoutMs} ms`), timeoutMs);
+    // Connected is enough to call it reachable; wait briefly for the greeting so the
+    // server does not log an aborted handshake for every probe, then close.
+    sock.once("connect", () => setTimeout(() => finish(true), 150));
+    sock.once("data", () => finish(true));
+    sock.once("error", (e) => finish(false, e.code || e.message));
+  });
+}
+
 // =================================================================== dispatcher (shared/tasks.mjs)
 
 export const MYSQL_TASKS = {
@@ -2215,6 +2685,7 @@ export const MYSQL_TASKS = {
   "mysql.readonly": setReadOnly,
   "mysql.users.sync": usersSync,
   "mysql.rebuild": rebuild,
+  "mysql.probe": mysqlProbe,
 };
 
 export async function runMysqlTask(type, payload, o) {
@@ -2223,6 +2694,6 @@ export async function runMysqlTask(type, payload, o) {
   try {
     return await fn(payload || {}, o);
   } finally {
-    if (type !== "mysql.status") forgetStatus();
+    if (type !== "mysql.status" && type !== "mysql.probe") forgetStatus();
   }
 }

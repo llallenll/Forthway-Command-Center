@@ -309,9 +309,11 @@ in memory and reports it to voters).
 
 ## Voting and leases (shared/ha-voter.mjs — used by node-agent and by main)
 
-Constants: `HEARTBEAT_MS = 3000`, `LEASE_MS = 15000`, `MARGIN_MS = 3000`,
-`FAILOVER_MS = 20000`. Durations use a monotonic clock
-(`performance.now()`), never wall time.
+Constants (v3.8–3.9): `HEARTBEAT_MS = 3000`, `LEASE_MS = 15000`, `MARGIN_MS = 3000`,
+`FAILOVER_MS = 20000`. **Since 3.10 every duration is derived from
+`config.ha.failoverSeconds`** — see "Failover speed" below; at the default (15 s):
+heartbeat 1 s, lease 6.8 s, margin 1.4 s, standby silence 5.8 s. Durations use a
+monotonic clock (`performance.now()`), never wall time.
 
 Every voter, every `HEARTBEAT_MS`, POSTs to **every** panel node's directUrl (list
 learned from `/agent/hello` and every `/ha/vote` reply; persisted in
@@ -319,10 +321,12 @@ learned from `/agent/hello` and every `/ha/vote` reply; persisted in
 ```
 POST /ha/vote   Authorization: Bearer <voter's server token>
   { voterId, term, votedFor, leaseLeftMs, knownCommitted: { term, seq },
-    grant?: { candidate, term, nonce } }
-  → { nodeId, role: "leader"|"follower"|"candidate", term, leaderId,
+    leaseMs, heartbeatMs, proto: 2,                     // 3.10: its current lease length / heartbeat
+    grant?: { candidate, term, nonce, leaseMs } }       // 3.10: the lease this grant is for
+  → { nodeId, role: "leader"|"follower"|"candidate", term, leaderId, proto: 2,
       committed?: { term, seq },                       // leader only
-      request?: { candidate, term, nonce, version: { term, seq } },
+      timings?: { failoverSeconds, heartbeatMs, leaseMs }, // leader only (3.10)
+      request?: { candidate, term, nonce, leaseMs, version: { term, seq } }, // leaseMs: 3.10
       handoverTo?: serverId }                           // leader during a handover
 ```
 `nonce` is the requesting node's monotonic timestamp when it built the reply.
@@ -436,7 +440,9 @@ The leader trusts proxy headers from panel-node and edge addresses
   `mainIsLocal`, operations throw 503 "Databases live on the main server, which is
   not running the active panel right now." and schedulers skip with a log line;
   status endpoints report `{ available: false, reason }`. (Phase 3 lifts this.)
-- **updates.mjs**: unchanged on the leader; followers follow `codeDigest`.
+- **updates.mjs**: with standby panel nodes an update is a coordinated rolling
+  update (see "Panel updates in a cluster" below); followers follow `codeDigest`
+  otherwise.
 
 ## HTTP API (UI)
 
@@ -497,7 +503,8 @@ config.mysqlHa = {
   history: [{ at, event, detail }],   // last 50: enabled, seeded, promoted, switchover, rebuilt, broken, fenced
 }
 ```
-Constants: `DETECT_MS = 60000`, `REPL_ALIAS = "fcc-mysql.internal"`, users `fcc_repl`, `fcc_admin`.
+Constants: `DETECT_MS = 60000` (3.10: derived from `config.ha.failoverSeconds`, 5 s at the
+default — see "Failover speed"), `REPL_ALIAS = "fcc-mysql.internal"`, users `fcc_repl`, `fcc_admin`.
 
 ## Database address
 
@@ -518,7 +525,7 @@ its embedded agent while it is a standby).
 
 All SQL through the `mysql` CLI with stdin scripts and `MYSQL_PWD` env (never argv),
 socket root locally. Under FCC_DRY_RUN: log, simulate, write nothing outside dataDir.
-`TASKS_VERSION 3.3.1`, `AGENT_VERSION 3.3.1` (3.3.0 in v3.9.0).
+`TASKS_VERSION 3.3.2`, `AGENT_VERSION 3.3.2` (3.3.0 in v3.9.0, 3.3.1 in v3.9.1).
 
 - `mysql.primary.prepare { serverId, replUser, replPassword, adminPassword, replicaIps, adminIps, allowFrom }`
   Ensures binlog (ROW), `server_id`, GTID (MySQL: `gtid_mode=ON`,
@@ -571,7 +578,8 @@ socket root locally. Under FCC_DRY_RUN: log, simulate, write nothing outside dat
 - **Automatic failover** (`mode: "auto"`): the primary counts as down when, for
   `DETECT_MS` continuously, (a) the primary server is offline to the panel
   (agent/votes), (b) the leader cannot open a TCP connection to primary:3306, and
-  (c) the replica reports its IO thread not connected. Then: `mysql.replica.promote`
+  (c) the replica reports its IO thread not connected. (3.10 replaces the detection with a
+  fast probe loop and adds the immediate cut-over — see "Fast database failover".) Then: `mysql.replica.promote`
   on the replica → `primary = replica`, `replica = null`, old primary into
   `needsRebuild`, state `promoted` → hosts alias everywhere → users.sync on the new
   primary → alert. Never promotes a replica whose last status showed `lastError` with
@@ -629,8 +637,115 @@ The edit/add server dialog replaces its row of switches with three menus:
 - **Status** (edit only, not main): Enabled · Disabled.
 Main shows Role as "Main (front door, panel)" read-only.
 
+## Panel updates in a cluster (coordinated rolling update)
+
+### Why
+
+Before this, Settings → Updates swapped the code on the leader only and
+restarted it (SIGTERM, `Restart=always`). The restarted process booted as a
+standby with a fresh `FAILOVER_MS` clock, while the real standby's clock had
+started when the leader went quiet, so the standby won the election
+(~20–25 s after the exit, although the restart took ~5 s). The updated
+node then followed the new leader's `codeDigest` — the old code — downloaded
+it and restarted on it: the panel moved, and the update was undone.
+
+### Flow (leader, `panel.update` / `panel.restore` jobs)
+
+1. Check, download, verify and back up once on the leader, as before.
+2. Build the release tree: the leader's own code items after the swap (update
+   items from the archive or backup, anything else copied from the running code)
+   plus `version.json`. Its digest (same function as `codeDigest`) is the target.
+   `ctx.ha.setCodeTarget({ updateId, digest, version, commit, dir })`.
+3. Each standby panel node in turn (offline ones are skipped with a warning and
+   catch up through `codeDigest` once the leader runs the new code; nodes that do
+   not report `cap=rollout` are skipped the same way):
+   `ctx.ha.releaseCodeTarget(id)` → its `/ha/state` replies now carry
+   `codeTarget`; the leader answers its long poll at once. The standby downloads
+   `GET /ha/update/<updateId>` (panel-node token; `X-FCC-Code-Digest`), checks the
+   digest, `node --check`s `panel/server.mjs`, imports the boot-time modules in a
+   child process, backs up its own code to `<dataDir>/update-backups/<id>` (same
+   layout as updates.mjs, last 3 kept), swaps (code items the bundle lacks are
+   removed), writes `version.json`, records `pendingUpdate` in ha-local.json and
+   exits 75. The job waits (3 min per node) until the node polls again **from a
+   new boot** (`boot=` poll parameter) with the target digest. A node that reports
+   `failed` (it kept its code) or `rolled-back`, or does not come back in time,
+   stops the update: the target is withdrawn, the leader keeps its old code and
+   standbys that were already updated converge back to it through `codeDigest`.
+4. The leader swaps itself, the job ends, and before exiting it calls
+   `ctx.ha.prepareRestart(RESTART_WINDOW_MS = 60 s)`: `/ha/state` (body
+   `restarting: { remainingMs }`, 204 header `X-FCC-Restarting-Ms`) and vote
+   replies carry the window; each standby's poll is answered at once and the
+   leader waits ≤ 4 s for every online standby to have heard it. It persists
+   `local.version` (= its replicated version) and `restart: { untilWall }` in
+   ha-local.json and exits.
+5. Standbys inside the window do not stand for election. The restarted process
+   finds `restart` in ha-local.json (local wall clock, same machine; capped at
+   5 min) and stands **at once** (no `FAILOVER_MS` wait, no random delay) in
+   term + 1. Voters still hold its lease (`votedFor` = it) or the lease has
+   expired, so they grant; it promotes and keeps leading. Not a failover: no
+   alert (cluster-alerts ignores a promotion whose previous leader is itself).
+   If it is not back within the window, normal failover applies — the standbys
+   already run the new code.
+
+With HA off (no standby panel nodes) nothing here runs: the update is the
+single-server path, unchanged.
+
+### Safety
+
+Unchanged Phase 2 properties: only a majority of voter leases makes a leader;
+the window only stops followers from *asking*, it never makes a voter grant
+anything it would not grant anyway. A graceful leader stop now writes its exact
+replicated version to ha-local.json, so voters (`V >= knownCommitted`) accept it
+again. A follower never moves to an older digest during an update: while
+`codeTarget` is present it converges to it only; after a successful update the
+leader's `codeDigest` is the target.
+
+### Standby auto-rollback
+
+`pendingUpdate.boots` is incremented on every boot of the new code; the first
+successful `/ha/state` from a leader (from a process that did not do the swap)
+clears it. After 3 boots without that, the next boot restores the backup taken
+before the swap (synchronously, before the panel starts), adds the update to
+`failedUpdates` (never retried) and exits 75; the leader hears `rolled-back`.
+Limit: code that crashes before `createHa()` runs (e.g. an import error in a
+module `node --check` and the import check do not reach) is not rolled back
+automatically — the leader still stops the update after 3 minutes and keeps
+its old code; reinstall that node from its backup (`update-backups/`) by hand.
+
+### Wire additions
+
+```
+GET /ha/state?…&boot=<16 hex>&cap=rollout&upd=<updateId>|<state>|<msg>
+  200 { …, codeTarget?: { digest, updateId, version, commit }, restarting?: { remainingMs } }
+  204 + X-FCC-Restarting-Ms while the leader is restarting for an update
+GET /ha/update/<updateId>   → zip of the release tree + version.json (X-FCC-Code-Digest, X-FCC-Version)
+POST /ha/vote reply (leader)  restarting?: { remainingMs }   (informational)
+ha-local.json  restart?: { untilWall, term, at }, pendingUpdate?: { updateId, digest, version, backupId, at, boots, swappedBy },
+               updateReport?: { updateId, state: swapped|ok|failed|rolled-back, msg }, failedUpdates?: [updateId]
+GET /api/updates   servers: null | [{ serverId, name, role: active|standby, local, online, version, sameCode, upToDate }]
+```
+
+UI (Settings → Updates): the panel servers with their versions; the button says
+**Update all panel servers** when there are standbys; the job log has one line
+per node.
+
+### Testing panel updates (test hooks, inert unless `FCC_DRY_RUN=1`)
+
+- `FCC_TEST_UPDATE_SOURCE=<dir|.tar.gz>` — updates.mjs takes the update from
+  there instead of GitHub (its "commit" is a hash of the bytes).
+- `FCC_TEST_REAL_CODE_SWAP=1` — updates.mjs and ha.mjs really replace the code
+  of a code dir that is **not** a git checkout and restart (process exit; run the
+  panel under a loop that restarts it, like `Restart=always`). Every other system
+  call stays dry-run.
+
+Run per-node code copies (not the git checkout): main (copy A, its data dir,
+`FCC_HA_DIRECT_URL`), a standby started from the dry-run-installed
+`<agent dataDir>/panel-dry-run/var-lib-fcc` with `FCC_NODE_CONFIG` pointing at
+its agent config, and two dry-run node agents for votes.
+
 ## Changes
 
+- 3.10.0 — failover speed and fast database failover: see the next part.
 - 3.9.0 — database replication, cluster alerts, server dialog menus (this section).
 - 3.9.1 — version preflight for `mysql.replica.setup` / `mysql.rebuild` (TASKS/AGENT 3.3.1).
   Before touching the replica the task reads the primary's version (handshake, then
@@ -649,3 +764,222 @@ Main shows Role as "Main (front door, panel)" read-only.
   checked before the copy, so the 8.0-client-vs-8.4-server `SHOW MASTER STATUS` (1064)
   failure is reported in plain words. The panel needs agent ≥ 3.3.1 on the replica to
   enable or rebuild; a failed enable leaves replication off and can simply be retried.
+- 3.10.0 — coordinated panel updates in a cluster ("Panel updates in a cluster" above): standbys first, one
+  at a time, then the leader, which keeps the panel through a restart window.
+- 3.9.2 — replica sync progress (TASKS/AGENT 3.3.2). Websites keep reading and writing on
+  the primary throughout; the progress only shows when the replica has caught up.
+  - **Task progress (generic)**: `executeTask(type, payload, { progress })` — tasks call
+    `o.progress(obj[, { force }])`, throttled to 1/s (latest wins, a trailing/forced call is
+    never dropped). node-agent sends the newest object with its next log flush:
+    `POST /agent/tasks/:id/log { lines, progress? }`. cluster.mjs keeps it as `task.progress`
+    and calls `runTask(…, { onProgress })` (in-process on main: passed straight to
+    executeTask). Flat objects only (≤ 40 keys of string ≤ 200 / finite number / bool / null,
+    ≤ 4 KB), anything else dropped; agents < 3.3.2 never send it.
+  - **Copy** (`mysql.replica.setup` / `mysql.rebuild` seed): before dumping, the primary's
+    `information_schema.tables` per database (`SUM(data_length)`, `index_length`, `table_rows`;
+    MySQL with `information_schema_stats_expiry = 0`). Bytes through `mysqldump | mysql` are
+    counted and mysqldump's `-- Current Database: \`name\`` comments found in the stream
+    (`DumpScanner`, Buffer.indexOf + a 89-byte carry across chunks). `SeedEstimator`: estimate
+    = data_length × 1.0 until ≥ 8 MB (or 10 %) of finished databases give the real
+    dump-bytes-per-data-byte ratio, then that ratio (0.15–6) for the rest; a database past its
+    estimate counts as nearly done. Rate: exponential smoothing, 10 s time constant; ETA null
+    until 4 s and 256 KB. Percent ≤ 99 until mysql has exited 0, then a forced 100. Reports
+    `{ phase: "copying", bytesDone, bytesEstimate, percent, rateBps, etaSeconds, database,
+    databaseIndex, databasesDone, databasesTotal, startedAt }`. No sizes → percent null
+    (indeterminate bar). Dry run: a simulated 2.4 GB copy over ~24 s, then ~14 s of catch-up
+    (`FCC_MYSQL_DRY_SIM { seedBytes, seedSeconds, catchUpChanges, catchUpSeconds }`; the
+    simulated GTID position default is now `…:1-48120`).
+  - **Catch-up** (panel): after the seed task returns, every 2.5 s, fresh `mysql.status` of
+    the primary (gtid_executed) then the replica (Executed_Gtid_Set / Gtid_Slave_Pos,
+    Seconds_Behind_Source). `transactionsBehind = |primary − replica|` (`gtidDiffCount`:
+    MySQL `uuid:1-5:7-9,uuid2:1-3` incl. 8.3+ tags, MariaDB `domain-server-seq` per domain).
+    ETA from the gap's shrink rate over ≤ 30 s; percent from the largest gap seen.
+    In sync = lag 0 and gap ≤ what the primary commits during one poll, twice in a row.
+    The monitor also starts a catch-up bar (kind `lag`) when a running replica is ≥ 30 s behind.
+  - **API**: `GET /api/mysql/replication` gains `progress: { kind: "enable"|"rebuild"|"lag",
+    phase: "preparing"|"copying"|"catching-up"|"in-sync", …copy fields, transactionsBehind,
+    lagSeconds, phaseStartedAt, syncedAt, updatedAt, replicaServerId, replicaName } | null`
+    (in memory on the leader; "in-sync" stays 10 min, 1 min for `lag`). SSE `mysql-ha` for
+    progress is throttled to one per 2 s. Job logs get a line every ~10 % and end with
+    "In sync — the replica has every change." — the enable/rebuild job waits up to 30 s for it,
+    else says the card carries on and appends the line when it happens.
+  - **UI**: progress bar (`role=progressbar`, `aria-valuenow`, indeterminate without an
+    estimate, reduced-motion safe) with Copy → Catch up → In sync steps and "Your websites
+    keep working normally while this runs." in the Replication card (also while turning on,
+    before `enabled`); compact bar on the Databases page line and the dashboard availability
+    card. Mock: `?mock=1&mockrepl=syncing`.
+
+---
+
+# Failover speed and fast database failover (v3.10.0)
+
+## Goal
+
+"The automatic failover should happen within 15 seconds of the primary going down" —
+for the database. Before 3.10, when main (panel leader + database primary) died, the
+panel moved after ~20 s and the database monitor then needed 60 s of "primary offline"
+(agent last-seen, 45 s) on top: ~80–100 s. Now one cluster-wide setting, **failover
+speed**, sets the target, and the worst case fits it.
+
+## Setting
+
+`config.ha.failoverSeconds` (replicated): the target, in whole seconds, from "the
+server running the panel and the database primary goes down" to "the replica is
+promoted and every server is cut over". 10–300, default 15 (also for existing
+installs: a missing value means 15).
+
+```
+GET   /api/ha/settings                       → { failoverSeconds, panelTakeoverSeconds, databaseFailoverSeconds,
+                                                 heartbeatSeconds, blipToleranceSeconds, leaseSeconds, detectSeconds,
+                                                 min: 10, max: 300, default: 15 }
+GET   /api/ha/settings?failoverSeconds=N     → the same for N, `preview: true` (nothing saved; the UI while typing)
+PATCH /api/ha/settings { failoverSeconds }   → the new summary (leader only; 400 outside 10–300 / not an integer)
+GET   /api/ha                                → … + failover: <summary>
+GET   /api/mysql/replication                 → … + failover: { …summary, detectMs }, detect.detectMs
+```
+Activity: `ha.failover-speed` `{ from, to }`. UI: a **Failover speed** box in the
+Servers page HA strip (a number input, presets 10 / 15 / 30 / 60 / 120, Save, a live
+one-line breakdown "Panel takes over in about 8.8 s, databases in about 12 s. Network
+outages between servers shorter than about 3.4 s are ignored.", and below 15 s a warning
+that short hiccups can trigger a failover and a private network helps); with panel
+failover off the box stands alone on that page. Settings → Databases → Replication shows
+a read-only summary and a link to it.
+
+## Timing formula (shared/ha-timing.mjs — one pure function, used by ha.mjs, ha-voter.mjs, mysql-ha.mjs, cluster.mjs)
+
+T = failoverSeconds × 1000.
+
+| value | formula | meaning |
+|---|---|---|
+| heartbeat H | clamp(T/15, 1 s, 5 s) | voter → every panel node |
+| lease L | 0.45 T (3–180 s) | a vote is a lease of L |
+| margin M | max(1 s, L/5) | a leader's view of a grant ends M early |
+| standby window F | L − H | a standby that heard nothing for F may stand (if no voter reports a live lease) |
+| vote request timeout | min(2.5 s, 0.9 H) | always below H |
+| standby long-poll | clamp(⌊F/2.5 s⌋, 1, 5) s | well under F |
+| agent-node tie-break | 0…min(3 s, H/2) | main stands at once, agent panel nodes wait a random part of this |
+| candidacy | max(10 s, L + 2H) | |
+| beforeFence hooks | clamp(M − 250 ms, 0.75 s, 3 s) | all hooks together, inside the margin |
+| DB: voter silent | 3H | condition (a) |
+| DB: TCP probe | every max(0.5 s, H/2), timeout clamp(0.8H, 0.8 s, 3 s), 3 consecutive failures | condition (b) |
+| DB: detect D | max(3 s, T/3) | no sign of life from the primary for D |
+
+Estimates (worst case) shown in the UI: panel takeover = L + H + tie-break + 0.5 s;
+database = max(panel takeover, D) + 2 probes + 0.7 s (replica check) + 1.5 s (promote +
+push); outages ignored = min(L − M − 2H, D).
+
+| failoverSeconds | H | L | M | F | D | panel | database | ignored |
+|---|---|---|---|---|---|---|---|---|
+| 10 | 1 s | 4.5 s | 1 s | 3.5 s | 3.3 s | 6.5 s | 9.7 s | 1.5 s |
+| 15 | 1 s | 6.8 s | 1.4 s | 5.8 s | 5 s | 8.8 s | 12 s | 3.4 s |
+| 30 | 2 s | 13.5 s | 2.7 s | 11.5 s | 10 s | 17 s | 21.2 s | 6.8 s |
+| 60 | 4 s | 27 s | 5.4 s | 23 s | 20 s | 33.5 s | 39.7 s | 13.6 s |
+| 120 | 5 s | 54 s | 10.8 s | 49 s | 40 s | 62 s | 69.2 s | 33.2 s |
+
+60 s is roughly the pre-3.10 behaviour. `scripts/ha-timing.test.mjs` (`node --test scripts/`)
+checks the invariants for every value 10–300 (request timeout < H, L − M ≥ 2H + 0.5 s,
+long-poll + 1 s < F, fence hooks < M, D ≥ 3H, estimate ≤ T, monotonic) and the voter's
+lease rules against a fake candidate.
+
+## Distribution and safety while the value changes (vote protocol 2)
+
+- The leader puts `timings { failoverSeconds, heartbeatMs, leaseMs }` in every vote reply,
+  and `haTimings` in agent hello and poll replies (while HA is on).
+- **Voters** (shared/ha-voter.mjs, agent 3.4.0, and main's embedded voter) heartbeat at the
+  leader's `heartbeatMs` (applied to the very next beat). The **lease of a grant is the one
+  the request names** (`request.leaseMs`, bounded to 3–180 s); a request without it (a
+  3.8/3.9 leader) gets 15 s. Each grant echoes it (`grant.leaseMs`) and the voter keeps
+  `leaseUntil = max(leaseUntil, now + lease)`: a renewal under a shorter lease never shortens
+  one already given. It refuses any other candidate before `leaseUntil`. The length is saved
+  with the vote before the grant is sent; after a restart the saved length (15 s for an older
+  vote.json) is held in full.
+- **Leaders/candidates** (ha.mjs) remember for every request they issue (nonce, L, M as of
+  that moment) and count a grant until `nonce + min(grant.leaseMs ?? 15 s, L) − M`. Fencing,
+  handover and status use that per-grant end.
+- **Followers** derive their windows from the last replicated `config.json`
+  (`followerFailoverSeconds`); a voter message counts as fresh for 2·max(our H, its H) + 2 s.
+
+Why this can never produce two leaders, whatever the values and whenever they change:
+the voter granted strictly after the nonce and keeps the vote until at least
+grant time + grant.leaseMs > nonce + grant.leaseMs ≥ nonce + min(grant.leaseMs, L) =
+the leader's end + M. Every grant carries its own numbers, so no node ever needs to know
+another node's setting; changing failoverSeconds only changes the numbers in *new*
+requests. Lowering it cannot shorten a lease already granted (the max rule), raising it
+cannot make a leader count longer than the voter holds (the min rule). A pre-3.10 voter
+ignores `leaseMs` and holds 15 s, and the leader counts min(15 s, L); a pre-3.10 leader sends
+no `leaseMs`, a 3.10 voter holds 15 s and that leader counts 15 s − 3 s. The heartbeat and
+the standby window only affect *when* someone asks — never whether a vote is granted twice.
+Only liveness is affected by a change: after lowering the value, a failover in the next
+old-lease period still waits for the old (longer) leases to run out.
+
+## Fast database failover (panel/lib/mysql-ha.mjs)
+
+A probe loop runs every 250 ms on the leader while replication is on (beside the 10 s
+monitor, which keeps broken-replication detection, fencing, rebuild, users):
+- **(a) liveness**: `ctx.ha.voterSeenMs(primary)` — every enabled server heartbeats every
+  panel node, so even a standby that just took over knows when the primary's server last
+  voted; silent after 3H. Without a voter (HA off) the agent's last request
+  (`ctx.cluster.lastSeenMs`), silent after 35 s. The leader's own server never counts as silent.
+- **(b) TCP**: only while (a) holds — connects to primary:3306 every max(0.5 s, H/2) while
+  they fail, every 10 s while they succeed (each probe is an unauthenticated connect, which
+  MySQL counts towards `max_connect_errors`); 3 consecutive failures.
+- **Window**: the primary's last sign of life = max(its last vote / agent request, our last
+  good connect). Nothing happens before it is D old.
+- **(c) the replica confirms**, at most once a second, both at once and bounded (4 s): a fresh
+  `mysql.status` with the IO thread not running, **or** `mysql.probe { host: primary, port,
+  timeoutMs }` (new task, agent 3.4.0: one TCP connect from the replica, closed on the greeting)
+  failing. The probe matters for a primary that vanished without a reset (power loss): the IO
+  thread can take up to `replica_net_timeout` (60 s) to notice.
+- Then (auto mode) the single-flight promotion job re-checks all three with a fresh replica
+  status, skips fencing the old primary when it is silent (a task to a dead agent only waits),
+  promotes (`mysql.replica.promote`), saves the new primary, and pushes the cluster.sync **at
+  once** (`ctx.cluster.pushEdgesNow()`: no 2 s debounce) before refreshing statuses, syncing
+  users and alerting (`db.failover`, unchanged). A replica whose SQL thread stopped with an
+  error is still never promoted automatically: one history entry + alert, promote with force.
+  Manual mode: the same detection, an alert with the seconds down.
+- `GET /api/mysql/replication` `detect = { primaryDownForMs, detectMs, conditions: { a, b, c, quietMs, source } }`.
+
+Agents (node-agent 3.4.0) abandon a parked `/agent/poll` as soon as the votes show a new
+leader (a dead leader's poll would otherwise hang until its 40 s timeout after a power loss),
+and wait for a new leader instead of a fixed back-off.
+
+## Cut-over (`dbCutover`, shared/edge.mjs)
+
+cluster.sync gains `dbCutover: { blockIps: [ip…], port } | null` (same for every server; main
+applies it in-process, or through its frontDoor sync while it is a standby). `blockIps` =
+the addresses of every server in `needsRebuild` (old primaries), minus any address of the
+current primary or replica, never loopback; persisted as `config.mysqlHa.cutoverIps`.
+Applied **first** in the task (with the hosts block), on every server:
+1. refuse new connections with a TCP RST — `iptables`/`ip6tables -I OUTPUT 1 -p tcp -d <ip>
+   --dport <port> -m comment --comment fcc-db-cutover -j REJECT --reject-with tcp-reset`
+   (checked with `-C`, idempotent, re-checked every sync since a reboot drops it), else an
+   nft table `inet fcc_db_cutover` (rewritten atomically with `nft -f -`);
+2. kill existing connections to addresses newly blocked: `ss -K -t dst <ip> dport = :<port>`;
+   when some survive (kernel without CONFIG_INET_DIAG_DESTROY) it says so in the task log.
+State in `<dataDir>/db-cutover.json`; `edge-state.json` gets `dbCutover` and `hostsAppliedAt`.
+All through sys.run with fixed argument lists (no shell), dry-run safe (logged only), inputs
+validated (IP addresses, port 1–65535, ≤ 32 entries, never 0.0.0.0/::). Only OUTPUT is touched:
+containers that reach MySQL through FORWARD are not covered.
+
+Lifted when the old primary is rebuilt as the replica (rebuild → hostsChanged) or becomes the
+replica in a switchover (excluded as the replica, and the switchover refreshes the list
+before it starts). The rebuild runs `mysqldump` *from* the old primary *against the new
+primary*, and replication connects replica → primary, so blocking connections *to* the old
+primary never blocks its own rebuild.
+
+## Measured (dry run, real processes: main 5501 + standby panel on agent A 5502 + agents A, B)
+
+`kill -9` of main (panel leader + database primary), failoverSeconds 15, three runs —
+new leader 7.8 / 7.9 / 7.8 s, replica promoted 9.0 / 9.0 / 8.9 s, hosts + cut-over on both
+surviving agents 9.0 / 9.0 / 8.9 s. At 30: leader 15.8 s, promoted and cut over 18.1 s. Database primary on agent A
+(leader on main), A killed: promoted 5.1 s, cut over 5.1 s. Main frozen (SIGSTOP) 3 s: nothing
+moves; 10 s: standby leads at 7.9 s, main fences itself when it resumes, and (database also
+unreachable) the replica is promoted at 9.0 s. 15 → 60 → 10 → 15 at runtime: one leader
+(term 1) throughout, no candidacy, voters followed the heartbeat (1 → 4 → 1 s) and kept the
+26 s leases granted at 60 until they ran out.
+
+## Versions
+
+Panel 3.10.0; TASKS_VERSION / AGENT_VERSION 3.4.0 (`mysql.probe`, `dbCutover`, voter protocol 2,
+poll abandon). The replica probe needs agent ≥ 3.4.0 on the replica (else the IO-thread state
+alone); agents update themselves from the leader.

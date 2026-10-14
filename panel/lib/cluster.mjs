@@ -8,7 +8,7 @@
  *
  *   POST /agent/hello                 who am I, which agent files are stale
  *   GET  /agent/poll?running=a,b      long-poll (25s) → { tasks: [...], cancel: [...] }
- *   POST /agent/tasks/:id/log         { lines } → { ok, cancel }
+ *   POST /agent/tasks/:id/log         { lines, progress? } → { ok, cancel }   (progress: agent ≥ 3.3.2, see runTask onProgress)
  *   POST /agent/tasks/:id/result      { ok, result, error, aborted }
  *   POST /agent/metrics               latest server.metrics sample (+ `edge` status on edge nodes, `mysql` status)
  *   POST /agent/edge/logs             { sites: { <siteId>: [access log lines] } } from an edge's nginx
@@ -59,6 +59,7 @@ import * as sys from "./sys.mjs";
 import { setTrustedProxies } from "./auth.mjs";
 import * as sharedTasks from "../../shared/tasks.mjs";
 import { executeTask, collectMetrics, systemInfo, TASK_TIMEOUTS_MS, TASK_TYPES } from "../../shared/tasks.mjs";
+import { advertised as haAdvertised } from "../../shared/ha-timing.mjs";
 
 export const MAIN_ID = "main";
 const ONLINE_MS = 45_000;
@@ -416,7 +417,31 @@ function createCluster(ctx) {
     return null;
   }
 
-  function runTask(serverId, type, payload = {}, { log = () => {}, signal = null, timeoutMs } = {}) {
+  /**
+   * Structured progress from an agent (POST …/log { progress }): a flat object of
+   * short strings / finite numbers / booleans / null, ≤ 40 keys, ≤ 4 KB. Anything
+   * else is dropped; unknown fields are kept for the caller to ignore.
+   */
+  function cleanProgress(p) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+    const out = {};
+    let n = 0;
+    for (const [k, v] of Object.entries(p)) {
+      if (++n > 40 || !/^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(k)) continue;
+      if (v === null || typeof v === "boolean") out[k] = v;
+      else if (typeof v === "number") out[k] = Number.isFinite(v) ? v : null;
+      else if (typeof v === "string") out[k] = v.slice(0, 200);
+    }
+    return JSON.stringify(out).length <= 4096 ? out : null;
+  }
+
+  /**
+   * Run a named task on a server. `onProgress(obj)` (optional) receives the
+   * task's structured progress: in-process on main straight from executeTask
+   * (throttled to 1/s there), from agents with their log flushes (agents older
+   * than 3.3.2 never send any). It is also kept on the task as `task.progress`.
+   */
+  function runTask(serverId, type, payload = {}, { log = () => {}, signal = null, timeoutMs, onProgress = null } = {}) {
     const server = db.get("servers", serverId);
     if (!server) return Promise.reject(httpError(404, `Server ${serverId} not found`));
     if (!TASK_TYPES.includes(type)) return Promise.reject(new Error(`Unknown task type "${type}"`));
@@ -426,6 +451,7 @@ function createCluster(ctx) {
     if (serverId === MAIN_ID && mainLocal()) {
       return executeTask(type, payload, {
         log,
+        ...(typeof onProgress === "function" ? { progress: onProgress } : {}),
         signal,
         dataDir: ctx.dataDir,
         isMain: true,
@@ -467,6 +493,8 @@ function createCluster(ctx) {
         cancelRequested: false,
         timeoutMs: timeoutMs || TASK_TIMEOUTS_MS[type] || 15 * MINUTE,
         log,
+        onProgress: typeof onProgress === "function" ? onProgress : null,
+        progress: null,
         settle: null,
       };
       let done = false;
@@ -994,7 +1022,7 @@ function createCluster(ctx) {
     for (const m of [ipMap, pIpMap]) for (const [id, ips] of m) if (id !== s.id) for (const ip of ips) allow.add(ip);
     const allowFrom = [...allow].filter((ip) => net.isIP(ip) && !isLoopback(ip)).sort();
     const edge = { files: ctx.lb?.mainFiles?.() || {}, connectors: [], shims: [] };
-    const body = { allowFrom, frontDoor: true, edge, hosts: hostsFor(s.id) };
+    const body = { allowFrom, frontDoor: true, edge, hosts: hostsFor(s.id), dbCutover: dbCutoverSpec() };
     return { hash: sha256(JSON.stringify(body)), ...body };
   }
 
@@ -1018,6 +1046,24 @@ function createCluster(ctx) {
     }
   }
 
+  /**
+   * 3.10 (fast database failover): `dbCutover` — every server refuses and resets
+   * connections to the old database primary's addresses. Owned by mysql-ha.mjs;
+   * the same for every server; null when none is in force.
+   */
+  function dbCutoverSpec() {
+    try {
+      const c = ctx.mysqlHa?.dbCutover?.();
+      if (!c || typeof c !== "object") return null;
+      const blockIps = (Array.isArray(c.blockIps) ? c.blockIps : []).filter((ip) => typeof ip === "string" && net.isIP(ip) && !isLoopback(ip)).sort();
+      const port = Number(c.port) || 3306;
+      return blockIps.length && Number.isInteger(port) && port > 0 && port < 65536 ? { blockIps, port } : null;
+    } catch (err) {
+      console.warn("[cluster] db cut-over:", err.message);
+      return null;
+    }
+  }
+
   /** Main's own copy of the hosts block, applied in-process while this process runs on main. */
   let mainHostsKey; // JSON of the last block applied on main (undefined = never)
   let mainHostsMissingNoted = false;
@@ -1027,7 +1073,8 @@ function createCluster(ctx) {
       return;
     }
     const hosts = hostsFor(MAIN_ID);
-    const key = JSON.stringify(hosts);
+    const cut = dbCutoverSpec();
+    const key = JSON.stringify([hosts, cut]);
     if (key === mainHostsKey) return;
     let edgeMod;
     try {
@@ -1042,7 +1089,10 @@ function createCluster(ctx) {
       return;
     }
     try {
-      await edgeMod.applyHostsBlock(hosts, { log: (l) => console.log(`[cluster] main /etc/hosts: ${l}`) });
+      await edgeMod.applyHostsBlock(hosts, { log: (l) => console.log(`[cluster] main /etc/hosts: ${l}`), ...(sys.DRY_RUN ? { file: path.join(ctx.dataDir, "edge-dry-run", "hosts") } : {}) });
+      if (typeof edgeMod.applyDbCutover === "function") {
+        await edgeMod.applyDbCutover(cut, { log: (l) => console.log(`[cluster] main db cut-over: ${l}`), dataDir: ctx.dataDir });
+      }
       mainHostsKey = key;
       if (hosts) console.log(`[cluster] main /etc/hosts block: ${Object.entries(hosts).map(([k, v]) => `${k} → ${v}`).join(", ")}`);
     } catch (err) {
@@ -1092,7 +1142,7 @@ function createCluster(ctx) {
       for (const c of connectors) edgeConnectorNames.set(c.id, c.name);
       edge = { files: ctx.lb?.edgeFiles?.(s.id) || {}, connectors, shims };
     }
-    const body = { allowFrom, edge, hosts: hostsFor(s.id) };
+    const body = { allowFrom, edge, hosts: hostsFor(s.id), dbCutover: dbCutoverSpec() };
     return { hash: sha256(JSON.stringify(body)), ...body };
   }
 
@@ -1322,6 +1372,22 @@ function createCluster(ctx) {
         pushEdge(s.id, { force: forced.has(s.id) || !!drifted || due }).catch((err) => console.warn(`[cluster] cluster.sync on ${s.name} failed: ${err.message}`));
       }
     }
+  }
+
+  /**
+   * Like edgesChanged() but now, without the 2 s debounce (mysql-ha after a database
+   * promotion: the hosts alias and the cut-over are the urgent part of a failover).
+   * Resolves when the round has started every push (not when the agents applied them).
+   */
+  function pushEdgesNow() {
+    if (!started) return Promise.resolve();
+    if (edgeTimer) {
+      clearTimeout(edgeTimer);
+      edgeTimer = null;
+    }
+    const forced = new Set(edgeForce);
+    edgeForce.clear();
+    return edgeRound({ forced }).catch((err) => console.warn("[cluster] edge sync round:", err.message));
   }
 
   /** Something that goes into the edge payloads changed: re-check every agent in 2 s. */
@@ -2189,6 +2255,8 @@ function createCluster(ctx) {
         // Panel failover: run the voter when HA is on; every panel node, main first.
         ha: haOn(),
         panels: panelNodeList(),
+        // 3.10: the vote heartbeat (and lease) of the configured failover speed (voters ≥ 3.4.0 adopt it).
+        ...(haOn() ? { haTimings: haAdvertised(ctx.config?.ha?.failoverSeconds) } : {}),
       };
     });
 
@@ -2196,7 +2264,7 @@ function createCluster(ctx) {
       const s = node(req);
       // Every reply carries the failover state, so an agent that connected
       // before HA was turned on (or off) starts (or stops) voting without a reconnect.
-      const withHa = (r) => (r && typeof r === "object" ? { ...r, ha: haOn(), panels: haOn() ? panelNodeList() : [] } : r);
+      const withHa = (r) => (r && typeof r === "object" ? { ...r, ha: haOn(), panels: haOn() ? panelNodeList() : [], ...(haOn() ? { haTimings: haAdvertised(ctx.config?.ha?.failoverSeconds) } : {}) } : r);
       const running = new Set(String(query.running || "").split(",").filter(Boolean));
       reconcile(s.id, running);
       // Out of date and idle: have it reconnect (which updates it) before it
@@ -2255,6 +2323,17 @@ function createCluster(ctx) {
           t.log(String(l).slice(0, 4000));
         } catch {
           /* a broken log sink must not fail the agent */
+        }
+      }
+      if (body.progress !== undefined) {
+        const p = cleanProgress(body.progress);
+        if (p) {
+          t.progress = p;
+          try {
+            t.onProgress?.(p);
+          } catch {
+            /* a broken progress sink must not fail the agent */
+          }
         }
       }
       return { ok: true, cancel: !!t.cancelRequested };
@@ -2463,6 +2542,9 @@ function createCluster(ctx) {
     agentFiles: () => Object.fromEntries(agentFiles()),
     // edge nodes (docs/HA.md)
     edgesChanged: () => edgesChanged(),
+    pushEdgesNow,
+    /** Epoch ms of the last request from server `id`'s agent (now for main while this process runs on main). */
+    lastSeenMs: (id) => lastSeenMs(id),
     edgeReplicas,
     edgeIps,
     haSummary,

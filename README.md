@@ -388,8 +388,9 @@ continuously, and its code follows every panel update.
 Exactly one panel is active at a time. It stays active only while a majority
 of your servers — every server votes, main and agents alike — keep confirming
 it. If the active panel's server goes down (or is cut off from most of the
-others), it stops itself, and after about 20–40 seconds the servers elect a
-standby that holds the latest copy of the data. You sign in at the same
+others), it stops itself, and within seconds the servers elect a standby that
+holds the latest copy of the data — about 8–9 seconds at the default
+**Failover speed** (below). You sign in at the same
 address with the same session; agents follow on their own. Opening the panel
 on a standby simply forwards you to the active one.
 
@@ -406,18 +407,47 @@ on a standby simply forwards you to the active one.
 - Every panel node must be able to reach the others' panel port (4000 by
   default) — opened automatically where `ufw` is active.
 
+**Failover speed** (Servers page, in the panel failover strip) is one number
+for the whole cluster: the time from a server going down until the panel *and*
+the databases run elsewhere. Default **15 seconds**; anything from 10 to 300.
+Presets 10 / 15 / 30 / 60 / 120, and a live breakdown below the box:
+
+| Failover speed | Panel takes over | Databases move | Outages ignored |
+|---|---|---|---|
+| 10 s | ~6.5 s | ~9.7 s | < 1.5 s |
+| 15 s (default) | ~8.8 s | ~12 s | < 3.4 s |
+| 30 s | ~17 s | ~21 s | < 6.8 s |
+| 60 s | ~34 s | ~40 s | < 13.6 s |
+| 120 s | ~62 s | ~69 s | < 33 s |
+
+(Estimates are worst cases; measured with the default: panel ~7.8 s, database
+promoted and every server cut over ~9 s after the main server died.) Faster
+means a short network hiccup between your servers is more likely to be taken
+for an outage — below 15 seconds the panel says so; a private network between
+the servers makes it much less likely.
+
 ### Database replication
 
 **Settings → Databases → Replication** keeps a live copy of every database on
 a second server (pick a panel node). The panel prepares main's MySQL (binary
 log and GTID — MySQL restarts once, for a few seconds), installs the same
 MySQL or MariaDB on the replica, copies the data and starts replication.
+A progress bar on that card (and on the Databases page and the dashboard)
+shows the copy — percent, current database, speed and time left — then the
+replica catching up on changes made meanwhile, and turns green with **In sync**
+once the replica has every change. Your websites keep working normally the
+whole time: they keep reading and writing on the primary while it copies.
 
 Websites then reach their database as `fcc-mysql.internal`, a name every
-server resolves to the current primary. If the primary stops answering — to
-the active panel and to the replica — for a minute, the replica is promoted
-and that name moves to it: websites reconnect on their own, without a restart.
-In **Manual** mode you get an alert and a **Promote** button instead.
+server resolves to the current primary. If the primary stops answering — its
+server stops voting, the active panel cannot connect to its MySQL, and the
+replica confirms it cannot either — the replica is promoted and that name moves
+to it. Every server also refuses and resets connections to the old primary, so
+websites reconnect to the new one within a second, without a restart. How fast
+follows the **Failover speed** setting (above): with the default 15 seconds the
+database moves about 5 seconds after its server dies, or about 9 seconds when
+that server also ran the active panel (the panel moves first). In **Manual**
+mode you get an alert and a **Promote** button instead.
 
 - A server that was primary comes back **read-only** and is rebuilt as the new
   replica; its old data is first saved to

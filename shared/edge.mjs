@@ -13,12 +13,21 @@
  *   edgeLogSites(dataDir)     site ids whose fcc-<siteId>.conf this server manages
  *   panelInstall / panelRemove  tasks panel.install / panel.remove (Phase 2: panel nodes)
  *   applyHostsBlock(map, opts)  the managed /etc/hosts block (Phase 3: database address)
+ *   applyDbCutover(spec, opts)  cut clients off a failed database primary (3.10)
  *
  * Phase 3 (database replication) adds `hosts: { "fcc-mysql.internal": "<ip>" } | null`
  * to cluster.sync: a managed block in /etc/hosts (null or {} removes it; a
  * payload without the key leaves it alone). The panel on main calls
  * applyHostsBlock() in-process for main itself. panel.install also installs
  * the MySQL client of `mysqlFlavor` when the payload names one.
+ *
+ * 3.10 (fast database failover) adds `dbCutover: { blockIps: [ip…], port } | null`:
+ * on every server, existing TCP connections to those ip:port are killed
+ * (`ss -K`, needs a kernel with sock-destroy) and new ones are refused with a
+ * TCP RST by a firewall rule (iptables/ip6tables OUTPUT, or an nft table
+ * `inet fcc_db_cutover`), tagged "fcc-db-cutover"; null / [] removes them. It
+ * is applied before anything else in the task — it is what moves websites off
+ * a dead database primary within a second instead of a TCP timeout.
  *
  * Phase 2 (panel failover) adds two things to cluster.sync:
  *   - `frontDoor: true` — sent only to main's embedded agent while another
@@ -159,7 +168,16 @@ function checkPayload(payload) {
       throw bad(err.message);
     }
   }
-  if (payload.edge == null) return { hash, allowFrom, ignored, notes: [], frontDoor, hosts, edge: null };
+  // dbCutover (3.10): undefined = leave alone, null = remove every block.
+  let dbCutover;
+  if (payload.dbCutover !== undefined) {
+    try {
+      dbCutover = checkDbCutover(payload.dbCutover);
+    } catch (err) {
+      throw bad(err.message);
+    }
+  }
+  if (payload.edge == null) return { hash, allowFrom, ignored, notes: [], frontDoor, hosts, dbCutover, edge: null };
   const e = payload.edge;
   if (typeof e !== "object") throw bad("edge must be an object or null");
 
@@ -220,7 +238,7 @@ function checkPayload(payload) {
     notes.push("Front door mode: the shims and connectors in the payload are not used on the main server.");
   }
 
-  return { hash, allowFrom, ignored, notes, frontDoor, hosts, edge: { files, connectors, shims } };
+  return { hash, allowFrom, ignored, notes, frontDoor, hosts, dbCutover, edge: { files, connectors, shims } };
 }
 
 // --------------------------------------------------------------- the task
@@ -239,17 +257,8 @@ export async function clusterSync(payload, o) {
     }
   };
 
-  // 1. Firewall — on every agent, edge or not: the edges must reach its site ports.
-  log("── Firewall ──");
-  const firewall = await syncFirewall(p.allowFrom, log).catch((err) => {
-    errors.push(`firewall: ${err.message}`);
-    return { error: err.message };
-  });
-  if (p.ignored.length) log(`Ignored allowFrom entries that are not IP addresses: ${p.ignored.join(", ")}`);
-  for (const n of p.notes) log(n);
-  checkAbort();
-
-  // 1b. Database address (Phase 3): the managed /etc/hosts block.
+  // 1. Database address (Phase 3) first — after a database failover it is the urgent part:
+  // the managed /etc/hosts block, then (3.10) cut every client off the old primary.
   let hosts;
   if (p.hosts !== undefined) {
     log("── /etc/hosts ──");
@@ -261,9 +270,35 @@ export async function clusterSync(payload, o) {
       hosts = { error: err.message };
     }
   }
+  let dbCutover;
+  if (p.dbCutover !== undefined) {
+    log("── Database cut-over ──");
+    try {
+      dbCutover = await applyDbCutover(p.dbCutover, { log, dataDir: o.dataDir });
+    } catch (err) {
+      errors.push(`dbCutover: ${err.message}`);
+      log(`!! ${err.message}`);
+      dbCutover = { error: err.message };
+    }
+  }
+  checkAbort();
+
+  // 2. Firewall — on every agent, edge or not: the edges must reach its site ports.
+  log("── Firewall ──");
+  const firewall = await syncFirewall(p.allowFrom, log).catch((err) => {
+    errors.push(`firewall: ${err.message}`);
+    return { error: err.message };
+  });
+  if (p.ignored.length) log(`Ignored allowFrom entries that are not IP addresses: ${p.ignored.join(", ")}`);
+  for (const n of p.notes) log(n);
+  checkAbort();
 
   const state = { ...prev, edge: !!p.edge, frontDoor: !!p.edge && p.frontDoor, hash: p.hash, appliedAt: new Date().toISOString() };
-  if (hosts && !hosts.error) state.hosts = hosts.entries;
+  if (hosts && !hosts.error) {
+    state.hosts = hosts.entries;
+    state.hostsAppliedAt = state.appliedAt;
+  }
+  if (dbCutover && !dbCutover.error) state.dbCutover = dbCutover;
   let connectors = [];
   let shims = [];
 
@@ -379,8 +414,165 @@ export async function clusterSync(payload, o) {
     shims,
     firewall,
     ...(hosts !== undefined ? { hosts } : {}),
+    ...(dbCutover !== undefined ? { dbCutover } : {}),
     ...(sys.DRY_RUN ? { dryRun: true } : {}),
   };
+}
+
+// ------------------------------------------------------- database cut-over
+//
+// After a database failover the old primary may be half alive (a frozen VM, a
+// network partition) and clients may still hold connections to it, or reconnect
+// to it from a cached address. On every server: refuse new connections to the
+// old primary's addresses with a TCP RST (a firewall rule, so a client fails
+// over in milliseconds instead of waiting for a TCP timeout), then kill the
+// existing ones (ss -K). Only connections *to* those addresses on the database
+// port are touched: the old primary's own rebuild pulls from the new primary,
+// and its agent and SSH are unaffected.
+
+export const CUTOVER_COMMENT = "fcc-db-cutover";
+const CUTOVER_FILE = "db-cutover.json";
+const NFT_TABLE = "fcc_db_cutover";
+
+/** { blockIps, port } | null → { blockIps: [ip…] sorted, port }; throws on anything else. */
+export function checkDbCutover(v) {
+  if (v == null) return { blockIps: [], port: 3306 };
+  if (typeof v !== "object" || Array.isArray(v)) throw new Error("dbCutover must be an object { blockIps, port } or null");
+  const port = v.port === undefined ? 3306 : Number(v.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`dbCutover.port is not a valid port (${String(v.port).slice(0, 20)})`);
+  const list = v.blockIps == null ? [] : v.blockIps;
+  if (!Array.isArray(list)) throw new Error("dbCutover.blockIps must be a list of IP addresses");
+  if (list.length > 32) throw new Error("dbCutover.blockIps has too many entries");
+  const ips = new Set();
+  for (const raw of list) {
+    const ip = String(raw ?? "").trim();
+    if (!net.isIP(ip)) throw new Error(`dbCutover: ${JSON.stringify(ip.slice(0, 60))} is not an IP address`);
+    if (ip === "0.0.0.0" || ip === "::") throw new Error(`dbCutover: ${ip} cannot be blocked`);
+    ips.add(ip);
+  }
+  return { blockIps: [...ips].sort(), port };
+}
+
+function readCutoverState(dataDir) {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(dataDir, CUTOVER_FILE), "utf8"));
+    return checkDbCutover({ blockIps: s?.blockIps || [], port: s?.port });
+  } catch {
+    return { blockIps: [], port: 3306 };
+  }
+}
+
+const iptablesRule = (ip, port) => ["OUTPUT", "-p", "tcp", "-d", ip, "--dport", String(port), "-m", "comment", "--comment", CUTOVER_COMMENT, "-j", "REJECT", "--reject-with", "tcp-reset"];
+
+function renderNftTable(blockIps, port) {
+  const rules = blockIps.map((ip) => `    ${net.isIPv6(ip) ? "ip6" : "ip"} daddr ${ip} tcp dport ${port} reject with tcp reset comment "${CUTOVER_COMMENT}"`);
+  // "add table" + "delete table" first: the script works whether or not the table exists.
+  let out = `add table inet ${NFT_TABLE}\ndelete table inet ${NFT_TABLE}\n`;
+  if (rules.length) out += `table inet ${NFT_TABLE} {\n  chain out {\n    type filter hook output priority 0; policy accept;\n${rules.join("\n")}\n  }\n}\n`;
+  return out;
+}
+
+/**
+ * Make the cut-over rules be exactly `spec` (null / [] removes them), and kill
+ * existing connections to newly blocked addresses. Idempotent: rules are
+ * re-checked every time (a reboot drops them), connections are only killed for
+ * addresses that were not blocked before. → { blockIps, port, backend, killed, remaining, notes, appliedAt }
+ */
+export async function applyDbCutover(spec, { log = NOOP, dataDir, dryRun = sys.DRY_RUN } = {}) {
+  const want = checkDbCutover(spec);
+  const prev = dataDir ? readCutoverState(dataDir) : { blockIps: [], port: want.port };
+  const samePort = prev.port === want.port;
+  const added = want.blockIps.filter((ip) => !samePort || !prev.blockIps.includes(ip));
+  const removed = prev.blockIps.filter((ip) => !samePort || !want.blockIps.includes(ip));
+  const notes = [];
+  const run = (cmd, args, extra = {}) => sys.run(cmd, args, { allowFail: true, timeoutMs: 10_000, log: dryRun ? log : null, ...extra });
+
+  if (process.env.FCC_SKIP_UFW === "1") {
+    log("FCC_SKIP_UFW=1 — no database cut-over firewall rules.");
+    notes.push("firewall skipped (FCC_SKIP_UFW=1)");
+  }
+  const skipFw = process.env.FCC_SKIP_UFW === "1";
+  const backend = skipFw ? null : dryRun ? "iptables" : sys.which("iptables") ? "iptables" : sys.which("nft") ? "nft" : null;
+  if (!skipFw && !backend && (want.blockIps.length || prev.blockIps.length)) {
+    notes.push("neither iptables nor nft is installed — connections are only reset, new ones are not refused");
+    log("!! Neither iptables nor nft is installed: new connections to the old database primary cannot be refused here.");
+  }
+
+  // 1. Refuse new connections first, so a killed client cannot reconnect to the old primary.
+  if (backend === "iptables") {
+    for (const ip of [...new Set([...removed, ...want.blockIps])]) {
+      const bin = net.isIPv6(ip) ? "ip6tables" : "iptables";
+      if (!dryRun && !sys.which(bin)) {
+        notes.push(`${bin} missing — ${ip} not handled`);
+        continue;
+      }
+      const spec_ = iptablesRule(ip, removed.includes(ip) && !samePort ? prev.port : want.port);
+      if (removed.includes(ip)) {
+        // Delete every copy of our rule (there should be one).
+        for (let i = 0; i < 5; i++) {
+          const has = await run(bin, ["-w", "-C", ...spec_]);
+          if (!dryRun && has.code !== 0) break;
+          await run(bin, ["-w", "-D", ...spec_]);
+          if (dryRun) break;
+        }
+        log(`${dryRun ? "[dry-run] " : ""}No longer refusing connections to ${ip}:${prev.port}.`);
+        if (!want.blockIps.includes(ip)) continue;
+      }
+      const has = await run(bin, ["-w", "-C", ...iptablesRule(ip, want.port)]);
+      if (dryRun || has.code !== 0) {
+        const r = await run(bin, ["-w", "-I", ...iptablesRule(ip, want.port).slice(0, 1), "1", ...iptablesRule(ip, want.port).slice(1)]);
+        if (!dryRun && r.code !== 0) notes.push(`${bin}: could not add the rule for ${ip} (${(r.stderr || "").trim().slice(0, 200)})`);
+        else log(`${dryRun ? "[dry-run] " : ""}Refusing new connections to ${ip}:${want.port} (TCP reset).`);
+      }
+    }
+  } else if (backend === "nft") {
+    const r = await run("nft", ["-f", "-"], { input: renderNftTable(want.blockIps, want.port) });
+    if (r.code !== 0) notes.push(`nft: ${(r.stderr || "").trim().slice(0, 200)}`);
+    else log(want.blockIps.length ? `Refusing new connections to ${want.blockIps.join(", ")} on port ${want.port} (nft table ${NFT_TABLE}).` : `nft table ${NFT_TABLE} removed.`);
+  }
+
+  // 2. Kill what is already connected to a newly blocked address.
+  const killed = [];
+  let remaining = 0;
+  if (added.length) {
+    if (!dryRun && !sys.which("ss")) {
+      notes.push("ss is not installed — existing connections were not reset");
+    } else {
+      for (const ip of added) {
+        const dst = net.isIPv6(ip) ? `[${ip}]` : ip;
+        await run("ss", ["-K", "-t", "dst", dst, "dport", "=", `:${want.port}`]);
+        killed.push(ip);
+        if (!dryRun) {
+          const left = await run("ss", ["-H", "-t", "-n", "state", "established", "dst", dst, "dport", "=", `:${want.port}`]);
+          const n = String(left.stdout || "").split("\n").filter((l) => l.trim()).length;
+          if (n) {
+            remaining += n;
+            notes.push(`${n} connection(s) to ${ip}:${want.port} survived ss -K — this kernel lacks sock-destroy (CONFIG_INET_DIAG_DESTROY); they end when the client next uses them`);
+          }
+        }
+      }
+      log(`${dryRun ? "[dry-run] " : ""}Reset existing connections to ${added.join(", ")} on port ${want.port}${remaining ? ` (${remaining} could not be reset)` : ""}.`);
+    }
+  } else if (!want.blockIps.length && !removed.length) {
+    log("No database cut-over in force.");
+  } else if (!added.length && want.blockIps.length) {
+    log(`Database cut-over unchanged: refusing ${want.blockIps.join(", ")} on port ${want.port}.`);
+  }
+  for (const n of notes) log(`note: ${n}`);
+
+  const out = { blockIps: want.blockIps, port: want.port, backend, killed, remaining, notes, appliedAt: new Date().toISOString(), ...(dryRun ? { dryRun: true } : {}) };
+  if (dataDir) {
+    try {
+      ensureDir(dataDir);
+      const file = path.join(dataDir, CUTOVER_FILE);
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      log(`!! could not save ${CUTOVER_FILE}: ${err.message}`);
+    }
+  }
+  return out;
 }
 
 // ------------------------------------------------------------ /etc/hosts

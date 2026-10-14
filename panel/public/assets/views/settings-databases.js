@@ -4,7 +4,7 @@ import { html, raw, mount, $, $$, on, ago, fmtDate, fmtDuration, toast, toastErr
 import { icon } from "../icons.js";
 import { get, post, put, patch, del } from "../api.js";
 import { openJobLog, jobStarted } from "../components.js";
-import { dbUnavailable, unavailableState, getReplication, replBadge, fmtLagS, replicaBroken } from "./databases.js";
+import { dbUnavailable, unavailableState, getReplication, replBadge, fmtLagS, replicaBroken, syncWords, syncBar, SYNC_PHASES } from "./databases.js";
 
 const field = (label, control, hint) => html`<div class="field"><label>${label}</label>${control}${hint ? html`<div class="hint">${hint}</div>` : ""}</div>`;
 function setBusy(btn, busy) { if (!btn) return; btn.classList.toggle("loading", busy); btn.disabled = busy; }
@@ -105,9 +105,19 @@ export async function mysqlSettings(outer, ctx) {
 /* ───────── Replication (docs/HA.md, Phase 3) ───────── */
 
 const MODE = {
-  auto: { label: "Automatic failover", desc: "The replica takes over when the primary has been unreachable for 1 minute." },
+  auto: { label: "Automatic failover", desc: "The replica takes over as soon as the primary is confirmed down (see Failover speed)." },
   manual: { label: "Manual", desc: "You get an alert when the primary is down, and promote the replica yourself." },
 };
+/** "12 s" / "3.4 s" / "2 min" (failover speed breakdown, 3.10). */
+const secsWord = (n) => (n == null ? "?" : n >= 90 ? `${Math.round(n / 60)} min` : n >= 10 ? `${Math.round(n)} s` : `${Math.round(n * 10) / 10} s`);
+/** Read-only mirror of the cluster-wide Failover speed setting (Servers page). */
+function failoverSummary(f) {
+  if (!f) return "";
+  return html`<div class="repl-fo">
+    <div class="label">Failover speed</div>
+    <div class="repl-fo-v"><b>${f.failoverSeconds} s</b><span class="muted small"> · the database moves to the replica in about ${secsWord(f.databaseFailoverSeconds)}; network outages between servers shorter than about ${secsWord(f.blipToleranceSeconds)} are ignored.</span></div>
+    <a class="small" href="#/servers">Change it on the Servers page →</a></div>`;
+}
 const HIST = { enabled: "Replication turned on", seeded: "Replica copied", promoted: "Replica promoted to primary", switchover: "Primary switched",
   rebuilt: "Rebuilt as the replica", broken: "Replication broke", fenced: "Old primary set to read-only", disabled: "Replication turned off", mode: "Failover mode changed" };
 const thread = (on, err) => (on ? html`<span class="status"><span class="dot ok"></span>Running</span>` : html`<span class="status"><span class="dot ${err ? "err" : "off"}"></span>Stopped</span>`);
@@ -151,6 +161,26 @@ function enableDialog(r) {
   }).result;
 }
 
+/** The replica's sync: phase, bar, steps and — while it runs — that websites are unaffected. */
+function syncBlock(r) {
+  const p = r.progress, w = syncWords(p);
+  if (!w) return "";
+  const done = p.phase === "in-sync";
+  const at = SYNC_PHASES.findIndex(([k]) => k === p.phase); // -1 while preparing
+  const took = done && p.startedAt && p.syncedAt ? new Date(p.syncedAt) - new Date(p.startedAt) : null;
+  return html`<section class="sync ${done ? "is-ok" : ""}">
+    <div class="sync-top">
+      <span class="sync-ico">${icon(done ? "check" : "database", "sm")}</span>
+      <div class="sync-t"><b>${w.long}</b>
+        <span class="sync-meta">${done ? html`${p.replicaName || "The replica"} matches ${r.primary?.name || "the primary"} · synced <span title="${fmtDate(p.syncedAt)}">${ago(p.syncedAt)}</span>${took > 0 ? ` · took ${fmtDuration(took)}` : ""}` : w.meta.join(" · ")}</span></div>
+      ${!done && w.pct != null ? html`<span class="sync-pct">${w.pct}%</span>` : ""}
+    </div>
+    ${syncBar(p)}
+    <ol class="sync-steps">${SYNC_PHASES.map(([k, label], i) => html`<li class="${done || i < at ? "done" : i === at ? "now" : ""}">${done || i < at ? icon("check", "xs") : html`<span class="n">${i + 1}</span>`}${label}</li>`)}</ol>
+    ${done ? "" : html`<p class="sync-note">${icon("shield", "sm")}<span><b>Your websites keep working normally while this runs.</b> They keep reading and writing on ${r.primary?.name || "the primary"} the whole time. The replica copies everything, then catches up on the changes made meanwhile.</span></p>`}
+  </section>`;
+}
+
 /** Settings → Databases → Replication card. Live on SSE `mysql-ha`. */
 export async function replicationCard(box, ctx) {
   let r = null, showAll = false;
@@ -178,9 +208,20 @@ export async function replicationCard(box, ctx) {
     </div>`);
   };
 
+  // Turning replication on: not enabled until the copy is done, but the copy is the news.
+  const paintSyncing = () => {
+    const p = r.progress;
+    mount(box, html`<div class="card repl-card">
+      <div class="card-head"><span class="repl-ico on">${icon("database")}</span>
+        <div class="repl-head-t"><h3>Replication</h3><div class="sub">Turning on · ${r.primary?.name || "Primary"} → ${p.replicaName || "replica"}</div></div>
+        <div class="right">${replBadge(r.state === "off" ? "seeding" : r.state)}</div></div>
+      <div class="card-body">${syncBlock(r)}${histList()}</div>
+    </div>`);
+  };
+
   const paint = () => {
     if (!r) return mount(box, html``);
-    if (!r.enabled) return paintOff();
+    if (!r.enabled) return r.progress && r.progress.phase !== "in-sync" ? paintSyncing() : paintOff();
     const p = r.primary || {}, rep = r.replica, broken = replicaBroken(r);
     const flavor = r.flavor === "mariadb" ? "MariaDB" : "MySQL";
     const down = r.detect?.primaryDownForMs;
@@ -192,8 +233,9 @@ export async function replicationCard(box, ctx) {
       <div class="card-head"><span class="repl-ico on">${icon("database")}</span>
         <div class="repl-head-t"><h3>Replication</h3><div class="sub">${MODE[r.mode]?.label || r.mode} · ${flavor}</div></div>
         <div class="right">${replBadge(r.state)}</div></div>
-      ${down ? html`<div class="card-body" style="padding-bottom:0"><div class="note err">${icon("alert")}<div><b>${p.name} hasn't answered for ${fmtDuration(down)}.</b> ${r.mode === "auto" && rep ? `${rep.name} takes over once it has been down for 1 minute, unless it answers again.` : rep ? "Promote the replica if it stays down." : ""}</div></div></div>` : ""}
+      ${down ? html`<div class="card-body" style="padding-bottom:0"><div class="note err">${icon("alert")}<div><b>${p.name} hasn't answered for ${fmtDuration(down)}.</b> ${r.mode === "auto" && rep ? `${rep.name} takes over once it has been down for about ${secsWord(r.failover?.detectSeconds ?? 60)} and the replica confirms it, unless it answers again.` : rep ? "Promote the replica if it stays down." : ""}</div></div></div>` : ""}
       <div class="card-body">
+        ${r.progress ? syncBlock(r) : ""}
         <div class="repl-pair">
           <div class="repl-node">
             <div class="repl-node-h"><span class="label">Primary</span><span class="badge ${p.readOnly ? "warn" : "ok"}">${p.readOnly ? "Read-only" : "Writable"}</span></div>
@@ -224,6 +266,7 @@ export async function replicationCard(box, ctx) {
           <div class="field"><label for="repl-mode">Failover</label>
             <select class="select" id="repl-mode" data-rmode>${Object.entries(MODE).map(([k, v]) => html`<option value="${k}" ${k === r.mode ? raw("selected") : ""}>${v.label}</option>`)}</select>
             <div class="hint" data-rmode-desc>${MODE[r.mode]?.desc || ""}</div></div>
+          ${failoverSummary(r.failover)}
         </div>
         ${histList()}
       </div>

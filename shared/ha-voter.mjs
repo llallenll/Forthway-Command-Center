@@ -3,25 +3,37 @@
  *
  * Every enabled server has exactly one vote. Agent servers vote from fcc-node
  * (node/node-agent.mjs), main votes from its own panel process. A voter does
- * nothing clever: every HEARTBEAT_MS it POSTs /ha/vote to every panel node it
+ * nothing clever: every heartbeat it POSTs /ha/vote to every panel node it
  * knows, and when a node's reply carries a `request` it decides, by the rules
- * below, whether to give that candidate its vote (a lease of LEASE_MS).
+ * below, whether to give that candidate its vote (a lease).
+ *
+ * Timing (3.10 / agent 3.4, shared/ha-timing.mjs): the heartbeat follows what
+ * the leader advertises (`timings.heartbeatMs` in its vote replies, also in
+ * agent hello/poll replies — adopt()); the lease length is the one the
+ * *request* names (`request.leaseMs`; 15 s when absent — a pre-3.10 leader).
+ * Every grant echoes the lease it was given under (`grant.leaseMs`).
  *
  *   createVoter({ voterId, token, load, save, panels, onPanels, log })
  *     → { start(), stop(), status(), leader() }
  *
  * Why this cannot produce two active panels:
  *
- *   - A voter never grants a *different* candidate while its current grant is
- *     younger than LEASE_MS. Lease time is measured on this process's
- *     monotonic clock (performance.now()), so a wall-clock jump changes nothing.
- *   - The candidate counts a grant only until `nonce + LEASE_MS - MARGIN_MS`
- *     on *its* monotonic clock, where `nonce` is when it built the request —
- *     strictly before the voter could have granted the request. So every grant
- *     expires at the candidate MARGIN_MS before the voter would hand the same
- *     vote to someone else. Two majorities would need one voter in both: impossible.
+ *   - A voter never grants a *different* candidate before `leaseUntil`, the end
+ *     of the longest lease it has handed out: each grant of lease ℓ sets
+ *     leaseUntil = max(leaseUntil, now + ℓ) — a renewal with a shorter lease
+ *     never shortens a lease already given. Lease time is measured on this
+ *     process's monotonic clock (performance.now()), so a wall-clock jump
+ *     changes nothing.
+ *   - The candidate counts a grant only until
+ *     `nonce + min(grant.leaseMs, the lease it asked for) - margin` on *its*
+ *     monotonic clock, where `nonce` is when it built the request — strictly
+ *     before the voter could have granted the request. So every grant expires
+ *     at the candidate at least `margin` before the voter would hand the same
+ *     vote to someone else, whatever lease lengths either side uses or changes
+ *     to. Two majorities would need one voter in both: impossible.
  *   - A voter that restarts cannot know how long it was down, so it treats its
- *     lease as live for a full LEASE_MS after boot (whatever vote.json says).
+ *     lease as live for the full length of its last grant (`leaseMs` saved with
+ *     the vote; 15 s for a vote.json written before 3.10) after boot.
  *   - The vote is persisted (save()) *before* the grant is sent. If saving
  *     fails, nothing is granted.
  *   - `term` never decreases; a request for an older term is refused.
@@ -30,8 +42,9 @@
  *     so a stale node can never take over and lose acknowledged writes.
  *   - During a planned handover only the named target can get the vote.
  *
- * Liveness: every panel node is heartbeated on its own timer with a ~2.5 s
- * request timeout, so a dead or slow node never delays the others.
+ * Liveness: every panel node is heartbeated on its own timer with a request
+ * timeout below the heartbeat (0.9 s at 1 s), so a dead or slow node never
+ * delays the others.
  *
  * Zero dependencies; Node 18+.
  */
@@ -40,21 +53,19 @@ import http from "node:http";
 import https from "node:https";
 import { performance } from "node:perf_hooks";
 
-export const HEARTBEAT_MS = 3000;
-export const LEASE_MS = 15000;
-export const MARGIN_MS = 3000;
-export const FAILOVER_MS = 20000;
+import { haTimings, cleanLeaseMs, cleanHeartbeatMs, LEGACY_LEASE_MS } from "./ha-timing.mjs";
 
-const REQUEST_TIMEOUT_MS = 2500;
+/** The defaults (failoverSeconds = 15). Live values come from the leader; see adopt(). */
+const DEFAULT_TIMINGS = haTimings();
+export const HEARTBEAT_MS = DEFAULT_TIMINGS.heartbeatMs;
+export const LEASE_MS = DEFAULT_TIMINGS.leaseMs;
+export const MARGIN_MS = DEFAULT_TIMINGS.marginMs;
+export const FAILOVER_MS = DEFAULT_TIMINGS.failoverMs;
+/** Vote protocol: 2 = requests/grants carry `leaseMs`, replies carry `timings` (3.10). */
+export const HA_PROTO = 2;
+
 const MAX_REPLY_BYTES = 256 * 1024;
 const SYNC_NODES_MS = 1000;
-/**
- * How long a seen `handoverTo` restricts our vote to its target (refreshed
- * while the leader keeps sending it). The old leader stops renewing when it
- * starts the handover, so our lease for it ends within LEASE_MS; the target
- * then has two more heartbeats to itself before anyone else may ask.
- */
-const HANDOVER_HOLD_MS = LEASE_MS + 2 * HEARTBEAT_MS;
 
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const URL_RE = /^https?:\/\/[^\s/?#]+\/?$/i;
@@ -105,7 +116,7 @@ export function cleanPanels(list) {
 }
 
 /** POST JSON with a hard overall timeout. Resolves the parsed reply; rejects on anything else. */
-function postJson(url, body, token, timeoutMs = REQUEST_TIMEOUT_MS) {
+function postJson(url, body, token, timeoutMs) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -191,8 +202,13 @@ export function createVoter(opts) {
   }
   const state = cleanState(loaded);
   // Restart rule: whatever was saved, the lease we may have granted just before
-  // going down is treated as live for a full LEASE_MS from now.
-  let grantedMono = now();
+  // going down is treated as live for its full length from now (the length is
+  // saved with the vote, before the grant is sent; 15 s for an older vote.json).
+  let leaseLen = cleanLeaseMs(loaded?.leaseMs); // LEGACY_LEASE_MS when the saved vote has none
+  let leaseUntil = now() + leaseLen;
+  // Heartbeat: the leader's advertised value once we have one (adopt()).
+  let heartbeatMs = cleanHeartbeatMs(opts?.heartbeatMs) || HEARTBEAT_MS;
+  const requestTimeout = () => Math.min(2500, Math.round(0.9 * heartbeatMs));
 
   const nodes = new Map(); // directUrl -> node record
   let handover = null; // { target, until }
@@ -201,12 +217,21 @@ export function createVoter(opts) {
   let generation = 0; // bumped by start()/stop(): a heartbeat from an older run never reschedules itself
   let syncTimer = null;
 
-  const leaseLeft = () => Math.max(0, Math.round(grantedMono + LEASE_MS - now()));
-  const leaseExpired = () => now() - grantedMono >= LEASE_MS;
+  const leaseLeft = () => Math.max(0, Math.round(leaseUntil - now()));
+  const leaseExpired = () => now() >= leaseUntil;
   const handoverPending = () => (handover && now() < handover.until ? handover : null);
 
   function persist() {
-    save({ term: state.term, votedFor: state.votedFor, grantedAt: state.grantedAt, knownCommitted: { ...state.knownCommitted } });
+    save({ term: state.term, votedFor: state.votedFor, grantedAt: state.grantedAt, leaseMs: leaseLen, knownCommitted: { ...state.knownCommitted } });
+  }
+
+  /** Take the heartbeat a leader advertises ({ heartbeatMs }); safety never depends on it. */
+  function adopt(t) {
+    const hb = cleanHeartbeatMs(t?.heartbeatMs);
+    if (hb && hb !== heartbeatMs) {
+      log(`ha voter: heartbeat ${heartbeatMs} → ${hb} ms (from the active panel)`);
+      heartbeatMs = hb;
+    }
   }
 
   function voteBody(grant) {
@@ -215,6 +240,9 @@ export function createVoter(opts) {
       term: state.term,
       votedFor: state.votedFor,
       leaseLeftMs: leaseLeft(),
+      leaseMs: leaseLen,
+      heartbeatMs,
+      proto: HA_PROTO,
       knownCommitted: { ...state.knownCommitted },
       ...(grant ? { grant } : {}),
     };
@@ -258,7 +286,8 @@ export function createVoter(opts) {
       .catch(() => {})
       .finally(() => {
         if (!running || n.removed || gen !== generation) return;
-        n.timer = setTimeout(() => beat(n), Math.max(0, started + HEARTBEAT_MS - now()));
+        // heartbeatMs as of now: a reply that just changed it applies to the very next beat.
+        n.timer = setTimeout(() => beat(n), Math.max(0, started + heartbeatMs - now()));
         n.timer.unref?.();
       });
   }
@@ -266,7 +295,7 @@ export function createVoter(opts) {
   async function send(n, grant) {
     let reply;
     try {
-      reply = await postJson(`${n.directUrl}/ha/vote`, voteBody(grant), token);
+      reply = await postJson(`${n.directUrl}/ha/vote`, voteBody(grant), token, requestTimeout());
     } catch (err) {
       if (n.reachable || n.error !== err.message) log(`ha voter: ${n.serverId} (${n.directUrl}) unreachable: ${err.message}`);
       n.reachable = false;
@@ -298,6 +327,7 @@ export function createVoter(opts) {
 
     const isLeader = role === "leader" && n.leaderId === nodeId;
     if (isLeader) {
+      if (r.timings && typeof r.timings === "object") adopt(r.timings);
       if (r.committed && compareVersion(r.committed, state.knownCommitted) > 0) {
         state.knownCommitted = cleanVersion(r.committed);
         try {
@@ -309,7 +339,8 @@ export function createVoter(opts) {
       if (typeof r.handoverTo === "string" && ID_RE.test(r.handoverTo)) {
         if (handoverLogged !== `${nodeId}>${r.handoverTo}`) log(`ha voter: ${nodeId} is handing over to ${r.handoverTo}`);
         handoverLogged = `${nodeId}>${r.handoverTo}`;
-        handover = { target: r.handoverTo, until: now() + HANDOVER_HOLD_MS };
+        // Until the old leader's lease with us has surely ended, plus two heartbeats for the target.
+        handover = { target: r.handoverTo, until: Math.max(leaseUntil, now()) + 2 * heartbeatMs };
       }
       if (r.panels !== undefined) {
         const list = cleanPanels(r.panels);
@@ -337,24 +368,30 @@ export function createVoter(opts) {
       n.lastRefusal = why;
       return;
     }
+    // The lease this grant is for: what the request names (a pre-3.10 leader names none: 15 s).
+    const grantLease = q.leaseMs === undefined ? LEGACY_LEASE_MS : cleanLeaseMs(q.leaseMs);
     // Grant: remember it on disk first, then tell the candidate right away.
     const prev = { term: state.term, votedFor: state.votedFor, grantedAt: state.grantedAt };
-    const prevMono = grantedMono;
+    const prevUntil = leaseUntil;
+    const prevLen = leaseLen;
     state.term = qTerm;
     state.votedFor = candidate;
     state.grantedAt = new Date().toISOString();
-    grantedMono = now();
+    // Never shorten a lease already given (a renewal under a shorter lease keeps the old end).
+    leaseUntil = Math.max(leaseUntil, now() + grantLease);
+    leaseLen = Math.max(grantLease, Math.round(leaseUntil - now()));
     try {
       persist();
     } catch (err) {
       Object.assign(state, prev);
-      grantedMono = prevMono;
+      leaseUntil = prevUntil;
+      leaseLen = prevLen;
       log(`ha voter: could not save the vote (${err.message}) — not granting ${candidate}`);
       return;
     }
-    if (prev.votedFor !== candidate || prev.term !== qTerm) log(`ha voter: voted for ${candidate} (term ${qTerm})`);
+    if (prev.votedFor !== candidate || prev.term !== qTerm) log(`ha voter: voted for ${candidate} (term ${qTerm}, lease ${grantLease} ms)`);
     if (handover && handover.target === candidate) handover = null;
-    send(n, { candidate, term: qTerm, nonce }).catch(() => {});
+    send(n, { candidate, term: qTerm, nonce, leaseMs: grantLease }).catch(() => {});
   }
 
   /** Why a request is refused, or null to grant. */
@@ -387,6 +424,8 @@ export function createVoter(opts) {
       term: state.term,
       votedFor: state.votedFor,
       leaseLeftMs: leaseLeft(),
+      leaseMs: leaseLen,
+      heartbeatMs,
       knownCommitted: { ...state.knownCommitted },
       nodes: out,
     };
@@ -410,5 +449,5 @@ export function createVoter(opts) {
     for (const n of nodes.values()) clearTimeout(n.timer);
   }
 
-  return { start, stop, status, leader };
+  return { start, stop, status, leader, adopt };
 }

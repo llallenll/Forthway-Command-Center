@@ -1165,3 +1165,20 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   when it holds no databases of its own, and mysqldump's series is checked before the
   copy. The panel requires agent 3.3.1 on the replica before seeding. Details in
   docs/HA.md (Changes).
+- **3.9.2 — replica sync progress (agent/tasks 3.3.2).** `executeTask` takes an optional
+  `progress(obj)` sink (throttled to 1/s); agents send the latest object with their log
+  flush (`POST /agent/tasks/:id/log { lines, progress }`) and `ctx.cluster.runTask` takes
+  `{ onProgress }`. The database seed reports bytes / estimate / percent / rate / ETA /
+  current database; the panel measures the replica catching up (GTID set difference, lag)
+  and `GET /api/mysql/replication` returns `progress`. A progress bar in Settings →
+  Databases, the Databases page and the dashboard; websites keep working throughout.
+  Details in docs/HA.md (Changes).
+- **3.10.0 — failover speed and fast database failover (agent/tasks 3.4.0).** One
+  cluster-wide setting, `config.ha.failoverSeconds` (10–300, default 15; `GET/PATCH
+  /api/ha/settings`), drives every panel-failover and database-failover duration through
+  `shared/ha-timing.mjs` `haTimings()`. Vote protocol 2: requests and grants carry `leaseMs`,
+  leader replies carry `timings`; a grant counts until `nonce + min(grant lease, requested
+  lease) − margin`. `ctx.ha` gains `voterSeenMs(id)` and `timings()`; `ctx.cluster` gains
+  `pushEdgesNow()` and `lastSeenMs(id)`; `ctx.mysqlHa` gains `dbCutover()` and `timings()`.
+  New task `mysql.probe { host, port, timeoutMs }`; cluster.sync gains `dbCutover
+  { blockIps, port }` (iptables/nft TCP-reset rule + `ss -K`). Details in docs/HA.md.

@@ -1,4 +1,4 @@
-import { html, mount, $, on, fmtBytes, plural, emptyState, errorState, skeletonRows, debounce, toastError, openModal } from "../util.js";
+import { html, raw, mount, $, on, fmtBytes, fmtNum, plural, emptyState, errorState, skeletonRows, debounce, toastError, openModal } from "../util.js";
 import { icon } from "../icons.js";
 import { get, post } from "../api.js";
 import { pageHead, databasesTable, dbMenu, revealCredentials, createDatabase, openPhpMyAdmin } from "../components.js";
@@ -31,8 +31,65 @@ export function replBadge(state) {
 export const fmtLagS = (s) => (s == null ? "—" : s < 60 ? `${Math.round(s)} s` : s < 3600 ? `${Math.round(s / 60)} min` : `${Math.round(s / 3600)} h`);
 /** Replica can't be trusted to have everything: stopped with an error, or the cluster marked it broken. */
 export const replicaBroken = (r) => !!r?.replica && (r.state === "broken" || r.replica.state === "broken" || (!!r.replica.lastError && r.replica.sqlRunning === false));
+/* ───────── replica sync progress (3.9.2) ─────────
+   r.progress: { kind, phase: "preparing"|"copying"|"catching-up"|"in-sync", percent, bytesDone, bytesEstimate, rateBps,
+   etaSeconds, database, databaseIndex, databasesTotal, transactionsBehind, lagSeconds, startedAt, syncedAt, replicaName } | null */
+export const SYNC_PHASES = [["copying", "Copy"], ["catching-up", "Catch up"], ["in-sync", "In sync"]];
+export const syncActive = (p) => !!p && p.phase !== "in-sync";
+export function fmtEta(s) {
+  if (s == null) return "";
+  if (s < 45) return `${Math.max(5, Math.round(s / 5) * 5)} s`;
+  if (s < 90) return "1 min";
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+  return m ? `${h} h ${m} min` : `${h} h`;
+}
+const mbps = (b) => `${(b / 1048576).toFixed(b < 10 * 1048576 ? 1 : 0)} MB/s`;
+/** { title, pct (number|null = indeterminate), meta: [..], tone } for one progress object. */
+export function syncWords(p) {
+  if (!p) return null;
+  if (p.phase === "in-sync") return { title: "In sync", long: "In sync — the replica has every change", pct: 100, meta: [], tone: "ok" };
+  if (p.phase === "preparing") return { title: "Preparing the replica", long: "Preparing the replica", pct: null, meta: ["setting up MySQL and the replication settings"], tone: "run" };
+  const meta = [];
+  if (p.phase === "copying") {
+    if (p.database) meta.push(p.databaseIndex && p.databasesTotal ? `${p.database} (${p.databaseIndex} of ${p.databasesTotal})` : p.database);
+    if (p.percent == null && p.bytesDone) meta.push(`${fmtBytes(p.bytesDone)} copied`);
+    if (p.rateBps) meta.push(mbps(p.rateBps));
+  } else {
+    if (p.transactionsBehind != null) meta.push(`${fmtNum(p.transactionsBehind)} ${p.transactionsBehind === 1 ? "change" : "changes"} behind`);
+    else if (p.lagSeconds != null) meta.push(`${fmtNum(p.lagSeconds)} s behind`);
+  }
+  if (p.etaSeconds != null) meta.push(`about ${fmtEta(p.etaSeconds)} left`);
+  else if (p.percent != null || p.phase === "catching-up") meta.push("working out the time left…");
+  const title = p.phase === "copying" ? "Copying databases" : "Catching up";
+  return { title, long: title, pct: p.percent ?? null, meta, tone: "run" };
+}
+/** Accessible bar: role=progressbar with aria-valuenow, or indeterminate (no valuenow) while there's no estimate. */
+export function syncBar(p, { size = "", label = "Database replica sync" } = {}) {
+  const w = syncWords(p);
+  if (!w) return "";
+  const pct = w.pct == null ? null : Math.max(0, Math.min(100, Math.round(w.pct)));
+  const text = [w.long, pct != null && p.phase !== "in-sync" ? `${pct}%` : "", ...w.meta].filter(Boolean).join(", ");
+  return html`<div class="pbar ${size} ${pct == null ? "is-indet" : ""} ${w.tone === "ok" ? "is-ok" : ""}" role="progressbar" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" ${pct != null ? raw(`aria-valuenow="${pct}"`) : ""} aria-valuetext="${text}"><i style="${pct != null ? `width:${pct}%` : ""}"></i></div>`;
+}
+/** "Database replica syncing — 42%, about 4 min left" / "Database replica in sync". */
+export function syncShort(p) {
+  if (!p) return "";
+  if (p.phase === "in-sync") return "Database replica in sync";
+  if (p.phase === "preparing") return "Database replica syncing — preparing";
+  const bits = [];
+  if (p.phase === "catching-up") bits.push(p.transactionsBehind != null ? `catching up, ${fmtNum(p.transactionsBehind)} ${p.transactionsBehind === 1 ? "change" : "changes"} behind` : "catching up");
+  else if (p.percent != null) bits.push(`${p.percent}%`);
+  else bits.push("copying");
+  if (p.etaSeconds != null) bits.push(`about ${fmtEta(p.etaSeconds)} left`);
+  return `Database replica syncing — ${bits.join(", ")}`;
+}
+
 /** One-line summary + warnings for the Databases page and the dashboard. null when replication is off. */
 export function replSummary(r) {
+  const prog = r?.progress || null;
+  // Turning replication on: not "enabled" until the copy is done, but worth showing.
+  if (syncActive(prog)) return { text: syncShort(prog), tone: "run", warns: [], primary: r.primary?.name || r.primary?.serverId || "the primary", progress: prog };
   if (!r?.enabled) return null;
   const rep = r.replica, warns = [];
   const pName = r.primary?.name || r.primary?.serverId || "the primary";
@@ -41,9 +98,10 @@ export function replSummary(r) {
   for (const n of r.needsRebuild || []) warns.push(`${n.name} needs a rebuild to become the database replica again${n.online ? "." : " (it's offline)."}`);
   if (!rep && !(r.needsRebuild || []).length) warns.push("The databases have no replica right now.");
   const seeding = rep && (r.state === "seeding" || r.state === "preparing" || rep.state === "seeding");
-  const text = rep ? (replicaBroken(r) ? `Replication to ${rep.name} has stopped` : seeding ? `Copying the databases to ${rep.name}…` : `Replicated to ${rep.name} · lag ${fmtLagS(rep.lagSeconds)}`) : `Primary ${pName} · no replica`;
+  const synced = prog?.phase === "in-sync" && rep && !replicaBroken(r);
+  const text = rep ? (replicaBroken(r) ? `Replication to ${rep.name} has stopped` : seeding ? `Copying the databases to ${rep.name}…` : synced ? `Replicated to ${rep.name} · in sync` : `Replicated to ${rep.name} · lag ${fmtLagS(rep.lagSeconds)}`) : `Primary ${pName} · no replica`;
   const tone = warns.length ? (replicaBroken(r) || r.detect?.primaryDownForMs ? "err" : "warn") : seeding ? "run" : "ok";
-  return { text, tone, warns, primary: pName };
+  return { text, tone, warns, primary: pName, progress: synced ? prog : null };
 }
 
 export default async function databases(ctx) {
@@ -62,7 +120,7 @@ export default async function databases(ctx) {
     const box = $("[data-repl]", root), sum = unavailable ? null : replSummary(repl);
     if (!sum) return mount(box, html``);
     mount(box, html`<a class="repl-line ${sum.warns.length ? `is-${sum.tone}` : ""}" href="#/settings/databases" title="Replication settings">
-      <span class="dot ${sum.tone}"></span><span class="repl-line-t"><b>${sum.text}</b>${sum.warns.length ? html`<span class="repl-line-w">${sum.warns[0]}${sum.warns.length > 1 ? ` (+${sum.warns.length - 1} more)` : ""}</span>` : ""}</span>
+      <span class="dot ${sum.tone}"></span><span class="repl-line-t"><b>${sum.text}</b>${sum.warns.length ? html`<span class="repl-line-w">${sum.warns[0]}${sum.warns.length > 1 ? ` (+${sum.warns.length - 1} more)` : ""}</span>` : ""}${syncActive(sum.progress) ? html`<span class="repl-line-bar">${syncBar(sum.progress, { size: "sm" })}<span class="muted">Websites keep working normally.</span></span>` : ""}</span>
       <span class="repl-line-go"><span>Replication</span>${icon("chevronRight", "sm")}</span></a>`);
   };
 

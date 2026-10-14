@@ -250,6 +250,13 @@ async function updates(box, ctx) {
       : u.available === false ? html`<span class="badge ok">${icon("check")}Up to date</span>`
       : html`<span class="badge">${u.lastCheckedAt ? "Unknown" : "Not checked"}</span>`;
     const showUpdate = !!L && u.available !== false;
+    // Panel failover: every panel server, its version, and whether it runs the same code as the active one.
+    const servers = Array.isArray(u.servers) && u.servers.length > 1 ? u.servers : null;
+    const srvBadge = (sv) => !sv.online ? html`<span class="badge err">Offline</span>`
+      : sv.sameCode === false ? html`<span class="badge warn">Different version</span>`
+      : sv.upToDate === true ? html`<span class="badge ok">${icon("check")}Up to date</span>`
+      : sv.upToDate === false ? html`<span class="badge warn">${icon("arrowUp")}Update available</span>` : "";
+    const applyText = servers ? "Update all panel servers" : u.available === true ? "Update now" : "Install latest";
     mount(box, html`
       <div class="card">
         <div class="card-head" style="flex-wrap:wrap">
@@ -267,6 +274,12 @@ async function updates(box, ctx) {
             <dt>Latest on GitHub</dt><dd>${L ? html`${L.version ? `v${L.version} · ` : ""}${ghLink(L.url, L.shortCommit)} <span class="muted">— ${L.message}${L.date ? html` · ${ago(L.date)}` : ""}</span>` : html`<span class="muted">—</span>`}</dd>
             <dt>Last checked</dt><dd>${u.checking ? "Checking…" : u.lastCheckedAt ? ago(u.lastCheckedAt) : html`<span class="muted">never</span>`}${u.rateLimitedUntil ? html` <span class="badge warn">rate limited until ${new Date(u.rateLimitedUntil).toLocaleTimeString()}</span>` : ""}</dd>
           </dl>
+          ${servers ? html`<div class="mt-16"><div class="sub" style="margin-bottom:6px">Panel servers — an update installs on the standbys first, one at a time, then on the active panel</div>
+            <div class="list">${servers.map((sv) => html`<div class="list-item">
+              <span class="li-ico">${icon("server", "sm")}</span>
+              <div class="li-main"><div class="li-title">${sv.name} <span class="badge${sv.role === "active" ? " blue" : ""}">${sv.role === "active" ? "Active panel" : "Standby"}</span></div>
+                <div class="li-sub">${sv.version ? `v${sv.version}` : sv.online ? "version not reported yet" : "—"}</div></div>
+              <div class="li-right">${srvBadge(sv)}</div></div>`)}</div></div>` : ""}
           ${u.reason ? html`<p class="hint mt-16">${u.reason}${!u.tokenSet ? " Checks are anonymous (60 GitHub requests an hour); a token in Settings → GitHub raises that." : ""}</p>` : ""}
         </div>
       </div>
@@ -283,7 +296,7 @@ async function updates(box, ctx) {
           : html`<div class="card-body"><p class="muted small">GitHub can't list the commits between this install and ${L.shortCommit} (the installed commit is unknown to it). The newest commit is: <b style="color:var(--text)">${L.message}</b>.</p></div>`}
         <div class="card-foot" style="flex-wrap:wrap"><span class="muted small" style="flex:1 1 260px">${RESTART_HINT[u.restartMode] || ""} Agent servers pick up their new files automatically when they reconnect.</span>
           ${busy ? html`<button class="btn" type="button" data-view-job>${icon("fileText")}View progress</button>`
-            : html`<button class="btn btn-primary" type="button" data-apply ${u.restart?.pending ? raw("disabled") : ""}>${icon("arrowUp")}${u.available === true ? "Update now" : "Install latest"}</button>`}</div>
+            : html`<button class="btn btn-primary" type="button" data-apply ${u.restart?.pending ? raw("disabled") : ""}>${icon("arrowUp")}${applyText}</button>`}</div>
       </div>` : ""}
 
       <div class="card">
@@ -331,9 +344,10 @@ async function updates(box, ctx) {
   on(box, "click", "[data-view-job]", () => u.job && openJobLog(u.job.id));
   on(box, "click", "[data-apply]", async (e, b) => {
     const inst = u.installed || {}, L = u.latest || {};
+    const many = Array.isArray(u.servers) && u.servers.length > 1;
     const ok = await confirmDialog({
-      title: "Update the panel?", ico: "arrowUp", confirmText: "Update now",
-      message: html`Install ${L.version ? `v${L.version} ` : ""}<span class="mono">${L.shortCommit || ""}</span> from <span class="mono">${u.repo}@${u.ref}</span> over v${inst.version}${inst.shortCommit ? html` <span class="mono">${inst.shortCommit}</span>` : ""}. The current code is backed up first and can be restored from this page. ${RESTART_HINT[u.restartMode] || ""}`,
+      title: many ? "Update all panel servers?" : "Update the panel?", ico: "arrowUp", confirmText: many ? "Update all" : "Update now",
+      message: html`Install ${L.version ? `v${L.version} ` : ""}<span class="mono">${L.shortCommit || ""}</span> from <span class="mono">${u.repo}@${u.ref}</span> over v${inst.version}${inst.shortCommit ? html` <span class="mono">${inst.shortCommit}</span>` : ""}. The current code is backed up first and can be restored from this page. ${many ? `The ${u.servers.length - 1} standby panel server${u.servers.length > 2 ? "s are" : " is"} updated first, one at a time; this server goes last and stays the active panel. If a standby doesn't come back on the new version, the update stops and nothing else changes. ` : ""}${RESTART_HINT[u.restartMode] || ""}`,
     });
     if (!ok) return;
     setBusy(b, true);

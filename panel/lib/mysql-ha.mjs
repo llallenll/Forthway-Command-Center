@@ -15,10 +15,17 @@
  * Safety rules:
  *   - every mutating operation is single-flight (`op`), and runs as a job on the
  *     "mysql.ha" lock;
- *   - automatic promotion needs, for DETECT_MS continuously: (a) the primary's
- *     server offline to the panel (agent + votes), (b) no TCP connection from the
- *     leader to primary:3306, (c) the replica reporting its IO thread not
- *     connected — re-checked right before acting, with a fresh replica status;
+ *   - automatic promotion (3.10, "fast detection", timings from
+ *     config.ha.failoverSeconds via shared/ha-timing.mjs) needs: no sign of life
+ *     from the primary for detectMs (its voter heartbeats, else its agent, and
+ *     the leader's TCP connects), AND right now (a) its voter silent for
+ *     dbSilentMs (agent fallback: 35 s), (b) dbTcpFails consecutive failed TCP
+ *     connects from the leader to primary:3306, (c) the replica confirming —
+ *     IO thread not running, or its own TCP connect to the primary failing
+ *     (mysql.probe, agent ≥ 3.4.0). Checked by a probe loop (every 250 ms) on
+ *     the leader, and re-checked right before acting, with a fresh replica status;
+ *   - after a promotion the hosts alias and `dbCutover` (refuse + reset every
+ *     connection to the old primary's addresses on :3306) go out at once;
  *   - never promotes a replica whose SQL thread stopped with an error, unless an
  *     admin forces it;
  *   - fencing: servers that must not take writes are set read_only at once.
@@ -27,7 +34,8 @@
  *   { "offline": ["main"], "tcpDown": ["main"] }
  * makes the monitor treat those servers as offline to the panel / failing the
  * TCP probe (without it the dry-run probe always succeeds). It is re-read every
- * tick and ignored outside dry-run.
+ * tick and ignored outside dry-run. ("offline" is not needed to test fast
+ * detection: a killed panel's voter goes silent by itself.)
  */
 
 import fs from "node:fs";
@@ -40,8 +48,16 @@ import { httpError } from "./http.mjs";
 import { DRY_RUN } from "./sys.mjs";
 import { REPL_ALIAS, ADMIN_USER, validHost, cleanHost, generatePassword } from "./mysql.mjs";
 import * as sharedTasks from "../../shared/tasks.mjs";
+import { gtidDiffCount } from "../../shared/mysql-ha.mjs";
+import { haTimings, timingSummary } from "../../shared/ha-timing.mjs";
 
-export const DETECT_MS = 60_000;
+/** Default detection window (failoverSeconds 15); the live one is timings().detectMs. */
+export const DETECT_MS = haTimings().detectMs;
+/** Agent fallback when a server's voter is unknown (HA off): agents report at least every ~15 s. */
+const AGENT_SILENT_MS = 35_000;
+const FAST_TICK_MS = 250;
+const PROBE_OK_RECHECK_MS = 10_000; // primary's voter silent but TCP fine: re-probe this rarely (max_connect_errors)
+const PROBE_MIN_AGENT = "3.4.0";
 export const BROKEN_MS = 2 * 60_000;
 export const REPL_USER = "fcc_repl";
 export const MIN_AGENT = "3.3.0";
@@ -56,6 +72,13 @@ const AGENT_STATUS_CACHE_MS = 30_000; // node-agent refreshes its `mysql` metric
 const FENCE_RETRY_MS = 30_000;
 const REBUILD_RETRY_MS = 10 * 60_000;
 const USERS_RECONCILE_MS = 30 * 60_000;
+// Sync progress (3.9.2): catch-up is polled faster than the monitor, SSE is throttled.
+const CATCHUP_POLL_MS = 2500;
+const PROGRESS_BROADCAST_MS = 2000;
+const IN_SYNC_STREAK = 2; // consecutive in-sync polls before saying so (no flicker)
+const IN_SYNC_WAIT_MS = 30_000; // an enable / rebuild job waits this long for "In sync" before finishing
+const IN_SYNC_SHOW_MS = 10 * 60_000; // the green "In sync" state stays in the view this long
+const LAG_TRACK_S = 30; // a running replica this far behind gets a catch-up bar too
 const HA_OFF = Object.freeze({ enabled: false, localServerId: MAIN_ID, mainIsLocal: true, isLeader: () => true });
 const NEEDED_TASKS = ["mysql.primary.prepare", "mysql.replica.setup", "mysql.status", "mysql.replica.promote", "mysql.readonly", "mysql.users.sync", "mysql.rebuild"];
 const ACTIVITY_TARGET = { type: "mysql", id: "replication", name: "Database replication" };
@@ -140,6 +163,14 @@ function createMysqlHa(ctx) {
     }
   };
   const localServerId = () => ha().localServerId || MAIN_ID;
+  /** Failover timings in force (ctx.ha keeps them; a panel without ha.mjs derives them from config). */
+  const timings = () => {
+    try {
+      const t = typeof ha().timings === "function" ? ha().timings() : null;
+      if (t && t.detectMs) return t;
+    } catch {}
+    return haTimings(ctx.config.ha?.failoverSeconds);
+  };
 
   function cfg() {
     if (!ctx.config.mysqlHa || typeof ctx.config.mysqlHa !== "object") {
@@ -226,19 +257,27 @@ function createMysqlHa(ctx) {
     }
   }
 
-  /** Condition (a): the server is offline to the panel — its agent is silent AND (with HA) its vote doesn't arrive. */
-  function offlineToPanel(id) {
-    if (dryHook().offline.includes(id)) return true;
-    if (id === localServerId()) return false;
-    if (serverOnline(id)) return false;
+  /**
+   * Fast liveness of a server (3.10): how long since its last sign of life, and
+   * whether it counts as silent now. Votes first (every enabled server
+   * heartbeats every panel node, so even a just-promoted leader knows), else the
+   * agent's last request.
+   */
+  function primarySilence(id) {
+    const t = timings();
+    if (dryHook().offline.includes(id)) return { silent: true, quietMs: Infinity, source: "dry-run" };
+    if (id === localServerId()) return { silent: false, quietMs: 0, source: "local" };
+    let seen = null;
     try {
-      const votes = ha().status?.()?.votes;
-      if (Array.isArray(votes)) {
-        const v = votes.find((x) => x && x.serverId === id);
-        if (v && v.reachable === true) return false;
-      }
+      seen = typeof ha().voterSeenMs === "function" ? ha().voterSeenMs(id) : null;
     } catch {}
-    return true;
+    if (typeof seen === "number" && Number.isFinite(seen)) return { silent: seen >= t.dbSilentMs, quietMs: seen, source: "votes" };
+    let last = 0;
+    try {
+      last = Number(ctx.cluster?.lastSeenMs?.(id)) || 0;
+    } catch {}
+    const quietMs = last ? Math.max(0, Date.now() - last) : Infinity;
+    return { silent: quietMs >= Math.max(AGENT_SILENT_MS, t.dbSilentMs), quietMs, source: "agent" };
   }
 
   function agentOk(id) {
@@ -322,13 +361,52 @@ function createMysqlHa(ctx) {
     return ip ? { [REPL_ALIAS]: ip } : null;
   }
 
-  async function hostsChanged(log = () => {}) {
+  /**
+   * dbCutover (3.10): the addresses of old primaries waiting for a rebuild — every
+   * server refuses (TCP reset) and kills connections to them on the database port.
+   * Never the current primary's or replica's addresses, never loopback. Persisted
+   * (replicated) so a new leader keeps sending it.
+   */
+  async function refreshCutover() {
+    const c = cfg();
+    const keep = new Set();
+    for (const id of [c.primary, c.replica].filter(Boolean)) for (const ip of await serverIps(id)) keep.add(ip);
+    const block = new Set();
+    if (aliasActive()) {
+      for (const id of c.needsRebuild || []) {
+        if (id === c.primary || id === c.replica || !server(id)) continue;
+        for (const ip of await serverIps(id)) if (!keep.has(ip) && !isLoop(ip) && net.isIP(ip)) block.add(ip);
+      }
+    }
+    const next = [...block].sort();
+    if (JSON.stringify(next) !== JSON.stringify(c.cutoverIps || [])) {
+      c.cutoverIps = next;
+      save();
+    }
+    return next;
+  }
+
+  /** cluster.sync `dbCutover` (the same for every server): { blockIps, port } | null. */
+  function dbCutover() {
+    const c = cfg();
+    if (!aliasActive() || !Array.isArray(c.cutoverIps) || !c.cutoverIps.length) return null;
+    return { blockIps: [...c.cutoverIps], port: dbPort() };
+  }
+
+  /** The alias / cut-over changed. `now`: push at once (after a promotion), not after the 2 s debounce. */
+  async function hostsChanged(log = () => {}, { now = false } = {}) {
     await refreshAliasIp();
+    await refreshCutover();
     try {
-      ctx.cluster?.edgesChanged?.();
-    } catch {}
+      if (now && typeof ctx.cluster?.pushEdgesNow === "function") await ctx.cluster.pushEdgesNow();
+      else ctx.cluster?.edgesChanged?.();
+    } catch (err) {
+      console.error("[mysql-ha] pushing the hosts alias:", err.message);
+    }
     const lines = enabledServers().map((s) => `${s.name}: ${JSON.stringify(hostsMap(s.id))}`);
     log(`Hosts alias ${REPL_ALIAS} → ${lines.join(" · ")}`);
+    const cut = dbCutover();
+    if (cut) log(`Cut-over: every server refuses and resets connections to ${cut.blockIps.join(", ")} on port ${cut.port}.`);
   }
 
   /** Wait (bounded) until every online agent server confirmed a cluster.sync applied after `since`. */
@@ -403,7 +481,251 @@ function createMysqlHa(ctx) {
   /** After an operation touched these servers: fetch fresh statuses so views and the monitor don't use pre-operation reports. */
   const refreshStatuses = (...ids) => Promise.all(ids.filter(Boolean).map((id) => mysqlStatusOf(id, { fresh: true }).catch(() => null)));
 
-  function probeTcp(id, port = 3306, ms = 3000) {
+  // ------------------------------------------------------------ sync progress (3.9.2)
+  //
+  // In memory on the leader: { kind: "enable"|"rebuild"|"lag", phase: "preparing"|"copying"|"catching-up"|"in-sync",
+  //   percent, bytesDone, bytesEstimate, rateBps, etaSeconds, database, databaseIndex, databasesDone, databasesTotal,
+  //   transactionsBehind, lagSeconds, startedAt, phaseStartedAt, syncedAt, updatedAt, replicaServerId, replicaName }.
+  // Copying comes from the seed task (runTask onProgress); catching-up is measured here every
+  // CATCHUP_POLL_MS from fresh mysql.status of the primary (gtid_executed) and the replica.
+
+  let progress = null;
+  let progressJob = null; // { log, bucket } — the enable / rebuild job's log, also after it finished
+  const catchUp = { timer: null, busy: false, samples: [], peak: 0, okStreak: 0, rate: null, primaryPrev: null, primaryRate: 0 };
+  let progressSentAt = 0;
+  let progressTimer = null;
+
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const int = (n) => Math.round(n).toLocaleString("en-US");
+  const mbps = (b) => `${(b / 1048576).toFixed(b < 10 * 1048576 ? 1 : 0)} MB/s`;
+  function etaWords(s) {
+    if (s == null) return "";
+    if (s < 45) return `${Math.max(5, Math.round(s / 5) * 5)} s`;
+    if (s < 90) return "1 min";
+    if (s < 3600) return `${Math.round(s / 60)} min`;
+    const h = Math.floor(s / 3600);
+    const m = Math.round((s % 3600) / 60);
+    return m ? `${h} h ${m} min` : `${h} h`;
+  }
+  /** One line for the job log: "Copying databases · 42% · forthway (3 of 8) · 18 MB/s · about 4 min left". */
+  function progressLine(p) {
+    if (!p) return "";
+    if (p.phase === "in-sync") return "In sync — the replica has every change.";
+    if (p.phase === "preparing") return "Preparing the replica…";
+    const bits = [];
+    if (p.phase === "copying") {
+      bits.push("Copying databases");
+      if (p.percent != null) bits.push(`${p.percent}%`);
+      if (p.database) bits.push(`${p.database}${p.databaseIndex ? ` (${p.databaseIndex} of ${p.databasesTotal})` : ""}`);
+      if (p.rateBps) bits.push(mbps(p.rateBps));
+    } else {
+      bits.push("Catching up");
+      if (p.transactionsBehind != null) bits.push(`${int(p.transactionsBehind)} ${p.transactionsBehind === 1 ? "change" : "changes"} behind`);
+      else if (p.lagSeconds != null) bits.push(`${int(p.lagSeconds)} s behind`);
+    }
+    if (p.etaSeconds != null) bits.push(`about ${etaWords(p.etaSeconds)} left`);
+    return bits.join(" · ");
+  }
+
+  function sendProgress(force = false) {
+    const wait = PROGRESS_BROADCAST_MS - (Date.now() - progressSentAt);
+    if (force || wait <= 0) {
+      clearTimeout(progressTimer);
+      progressTimer = null;
+      progressSentAt = Date.now();
+      broadcast();
+      return;
+    }
+    if (!progressTimer) {
+      progressTimer = setTimeout(() => {
+        progressTimer = null;
+        progressSentAt = Date.now();
+        broadcast();
+      }, wait);
+      progressTimer.unref?.();
+    }
+  }
+
+  function setProgress(patch, { force = false } = {}) {
+    const now = nowIso();
+    const phaseChanged = !!progress && patch.phase && patch.phase !== progress.phase;
+    progress = { ...(progress || {}), ...patch, updatedAt: now };
+    if (phaseChanged) {
+      progress.phaseStartedAt = now;
+      if (progressJob) progressJob.bucket = 0;
+    }
+    sendProgress(force || phaseChanged);
+  }
+
+  function progressBegin(kind, replicaId, log = null) {
+    stopCatchUp();
+    const now = nowIso();
+    progress = { kind, phase: "preparing", replicaServerId: replicaId, replicaName: nameOf(replicaId), startedAt: now, phaseStartedAt: now, updatedAt: now, percent: null, etaSeconds: null };
+    progressJob = log ? { log, bucket: 0 } : null;
+    sendProgress(true);
+  }
+
+  function progressClear() {
+    stopCatchUp();
+    if (!progress) return;
+    progress = null;
+    progressJob = null;
+    sendProgress(true);
+  }
+
+  /** Every ~10 %, a line in the job log so it shows progress too. */
+  function logBucket() {
+    if (!progressJob || !progress || progress.percent == null) return;
+    const b = Math.floor(progress.percent / 10);
+    if (b > progressJob.bucket && b >= 1 && b <= 9) {
+      progressJob.bucket = b;
+      try {
+        progressJob.log(progressLine(progress));
+      } catch {}
+    }
+  }
+
+  /** runTask onProgress for mysql.replica.setup / mysql.rebuild: the copy. */
+  function onCopyProgress(p) {
+    if (!progress || !p || typeof p !== "object" || p.phase !== "copying") return;
+    const percent = num(p.percent);
+    setProgress({
+      phase: "copying",
+      percent: percent == null ? null : Math.max(0, Math.min(100, Math.floor(percent))),
+      bytesDone: num(p.bytesDone),
+      bytesEstimate: num(p.bytesEstimate),
+      rateBps: num(p.rateBps),
+      etaSeconds: num(p.etaSeconds),
+      database: typeof p.database === "string" ? p.database.slice(0, 64) : null,
+      databaseIndex: num(p.databaseIndex),
+      databasesDone: num(p.databasesDone),
+      databasesTotal: num(p.databasesTotal),
+      copyStartedAt: typeof p.startedAt === "string" ? p.startedAt : progress.copyStartedAt || null,
+    });
+    logBucket();
+  }
+
+  function stopCatchUp() {
+    clearInterval(catchUp.timer);
+    catchUp.timer = null;
+  }
+
+  /** Replication runs: measure the gap until the replica has every change. */
+  function startCatchUp() {
+    if (!progress) return;
+    stopCatchUp();
+    Object.assign(catchUp, { samples: [], peak: 0, okStreak: 0, rate: null, primaryPrev: null, primaryRate: 0 });
+    setProgress({ phase: "catching-up", percent: null, etaSeconds: null, rateBps: null, transactionsBehind: null, lagSeconds: null }, { force: true });
+    catchUp.timer = setInterval(() => catchUpTick().catch((err) => console.error("[mysql-ha] catch-up:", err.message)), CATCHUP_POLL_MS);
+    catchUp.timer.unref?.();
+    catchUpTick().catch(() => {});
+  }
+
+  async function catchUpTick() {
+    if (catchUp.busy) return;
+    if (!progress || progress.phase !== "catching-up") return stopCatchUp();
+    if (!isLeader()) return progressClear();
+    catchUp.busy = true;
+    try {
+      const c = cfg();
+      const rid = progress.replicaServerId;
+      if (!rid || rid === c.primary) return progressClear();
+      // Primary first, then the replica: a transaction committed in between can only make the replica look ahead.
+      const t0 = Date.now();
+      const pst = await mysqlStatusOf(c.primary, { fresh: true });
+      const t1 = Date.now();
+      const rst = await mysqlStatusOf(rid, { fresh: true });
+      if (!progress || progress.phase !== "catching-up") return;
+      const rep = rst?.replica;
+      if (!rep) return; // not reported yet (or the task is still starting it)
+      if (rep.lastError && rep.sqlRunning === false) return progressClear(); // broken: the card says so
+      const lag = num(rep.lagSeconds);
+      const behind = pst?.gtidExecuted != null && rep.executedGtid != null ? gtidDiffCount(pst.gtidExecuted, rep.executedGtid) : null;
+      // The primary keeps taking writes: what it committed while we asked the replica is in flight, not a gap.
+      const pCount = pst?.gtidExecuted != null ? gtidDiffCount(pst.gtidExecuted, "") : null;
+      if (pCount != null && catchUp.primaryPrev && t0 > catchUp.primaryPrev.t) {
+        const r = Math.max(0, (pCount - catchUp.primaryPrev.n) / ((t0 - catchUp.primaryPrev.t) / 1000));
+        catchUp.primaryRate = catchUp.primaryRate ? catchUp.primaryRate * 0.6 + r * 0.4 : r;
+      }
+      if (pCount != null) catchUp.primaryPrev = { t: t0, n: pCount };
+      const inFlight = Math.ceil(catchUp.primaryRate * ((Date.now() - t1) / 1000 + 0.5));
+      const gap = behind ?? null;
+      const now = Date.now();
+      const metric = gap ?? lag; // what we watch shrink
+      const inSyncNow = (lag === 0 || (lag == null && rep.sqlRunning === true && rep.ioRunning === true)) && (gap == null ? lag === 0 : gap <= inFlight);
+      catchUp.okStreak = inSyncNow ? catchUp.okStreak + 1 : 0;
+      if (catchUp.okStreak >= IN_SYNC_STREAK) return markInSync();
+
+      let etaSeconds = null;
+      let percent = null;
+      if (metric != null) {
+        catchUp.samples.push({ t: now, v: metric });
+        while (catchUp.samples.length > 2 && now - catchUp.samples[0].t > 30_000) catchUp.samples.shift();
+        catchUp.peak = Math.max(catchUp.peak, metric);
+        const first = catchUp.samples[0];
+        if (now - first.t >= 4000) {
+          const shrink = (first.v - metric) / ((now - first.t) / 1000); // per second, net of new writes
+          catchUp.rate = catchUp.rate == null ? shrink : catchUp.rate * 0.5 + shrink * 0.5;
+          if (catchUp.rate > 0) etaSeconds = Math.max(1, Math.round(metric / catchUp.rate));
+        }
+        if (catchUp.peak > 0) percent = Math.min(99, Math.max(0, Math.floor(((catchUp.peak - metric) / catchUp.peak) * 100)));
+      }
+      setProgress({ phase: "catching-up", transactionsBehind: gap, lagSeconds: lag, etaSeconds, percent, catchUpRate: catchUp.rate == null ? null : Math.round(catchUp.rate * 10) / 10 });
+      logBucket();
+    } finally {
+      catchUp.busy = false;
+    }
+  }
+
+  function markInSync() {
+    stopCatchUp();
+    const at = nowIso();
+    const took = progress?.startedAt ? Date.now() - Date.parse(progress.startedAt) : null;
+    setProgress({ phase: "in-sync", percent: 100, etaSeconds: 0, transactionsBehind: 0, lagSeconds: 0, syncedAt: at }, { force: true });
+    if (progressJob && progress.kind !== "lag") {
+      try {
+        progressJob.log(`In sync — the replica has every change${took ? ` (${etaWords(took / 1000)} after the start)` : ""}.`);
+      } catch {}
+    }
+    progressJob = null;
+    console.log(`[mysql-ha] ${progress.replicaName} is in sync with the primary`);
+  }
+
+  /** End of an enable / rebuild job: wait a little for "In sync", else say the card carries on. */
+  async function waitInSync(log, signal, ms = IN_SYNC_WAIT_MS) {
+    const until = Date.now() + ms;
+    while (Date.now() < until && progress && progress.phase === "catching-up" && !signal?.aborted) await sleep(1000);
+    if (!progress || progress.phase === "in-sync") return; // markInSync wrote the line
+    const left = progressLine(progress);
+    log(`Replication is running. The replica is still catching up on changes made during the copy${left ? ` (${left.replace(/^Catching up · /, "")})` : ""}.`);
+    log("Websites keep working normally meanwhile. Settings → Databases shows the progress, and this log gets an \"In sync\" line once it has every change.");
+  }
+
+  /** Monitor: a running replica that falls well behind shows a catch-up bar too. */
+  function maybeTrackLag(c, rst) {
+    if (op || progress || !c.replica || !rst?.replica) return;
+    const r = rst.replica;
+    if (r.ioRunning === true && r.sqlRunning === true && Number(r.lagSeconds) >= LAG_TRACK_S) {
+      progressBegin("lag", c.replica);
+      startCatchUp();
+    }
+  }
+
+  function progressView() {
+    if (!progress) return null;
+    if (progress.phase === "in-sync") {
+      const keep = progress.kind === "lag" ? IN_SYNC_SHOW_MS / 10 : IN_SYNC_SHOW_MS;
+      if (Date.now() - Date.parse(progress.syncedAt || progress.updatedAt) > keep) {
+        progress = null;
+        return null;
+      }
+    }
+    return { ...progress };
+  }
+
+  const dbPort = () => Number(ctx.config.mysql?.port) || 3306;
+
+  function probeTcp(id, port = dbPort(), ms = 3000) {
     if (DRY_RUN) return Promise.resolve(!dryHook().tcpDown.includes(id));
     const host = id === localServerId() ? "127.0.0.1" : addressOf(id);
     if (!host) return Promise.resolve(false);
@@ -422,18 +744,42 @@ function createMysqlHa(ctx) {
   const ioDisconnected = (st) => !!st && !!st.replica && st.replica.ioRunning !== true;
   const sqlErrored = (st) => !!st && !!st.replica && st.replica.sqlRunning !== true && !!st.replica.lastError;
 
-  /** The three failover conditions, evaluated now. */
+  /**
+   * Condition (c): the replica confirms the primary is gone — a fresh status with
+   * its IO thread not running, or (agent ≥ 3.4.0) its own TCP connect to the primary
+   * failing. Both asked at once, bounded. → { c, status, probe }
+   */
+  async function replicaConfirms(primary, replica, { fresh = true } = {}) {
+    const t = timings();
+    const host = addressOf(primary);
+    const canProbe = !!host && taskTypes().includes("mysql.probe") && (replica === MAIN_ID && ha().mainIsLocal !== false ? true : versionAtLeast(server(replica)?.agentVersion, PROBE_MIN_AGENT));
+    const [status, probe] = await Promise.all([
+      withTimeout(Promise.resolve(mysqlStatusOf(replica, { fresh, maxAgeMs: 20_000 })), 4000, "mysql.status").catch(() => null),
+      canProbe && serverOnline(replica)
+        ? withTimeout(Promise.resolve(ctx.cluster.runTask(replica, "mysql.probe", { host, port: dbPort(), timeoutMs: t.dbTcpTimeoutMs }, { timeoutMs: 5000 })), 4000, "mysql.probe").catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    const c = ioDisconnected(status) || probe?.reachable === false;
+    return { c, status, probe };
+  }
+
+  /** The three failover conditions, evaluated now (a: silent, b: no TCP from here, c: replica confirms). */
   async function conditions({ freshReplica = false } = {}) {
     const c = cfg();
+    const t = timings();
     const out = { a: false, b: null, c: null, all: false };
     if (!c.replica) return out;
-    out.a = offlineToPanel(c.primary);
+    const sil = primarySilence(c.primary);
+    out.a = sil.silent;
+    out.quietMs = Number.isFinite(sil.quietMs) ? Math.round(sil.quietMs) : null;
+    out.source = sil.source;
     if (!out.a) return out;
-    out.b = !(await probeTcp(c.primary));
+    out.b = !(await probeTcp(c.primary, dbPort(), t.dbTcpTimeoutMs));
     if (!out.b) return out;
-    const rst = await mysqlStatusOf(c.replica, { fresh: freshReplica, maxAgeMs: 20_000 });
-    out.c = ioDisconnected(rst);
-    out.replicaStatus = rst;
+    const rc = await replicaConfirms(c.primary, c.replica, { fresh: freshReplica });
+    out.c = rc.c;
+    out.replicaStatus = rc.status;
+    out.replicaProbe = rc.probe ? { reachable: rc.probe.reachable, ms: rc.probe.ms ?? null } : null;
     out.all = !!(out.a && out.b && out.c);
     return out;
   }
@@ -564,6 +910,7 @@ function createMysqlHa(ctx) {
     if (!isLeader()) throw httpError(409, "Only the active panel can change database replication.");
     if (!tasksReady()) throw httpError(503, "This panel's task executor does not know the database replication tasks yet (shared/tasks.mjs 3.3.0 is needed).");
     op = name;
+    if (name !== "enable" && name !== "rebuild") progressClear(); // the replica's role changes: the bar no longer applies
     try {
       return ctx.jobs.start({ type: `mysql.replication.${name}`, lock: "mysql.ha", ...meta }, async (h) => {
         op = name;
@@ -628,6 +975,7 @@ function createMysqlHa(ctx) {
       mysqlServerId(primary);
       mysqlServerId(replica);
       save();
+      progressBegin("enable", replica, log);
       broadcast(true);
       const creds = await credentials({ create: true });
       try {
@@ -643,9 +991,11 @@ function createMysqlHa(ctx) {
         save();
         broadcast(true);
         log(`Step 2/6 — setting up the replica on ${nameOf(replica)} and seeding it from the primary (this can take a while)…`);
-        const setup = await ctx.cluster.runTask(replica, "mysql.replica.setup", await setupPayload(replica, primary, creds), { log, signal });
+        log(`Websites keep working normally while this runs: they keep reading and writing on ${nameOf(primary)}, and the replica catches up on those changes afterwards.`);
+        const setup = await ctx.cluster.runTask(replica, "mysql.replica.setup", await setupPayload(replica, primary, creds), { log, signal, onProgress: onCopyProgress });
         c.seededAt = setup?.seededAt || nowIso();
         log(`Replica seeded: ${Array.isArray(setup?.databases) ? setup.databases.length : setup?.databases ?? "?"} database(s).`);
+        startCatchUp();
         history("seeded", `${nameOf(replica)} seeded from ${nameOf(primary)}`);
 
         log("Step 3/6 — creating the website database users on the replica…");
@@ -678,8 +1028,10 @@ function createMysqlHa(ctx) {
 
         history("enabled", `replica ${nameOf(replica)}, mode ${mode}`);
         audit(admin, "mysql.replication.enable", { replica, primary, mode });
+        await waitInSync(log, signal);
         return { primary, replica, flavor: c.flavor, envJobs: env.jobs };
       } catch (err) {
+        progressClear();
         c.state = "off";
         c.enabled = false;
         c.replica = null;
@@ -701,8 +1053,11 @@ function createMysqlHa(ctx) {
     if (!c.enabled || !replica) throw new Error("There is no replica to promote.");
 
     // Re-check right before acting.
+    const t0 = Date.now();
     const cond = await conditions({ freshReplica: true });
-    log(`Checks: primary offline to the panel=${cond.a}, TCP ${nameOf(oldPrimary)}:3306 failing=${cond.b}, replica IO not connected=${cond.c}.`);
+    log(
+      `Checks (${Date.now() - t0} ms): primary silent=${cond.a}${cond.quietMs != null ? ` (${(cond.quietMs / 1000).toFixed(1)} s, ${cond.source})` : ""}, TCP ${nameOf(oldPrimary)}:${dbPort()} failing=${cond.b}, replica confirms=${cond.c}${cond.replicaProbe ? ` (its TCP probe: ${cond.replicaProbe.reachable ? "reachable" : "unreachable"})` : ""}.`,
+    );
     if (auto && !cond.all) throw new Error("The primary is reachable again — automatic promotion cancelled.");
     if (!auto && !force && !(cond.a && cond.b)) throw new Error(`${nameOf(oldPrimary)} is still reachable. Use a switchover (no data loss), or force the promotion.`);
 
@@ -711,8 +1066,9 @@ function createMysqlHa(ctx) {
     if (sqlErrored(rst) && !force) throw new Error(`${nameOf(replica)}'s SQL thread stopped with an error (${rst.replica.lastError}); it may be missing data. Promote with force to accept that.`);
     if (sqlErrored(rst)) log(`Forced: the replica's SQL thread had stopped with an error (${rst.replica.lastError}).`);
 
-    // Best effort: fence the old primary in case it is only partly gone.
-    if (serverOnline(oldPrimary) && agentOk(oldPrimary)) {
+    // Best effort: fence the old primary in case it is only partly gone (not when it is
+    // silent — a task to a dead agent would only wait; the cut-over and rule (2) cover it).
+    if (!primarySilence(oldPrimary).silent && serverOnline(oldPrimary) && agentOk(oldPrimary)) {
       try {
         await withTimeout(Promise.resolve(ctx.cluster.runTask(oldPrimary, "mysql.readonly", { on: true }, { log, timeoutMs: 8000 })), 8000, "fencing the old primary");
         log(`${nameOf(oldPrimary)} set read-only.`);
@@ -734,7 +1090,9 @@ function createMysqlHa(ctx) {
     statusCache.clear();
     ctx.mysql?.resetConnection?.();
     detect.since = null;
-    await hostsChanged(log);
+    resetFast();
+    await hostsChanged(log, { now: true });
+    log(`Hosts alias and cut-over sent to every server ${Date.now() - t0} ms after the final check.`);
     await refreshStatuses(replica);
     history("promoted", `${nameOf(replica)} is the database primary; ${nameOf(oldPrimary)} needs a rebuild${auto ? " (automatic failover)" : force ? " (forced)" : ""}`);
 
@@ -785,6 +1143,9 @@ function createMysqlHa(ctx) {
         throw new Error(`${nameOf(target)} is not caught up (io=${pre?.replica?.ioRunning}, sql=${pre?.replica?.sqlRunning}, lag=${pre?.replica?.lagSeconds}).`);
       const creds = await credentials();
       let promoted = false;
+      // A cut-over must never block the server we switch to (it is the replica, so the
+      // block list excludes it by construction — refreshed here before anything moves).
+      if ((c.cutoverIps || []).length) await hostsChanged(log, { now: true });
       c.switching = true;
       try {
         log(`Step 1/5 — setting ${nameOf(oldPrimary)} read-only (writes pause from here)…`);
@@ -818,7 +1179,7 @@ function createMysqlHa(ctx) {
         save();
         statusCache.clear();
         ctx.mysql?.resetConnection?.();
-        await hostsChanged(log);
+        await hostsChanged(log, { now: true });
 
         log(`Step 4/5 — re-pointing ${nameOf(oldPrimary)} as the replica (no re-seed)…`);
         await ctx.cluster.runTask(target, "mysql.primary.prepare", await preparePayload(target, [oldPrimary], creds), { log, signal });
@@ -827,6 +1188,7 @@ function createMysqlHa(ctx) {
         c.needsRebuild = c.needsRebuild.filter((x) => x !== oldPrimary);
         c.state = "replicating";
         save();
+        await hostsChanged(log); // no cut-over against a server that is the replica again
 
         log("Step 5/5 — syncing website users on the new replica…");
         await syncUsersTo(oldPrimary, { log }).catch((err) => log(`User sync failed: ${err.message}`));
@@ -874,18 +1236,22 @@ function createMysqlHa(ctx) {
         }
         c.state = "seeding";
         save();
+        progressBegin("rebuild", id, log);
         broadcast(true);
         log(`Step 1/3 — preparing the primary ${nameOf(primary)} for ${nameOf(id)}…`);
         const prep = await ctx.cluster.runTask(primary, "mysql.primary.prepare", await preparePayload(primary, [id], creds), { log, signal });
         if (prep?.flavor) c.flavor = prep.flavor;
         log(`Step 2/3 — rebuilding ${nameOf(id)}: safety dump, drop, re-seed from ${nameOf(primary)}…`);
-        const res = await ctx.cluster.runTask(id, "mysql.rebuild", await setupPayload(id, primary, creds), { log, signal });
+        log(`Websites keep working normally while this runs: they keep reading and writing on ${nameOf(primary)}.`);
+        const res = await ctx.cluster.runTask(id, "mysql.rebuild", await setupPayload(id, primary, creds), { log, signal, onProgress: onCopyProgress });
         if (res?.safetyDump) log(`Safety dump of its old data: ${res.safetyDump}`);
+        startCatchUp();
         c.replica = id;
         c.needsRebuild = c.needsRebuild.filter((x) => x !== id);
         c.seededAt = res?.seededAt || nowIso();
         c.state = "replicating";
         save();
+        await hostsChanged(log); // it is the replica now: lift the cut-over against its addresses
         await refreshStatuses(id, primary);
         log("Step 3/3 — syncing website users…");
         await syncUsersTo(id, { log }).catch((err) => log(`User sync failed: ${err.message}`));
@@ -893,8 +1259,10 @@ function createMysqlHa(ctx) {
         history("rebuilt", `${nameOf(id)} is the replica of ${nameOf(primary)}`);
         alert("db.rebuilt", { title: "Database replica rebuilt", text: `${nameOf(id)} is the database replica again (primary: ${nameOf(primary)}).`, serverId: id, serverName: nameOf(id), primary, primaryName: nameOf(primary), automatic: !!auto });
         audit(admin, "mysql.replication.rebuild", { serverId: id, primary, automatic: !!auto });
+        await waitInSync(log, signal);
         return { replica: id, primary, safetyDump: res?.safetyDump || null };
       } catch (err) {
+        progressClear();
         rebuildFailedAt.set(id, Date.now());
         c.state = c.replica ? c.state : c.needsRebuild.length ? "needs-rebuild" : "promoted";
         save();
@@ -1025,11 +1393,13 @@ function createMysqlHa(ctx) {
     if (!isLeader()) {
       detect.since = null;
       broken.since = null;
+      if (progress) progressClear();
       return;
     }
     const c = cfg();
     if (!c.enabled || !tasksReady()) {
       detect.since = null;
+      if (!op && progress) progressClear();
       return;
     }
     if (op) return; // the running operation does its own checks
@@ -1039,39 +1409,8 @@ function createMysqlHa(ctx) {
     const pst = serverOnline(primary) ? await mysqlStatusOf(primary) : null;
     const rst = replica && serverOnline(replica) ? await mysqlStatusOf(replica) : null;
 
-    // --- failover detection
+    // --- failover detection: the fast probe loop (fastTick) owns it; detect.last is its view.
     if (replica) {
-      const cond = await conditions();
-      detect.last = { a: cond.a, b: cond.b, c: cond.c };
-      if (cond.all) {
-        if (!detect.since) {
-          detect.since = Date.now();
-          console.log(`[mysql-ha] primary ${nameOf(primary)} looks down (offline, no TCP, replica IO disconnected) — watching for ${DETECT_MS / 1000} s`);
-          broadcast(true);
-        }
-        if (Date.now() - detect.since >= DETECT_MS) {
-          if (c.mode === "auto") {
-            startAutoPromotion();
-          } else if (!detect.alerted) {
-            detect.alerted = true;
-            history("primary-down", `${nameOf(primary)} has been unreachable for ${Math.round((Date.now() - detect.since) / 1000)} s — manual mode: promote ${nameOf(replica)} when ready`);
-            alert("db.failover", {
-              title: "Database primary is down",
-              text: `${nameOf(primary)}'s database has been unreachable for over a minute. Manual mode: promote ${nameOf(replica)} from the panel.`,
-              promoted: false,
-              primary,
-              primaryName: nameOf(primary),
-              replica,
-              replicaName: nameOf(replica),
-            });
-          }
-        }
-      } else {
-        if (detect.since) broadcast(true);
-        detect.since = null;
-        detect.alerted = false;
-      }
-
       // --- broken replication (not while the primary is down: that is the failover path)
       const primaryDownish = detect.last?.a === true;
       const stoppedWithError = !!rst && !primaryDownish && (!rst.replica || ((rst.replica.ioRunning !== true || rst.replica.sqlRunning !== true) && !!rst.replica.lastError));
@@ -1093,10 +1432,8 @@ function createMysqlHa(ctx) {
           save();
           history("recovered", `${nameOf(replica)} is replicating again`);
         }
+        maybeTrackLag(c, rst);
       }
-    } else {
-      detect.since = null;
-      detect.last = null;
     }
 
     // --- fencing (2): no server but the primary may be writable
@@ -1159,11 +1496,116 @@ function createMysqlHa(ctx) {
   }
   let lastAliasRefresh = 0;
 
-  function startAutoPromotion() {
+  // ------------------------------------------------------------ fast detection (3.10)
+  //
+  // Every 250 ms on the leader while replication runs. Cheap until the primary's
+  // voter goes quiet: only then TCP probes (every dbProbeMs while failing, every 10 s
+  // while they succeed — each probe is an unauthenticated connect, which MySQL counts
+  // towards max_connect_errors), and only once (a) and (b) hold and the primary has
+  // shown no sign of life for detectMs, the replica is asked (at most once a second).
+
+  const fast = { timer: null, busy: false, fails: 0, lastProbeAt: 0, lastTcpOkAt: 0, replicaAt: 0, sqlErrNoted: false, logged: false };
+  function resetFast() {
+    Object.assign(fast, { fails: 0, lastProbeAt: 0, lastTcpOkAt: 0, replicaAt: 0, sqlErrNoted: false, logged: false });
+  }
+
+  async function fastTick() {
+    if (fast.busy) return;
+    fast.busy = true;
+    try {
+      await fastOnce();
+    } catch (err) {
+      console.error("[mysql-ha] fast detection:", err.message);
+    } finally {
+      fast.busy = false;
+    }
+  }
+
+  async function fastOnce() {
+    const c = cfg();
+    if (!isLeader() || !c.enabled || !c.replica || !tasksReady() || op) {
+      if (!op && (detect.since || fast.fails)) {
+        detect.since = null;
+        detect.alerted = false;
+        resetFast();
+        broadcast(true);
+      }
+      return;
+    }
+    const t = timings();
+    const primary = c.primary;
+    const replica = c.replica;
+    const sil = primarySilence(primary);
+    if (!sil.silent) {
+      if (detect.since || fast.fails || detect.last?.a) {
+        if (fast.logged) console.log(`[mysql-ha] primary ${nameOf(primary)} is answering again — no failover`);
+        detect.since = null;
+        detect.alerted = false;
+        detect.last = { a: false, b: null, c: null };
+        resetFast();
+        broadcast(true);
+      }
+      return;
+    }
+    const now = Date.now();
+    const every = fast.fails > 0 || !fast.lastTcpOkAt ? t.dbProbeMs : PROBE_OK_RECHECK_MS;
+    if (now - fast.lastProbeAt >= every) {
+      fast.lastProbeAt = now;
+      const ok = await probeTcp(primary, dbPort(), t.dbTcpTimeoutMs);
+      if (ok) {
+        fast.fails = 0;
+        fast.lastTcpOkAt = Date.now();
+      } else fast.fails++;
+    }
+    const b = fast.fails >= t.dbTcpFails;
+    // The primary's last sign of life: its last vote (or agent request), or our last good connect.
+    const lastAlive = Math.max(Number.isFinite(sil.quietMs) ? Date.now() - sil.quietMs : 0, fast.lastTcpOkAt || 0);
+    detect.last = { a: true, b: fast.fails ? b : null, c: detect.last?.c ?? null, quietMs: Number.isFinite(sil.quietMs) ? Math.round(sil.quietMs) : null, source: sil.source };
+    if (!b) return;
+    if (!detect.since) {
+      detect.since = lastAlive || Date.now();
+      fast.logged = true;
+      console.log(`[mysql-ha] primary ${nameOf(primary)} looks down (silent ${(Number.isFinite(sil.quietMs) ? sil.quietMs / 1000 : 0).toFixed(1)} s by ${sil.source}, ${fast.fails} failed TCP connects) — confirming with ${nameOf(replica)}`);
+      broadcast(true);
+    }
+    if (Date.now() - detect.since < t.detectMs) return;
+    if (Date.now() - fast.replicaAt < 1000) return;
+    fast.replicaAt = Date.now();
+    const rc = await replicaConfirms(primary, replica);
+    detect.last = { ...detect.last, c: rc.c };
+    if (!rc.c) return;
+    if (!isLeader() || op || cfg().primary !== primary) return;
+    if (sqlErrored(rc.status)) {
+      if (!fast.sqlErrNoted) {
+        fast.sqlErrNoted = true;
+        history("primary-down", `${nameOf(primary)} is down, but ${nameOf(replica)}'s SQL thread stopped with an error (${rc.status.replica.lastError}) — not promoting automatically; promote with force if you accept possible data loss`);
+        alert("db.failover", { title: "Database primary is down", text: `${nameOf(primary)}'s database is unreachable, and ${nameOf(replica)} cannot be promoted automatically: its replication stopped with an error. Promote it from the panel (force) if you accept that.`, promoted: false, primary, primaryName: nameOf(primary), replica, replicaName: nameOf(replica) });
+      }
+      return;
+    }
+    if (c.mode === "auto") {
+      startAutoPromotion(Date.now() - detect.since);
+    } else if (!detect.alerted) {
+      detect.alerted = true;
+      const secs = Math.round((Date.now() - detect.since) / 1000);
+      history("primary-down", `${nameOf(primary)} has been unreachable for ${secs} s — manual mode: promote ${nameOf(replica)} when ready`);
+      alert("db.failover", {
+        title: "Database primary is down",
+        text: `${nameOf(primary)}'s database has been unreachable for ${secs} seconds. Manual mode: promote ${nameOf(replica)} from the panel.`,
+        promoted: false,
+        primary,
+        primaryName: nameOf(primary),
+        replica,
+        replicaName: nameOf(replica),
+      });
+    }
+  }
+
+  function startAutoPromotion(downMs = null) {
     if (op) return;
     try {
       const c = cfg();
-      console.log(`[mysql-ha] primary ${nameOf(c.primary)} down for ${DETECT_MS / 1000} s — promoting ${nameOf(c.replica)} (auto mode)`);
+      console.log(`[mysql-ha] primary ${nameOf(c.primary)} down for ${((downMs ?? timings().detectMs) / 1000).toFixed(1)} s — promoting ${nameOf(c.replica)} (auto mode)`);
       runOp("failover", { title: `Automatic database failover to ${nameOf(c.replica)}`, serverId: c.replica }, ({ log, signal }) => promoteNow({ auto: true, log, signal }));
     } catch (err) {
       console.error("[mysql-ha] automatic promotion:", err.message);
@@ -1247,8 +1689,10 @@ function createMysqlHa(ctx) {
       history: [...c.history].reverse(),
       canEnable: canEnable(),
       candidates: candidates(),
-      detect: detect.since ? { primaryDownForMs: Date.now() - detect.since, detectMs: DETECT_MS, conditions: detect.last } : null,
+      detect: detect.since ? { primaryDownForMs: Date.now() - detect.since, detectMs: timings().detectMs, conditions: detect.last } : null,
+      failover: { ...timingSummary(ctx.config.ha?.failoverSeconds), detectMs: timings().detectMs },
       hosts,
+      progress: progressView(),
     };
   }
 
@@ -1291,6 +1735,9 @@ function createMysqlHa(ctx) {
     await refreshAliasIp().catch(() => {});
     timer = setInterval(() => tick(), TICK_MS);
     timer.unref?.();
+    fast.timer = setInterval(() => fastTick(), FAST_TICK_MS);
+    fast.timer.unref?.();
+    fastTick();
     const first = setTimeout(() => tick(), 3000);
     first.unref?.();
     try {
@@ -1303,15 +1750,22 @@ function createMysqlHa(ctx) {
 
   async function _stop() {
     clearInterval(timer);
+    clearInterval(fast.timer);
+    fast.timer = null;
     clearTimeout(usersTimer);
+    clearTimeout(progressTimer);
+    stopCatchUp();
     timer = null;
   }
 
   return {
     REPL_ALIAS,
     DETECT_MS,
+    timings: () => timings(),
     status: statusView,
+    progress: progressView,
     hostsMap,
+    dbCutover,
     primaryId: () => cfg().primary || MAIN_ID,
     replicaId: () => cfg().replica || null,
     isEnabled: () => cfg().enabled === true,

@@ -197,8 +197,35 @@ async function makeActive(node, ha, ctx) {
 }
 
 /** Servers page header strip: active panel, standbys, votes; standby rows with lag and "Make active panel". */
+/* ───────── failover speed (3.10, docs/HA.md "Failover speed") ───────── */
+
+const FO_PRESETS = [10, 15, 30, 60, 120];
+const FO_MIN = 10, FO_MAX = 300;
+const secsWord = (n) => (n == null ? "?" : n >= 90 ? `${Math.round(n / 60)} min` : n >= 10 ? `${Math.round(n)} s` : `${Math.round(n * 10) / 10} s`);
+const foLine = (f) => `Panel takes over in about ${secsWord(f.panelTakeoverSeconds)}, databases in about ${secsWord(f.databaseFailoverSeconds)}. Network outages between servers shorter than about ${secsWord(f.blipToleranceSeconds)} are ignored.`;
+const foValid = (v) => Number.isInteger(v) && v >= FO_MIN && v <= FO_MAX;
+const foWarn = (v) => (v < 15 ? html`<div class="note warn ha-fo-warn">${icon("alert")}<div>At this speed a short network hiccup between your servers can be mistaken for an outage and start a failover. A private network between the servers makes that much less likely.</div></div>` : "");
+
+/** The "Failover speed" box: one cluster-wide number of seconds (GET/PATCH /api/ha/settings). */
+function failoverBox(f) {
+  if (!f) return "";
+  const v = f.failoverSeconds;
+  return html`<div class="ha-fo" data-fo>
+    <div class="ha-fo-head"><label for="ha-fo-secs"><b>Failover speed</b></label>
+      <span class="muted small">How long from a server going down until the panel and the databases run elsewhere.</span></div>
+    <div class="ha-fo-row">
+      <span class="ha-fo-input"><input class="input" id="ha-fo-secs" type="number" inputmode="numeric" min="${FO_MIN}" max="${FO_MAX}" step="1" value="${v}" data-fo-input aria-describedby="ha-fo-line"/><span class="muted small">seconds</span></span>
+      <span class="seg ha-fo-presets" role="group" aria-label="Presets">${FO_PRESETS.map((p) => html`<button type="button" class="${p === v ? "active" : ""}" aria-pressed="${p === v ? "true" : "false"}" data-fo-preset="${p}">${p} s</button>`)}</span>
+      <button class="btn btn-sm btn-primary" type="button" data-fo-save disabled>Save</button>
+    </div>
+    <p class="small ha-fo-line" id="ha-fo-line" data-fo-line aria-live="polite">${foLine(f)}</p>
+    <div data-fo-warn>${foWarn(v)}</div>
+  </div>`;
+}
+
 function haStrip(ha, items) {
-  if (!ha?.enabled) return html``;
+  // Panel failover off: the speed still sets how fast the database fails over (shown once there is a second server).
+  if (!ha?.enabled) return ha?.failover && (items || []).length >= 2 ? html`<div class="card ha-strip ha-strip-solo">${failoverBox(ha.failover)}</div>` : html``;
   const leader = nodeName(ha, items, ha.leaderId);
   const standbys = (ha.nodes || []).filter((n) => n.serverId !== ha.leaderId);
   const votes = (ha.votes || []).filter((v) => v.votedFor === ha.leaderId && v.reachable !== false && (v.leaseLeftMs == null || v.leaseLeftMs > 0)).length;
@@ -222,6 +249,7 @@ function haStrip(ha, items) {
         <button class="btn btn-sm" type="button" data-ha-active="${n.serverId}" ${can ? "" : raw("disabled")} title="${!n.online ? `${n.name} is offline.` : ha.armed === false ? "Wait until the servers have voted." : "Hand the active panel over to this server."}">Make active panel</button>
       </div>`;
     })}</div>` : ""}
+    ${failoverBox(ha.failover)}
   </div>`;
 }
 
@@ -529,5 +557,37 @@ export default async function servers(ctx) {
     const fresh = await get("/api/servers").catch(() => null);
     if (fresh?.items && ctx.alive()) { items = fresh.items; paint(); }
   }, 500));
+  // Failover speed: preview the breakdown while typing (GET /api/ha/settings?failoverSeconds=N), save with PATCH.
+  const foSaved = () => ha?.failover?.failoverSeconds;
+  const foState = (v, f) => {
+    const box = $("[data-fo]", haBox); if (!box) return;
+    const ok = foValid(v);
+    $("[data-fo-input]", box).classList.toggle("invalid", !ok);
+    $("[data-fo-save]", box).disabled = !ok || v === foSaved();
+    $$("[data-fo-preset]", box).forEach((b) => { const on_ = Number(b.dataset.foPreset) === v; b.classList.toggle("active", on_); b.setAttribute("aria-pressed", on_ ? "true" : "false"); });
+    $("[data-fo-line]", box).textContent = !ok ? `Enter a whole number of seconds from ${FO_MIN} to ${FO_MAX}.` : f ? foLine(f) : "…";
+    mount($("[data-fo-warn]", box), ok ? foWarn(v) : html``);
+  };
+  let foSeq = 0;
+  const foPreview = debounce(async (v) => {
+    const seq = ++foSeq;
+    if (!foValid(v)) return foState(v, null);
+    const f = await get(`/api/ha/settings?failoverSeconds=${v}`).catch(() => null);
+    if (seq === foSeq && ctx.alive()) foState(v, f);
+  }, 200);
+  const foValue = () => Math.round(Number($("[data-fo-input]", haBox)?.value));
+  on(root, "input", "[data-fo-input]", () => { const v = foValue(); foState(v, null); foPreview(v); });
+  on(root, "click", "[data-fo-preset]", (e, b) => { const inp = $("[data-fo-input]", haBox); if (!inp) return; inp.value = b.dataset.foPreset; const v = foValue(); foState(v, null); foPreview(v); });
+  on(root, "click", "[data-fo-save]", async (e, b) => {
+    const v = foValue(); if (!foValid(v)) return;
+    b.classList.add("loading");
+    try {
+      const f = await patch("/api/ha/settings", { failoverSeconds: v });
+      ha = { ...(ha || {}), failover: f };
+      paintHa();
+      toast(`Failover speed: ${f.failoverSeconds} s`, "ok", { msg: foLine(f) });
+    } catch (ex) { toastError(ex, "Couldn't change the failover speed"); }
+    finally { b.classList.remove("loading"); }
+  });
   ctx.on(["lb", "site"], debounce(async () => { lb = await get("/api/loadbalancer").catch(() => lb); if (ctx.alive()) paintLb(); }, 500));
 }

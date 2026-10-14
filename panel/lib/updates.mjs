@@ -15,6 +15,11 @@
  *      its log reached the browsers (Restart=always brings it back); otherwise
  *      the admin is told to restart.
  *
+ * With standby panel nodes (HA, docs/HA.md "Panel updates in a cluster") step 4
+ * becomes a rolling update: each standby installs the staged code in turn and
+ * must come back on it, then this server swaps and restarts inside a window in
+ * which the standbys let it keep the panel. A restore takes the same path.
+ *
  * Only the code items install.sh copies are touched (panel node shared scripts
  * patches README.md install.sh LICENSE + version.json) — never the data dir,
  * /etc/fcc or the websites.
@@ -218,11 +223,43 @@ export function register(router, ctx) {
 
   const isGitCheckout = () => exists(path.join(root, ".git"));
 
+  /**
+   * Test hook (docs/HA.md "Testing panel updates"), inert unless FCC_DRY_RUN=1:
+   * FCC_TEST_UPDATE_SOURCE=<dir or .tar.gz> replaces GitHub as the update source,
+   * and FCC_TEST_REAL_CODE_SWAP=1 lets the swap and the restart (process exit — a
+   * supervisor stands in for systemd) happen for real in a code dir that is not
+   * a git checkout. Every other system call stays dry-run.
+   */
+  const testSource = ctx.sys?.DRY_RUN && process.env.FCC_TEST_UPDATE_SOURCE ? path.resolve(process.env.FCC_TEST_UPDATE_SOURCE) : null;
+  const testRealSwap = !!(ctx.sys?.DRY_RUN && process.env.FCC_TEST_REAL_CODE_SWAP === "1");
+
   /** Why apply/restore only pretend here (null = they run for real). */
   function simulateReason() {
-    if (ctx.sys?.DRY_RUN) return "dry-run";
+    if (ctx.sys?.DRY_RUN && !(testRealSwap && !isGitCheckout())) return "dry-run";
     if (isGitCheckout()) return "git-checkout";
     return null;
+  }
+
+  /** FCC_TEST_UPDATE_SOURCE only: the source's "commit" is a stable hash of its bytes. */
+  function testLatest() {
+    const h = crypto.createHash("sha1");
+    const feed = (p) => {
+      const st = fs.lstatSync(p);
+      if (st.isDirectory()) {
+        for (const n of fs.readdirSync(p).sort()) {
+          if (COPY_SKIP.has(n)) continue;
+          h.update(`${n}/`);
+          feed(path.join(p, n));
+        }
+      } else if (st.isFile()) h.update(fs.readFileSync(p));
+    };
+    feed(testSource);
+    const sha = h.digest("hex");
+    let version = null;
+    try {
+      version = versionFromSource(fs.readFileSync(path.join(testSource, "panel", "server.mjs"), "utf8"));
+    } catch { /* an archive: the version is read after extraction */ }
+    return { commit: sha, shortCommit: sha.slice(0, 7), message: `local test source ${path.basename(testSource)}`, author: null, date: new Date().toISOString(), url: `file://${testSource}`, version };
   }
 
   /**
@@ -274,6 +311,7 @@ export function register(router, ctx) {
 
   function restartMode() {
     if (simulateReason()) return "simulated";
+    if (testRealSwap) return "systemd"; // test hook: exit; the test's supervisor restarts the process
     if (process.env.INVOCATION_ID) return "systemd";
     try {
       if (systemctlActive()) return "service";
@@ -417,6 +455,13 @@ export function register(router, ctx) {
     s.lastAttemptAt = Date.now();
     const checkedAt = new Date().toISOString();
     try {
+      if (testSource) {
+        const latest = testLatest();
+        s.last = { repo, ref, latest, changes: [], totalChanges: null, compareStatus: null, compareUrl: null, checkedAt, checkedFor: inst.commit, error: null, ...decide(inst, latest, null) };
+        persist();
+        ctx.events.broadcast("updates", status());
+        return s.last;
+      }
       const latest = await latestCommit(repo, ref, token);
       const [version, cmp] = await Promise.all([
         versionAt(repo, latest.commit, token),
@@ -556,7 +601,16 @@ export function register(router, ctx) {
       job: activeJob(),
       restart: s.restart,
       bootId: BOOT_ID,
+      servers: safeServers(last ? last.available ?? null : null), // HA: every panel server and its version; null otherwise
     };
+  }
+
+  function safeServers(available) {
+    try {
+      return panelServers(available);
+    } catch {
+      return null;
+    }
   }
 
   // ---- apply / restore --------------------------------------------------------
@@ -716,6 +770,123 @@ export function register(router, ctx) {
     return null;
   }
 
+  // ---- panel servers in a cluster (docs/HA.md "Panel updates in a cluster") ----------
+
+  /** The standby panel nodes an update has to go through (none with HA off: exactly the single-server path). */
+  function haPeers() {
+    const ha = ctx.ha;
+    if (!ha?.enabled || typeof ha.peers !== "function" || !ha.isLeader?.()) return [];
+    return ha.peers().filter((p) => p.enabled !== false);
+  }
+
+  /** Every panel server with the version it runs (Settings → Updates). null with HA off. */
+  function panelServers(available) {
+    const ha = ctx.ha;
+    if (!ha?.enabled || typeof ha.peers !== "function") return null;
+    if (!ha.isLeader?.()) return null;
+    const mine = ha.codeDigest();
+    const me = ha.localServerId;
+    const out = [{ serverId: me, name: ctx.db.get("servers", me)?.name || (me === "main" ? "Main" : me), role: "active", local: true, online: true, version: ctx.version, sameCode: true, upToDate: available === false ? true : available === true ? false : null }];
+    for (const p of haPeers()) {
+      const sameCode = p.codeDigest ? p.codeDigest === mine : null;
+      out.push({ serverId: p.serverId, name: p.name, role: "standby", local: false, online: p.online, version: p.version || null, sameCode, upToDate: sameCode === false ? false : out[0].upToDate });
+    }
+    return out;
+  }
+
+  /**
+   * Install new code on every panel server, one at a time, with this server
+   * (the active panel) last. `fromDir` holds the new code items (`move`: they
+   * are renamed out of it; otherwise copied). The release tree is exactly this
+   * server's code after the swap, so its digest is what every standby must end
+   * up running. Each standby is released in turn and must come back from a new
+   * boot on that digest within NODE_WAIT_MS; any failure withdraws the target
+   * and stops the update with this server still on its old code. On success
+   * this server is swapped last and keeps the target advertised until it exits.
+   */
+  const NODE_WAIT_MS = 3 * 60_000;
+  async function rollingInstall({ fromDir, items, move, stage, stamp, updateId, log, signal }) {
+    const ha = ctx.ha;
+    const tree = path.join(stage, "tree");
+    rmrf(tree);
+    fs.mkdirSync(tree, { recursive: true });
+    const all = [...new Set([...items, ...(ha.codeItems || [])])];
+    for (const item of all) {
+      const from = path.join(fromDir, item);
+      if (items.includes(item) && exists(from)) {
+        if (move) fs.renameSync(from, path.join(tree, item));
+        else copyTree(from, path.join(tree, item));
+      } else if (exists(path.join(root, item))) {
+        copyTree(path.join(root, item), path.join(tree, item)); // not part of the release: keep ours
+      }
+    }
+    if (stamp) writeJsonAtomic(path.join(tree, "version.json"), stamp);
+    const digest = ha.codeDigestOf(tree);
+    const version = versionFromSource(fs.readFileSync(path.join(tree, "panel", "server.mjs"), "utf8")) || stamp?.version || null;
+    ha.setCodeTarget({ updateId, digest, version, commit: stamp?.commit || null, dir: tree });
+    const updated = [];
+    try {
+      const peers = haPeers();
+      log(`${peers.length} standby panel server${peers.length === 1 ? "" : "s"} first, one at a time, then this server.`);
+      for (const p of peers) {
+        if (signal.aborted) throw new Error("Cancelled.");
+        if (!p.online) {
+          log(`⚠ Standby ${p.name} is offline — skipped. It picks up v${version || "?"} when it is back.`);
+          continue;
+        }
+        if (p.codeDigest === digest) {
+          log(`✓ Standby ${p.name} already runs v${version || "?"}.`);
+          continue;
+        }
+        if (!p.capable) {
+          log(`⚠ Standby ${p.name} runs v${p.version || "?"}, which can't take part in a coordinated update — it follows once this server has restarted.`);
+          continue;
+        }
+        log(`Updating standby ${p.name} (v${p.version || "?"} → v${version || "?"}) …`);
+        const bootBefore = p.bootId;
+        const t0 = Date.now();
+        ha.releaseCodeTarget(p.serverId);
+        let said = null;
+        for (;;) {
+          if (signal.aborted) throw new Error("Cancelled.");
+          const st = ha.peerStatus(p.serverId);
+          const rep = st.report?.updateId === updateId ? st.report : null;
+          if (rep && (rep.state === "failed" || rep.state === "rolled-back")) {
+            // "failed": it never swapped (kept its code); "rolled-back": it is on its backup again.
+            throw new Error(`Standby ${p.name} ${rep.state === "rolled-back" ? "could not start the new code and went back to its backup" : "could not install the update and kept its current code"}: ${rep.msg || rep.state}`);
+          }
+          if (rep?.state === "swapped" && said !== "swapped") {
+            said = "swapped";
+            log(`  ${p.name}: new code installed (its own backup taken) — restarting …`);
+          }
+          if (st.bootId && st.bootId !== bootBefore && st.codeDigest === digest && st.lastPollAgoMs != null && st.lastPollAgoMs < 10_000) {
+            log(`✓ Standby ${p.name} is back on v${st.version || version || "?"} (${Math.round((Date.now() - t0) / 1000)} s)`);
+            updated.push(p.name);
+            break;
+          }
+          if (Date.now() - t0 > NODE_WAIT_MS) {
+            throw Object.assign(new Error(`Standby ${p.name} did not come back on v${version || "?"} within ${NODE_WAIT_MS / 60_000} minutes`), { node: p.name });
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+      if (signal.aborted) throw new Error("Cancelled.");
+      log("Updating this server (the active panel) — restarting; the page reconnects in a few seconds.");
+      swapIn(tree, all, { log });
+      if (stamp) writeJsonAtomic(path.join(root, "version.json"), stamp);
+      else if (!exists(path.join(tree, "version.json"))) rmrf(path.join(root, "version.json"));
+      ha.codeChanged?.();
+      if (ha.codeDigest() !== digest) log("⚠ This server's code does not match the digest the standbys received — they will follow this server after the restart.");
+      return { digest, version, standbysUpdated: updated };
+    } catch (err) {
+      ha.clearCodeTarget(err.message);
+      const back = updated.length ? ` ${updated.join(", ")} ${updated.length === 1 ? "was" : "were"} already updated and ${updated.length === 1 ? "goes" : "go"} back to it automatically.` : "";
+      const node = err.node ? ` ${err.node} goes back to its own backup if the new code does not start.` : "";
+      if (err.message === "Cancelled.") throw err;
+      throw new Error(`${err.message}. The update was stopped: this server still runs v${ctx.version}.${back}${node}`);
+    }
+  }
+
   function scheduleRestart(jobId, by) {
     ctx.jobs.wait(jobId).then((job) => {
       if (job.status !== "succeeded") return;
@@ -724,7 +895,15 @@ export function register(router, ctx) {
       s.restart = { pending: true, mode, at: new Date().toISOString(), by, bootId: BOOT_ID };
       ctx.events.broadcast("updates", { ...status(), restarting: true });
       // Let the job's last log lines, the `job` event and this one reach the browsers.
-      setTimeout(() => {
+      setTimeout(async () => {
+        // HA: announce the restart window so the standbys let this node take the panel back.
+        if (ctx.ha?.enabled && typeof ctx.ha.prepareRestart === "function") {
+          try {
+            await ctx.ha.prepareRestart(ctx.ha.restartWindowMs);
+          } catch (err) {
+            console.warn(`[fcc] could not announce the restart window: ${err.message}`);
+          }
+        }
         console.log(`[fcc] panel ${job.type === "panel.restore" ? "restored" : "updated"} — restarting (${mode})`);
         if (mode === "systemd") {
           process.kill(process.pid, "SIGTERM"); // graceful shutdown; Restart=always starts the new code
@@ -753,7 +932,7 @@ export function register(router, ctx) {
 
     const job = ctx.jobs.start(
       { type: "panel.update", title: `Update panel from ${repo}@${ref}`, adminId: admin?.id || null, lock: "panel:update" },
-      async ({ log, signal }) => {
+      async ({ log, signal, job }) => {
         if (sim) log(`[simulated] ${sim === "dry-run" ? "FCC_DRY_RUN is set" : `${root} is a git checkout`} — download and checks are real, the install is not touched.`);
         if (!sim) {
           try {
@@ -764,7 +943,7 @@ export function register(router, ctx) {
         }
 
         log(`▸ Checking ${repo}@${ref}`);
-        const latest = await latestCommit(repo, ref, token, { signal });
+        const latest = testSource ? testLatest() : await latestCommit(repo, ref, token, { signal });
         log(`Latest commit ${latest.shortCommit}: ${latest.message}`);
         if (inst.commit && inst.commit === latest.commit && !inst.stale) log("(This is the installed commit — re-installing it.)");
 
@@ -776,11 +955,19 @@ export function register(router, ctx) {
         try {
           log("▸ Download");
           const tarball = path.join(stage, "src.tar.gz");
-          await download(repo, latest.commit, token, tarball, { log, signal });
           const extract = path.join(stage, "src");
-          fs.mkdirSync(extract);
-          await runReal("tar", ["-xzf", tarball, "-C", extract], { signal, timeoutMs: 5 * 60_000 });
-          rmrf(tarball);
+          if (testSource && fs.statSync(testSource).isDirectory()) {
+            log(`[test] Copying the update from ${testSource}`);
+            copyTree(testSource, path.join(extract, "src"));
+          } else {
+            if (testSource) {
+              log(`[test] Using the local archive ${testSource}`);
+              fs.copyFileSync(testSource, tarball);
+            } else await download(repo, latest.commit, token, tarball, { log, signal });
+            fs.mkdirSync(extract);
+            await runReal("tar", ["-xzf", tarball, "-C", extract], { signal, timeoutMs: 5 * 60_000 });
+            rmrf(tarball);
+          }
           const src = findSourceRoot(extract);
           if (!src || !exists(path.join(src, "shared")) || !fs.statSync(path.join(src, "shared")).isDirectory()) {
             throw new Error(`${repo}@${ref} does not contain panel/server.mjs and shared/ — is that the Standalone branch? Nothing was changed.`);
@@ -815,10 +1002,16 @@ export function register(router, ctx) {
             updatedFrom: { version: inst.version, commit: inst.commit },
             backup: backupId,
           };
+          const peers = haPeers();
+          let rolled = null;
           if (sim) {
             const present = CODE_ITEMS.filter((i) => exists(path.join(src, i)));
             log(`[simulated] Would replace ${present.map((i) => path.join(root, i)).join(", ")}`);
             log(`[simulated] Would write ${path.join(root, "version.json")}: ${JSON.stringify({ version: stamp.version, ref, commit: stamp.commit })}`);
+            if (peers.length) log(`[simulated] Would update the standby panel servers first, one at a time: ${peers.map((p) => p.name).join(", ")}`);
+          } else if (peers.length) {
+            rolled = await rollingInstall({ fromDir: src, items: CODE_ITEMS, move: true, stage, stamp, updateId: job.id, log, signal });
+            log(`✓ version.json → ${stamp.version ? `v${stamp.version} ` : ""}${latest.shortCommit}`);
           } else {
             swapIn(src, CODE_ITEMS, { log });
             writeJsonAtomic(path.join(root, "version.json"), stamp);
@@ -834,7 +1027,7 @@ export function register(router, ctx) {
             s.last = null; // describes the old code now
             persist();
           }
-          return { from: inst, to: { ...latest, version: stamp.version }, backup: backupId, restart: mode, simulated: !!sim };
+          return { from: inst, to: { ...latest, version: stamp.version }, backup: backupId, restart: mode, simulated: !!sim, ...(rolled ? { standbysUpdated: rolled.standbysUpdated } : {}) };
         } finally {
           rmrf(stage);
         }
@@ -857,7 +1050,7 @@ export function register(router, ctx) {
 
     const job = ctx.jobs.start(
       { type: "panel.restore", title: `Restore panel from backup ${id}`, adminId: admin?.id || null, lock: "panel:update" },
-      async ({ log, signal }) => {
+      async ({ log, signal, job }) => {
         if (sim) log(`[simulated] ${sim === "dry-run" ? "FCC_DRY_RUN is set" : `${root} is a git checkout`} — checks are real, the install is not touched.`);
         const items = (meta.items?.length ? meta.items : BACKUP_ITEMS).filter((i) => BACKUP_ITEMS.includes(i) && exists(path.join(dir, i)));
         log(`Backup ${id}: ${meta.was?.version ? `v${meta.was.version} ` : ""}${meta.was?.commit ? meta.was.commit.slice(0, 7) : ""} (taken ${meta.takenAt || "?"})`);
@@ -876,8 +1069,21 @@ export function register(router, ctx) {
         });
 
         log("▸ Restore");
+        const peers = haPeers();
         if (sim) {
           log(`[simulated] Would replace ${items.map((i) => path.join(root, i)).join(", ")} from ${dir}`);
+          if (peers.length) log(`[simulated] Would restore the standby panel servers first, one at a time: ${peers.map((p) => p.name).join(", ")}`);
+        } else if (peers.length) {
+          // Same coordinated path as an update: standbys first, this server last.
+          const stage = path.join(root, `.update-staging.${Date.now()}`);
+          rmrf(stage);
+          fs.mkdirSync(stage, { recursive: true, mode: 0o700 });
+          try {
+            const stamp = items.includes("version.json") ? readJson(path.join(dir, "version.json"), null) : null;
+            await rollingInstall({ fromDir: dir, items: items.filter((i) => i !== "version.json"), move: false, stage, stamp, updateId: job.id, log, signal });
+          } finally {
+            rmrf(stage);
+          }
         } else {
           const stage = path.join(root, `.update-staging.${Date.now()}`);
           rmrf(stage);
