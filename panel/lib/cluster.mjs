@@ -10,7 +10,7 @@
  *   GET  /agent/poll?running=a,b      long-poll (25s) → { tasks: [...], cancel: [...] }
  *   POST /agent/tasks/:id/log         { lines } → { ok, cancel }
  *   POST /agent/tasks/:id/result      { ok, result, error, aborted }
- *   POST /agent/metrics               latest server.metrics sample (+ `edge` status on edge nodes)
+ *   POST /agent/metrics               latest server.metrics sample (+ `edge` status on edge nodes, `mysql` status)
  *   POST /agent/edge/logs             { sites: { <siteId>: [access log lines] } } from an edge's nginx
  *   POST /agent/upload/:taskId        raw body: a server.backup archive, or the
  *                                     packaged build of a site.deploy (build once, ship everywhere)
@@ -38,6 +38,13 @@
  * its embedded agent (token hash in servers.main.tokenHash) and its front door
  * goes out as a `frontDoor` cluster.sync. Agent servers can be made panel nodes
  * (servers[].panel) — panel.install / panel.remove tasks, config.ha.enabled.
+ *
+ * Database replication (docs/HA.md, Phase 3): every cluster.sync payload (the
+ * frontDoor one too) carries `hosts` — the /etc/hosts block mysql-ha.mjs wants
+ * on that server (ctx.mysqlHa.hostsMap), null while replication is off; main
+ * applies its own block in-process (shared/edge.mjs applyHostsBlock) while this
+ * process runs on main. A "mysql-ha" event re-checks every payload. Agents push
+ * a `mysql` block (mysql.status) with their metrics: ctx.cluster.mysqlStatus(id).
  */
 
 import fs from "node:fs";
@@ -148,6 +155,7 @@ function createCluster(ctx) {
   const tails = new Map(); // siteId -> { ino, pos }
   // Edge nodes — in memory only (edgeSync, the last task result, is persisted on the record).
   const edgeStatus = new Map(); // serverId -> sanitised `edge` from /agent/metrics + reportedAt
+  const mysqlReports = new Map(); // serverId -> sanitised `mysql` from /agent/metrics + reportedAt (Phase 3)
   const edgeDesired = new Map(); // serverId -> payload hash the panel wants it to have
   const edgePushed = new Map(); // serverId -> { hash, at } of the last cluster.sync sent
   const edgeInflight = new Map(); // serverId -> Promise of the push chain
@@ -160,6 +168,7 @@ function createCluster(ctx) {
   let edgeTimer = null;
   const edgeForce = new Set();
   let started = false;
+  let onMysqlHa = null;
   const timers = [];
   let metricsDirty = false;
   // Panel failover — read ctx.ha at call time, with HA-off defaults.
@@ -985,8 +994,60 @@ function createCluster(ctx) {
     for (const m of [ipMap, pIpMap]) for (const [id, ips] of m) if (id !== s.id) for (const ip of ips) allow.add(ip);
     const allowFrom = [...allow].filter((ip) => net.isIP(ip) && !isLoopback(ip)).sort();
     const edge = { files: ctx.lb?.mainFiles?.() || {}, connectors: [], shims: [] };
-    const body = { allowFrom, frontDoor: true, edge };
+    const body = { allowFrom, frontDoor: true, edge, hosts: hostsFor(s.id) };
     return { hash: sha256(JSON.stringify(body)), ...body };
+  }
+
+  /**
+   * Phase 3 (docs/HA.md "Database address"): the /etc/hosts managed block for
+   * server `id` — { "fcc-mysql.internal": "<ip>" } while database replication is
+   * on, null otherwise (null removes the block). Owned by mysql-ha.mjs.
+   */
+  function hostsFor(id) {
+    try {
+      const h = ctx.mysqlHa?.hostsMap?.(id);
+      if (!h || typeof h !== "object" || Array.isArray(h)) return null;
+      const out = {};
+      for (const [name, ip] of Object.entries(h)) {
+        if (/^[a-z0-9.-]{1,253}$/i.test(name) && typeof ip === "string" && net.isIP(ip)) out[name] = ip;
+      }
+      return Object.keys(out).length ? out : null;
+    } catch (err) {
+      console.warn("[cluster] hosts map:", err.message);
+      return null;
+    }
+  }
+
+  /** Main's own copy of the hosts block, applied in-process while this process runs on main. */
+  let mainHostsKey; // JSON of the last block applied on main (undefined = never)
+  let mainHostsMissingNoted = false;
+  async function applyMainHosts() {
+    if (!mainLocal()) {
+      mainHostsKey = undefined; // main's agent applies it from its frontDoor cluster.sync
+      return;
+    }
+    const hosts = hostsFor(MAIN_ID);
+    const key = JSON.stringify(hosts);
+    if (key === mainHostsKey) return;
+    let edgeMod;
+    try {
+      edgeMod = await import("../../shared/edge.mjs");
+    } catch (err) {
+      console.warn("[cluster] shared/edge.mjs could not be loaded:", err.message);
+      return;
+    }
+    if (typeof edgeMod.applyHostsBlock !== "function") {
+      if (!mainHostsMissingNoted) console.warn("[cluster] shared/edge.mjs has no applyHostsBlock yet — main's /etc/hosts database alias is not managed.");
+      mainHostsMissingNoted = true;
+      return;
+    }
+    try {
+      await edgeMod.applyHostsBlock(hosts, { log: (l) => console.log(`[cluster] main /etc/hosts: ${l}`) });
+      mainHostsKey = key;
+      if (hosts) console.log(`[cluster] main /etc/hosts block: ${Object.entries(hosts).map(([k, v]) => `${k} → ${v}`).join(", ")}`);
+    } catch (err) {
+      console.warn("[cluster] could not apply main's /etc/hosts block:", err.message);
+    }
   }
 
   /** The cluster.sync payload for agent server `s`. Contains the connector tokens: never log or return it. */
@@ -1031,7 +1092,7 @@ function createCluster(ctx) {
       for (const c of connectors) edgeConnectorNames.set(c.id, c.name);
       edge = { files: ctx.lb?.edgeFiles?.(s.id) || {}, connectors, shims };
     }
-    const body = { allowFrom, edge };
+    const body = { allowFrom, edge, hosts: hostsFor(s.id) };
     return { hash: sha256(JSON.stringify(body)), ...body };
   }
 
@@ -1226,6 +1287,7 @@ function createCluster(ctx) {
         if (!first) console.log(`[cluster] edge node addresses now: ${flat.join(", ") || "(none)"}`);
         await applyMainEdges(flat);
       }
+      await applyMainHosts();
       if (!syncSupported()) return;
       for (const s of db.list("servers")) {
         if (s.id === MAIN_ID && mainLocal()) continue;
@@ -1311,6 +1373,48 @@ function createCluster(ctx) {
         /* no SSE yet */
       }
     }
+  }
+
+  // ------------------------------------------------- MySQL status (Phase 3)
+
+  /** Sanitise the `mysql` block (mysql.status result) an agent pushes with its metrics. */
+  function cleanMysqlReport(m) {
+    if (!m || typeof m !== "object" || Array.isArray(m)) return null;
+    const str = (v, n) => (v == null ? null : String(v).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, n));
+    const bool = (v) => (v == null ? null : !!v);
+    const r = m.replica && typeof m.replica === "object" ? m.replica : null;
+    const lag = Number(r?.lagSeconds);
+    return {
+      installed: bool(m.installed),
+      flavor: ["mysql", "mariadb"].includes(m.flavor) ? m.flavor : null,
+      version: str(m.version, 60),
+      readOnly: bool(m.readOnly),
+      role: ["primary", "replica", "standalone"].includes(m.role) ? m.role : null,
+      replica: r
+        ? {
+            ioRunning: bool(r.ioRunning),
+            sqlRunning: bool(r.sqlRunning),
+            lagSeconds: r.lagSeconds == null || !Number.isFinite(lag) ? null : Math.max(0, lag),
+            lastError: str(r.lastError, 1000),
+            sourceHost: str(r.sourceHost, 255),
+            retrievedGtid: str(r.retrievedGtid, 4000),
+            executedGtid: str(r.executedGtid, 4000),
+          }
+        : null,
+      error: str(m.error, 500),
+    };
+  }
+
+  function ingestMysqlReport(s, mysql) {
+    const next = cleanMysqlReport(mysql);
+    if (next) mysqlReports.set(s.id, { ...next, reportedAt: nowIso() });
+    else mysqlReports.delete(s.id);
+  }
+
+  /** Last `mysql` block server `id`'s agent pushed ({ …mysql.status, reportedAt }), or null. Main reports none while this process runs on main. */
+  function mysqlStatus(id) {
+    const r = mysqlReports.get(id);
+    return r ? { ...r, replica: r.replica ? { ...r.replica } : null } : null;
   }
 
   /** GET /api/servers edgeStatus: null for main and for servers that are not (and do not report being) an edge. */
@@ -2184,6 +2288,7 @@ function createCluster(ctx) {
         uptime: n(body.uptime),
       });
       if (body.edge !== undefined) ingestEdgeReport(s, body.edge);
+      if (body.mysql !== undefined) ingestMysqlReport(s, body.mysql);
       return { ok: true };
     });
 
@@ -2318,6 +2423,9 @@ function createCluster(ctx) {
       if (e?.reason === "hello") return; // the hello route already asked for a forced push
       edgesChanged();
     });
+    // Database replication (mysql-ha.mjs): the hosts alias goes out with cluster.sync.
+    onMysqlHa = () => edgesChanged();
+    ctx.events?.on?.("mysql-ha", onMysqlHa);
     started = true;
     every(EDGE_RECONCILE_MS, () => edgeRound({ resend: true }));
     // First round once loadbalancer.mjs has rendered (its initial apply runs at +3 s).
@@ -2329,6 +2437,8 @@ function createCluster(ctx) {
 
   async function _stop() {
     started = false;
+    if (onMysqlHa) ctx.events?.off?.("mysql-ha", onMysqlHa);
+    onMysqlHa = null;
     if (edgeTimer) clearTimeout(edgeTimer);
     for (const t of timers) clearInterval(t);
     for (const p of [...parked.values()]) p.finish(true);
@@ -2360,6 +2470,8 @@ function createCluster(ctx) {
     panelNodes: () => panelNodeList(),
     panelCanEnable,
     mainDirectUrl: () => mainDirectUrl(),
+    // database replication (docs/HA.md Phase 3)
+    mysqlStatus,
     _routes: routes,
     _start,
     _stop,

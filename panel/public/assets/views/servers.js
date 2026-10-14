@@ -121,19 +121,52 @@ export function panelBlock(s, ha, items, { edge } = {}) {
   return null;
 }
 
-/** Turn a panel node on/off: confirm, POST /api/servers/:id/panel, open the job log. Resolves true when started. */
-async function setPanelNode(s, enabled) {
-  const ok = await confirmDialog(enabled
-    ? { title: `Make ${s.name} a panel node?`, ico: "layers", confirmText: "Install the panel",
-      message: `${PANEL_HELP} ${s.name} downloads the panel code, starts a standby panel and joins the vote. Websites and the active panel keep running.` }
-    : { title: `Stop running the panel on ${s.name}?`, ico: "layers", danger: true, confirmText: "Remove panel node",
-      message: `${s.name} stops its standby panel. Its panel data is kept on the server in a renamed folder, because it holds secrets. Websites on it keep running.` });
-  if (!ok) return false;
+/** Confirm turning a panel node on/off (`toHost`: the edge is removed afterwards too). */
+function confirmPanel(s, enabled, { toHost = false } = {}) {
+  if (enabled) return confirmDialog({ title: `Make ${s.name} a panel node?`, ico: "layers", confirmText: "Install the panel",
+    message: `${PANEL_HELP} ${s.name} downloads the panel code, starts a standby panel and joins the vote. Websites and the active panel keep running.` });
+  if (toHost) return confirmDialog({ title: `Make ${s.name} a website host?`, ico: "layers", danger: true, confirmText: "Remove panel and edge",
+    message: `${s.name} stops its standby panel first, then its front door and tunnel replica. Its panel data is kept on the server in a renamed folder, because it holds secrets. Websites on it keep running.` });
+  return confirmDialog({ title: `Stop running the panel on ${s.name}?`, ico: "layers", danger: true, confirmText: "Remove panel node",
+    message: `${s.name} stops its standby panel. Its panel data is kept on the server in a renamed folder, because it holds secrets. Websites on it keep running.` });
+}
+
+/** POST /api/servers/:id/panel and open the job log. Resolves the job (or true without one), or null when it couldn't start. */
+async function startPanelJob(s, enabled) {
   try {
     const job = await post(`/api/servers/${s.id}/panel`, { enabled });
     if (job?.id) openJobLog(job.id); else toast(enabled ? "Panel node added" : "Panel node removed", "ok");
-    return true;
-  } catch (ex) { toastError(ex, enabled ? "Couldn't add the panel node" : "Couldn't remove the panel node"); return false; }
+    return job?.id ? job : true;
+  } catch (ex) { toastError(ex, enabled ? "Couldn't add the panel node" : "Couldn't remove the panel node"); return null; }
+}
+
+/** Turn a panel node on/off: confirm, POST /api/servers/:id/panel, open the job log. Resolves true when started. */
+async function setPanelNode(s, enabled) {
+  if (!(await confirmPanel(s, enabled))) return false;
+  return !!(await startPanelJob(s, enabled));
+}
+
+/** Resolves the finished job (succeeded / failed / cancelled), or null after `timeoutMs`. Live events first, polling as a fallback. */
+async function waitForJob(id, timeoutMs = 20 * 60_000) {
+  const { onEvent } = await import("../events.js");
+  const done = (j) => j && ["succeeded", "failed", "cancelled"].includes(j.status);
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (j) => { if (finished) return; finished = true; off(); clearInterval(poll); clearTimeout(limit); resolve(j); };
+    const off = onEvent("job", (j) => { if (j?.id === id && done(j)) finish(j); });
+    const poll = setInterval(async () => { try { const j = await get(`/api/jobs/${id}`); if (done(j)) finish(j); } catch { /* keep waiting */ } }, 4000);
+    const limit = setTimeout(() => finish(null), timeoutMs);
+  });
+}
+
+/** Panel node → website host: once the panel removal job has finished, turn the edge off (panel nodes must be edges). */
+async function edgeOffAfter(job, s) {
+  if (job?.id) {
+    const j = await waitForJob(job.id);
+    if (j?.status !== "succeeded") { toast(`${s.name} is still an edge node`, "warn", { msg: "The panel wasn't removed, so the edge was left on. Try again once the panel removal works." }); return; }
+  }
+  try { await patch(`/api/servers/${s.id}`, { edge: false }); toast(`${s.name} is now a website host`, "ok"); }
+  catch (ex) { toastError(ex, `Couldn't turn off the edge on ${s.name}`); }
 }
 
 /** Planned switchover: confirm, POST /api/ha/handover, then wait (through 503s and dropped connections) until the leader changes. */
@@ -192,57 +225,120 @@ function haStrip(ha, items) {
   </div>`;
 }
 
+/* ───────── add/edit server dialog (docs/HA.md, Phase 3: three menus instead of switches) ───────── */
+
+const ROLE = {
+  host: { label: "Website host", desc: "Runs the websites placed on it. Visitors reach them through the main server or an edge node." },
+  edge: { label: "Edge node", desc: EDGE_HELP },
+  panel: { label: "Edge + panel node", desc: "An edge node that also runs a standby copy of the panel, which takes over if the active panel's server goes down." },
+};
+const LB_OPT = {
+  in: { label: "In the pool", desc: "Offered when you build a load-balanced pool." },
+  out: { label: "Not in the pool", desc: "Not offered when you build a load-balanced pool." },
+};
+const STATUS_OPT = {
+  on: { label: "Enabled", desc: "Takes traffic and can get new websites." },
+  off: { label: "Disabled", desc: "nginx stops sending traffic here and no new websites can be placed on it." },
+};
+const roleOf = (s) => (s?.panel?.enabled ? "panel" : s?.edge?.enabled ? "edge" : "host");
+const EDGE_FIREWALL = "Edges must reach every server's site ports (3000–3999) and main's panel port; the panel opens them in ufw where ufw is active.";
+
+/** Which Role options exist and why some can't be picked: { options: [{ id, label, why }] }. */
+function roleOptions(s, { panel }) {
+  const was = s ? roleOf(s) : null;
+  // A panel node can only step down when it isn't running the active panel (same reason Phase 2 computes).
+  const down = was === "panel" && panel ? panel.block(true) : null;
+  const opts = [
+    { id: "host", label: ROLE.host.label, why: down },
+    { id: "edge", label: ROLE.edge.label, why: down },
+  ];
+  if (panel) opts.push({ id: "panel", label: ROLE.panel.label, why: !s ? "Add the server first. Once its agent is connected, edit it to make it a panel node." : was === "panel" ? null : panel.block(true) });
+  return opts;
+}
+
+/** What saving does when the role changes (null when nothing extra happens). */
+function roleChangeNote(was, to, isEdit) {
+  if (!isEdit) return to === "host" ? null : EDGE_FIREWALL;
+  if (was === to) return null;
+  if (to === "panel") return was === "host" ? "Saving makes it an edge node, then installs the panel and opens the job log." : "Saving installs the panel here and opens the job log.";
+  if (was === "panel") return to === "host" ? "Saving removes the standby panel, then the front door and tunnel replica." : "Saving removes the standby panel from this server and opens the job log.";
+  return to === "edge" ? `Saving sets up the front door and a tunnel replica here. ${EDGE_FIREWALL}` : "Saving removes the front door and tunnel replica from this server.";
+}
+
+const menuField = (name, label, options, value, extra = "", cls = "") => html`<div class="field srv-menu ${cls}"><label for="sf-${name}">${label}</label>
+  <select class="select" id="sf-${name}" name="${name}">${options.map((o) => html`<option value="${o.id}" ${o.id === value ? raw("selected") : ""} ${o.why ? raw("disabled") : ""}>${o.label}</option>`)}</select>
+  <div class="hint" data-desc="${name}"></div>${extra}</div>`;
+
 async function serverForm(s, { edgeSupported = true, panel = null } = {}) {
-  const isEdit = !!s;
+  const isEdit = !!s, isMain = s?.role === "main";
+  const was = isEdit ? roleOf(s) : "host";
+  const roles = !isMain && edgeSupported ? roleOptions(s, { panel }) : null;
   let result = null;
+  const roleField = isMain
+    ? html`<div class="field srv-menu srv-role span-2"><label>Role</label><div class="srv-static">${icon("lock", "xs")}<span>Main (front door, panel)</span></div><div class="hint">Always runs the website front door, the tunnel connectors and the panel.</div></div>`
+    : roles ? menuField("role", "Role", roles, was, html`<div class="hint srv-note" data-note hidden></div><div class="hint srv-why" data-why hidden></div>`, "srv-role span-2") : "";
   const m = openModal({
     title: isEdit ? `Edit ${s.name}` : "Add an agent server", ico: "server", size: "lg",
     sub: isEdit ? "" : "Any Linux box running the Forthway agent can host single-server websites and join load-balanced pools.",
     body: html`<form class="form-grid" novalidate>
-      <div class="field"><label>Name</label><input class="input" name="name" value="${s?.name || ""}" placeholder="fra-agent-3" ${s?.role === "main" ? "" : ""}/></div>
+      <div class="field"><label>Name</label><input class="input" name="name" value="${s?.name || ""}" placeholder="fra-agent-3"/></div>
       <div class="field"><label>Public host or IP</label><input class="input mono" name="host" value="${s?.host || ""}" placeholder="203.0.113.30"/></div>
       <div class="field"><label>Private address <span class="dim">(optional)</span></label><input class="input mono" name="privateHost" value="${s?.privateHost || ""}" placeholder="10.0.0.30"/><div class="hint">Used by nginx and MySQL when servers share a private network.</div></div>
       <div class="field"><label>Load-balancing weight</label><input class="input" type="number" min="1" max="100" name="weight" value="${s?.weight ?? 1}"/><div class="hint">A server with weight 2 gets twice the traffic of weight 1.</div></div>
-      <div class="field span-2"><label class="switch"><input type="checkbox" name="lbEligible" ${s?.lbEligible !== false ? raw("checked") : ""}/><span class="track"></span><span><b style="color:var(--text)">Available for load balancing</b> — offer this server when building load-balanced pools</span></label></div>
-      ${!edgeSupported ? "" : s?.role === "main" ? html`<div class="field span-2"><div class="row" style="gap:10px;font-size:13px;color:var(--text-2)"><span class="badge blue">${icon("shield")}Edge</span><span><b style="color:var(--text)">Always an edge (front door)</b> — the main server runs nginx and the tunnel connectors</span></div></div>`
-        : html`<div class="field span-2"><label class="switch"><input type="checkbox" name="edge" ${s?.edge?.enabled ? raw("checked") : ""}/><span class="track"></span><span><b style="color:var(--text)">Edge node</b> — ${EDGE_HELP}</span></label><div class="hint" style="padding-left:46px">Edges must reach each server's site ports (3000–3999) and main's panel port. The panel opens ufw automatically where it is active.</div></div>`}
-      ${panel && isEdit && s.role !== "main" ? html`<div class="field span-2" data-panel-field><label class="switch"><input type="checkbox" name="panel" ${s.panel?.enabled ? raw("checked") : ""} ${panel.block(s.edge?.enabled) ? raw("disabled") : ""}/><span class="track"></span><span><b style="color:var(--text)">Panel node</b> — ${PANEL_HELP}</span></label><div class="hint" style="padding-left:46px" data-panel-why>${panel.block(s.edge?.enabled) || (s.panel?.enabled ? "Turning it off removes the standby panel from this server." : "Saving installs the panel here and opens the job log.")}</div></div>` : ""}
-      ${isEdit && s.role !== "main" ? html`<div class="field span-2"><label class="switch"><input type="checkbox" name="enabled" ${s?.enabled !== false ? raw("checked") : ""}/><span class="track"></span><span><b style="color:var(--text)">Enabled</b> — when off, nginx stops sending traffic here and no new sites can be placed on it</span></label></div>` : ""}
+      <div class="span-2 srv-sep"><span>Role and availability</span></div>
+      ${roleField}
+      ${menuField("lb", "Load balancing", [{ id: "in", label: LB_OPT.in.label }, { id: "out", label: LB_OPT.out.label }], s?.lbEligible !== false ? "in" : "out")}
+      ${isEdit && !isMain ? menuField("status", "Status", [{ id: "on", label: STATUS_OPT.on.label }, { id: "off", label: STATUS_OPT.off.label }], s.enabled !== false ? "on" : "off") : ""}
       <div class="error-box span-2" data-err hidden></div><button type="submit" hidden></button></form>`,
     foot: html`<button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok>${isEdit ? "Save changes" : html`${icon("plus")}Add server`}</button>`,
     onMount(el, close) {
       const form = $("form", el), btn = $("[data-ok]", el), err = $("[data-err]", el);
-      // Panel node needs Edge node: keep the two switches consistent while editing.
-      const syncPanel = () => {
-        const f = form.elements; if (!f.panel || !panel) return;
-        if (s.panel?.enabled && f.edge) { f.edge.disabled = true; f.edge.checked = true; }
-        const why = panel.block(f.edge ? f.edge.checked : s.edge?.enabled);
-        f.panel.disabled = !!why;
-        if (why && !s.panel?.enabled) f.panel.checked = false;
-        $("[data-panel-why]", el).textContent = why || (s.panel?.enabled ? "Turning it off removes the standby panel from this server." : "Saving installs the panel here and opens the job log.");
+      // One short line under each menu describing the selected option; under Role also what saving does and why options are off.
+      const describe = () => {
+        const f = form.elements;
+        const set = (name, text) => { const d = $(`[data-desc="${name}"]`, form); if (d) d.textContent = text || ""; };
+        set("lb", LB_OPT[f.lb.value]?.desc);
+        if (f.status) set("status", STATUS_OPT[f.status.value]?.desc);
+        if (!f.role) return;
+        set("role", ROLE[f.role.value]?.desc);
+        const note = roleChangeNote(was, f.role.value, isEdit), noteEl = $("[data-note]", form);
+        noteEl.hidden = !note; noteEl.textContent = note || "";
+        // group blocked options by reason: "Website host and Edge node aren't available: …"
+        const byWhy = new Map();
+        for (const o of roles) if (o.why) byWhy.set(o.why, [...(byWhy.get(o.why) || []), o.label]);
+        const whyEl = $("[data-why]", form);
+        whyEl.hidden = !byWhy.size;
+        mount(whyEl, html`${[...byWhy].map(([why, labels]) => html`<span class="srv-why-line">${icon("lock", "xs")}<span><b>${labels.join(" and ")}</b> ${labels.length > 1 ? "aren't" : "isn't"} available. ${why}</span></span>`)}`);
       };
-      if (s?.panel?.enabled && form.elements.edge) $(".hint", form.elements.edge.closest(".field")).textContent = "Panel nodes must be edges. Remove the panel node first to turn this off.";
-      syncPanel();
-      form.addEventListener("change", (e) => { if (e.target.name === "edge" || e.target.name === "panel") syncPanel(); });
+      describe();
+      form.addEventListener("change", (e) => { if (e.target.matches("select")) describe(); });
+      form.addEventListener("input", (e) => e.target.classList?.remove("invalid"));
       const go = async (e) => {
         e?.preventDefault();
         const f = form.elements;
-        const body = { name: f.name.value.trim(), host: f.host.value.trim(), privateHost: f.privateHost.value.trim() || null, weight: Math.max(1, Number(f.weight.value) || 1), lbEligible: f.lbEligible.checked };
-        if (f.enabled) body.enabled = f.enabled.checked;
-        if (f.edge) body.edge = f.edge.checked;
+        const body = { name: f.name.value.trim(), host: f.host.value.trim(), privateHost: f.privateHost.value.trim() || null, weight: Math.max(1, Number(f.weight.value) || 1), lbEligible: f.lb.value === "in" };
+        if (f.status) body.enabled = f.status.value === "on";
+        const role = f.role ? f.role.value : null;
+        if (role) body.edge = role !== "host";
         if (!body.name) { f.name.classList.add("invalid"); f.name.focus(); return; }
         if (!body.host) { f.host.classList.add("invalid"); f.host.focus(); return; }
+        // Panel changes: confirm while the dialog is still open. Panel → website host keeps the edge
+        // on in this save; it is turned off once the panel removal job has finished.
+        const panelChange = isEdit && role && (role === "panel") !== (was === "panel") ? (role === "panel" ? "add" : "remove") : null;
+        const toHost = panelChange === "remove" && role === "host";
+        if (toHost) body.edge = true;
+        if (panelChange && !(await confirmPanel(s, panelChange === "add", { toHost }))) return;
         btn.classList.add("loading"); err.hidden = true;
         try {
           if (isEdit) {
             result = await patch(`/api/servers/${s.id}`, body);
-            const f2 = form.elements;
-            if (f2.panel && !f2.panel.disabled && f2.panel.checked !== !!s.panel?.enabled) {
-              close(result);
-              await setPanelNode({ ...s, ...result }, f2.panel.checked);
-              return;
+            close(result);
+            if (panelChange) {
+              const sv = { ...s, ...result };
+              const job = await startPanelJob(sv, panelChange === "add");
+              if (job && toHost) edgeOffAfter(job, sv);
             }
-            close(result); return;
+            return;
           }
           const r = await post("/api/servers", body);
           result = r.server;
@@ -379,7 +475,7 @@ export default async function servers(ctx) {
 
   const edgeSupported = () => items.some((x) => x.edge);
   const panelOpts = (s) => (panelSupported(ha, items) ? { block: (edge) => panelBlock(s, ha, items, { edge }) } : null);
-  on(root, "click", "[data-add]", async () => { if (await serverForm(null, { edgeSupported: edgeSupported() })) load(); });
+  on(root, "click", "[data-add]", async () => { if (await serverForm(null, { edgeSupported: edgeSupported(), panel: panelSupported(ha, items) ? { block: () => null } : null })) load(); });
   on(root, "click", "[data-ha-active]", (e, b) => { const n = (ha?.nodes || []).find((x) => x.serverId === b.dataset.haActive); if (n) makeActive(n, ha, ctx); });
   on(root, "click", "[data-edge]", (e, b) => { const s = items.find((x) => x.id === b.dataset.edge); if (s) edgeDialog(s); });
   on(root, "click", "[data-apply]", async (e, b) => {

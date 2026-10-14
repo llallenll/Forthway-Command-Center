@@ -5,6 +5,7 @@ import { sparkline } from "../charts.js";
 import { trafficCard } from "../traffic.js";
 import { jobItem, activityItem, bindJobClicks } from "../components.js";
 import { downBanner } from "./monitor.js"; // MONITOR: "N websites down" card
+import { getReplication, replSummary } from "./databases.js"; // Phase 3: database replication line
 
 function greeting() {
   const h = new Date().getHours();
@@ -27,14 +28,15 @@ function haCard(el, ctx) {
   const siteLinks = (list, max) => html`${list.slice(0, max).map((x, i) => html`${i ? ", " : ""}<a href="#/sites/${x.id}">${x.name}</a>`)}${list.length > max ? html` and ${list.length - max} more` : ""}`;
   const edgeTone = (e) => (!e.online ? "err" : !e.inSync ? (e.applying ? "run" : "warn") : e.tunnelConnected === false ? "warn" : "ok");
   const edgeText = (e) => (!e.online ? "Offline" : !e.inSync ? (e.applying ? "Applying" : "Out of date") : e.tunnelConnected === false ? "In sync · tunnel not connected" : "In sync");
-  const paint = (r, p) => {
-    const sig = JSON.stringify([r || null, p || null]);
+  const paint = (r, p, d) => {
+    const sig = JSON.stringify([r || null, p || null, d || null]);
     if (sig === last) return; last = sig;
     const panel = p?.enabled ? p : null;
-    if (!r && !panel) { el.hidden = true; mount(el, html``); return; }
+    const dbs = replSummary(d); // null when replication is off or unknown to this panel
+    if (!r && !panel && !dbs) { el.hidden = true; mount(el, html``); return; }
     el.hidden = false;
     const edges = r?.edges || [], solo = r?.mainOnlySites || [];
-    const warns = [...(panel && panel.armed === false ? ["Waiting for the servers to vote… Panel failover starts once a majority has voted."] : []), ...(panel?.warnings || []), ...(r?.warnings || [])];
+    const warns = [...(panel && panel.armed === false ? ["Waiting for the servers to vote… Panel failover starts once a majority has voted."] : []), ...(panel?.warnings || []), ...(r?.warnings || []), ...(dbs?.warns || [])];
     const reps = r?.tunnelReplicasOnline ?? 0, conns = r?.connectors ?? 0;
     const repText = conns ? `${plural(reps, "tunnel replica")} online` : "No tunnel connectors";
     const edgeLine = edges.length ? `${plural(edges.length, "edge node")} besides main` : "No edge nodes besides main";
@@ -45,18 +47,19 @@ function haCard(el, ctx) {
       const sb = (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId).length;
       panelText = `Active panel: ${leader} · ${sb ? `${sb} ${sb === 1 ? "standby" : "standbys"}` : "no standbys"}`;
     }
+    const dbText = dbs ? `Databases: ${dbs.text}` : "";
     const sub = [panelText, r ? repText : "", r ? edgeLine : ""].filter(Boolean).join(" · ");
     const nodes = panel ? (panel.nodes || []).filter((n) => n.serverId !== panel.leaderId) : [];
     if (!warns.length) {
       mount(el, html`<div class="card ha-quiet">
         <span class="ha-ico ok">${icon("shield", "sm")}</span>
-        <span class="ha-quiet-t"><b>Availability</b><span class="muted"> · ${sub}${solo.length ? html` · ${soloText}: ${siteLinks(solo, 3)}` : ""}</span></span>
+        <span class="ha-quiet-t"><b>Availability</b><span class="muted"> · ${sub}${solo.length ? html` · ${soloText}: ${siteLinks(solo, 3)}` : ""}</span>${dbs ? html`<span class="ha-db"><span class="dot ${dbs.tone}"></span><a href="#/settings/databases">${dbText}</a></span>` : ""}</span>
         <a class="btn btn-sm btn-ghost" href="#/servers">Servers ${icon("arrowRight", "sm")}</a></div>`);
       return;
     }
     mount(el, html`<div class="card ha-alert">
       <div class="card-head"><span class="ha-ico warn">${icon("alert")}</span>
-        <div class="ha-head-t"><h3>Availability needs attention</h3><div class="sub">${sub}</div></div>
+        <div class="ha-head-t"><h3>Availability needs attention</h3><div class="sub">${sub}</div>${dbs ? html`<div class="ha-db"><span class="dot ${dbs.tone}"></span><a href="#/settings/databases">${dbText}</a></div>` : ""}</div>
         <div class="right"><a class="btn btn-sm" href="#/servers">${icon("server")}Servers</a></div></div>
       <div class="card-body ha-body">
         <ul class="ha-warns">${warns.map((w) => html`<li>${icon("alert", "xs")}<span>${w}</span></li>`)}</ul>
@@ -67,10 +70,10 @@ function haCard(el, ctx) {
       </div></div>`);
   };
   const load = async () => {
-    const [r, p] = await Promise.all([get("/api/cluster/ha").catch(() => null), get("/api/ha").catch(() => null)]);
-    if (ctx.alive()) paint(r, p);
+    const [r, p, d] = await Promise.all([get("/api/cluster/ha").catch(() => null), get("/api/ha").catch(() => null), getReplication()]);
+    if (ctx.alive()) paint(r, p, d);
   };
-  ctx.on(["server", "cloudflare", "site", "ha"], debounce((d) => { if (d?.kind !== "log") load(); }, 1500));
+  ctx.on(["server", "cloudflare", "site", "ha", "mysql-ha"], debounce((d) => { if (d?.kind !== "log") load(); }, 1500));
   load();
 }
 

@@ -105,6 +105,8 @@ const URL_RE = /^https?:\/\/[^\s/?#]+\/?$/i;
 const TICK_MS = 250;
 const POLL_WAIT_S = 5; // follower long-poll; well under FAILOVER_MS so a quiet leader is never mistaken for a dead one
 const CANDIDACY_MS = 10_000;
+const FENCE_HOOKS_MS = 3000; // ctx.ha.beforeFence hooks, all together (docs/HA.md Phase 3, fencing rule 1)
+const HANDOVER_MARK_MS = 5 * 60_000; // a config.ha.handover marker older than this is stale
 const ONLINE_MS = 30_000; // a follower that polled within this is online
 const VOTER_FRESH_MS = HEARTBEAT_MS * 2 + 2000; // a voter message younger than this describes the voter now
 const SLOW_EVERY_MS = 60_000;
@@ -342,6 +344,12 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
   let switchedAt = null; // wall time of our last promotion (UI banner)
   let committed = { term: 0, seq: 0 };
   let lastBlockLog = { why: null, at: -Infinity };
+  // Phase 3 (cluster alerts): who led before us, remembered across restarts in
+  // ha-local.json (`lastLeaderId`, local identity — never replicated), and who
+  // told us they were handing over to us.
+  let lastLeader = typeof local.lastLeaderId === "string" && ID_RE.test(local.lastLeaderId) ? local.lastLeaderId : haBoot ? null : me;
+  let handoverFrom = null; // { id, until } — from a /ha/handover notice
+  const fenceHooks = new Set(); // ctx.ha.beforeFence(fn)
 
   const grants = new Map(); // voterId -> { term, nonce }
   const issued = new Map(); // voterId -> [{ term, nonce }]
@@ -504,6 +512,14 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     maybeAnnounce(true);
   }
 
+  /** The active panel we know of (followed, or ourselves when leading) — persisted so a restart remembers it. */
+  function noteLeader(id) {
+    if (!id || !ID_RE.test(id) || id === lastLeader) return;
+    lastLeader = id;
+    local.lastLeaderId = id;
+    saveLocalSoon();
+  }
+
   function noteTerm(t) {
     const n = Math.floor(Number(t) || 0);
     if (n > maxTermSeen) {
@@ -634,6 +650,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       warn(`could not write ${LOCAL_FILE}: ${err.message}`);
     }
     haLeading = true;
+    noteLeader(me);
     trackerStart();
     log(`HA active: leading as ${me} in term ${term} — asking the servers for their votes`);
     maybeAnnounce(true);
@@ -646,12 +663,40 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     stopVoter();
     stopMainAgent();
     for (const w of [...tracker.waiters]) w();
+    const exit = () => {
+      try {
+        onFence?.(reason);
+      } catch (err) {
+        console.error("[ha] fence hook failed:", err);
+        process.exit(75);
+      }
+    };
+    const hooks = [...fenceHooks];
+    if (!hooks.length) return exit();
+    // ctx.ha.beforeFence hooks (e.g. mysql-ha: local MySQL read_only=ON when main is the
+    // primary) get FENCE_HOOKS_MS in total, never more: the lease runs out MARGIN_MS after
+    // we fence. Flush first and stop writing db.json — nothing is ours to write any more.
     try {
-      onFence?.(reason);
+      db.save({ immediate: true });
     } catch (err) {
-      console.error("[ha] fence hook failed:", err);
-      process.exit(75);
+      console.error("[ha] could not flush db.json before fencing:", err.message);
     }
+    db.readOnly = true;
+    let timer;
+    Promise.race([
+      Promise.allSettled(hooks.map((fn) => Promise.resolve().then(() => fn({ reason, handoverTo: handover?.to || null })))).then((rs) => {
+        for (const r of rs) if (r.status === "rejected") warn(`beforeFence hook failed: ${r.reason?.message || r.reason}`);
+      }),
+      new Promise((r) => {
+        timer = setTimeout(() => {
+          warn(`beforeFence hooks still running after ${FENCE_HOOKS_MS / 1000} s — fencing anyway`);
+          r();
+        }, FENCE_HOOKS_MS);
+      }),
+    ]).finally(() => {
+      clearTimeout(timer);
+      exit();
+    });
   }
 
   function evaluate() {
@@ -759,7 +804,13 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     }
     grants.clear();
     leaderId = null;
-    candidate = { term: t, since: mono(), until: mono() + (handoverMode ? Math.max(CANDIDACY_MS, handoverExpectedUntil - mono()) : CANDIDACY_MS) };
+    candidate = {
+      term: t,
+      since: mono(),
+      until: mono() + (handoverMode ? Math.max(CANDIDACY_MS, handoverExpectedUntil - mono()) : CANDIDACY_MS),
+      handover: !!handoverMode,
+      previousLeaderId: (handoverMode && handoverFrom && mono() < handoverFrom.until ? handoverFrom.id : null) || lastLeader,
+    };
     setRole("candidate", `${handoverMode ? "handover target" : `no active panel for ${Math.round((mono() - lastStateOkAt) / 1000)} s`} — term ${t}, version ${fmtV(local.version)}`);
   }
 
@@ -767,6 +818,8 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (promoting || role !== "candidate") return;
     promoting = true;
     const t = candidate.term;
+    const wasHandover = !!candidate.handover;
+    let previousLeaderId = candidate.previousLeaderId || null;
     candidate = null;
     leaderId = me;
     haLeading = true;
@@ -788,6 +841,28 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (config.ha?.armed !== true && validGrantCount(term) >= majority()) arm();
     log(`now the active panel (term ${t})`);
     maybeAnnounce(true);
+    if (fencing) return;
+
+    // Planned handover or failover? The old leader writes config.ha.handover =
+    // { to, from, at } into the frozen version we acked before it stepped down, so
+    // this holds even when its /ha/handover notice never reached us.
+    const mark = config.ha?.handover;
+    const markFresh = !!mark && mark.to === me && Date.now() - (Date.parse(mark.at) || 0) < HANDOVER_MARK_MS;
+    const reason = wasHandover || markFresh ? "handover" : "failover";
+    if (markFresh && typeof mark.from === "string" && ID_RE.test(mark.from)) previousLeaderId = mark.from;
+    if (mark) {
+      const { handover: _drop, ...rest } = config.ha;
+      config.ha = rest;
+      try {
+        ctx.saveConfig();
+      } catch (err) {
+        warn(`could not clear config.ha.handover: ${err.message}`);
+      }
+    }
+    handoverFrom = null;
+    noteLeader(me);
+    log(`promoted by ${reason}${previousLeaderId ? ` — the previous active panel was ${previousLeaderId}` : ""}`);
+    emit("promoted", { term: t, previousLeaderId, reason });
   }
 
   // ========================================================== replication
@@ -1320,6 +1395,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     condSince = 0;
     firstDelay = null;
     proxyUrl = urlOf(id) || url;
+    noteLeader(id);
     if (leaderId !== id) {
       leaderId = id;
       log(`following ${id} (${url})`);
@@ -1432,6 +1508,19 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (n.codeDigest && n.codeDigest !== codeDigest()) throw httpError(409, `${s.name || id} runs different panel code — wait until it has caught up.`);
     if (validGrantCount(term) < majority()) throw httpError(409, "This panel does not hold a majority of the votes right now.");
 
+    // Mark the handover in the replicated config (part of the frozen version the target
+    // acks), so the target knows it took over by handover, not failover (cluster alerts).
+    const setMark = (mark) => {
+      const { handover: _old, ...rest } = config.ha || {};
+      config.ha = mark ? { ...rest, handover: mark } : rest;
+      try {
+        ctx.saveConfig();
+      } catch (err) {
+        warn(`could not save config.ha.handover: ${err.message}`);
+      }
+    };
+    setMark({ to: id, from: me, at: new Date().toISOString() });
+
     // Freeze: flush everything, stop producing versions, and wait for the target to have exactly what we have.
     db.save({ immediate: true });
     db.readOnly = true;
@@ -1445,6 +1534,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
         tracker.frozen = false;
         db.readOnly = false;
         db.save();
+        if (role === "leader" && !fencing) setMark(null);
         throw httpError(409, `${s.name || id} did not confirm the latest data in time — nothing was switched.`);
       }
       await sleep(100);
@@ -1489,6 +1579,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     if (role === "leader") return sendJson(res, 409, { error: "This node is the active panel." });
     if (cmpV(body.version, local.version) > 0) return sendJson(res, 409, { error: "This node does not have that version." });
     handoverExpectedUntil = mono() + LEASE_MS + FAILOVER_MS;
+    handoverFrom = { id: s.id, until: handoverExpectedUntil };
     backoffUntil = 0;
     log(`${s.id} is handing the panel over to this node`);
     evaluate();
@@ -1923,8 +2014,19 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
     term: () => term,
     status,
     panelNodes,
-    on,
+    on, // "role" | "status" | "promoted" ({ term, previousLeaderId, reason: "failover" | "handover" }, after the modules started)
     handover: (serverId) => startHandover(serverId),
+    /**
+     * Run `fn({ reason, handoverTo })` when this leader fences, before it exits. All hooks
+     * together get at most 3 s; db.json is already flushed and read-only. Returns an unsubscribe.
+     */
+    beforeFence(fn) {
+      if (typeof fn !== "function") throw new TypeError("beforeFence(fn): fn must be a function");
+      fenceHooks.add(fn);
+      return () => fenceHooks.delete(fn);
+    },
+    /** The last active panel this node knew of before itself (or itself), persisted in ha-local.json. */
+    lastLeaderId: () => lastLeader,
     directUrl: localDirectUrl,
     /** cluster.mjs: give this node (main) its token without racing our own writes of ha-local.json. */
     setLocalToken(token) {

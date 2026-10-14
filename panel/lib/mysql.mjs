@@ -40,6 +40,11 @@ const MAIN_ID = "main";
 // Panel failover (docs/HA.md Phase 2): MySQL is on main; reachable only while the panel runs there.
 const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
 export const DB_REMOTE = "Databases live on the main server, which is not running the active panel right now.";
+// Database replication (docs/HA.md Phase 3): websites reach the primary through this
+// alias (an /etc/hosts block on every server); the panel administers a primary on
+// another machine over TCP as fcc_admin.
+export const REPL_ALIAS = "fcc-mysql.internal";
+export const ADMIN_USER = "fcc_admin";
 const RESERVED = new Set(["mysql", "information_schema", "performance_schema", "sys", "test", "root", "mariadb.sys", "debian-sys-maint"]);
 const DB_NAME_MAX = 64;
 const USER_MAX = 32;
@@ -401,33 +406,74 @@ export function register(router, ctx) {
     } catch {}
   };
   const decrypt = (v) => (v ? ctx.secrets.decrypt(v) : "");
-  // Not on main: every MySQL operation is refused (503) until main leads again.
   const mainLocal = () => (ctx.ha || HA_OFF).mainIsLocal !== false;
-  const guard = () => {
-    if (!mainLocal()) throw httpError(503, DB_REMOTE, { available: false });
+  const localServerId = () => (ctx.ha || HA_OFF).localServerId || MAIN_ID;
+
+  // ---------------------------------------------------------- replication
+  //
+  // config.mysqlHa (owned by mysql-ha.mjs). The database layer follows
+  // `primary` while replication is on — and after it was turned off with the
+  // alias kept (`aliasKept`), since websites still use the alias then.
+  const rcfg = () => ctx.config.mysqlHa || {};
+  const replOn = () => {
+    const r = rcfg();
+    return !!r.primary && (r.enabled === true || r.aliasKept === true);
   };
+  const primaryId = () => (replOn() ? rcfg().primary : MAIN_ID);
+  /** true when MySQL operations go over TCP to a primary on another machine. */
+  const primaryRemote = () => replOn() && primaryId() !== localServerId();
+  /** Can this panel reach the databases at all? (Phase 2 rule applies only without replication.) */
+  const dbReachable = () => replOn() || mainLocal();
+  const guard = () => {
+    if (!dbReachable()) throw httpError(503, DB_REMOTE, { available: false });
+  };
+  /** Address of the primary as seen from this panel (the server record, not the alias: no /etc/hosts dependency). */
+  function primaryAddress() {
+    let s = null;
+    try {
+      s = ctx.cluster?.getServer?.(primaryId());
+    } catch {}
+    for (const raw of [s?.privateHost, s?.host]) {
+      const h = cleanHost(raw);
+      if (h && !isLoopback(h)) return h;
+    }
+    return REPL_ALIAS;
+  }
 
   // ---------------------------------------------------------- connection
 
   let connCache = null;
   let partialRevokes = null;
 
+  /** Which connection we want right now; a change (failover, switchover) drops the cache. */
+  const connKey = () => (primaryRemote() ? `remote:${primaryId()}:${primaryAddress()}` : "local");
+
   async function rootConn({ fresh = false } = {}) {
     guard();
-    if (!fresh && connCache && Date.now() - connCache.at < 5 * 60_000) return connCache;
+    const key = connKey();
+    if (!fresh && connCache && connCache.key === key && Date.now() - connCache.at < 5 * 60_000) return connCache;
     const b = bin();
-    if (!b && !DRY_RUN) throw httpError(503, "MySQL is not installed on this server.");
+    if (!b && !DRY_RUN) throw httpError(503, "MySQL client is not installed on this server.");
     const cfg = mcfg();
     const rootUser = /^[A-Za-z0-9_.-]{1,32}$/.test(cfg.rootUser || "") ? cfg.rootUser : "root";
-    const tries = [
-      {
+    const tries = [];
+    if (primaryRemote()) {
+      // The primary is another server: fcc_admin over TCP, password via MYSQL_PWD (never argv).
+      let pw = "";
+      try {
+        pw = decrypt(rcfg().adminPasswordEnc);
+      } catch {}
+      if (!pw) throw httpError(503, "The database primary is on another server, but the panel has no fcc_admin password for it.");
+      tries.push({ mode: "remote", args: tcpArgs({ host: primaryAddress(), port: cfg.port }, ADMIN_USER), env: { MYSQL_PWD: pw }, secret: pw, remote: true });
+    } else {
+      tries.push({
         mode: "socket",
         args: ["-u", rootUser, ...(cfg.socket && /^\/[A-Za-z0-9_./-]+$/.test(cfg.socket) ? [`--socket=${cfg.socket}`] : [])],
         env: null,
         secret: null,
-      },
-    ];
-    if (cfg.rootPasswordEnc) {
+      });
+    }
+    if (cfg.rootPasswordEnc && !primaryRemote()) {
       let pw = "";
       try {
         pw = decrypt(cfg.rootPasswordEnc);
@@ -442,7 +488,7 @@ export function register(router, ctx) {
           env: t.env,
           timeoutMs: 15_000,
         });
-        connCache = { ...t, bin: b || "mysql", at: Date.now() };
+        connCache = { ...t, bin: b || "mysql", at: Date.now(), key };
         return connCache;
       } catch (e) {
         lastErr = scrub(e, [t.secret]);
@@ -451,9 +497,16 @@ export function register(router, ctx) {
     }
     connCache = null;
     const code = lastErr?.mysqlCode;
+    const remoteName = primaryRemote() ? (ctx.cluster?.getServer?.(primaryId())?.name || primaryId()) : null;
     const err = httpError(
       503,
-      NOT_RUNNING_CODES.has(code)
+      remoteName
+        ? NOT_RUNNING_CODES.has(code)
+          ? `The database primary (${remoteName}, ${primaryAddress()}) is not reachable.`
+          : ACCESS_DENIED_CODES.has(code)
+            ? `The database primary (${remoteName}) refused the panel's fcc_admin login.`
+            : `Cannot reach the database primary on ${remoteName}: ${lastErr?.message || "unknown error"}`
+        : NOT_RUNNING_CODES.has(code)
         ? "MySQL is not running."
         : ACCESS_DENIED_CODES.has(code)
           ? "The panel cannot sign in to MySQL as root. Socket authentication is not available — store the root password under Databases → MySQL."
@@ -504,17 +557,28 @@ export function register(router, ctx) {
   // ---------------------------------------------------------- status
 
   let statusCache = null;
+  function replInfo() {
+    if (!replOn()) return { replication: null };
+    const pid = primaryId();
+    let name = pid;
+    try {
+      name = ctx.cluster?.getServer?.(pid)?.name || pid;
+    } catch {}
+    return { replication: { enabled: rcfg().enabled === true, primary: pid, primaryName: name, remote: primaryRemote(), address: primaryRemote() ? primaryAddress() : null, alias: REPL_ALIAS } };
+  }
+
   async function status({ fresh = false } = {}) {
-    if (!mainLocal()) {
-      return { installed: false, running: false, rootOk: false, version: null, available: false, reason: DB_REMOTE, error: DB_REMOTE, ...hostInfo() };
+    if (!dbReachable()) {
+      return { installed: false, running: false, rootOk: false, version: null, available: false, reason: DB_REMOTE, error: DB_REMOTE, ...hostInfo(), ...replInfo() };
     }
-    if (!fresh && statusCache && Date.now() - statusCache.at < 10_000) return { ...statusCache.value, ...hostInfo() };
+    const key = connKey();
+    if (!fresh && statusCache && statusCache.key === key && Date.now() - statusCache.at < 10_000) return { ...statusCache.value, ...hostInfo(), ...replInfo() };
     let value;
     if (DRY_RUN) {
       // Bind address is simulated so the "listen on the network" flow can be exercised.
       value = { installed: true, running: true, rootOk: true, version: "dry-run", flavor: "mysql", authMode: "dry-run", bindAddress: mcfg().dryRunBind || "127.0.0.1", error: null, dryRun: true };
     } else if (!bin()) {
-      value = { installed: false, running: false, rootOk: false, version: null, error: "MySQL is not installed on this server." };
+      value = { installed: false, running: false, rootOk: false, version: null, error: primaryRemote() ? "The MySQL client is not installed on this server, so it cannot reach the database primary." : "MySQL is not installed on this server." };
     } else {
       try {
         const c = await rootConn({ fresh });
@@ -550,9 +614,10 @@ export function register(router, ctx) {
         };
       }
     }
-    statusCache = { at: Date.now(), value };
-    if (value.rootOk && value.bindAddress !== undefined) rememberBind(value.bindAddress);
-    return { ...value, ...hostInfo() };
+    statusCache = { at: Date.now(), value, key };
+    // The bind address of a remote primary says nothing about this machine.
+    if (value.rootOk && value.bindAddress !== undefined && !primaryRemote()) rememberBind(value.bindAddress);
+    return { ...value, ...hostInfo(), ...replInfo() };
   }
 
   // ---------------------------------------------------------- addresses
@@ -664,14 +729,14 @@ export function register(router, ctx) {
 
   // ---------------------------------------------------------- hosts
 
-  async function workerHosts() {
+  async function workerHosts({ includeMain = false } = {}) {
     let servers = [];
     try {
       servers = (await ctx.cluster?.listServers?.()) || [];
     } catch {}
     const out = new Set();
     for (const s of servers) {
-      if (!s || s.id === MAIN_ID || s.role === "main") continue;
+      if (!s || (!includeMain && (s.id === MAIN_ID || s.role === "main"))) continue;
       for (const raw of [s.privateHost, s.host]) {
         const h = cleanHost(raw);
         if (!h) continue;
@@ -693,6 +758,14 @@ export function register(router, ctx) {
 
   async function desiredHosts(remoteAccess) {
     const base = ["localhost", "127.0.0.1"];
+    if (replOn()) {
+      // Replication: websites on every server reach the primary (wherever it is now)
+      // through the alias, so accounts exist for every server's addresses, main and
+      // the replica included, plus this machine's own.
+      if (mainLocal()) base.push(...(await mainSelfHosts()));
+      base.push(...(await workerHosts({ includeMain: true })));
+      return [...new Set(base)].filter((h) => !isLoopback(h) || h === "localhost" || h === "127.0.0.1");
+    }
     // Websites on the main server that connect via the panel address appear
     // from this server's own address(es), so those need an account too.
     if (mainSitesVia() === "panel") base.push(...(await mainSelfHosts()));
@@ -718,13 +791,14 @@ export function register(router, ctx) {
   let syncChain = Promise.resolve();
   let remoteNoted = false;
   function syncRemoteHosts({ log } = {}) {
-    if (!mainLocal()) {
+    if (!dbReachable()) {
       if (!remoteNoted) console.log(`[fcc] mysql host sync skipped: ${DB_REMOTE}`);
       remoteNoted = true;
       log?.(`Skipping MySQL host sync: ${DB_REMOTE}`);
       return Promise.resolve({ changed: 0, error: DB_REMOTE });
     }
     syncChain = syncChain.then(async () => {
+      const removedAccounts = [];
       const dbs = ctx.db.list("databases");
       if (!dbs.length) return { changed: 0 };
       try {
@@ -746,6 +820,7 @@ export function register(router, ctx) {
           let script = grantScript(rec, add, pw, pr);
           for (const h of drop) script += `DROP USER IF EXISTS ${account(rec.user, h)};\n`;
           await sql(script, { secrets: [pw] });
+          for (const h of drop) removedAccounts.push({ user: rec.user, host: h });
           ctx.db.update("databases", rec.id, { hosts: want });
           changed++;
           log?.(`${rec.name}: +[${add.join(", ")}] -[${drop.join(", ")}]`);
@@ -754,12 +829,24 @@ export function register(router, ctx) {
           console.error(`[fcc] mysql host sync ${rec.name}:`, e.message);
         }
       }
-      if (changed) broadcast("database", { action: "hosts-synced" });
+      if (changed) {
+        broadcast("database", { action: "hosts-synced" });
+        usersChanged(removedAccounts);
+      }
       return { changed };
     });
     const p = syncChain;
     syncChain = syncChain.catch(() => {});
     return p;
+  }
+
+  /** Tell mysql-ha the account set changed (it re-syncs users on the replica; passwords never leave that task payload). */
+  function usersChanged(remove = []) {
+    try {
+      ctx.mysqlHa?.usersChanged?.({ remove });
+    } catch (e) {
+      console.error("[fcc] mysql replica user sync:", e.message);
+    }
   }
 
   // ---------------------------------------------------------- records
@@ -788,7 +875,8 @@ export function register(router, ctx) {
       remoteAccess: !!rec.remoteAccess,
       hosts: rec.hosts || [],
       host: publicHost(),
-      mainSitesHost: mainSitesHost(),
+      mainSitesHost: siteHostFor(MAIN_ID),
+      sitesHost: siteHostFor(null),
       port: Number(cfg.port) || 3306,
       sizeBytes: rec.sizeBytes || 0,
       sizeCheckedAt: rec.sizeCheckedAt || null,
@@ -808,7 +896,7 @@ export function register(router, ctx) {
 
   let sizesAt = 0;
   async function refreshSizes({ force = false } = {}) {
-    if (DRY_RUN || !mainLocal()) return;
+    if (DRY_RUN || !dbReachable()) return;
     if (!force && Date.now() - sizesAt < 60_000) return;
     sizesAt = Date.now();
     const dbs = ctx.db.list("databases");
@@ -895,6 +983,7 @@ export function register(router, ctx) {
     });
     audit(admin, "database.create", { type: "database", id: rec.id, name: dbName }, { projectId, user: dbUser, remoteAccess: !!remoteAccess });
     broadcast("database", { action: "created", database: publicDb(rec) });
+    usersChanged();
     return { database: publicDb(rec), password: pw };
   }
 
@@ -920,6 +1009,7 @@ export function register(router, ctx) {
     for (const h of hosts.filter(validHost)) script += `ALTER USER ${account(rec.user, h)} IDENTIFIED BY ${sqlString(pw)};\n`;
     if (script) await sql(script, { secrets: [pw] });
     ctx.db.update("databases", rec.id, { passwordEnc: ctx.secrets.encrypt(pw), passwordRotatedAt: new Date().toISOString() });
+    usersChanged();
     audit(admin, "database.password.rotate", { type: "database", id: rec.id, name: rec.name });
     broadcast("database", { action: "updated", database: publicDb(ctx.db.get("databases", rec.id)) });
 
@@ -992,6 +1082,7 @@ export function register(router, ctx) {
     script += `DROP DATABASE IF EXISTS ${quoteIdent(rec.name)};\n`;
     await sql(script);
     ctx.db.remove("databases", rec.id);
+    usersChanged(hosts.filter(validHost).map((h) => ({ user: rec.user, host: h })));
     audit(admin, "database.delete", { type: "database", id: rec.id, name: rec.name }, { projectId: rec.projectId });
     broadcast("database", { action: "deleted", id: rec.id, projectId: rec.projectId });
   }
@@ -1052,21 +1143,27 @@ export function register(router, ctx) {
     return gtidFlag ? ["--set-gtid-purged=OFF"] : [];
   }
 
+  /** Connection for dumps/restores: the remote primary (fcc_admin) or local root. Dry run shows the real arguments. */
+  async function dumpConn() {
+    if (DRY_RUN && !primaryRemote()) return { args: ["-u", "root"], env: null, secret: null };
+    return rootConn();
+  }
+
   const DUMP_FLAGS = ["--single-transaction", "--routines", "--triggers", "--events", "--hex-blob", "--default-character-set=utf8mb4"];
 
   async function dump(databaseId, { file, log, signal } = {}) {
     guard();
     const rec = getRec(databaseId);
     if (!file) throw new Error("dump() needs a file");
-    const c = DRY_RUN ? { args: ["-u", "root"], env: null, secret: null } : await rootConn();
+    const c = await dumpConn();
     quoteIdent(rec.name);
-    log?.(`Dumping ${rec.name}…`);
+    log?.(primaryRemote() ? `Dumping ${rec.name} from the database primary ${primaryId()} (${primaryAddress()}) as ${ADMIN_USER}…` : `Dumping ${rec.name}…`);
     return dumpTo([...c.args, ...DUMP_FLAGS, ...(await extraDumpFlags()), rec.name], { file, log, signal, secret: c.secret, env: c.env, label: rec.name });
   }
 
   async function dumpAll({ file, log, signal } = {}) {
     guard();
-    const c = DRY_RUN ? { args: ["-u", "root"], env: null, secret: null } : await rootConn();
+    const c = await dumpConn();
     log?.("Dumping all databases…");
     return dumpTo([...c.args, ...DUMP_FLAGS, ...(await extraDumpFlags()), "--all-databases"], { file, log, signal, secret: c.secret, env: c.env, label: "all databases" });
   }
@@ -1087,10 +1184,10 @@ export function register(router, ctx) {
     let secret = null;
     if (as === "user") {
       secret = decrypt(rec.passwordEnc);
-      args = [...tcpArgs({ host: "127.0.0.1", port: mcfg().port }, rec.user)];
+      args = [...tcpArgs({ host: primaryRemote() ? primaryAddress() : "127.0.0.1", port: mcfg().port }, rec.user)];
       env = { MYSQL_PWD: secret };
     } else {
-      const c = DRY_RUN ? { args: ["-u", "root"], env: null, secret: null } : await rootConn();
+      const c = await dumpConn();
       args = [...c.args];
       env = c.env;
       secret = c.secret;
@@ -1118,11 +1215,17 @@ export function register(router, ctx) {
    * Main server → mainSitesHost() (panel address, or 127.0.0.1); agent servers → panel address.
    * `{ host }` forces a host (credentials view).
    */
+  /** DB_HOST a website on `serverId` gets. Replication: the alias, on every server. */
+  function siteHostFor(serverId) {
+    if (replOn()) return REPL_ALIAS;
+    return !serverId || serverId === MAIN_ID ? mainSitesHost() : publicHost();
+  }
+
   function envFor(databaseId, { serverId, host: forceHost } = {}) {
     const rec = ctx.db.get("databases", databaseId);
     if (!rec) return null;
     const pw = decrypt(rec.passwordEnc);
-    const host = forceHost || (!serverId || serverId === MAIN_ID ? mainSitesHost() : publicHost());
+    const host = forceHost || siteHostFor(serverId);
     const port = String(Number(mcfg().port) || 3306);
     return {
       DB_HOST: host,
@@ -1136,6 +1239,7 @@ export function register(router, ctx) {
 
   async function setRootPassword({ password, user }, admin) {
     guard();
+    if (primaryRemote()) throw httpError(409, "The database primary is on another server; the panel signs in there as fcc_admin, so there is no local root password to store.");
     const cfg = mcfg();
     if (password === "" || password == null) {
       delete cfg.rootPasswordEnc;
@@ -1184,7 +1288,7 @@ export function register(router, ctx) {
   /** siteId → the DB_HOST each of its servers gets right now. */
   function envHostsSnapshot() {
     const out = new Map();
-    for (const s of sitesWithDatabases()) out.set(s.id, siteTargets(s).map((t) => (t === MAIN_ID ? mainSitesHost() : publicHost())).join(","));
+    for (const s of sitesWithDatabases()) out.set(s.id, siteTargets(s).map((t) => siteHostFor(t)).join(","));
     return out;
   }
 
@@ -1221,6 +1325,7 @@ export function register(router, ctx) {
       flavor: st?.flavor || null,
       sitesUsingDatabases: sitesWithDatabases().length,
       dryRun: DRY_RUN,
+      ...replInfo(),
     };
   }
 
@@ -1293,6 +1398,7 @@ export function register(router, ctx) {
    */
   function setBind(mode, admin) {
     guard();
+    if (replOn()) throw httpError(409, "Database replication manages MySQL's listen address (it listens on the network, firewalled to the cluster's servers).");
     if (!["network", "local"].includes(mode)) throw httpError(400, 'mode must be "network" or "local".');
     const bind = mode === "network" ? "0.0.0.0" : "127.0.0.1";
     const job = ctx.jobs.start(
@@ -1393,6 +1499,24 @@ export function register(router, ctx) {
     settings: settingsView,
     localLogin,
     refreshAddresses: resolvePublicHost,
+    // Phase 3 (mysql-ha.mjs)
+    REPL_ALIAS,
+    siteHostFor,
+    envHostsSnapshot,
+    /** Env-update jobs for every linked website whose DB_HOST differs from `before` (a snapshot). */
+    pushEnvForChanged: (before, admin) => {
+      const affected = changedSites(before);
+      return { sites: affected.map((s) => ({ id: s.id, name: s.name })), jobs: pushEnvTo(affected, admin) };
+    },
+    primaryRemote,
+    dbReachable,
+    /** Drop cached connections/status (primary moved). */
+    resetConnection: () => {
+      connCache = null;
+      statusCache = null;
+      partialRevokes = null;
+      gtidFlag = null;
+    },
   };
 
   // ---------------------------------------------------------- routes
@@ -1474,7 +1598,8 @@ export function register(router, ctx) {
       name: rec.name,
       url: env.DATABASE_URL,
       remoteHost: rec.remoteAccess ? publicHost() : null,
-      mainSitesHost: mainSitesHost(),
+      mainSitesHost: siteHostFor(MAIN_ID),
+      sitesHost: siteHostFor(null),
       listensOnPublic: listensOnPublic(),
     };
   });

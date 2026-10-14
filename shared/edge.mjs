@@ -12,6 +12,13 @@
  *   edgeStatus(dataDir)       that state + live probes, for /agent/metrics
  *   edgeLogSites(dataDir)     site ids whose fcc-<siteId>.conf this server manages
  *   panelInstall / panelRemove  tasks panel.install / panel.remove (Phase 2: panel nodes)
+ *   applyHostsBlock(map, opts)  the managed /etc/hosts block (Phase 3: database address)
+ *
+ * Phase 3 (database replication) adds `hosts: { "fcc-mysql.internal": "<ip>" } | null`
+ * to cluster.sync: a managed block in /etc/hosts (null or {} removes it; a
+ * payload without the key leaves it alone). The panel on main calls
+ * applyHostsBlock() in-process for main itself. panel.install also installs
+ * the MySQL client of `mysqlFlavor` when the payload names one.
  *
  * Phase 2 (panel failover) adds two things to cluster.sync:
  *   - `frontDoor: true` — sent only to main's embedded agent while another
@@ -143,7 +150,16 @@ function checkPayload(payload) {
   // frontDoor (docs/HA.md, Phase 2): sent only to main's embedded agent while
   // another server runs the active panel — main's own front door files, nothing else.
   const frontDoor = payload.frontDoor === true;
-  if (payload.edge == null) return { hash, allowFrom, ignored, notes: [], frontDoor, edge: null };
+  // hosts (Phase 3): undefined = leave /etc/hosts alone, null / {} = remove the block.
+  let hosts;
+  if (payload.hosts !== undefined) {
+    try {
+      hosts = checkHostsMap(payload.hosts);
+    } catch (err) {
+      throw bad(err.message);
+    }
+  }
+  if (payload.edge == null) return { hash, allowFrom, ignored, notes: [], frontDoor, hosts, edge: null };
   const e = payload.edge;
   if (typeof e !== "object") throw bad("edge must be an object or null");
 
@@ -204,7 +220,7 @@ function checkPayload(payload) {
     notes.push("Front door mode: the shims and connectors in the payload are not used on the main server.");
   }
 
-  return { hash, allowFrom, ignored, notes, frontDoor, edge: { files, connectors, shims } };
+  return { hash, allowFrom, ignored, notes, frontDoor, hosts, edge: { files, connectors, shims } };
 }
 
 // --------------------------------------------------------------- the task
@@ -233,7 +249,21 @@ export async function clusterSync(payload, o) {
   for (const n of p.notes) log(n);
   checkAbort();
 
+  // 1b. Database address (Phase 3): the managed /etc/hosts block.
+  let hosts;
+  if (p.hosts !== undefined) {
+    log("── /etc/hosts ──");
+    try {
+      hosts = await applyHostsBlock(Object.fromEntries(p.hosts), { log, dryRun: sys.DRY_RUN, file: sys.DRY_RUN ? path.join(o.dataDir, "edge-dry-run", "hosts") : HOSTS_FILE });
+    } catch (err) {
+      errors.push(`hosts: ${err.message}`);
+      log(`!! ${err.message}`);
+      hosts = { error: err.message };
+    }
+  }
+
   const state = { ...prev, edge: !!p.edge, frontDoor: !!p.edge && p.frontDoor, hash: p.hash, appliedAt: new Date().toISOString() };
+  if (hosts && !hosts.error) state.hosts = hosts.entries;
   let connectors = [];
   let shims = [];
 
@@ -348,8 +378,103 @@ export async function clusterSync(payload, o) {
     connectors,
     shims,
     firewall,
+    ...(hosts !== undefined ? { hosts } : {}),
     ...(sys.DRY_RUN ? { dryRun: true } : {}),
   };
+}
+
+// ------------------------------------------------------------ /etc/hosts
+//
+// One managed block, rewritten atomically; every other line is kept exactly.
+
+export const HOSTS_FILE = "/etc/hosts";
+export const HOSTS_BEGIN = "# >>> forthway command center >>>";
+export const HOSTS_END = "# <<< forthway command center <<<";
+const HOSTNAME_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+/** { name: ip } | null → sorted [[name, ip]]; throws on anything that is not a plain host name / IP. */
+export function checkHostsMap(map) {
+  if (map == null) return [];
+  if (typeof map !== "object" || Array.isArray(map)) throw new Error("hosts must be an object { name: ip } or null");
+  const out = [];
+  const entries = Object.entries(map);
+  if (entries.length > 64) throw new Error("hosts has too many entries");
+  for (const [rawName, rawIp] of entries) {
+    const name = String(rawName).trim().toLowerCase();
+    const ip = String(rawIp ?? "").trim();
+    if (!HOSTNAME_RE.test(name) || name === "localhost") throw new Error(`hosts: ${JSON.stringify(String(rawName).slice(0, 80))} is not an allowed host name`);
+    if (!net.isIP(ip)) throw new Error(`hosts: ${JSON.stringify(ip.slice(0, 80))} (for ${name}) is not an IP address`);
+    out.push([name, ip]);
+  }
+  return out.sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+/** The whole hosts file with our block replaced by `entries` (removed when empty). Pure. */
+export function renderHostsFile(current, entries) {
+  const lines = String(current ?? "").split("\n");
+  const hadTrailingNewline = String(current ?? "").endsWith("\n");
+  if (hadTrailingNewline) lines.pop();
+  const kept = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== HOSTS_BEGIN) {
+      kept.push(lines[i]);
+      continue;
+    }
+    const end = lines.findIndex((l, j) => j > i && l.trim() === HOSTS_END);
+    if (end === -1) continue; // a lone begin marker: drop just that line
+    if (kept.length && kept[kept.length - 1].trim() === "") kept.pop(); // the blank line we put before it
+    i = end;
+  }
+  while (kept.length && kept[kept.length - 1].trim() === "" && entries.length) kept.pop();
+  if (entries.length) {
+    if (kept.length) kept.push("");
+    kept.push(HOSTS_BEGIN, "# Managed by Forthway Command Center (database address) — edits inside this block are lost.");
+    for (const [name, ip] of entries) kept.push(`${ip}\t${name}`);
+    kept.push(HOSTS_END);
+  }
+  return kept.length ? kept.join("\n") + "\n" : "";
+}
+
+/**
+ * Apply the managed block (`map` null/{} removes it). Writes only when the
+ * content changes, atomically (temp file + rename in the same directory,
+ * falling back to an in-place write where /etc/hosts is a bind mount, as in
+ * containers). With dryRun and no `file`, only logs. → { changed, entries, file }
+ */
+export async function applyHostsBlock(map, { log = NOOP, dryRun = sys.DRY_RUN, file } = {}) {
+  const entries = checkHostsMap(map);
+  const target = file || (dryRun ? null : HOSTS_FILE);
+  const shown = entries.length ? entries.map(([n, ip]) => `${n} → ${ip}`).join(", ") : "(no entries — block removed)";
+  if (!target) {
+    log(`[dry-run] /etc/hosts block: ${shown}`);
+    return { changed: null, entries: Object.fromEntries(entries), file: null, dryRun: true };
+  }
+  let current = "";
+  let mode = 0o644;
+  try {
+    current = fs.readFileSync(target, "utf8");
+    mode = fs.statSync(target).mode & 0o777;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw new Error(`cannot read ${target}: ${err.message}`);
+  }
+  const next = renderHostsFile(current, entries);
+  if (next === current) {
+    log(`${target}: already up to date (${shown}).`);
+    return { changed: false, entries: Object.fromEntries(entries), file: target, ...(dryRun ? { dryRun: true } : {}) };
+  }
+  ensureDir(path.dirname(target));
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.fcc.${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(tmp, next, { mode });
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    if (!["EBUSY", "EXDEV", "EPERM", "EACCES"].includes(err.code)) throw new Error(`cannot write ${target}: ${err.message}`);
+    fs.writeFileSync(target, next); // bind-mounted file: rename is not possible
+  }
+  log(`${dryRun ? "[dry-run] " : ""}${target}: ${shown}.`);
+  return { changed: true, entries: Object.fromEntries(entries), file: target, ...(dryRun ? { dryRun: true } : {}) };
 }
 
 // --------------------------------------------------------------- firewall
@@ -371,7 +496,7 @@ async function syncFirewall(allowFrom, log) {
  * of `allowFrom`" (an empty list removes them all). Rules with other comments
  * are never touched. Resolves { active, added, removed } or { skipped } / { active: false }.
  */
-async function syncUfwRules({ allowFrom, ports, comment, log }) {
+export async function syncUfwRules({ allowFrom, ports, comment, log }) {
   if (process.env.FCC_SKIP_UFW === "1") {
     log("FCC_SKIP_UFW=1 — the firewall is left alone.");
     return { skipped: true };
@@ -1006,7 +1131,10 @@ function checkPanelPayload(payload, o) {
   if (!o.authToken) throw panelBad("this agent has no token to download the code with");
   if (!o.serverId) throw panelBad("this agent does not know its server id");
   const directUrl = `${m[1]}://${m[2].toLowerCase()}:${Number(m[3])}`;
-  return { codeUrl, directUrl, port, host, allowFrom };
+  // Phase 3: the MySQL client of the cluster's flavor (remote admin and dumps from this panel node).
+  const mysqlFlavor = payload.mysqlFlavor == null || payload.mysqlFlavor === "" ? null : String(payload.mysqlFlavor);
+  if (mysqlFlavor && mysqlFlavor !== "mysql" && mysqlFlavor !== "mariadb") throw panelBad(`mysqlFlavor must be "mysql" or "mariadb" (got ${mysqlFlavor.slice(0, 20)})`);
+  return { codeUrl, directUrl, port, host, allowFrom, mysqlFlavor };
 }
 
 async function downloadPanelCode(url, token, signal, log) {
@@ -1150,6 +1278,14 @@ export async function panelInstall(payload, o) {
   log(`Wrote ${haFile} (server ${o.serverId}, reachable at ${p.directUrl}).`);
   if (!sys.DRY_RUN) ensureDir(PANEL_SITES_DIR);
 
+  // 2b. MySQL client (Phase 3) — before the panel starts, so it can reach the database at once.
+  let mysqlClient = null;
+  if (p.mysqlFlavor) {
+    log("── MySQL client ──");
+    abortIf(o.signal);
+    mysqlClient = await (await import("./mysql-ha.mjs")).ensureMysqlClient(p.mysqlFlavor, { log });
+  }
+
   // 3. fcc.service
   log("── fcc.service ──");
   const unit = renderPanelUnit({ nodeBin: process.execPath, port: p.port, host: p.host });
@@ -1194,6 +1330,7 @@ export async function panelInstall(payload, o) {
     codeDir: P.code,
     dataDir: P.data,
     firewall,
+    ...(mysqlClient ? { mysqlClient } : {}),
     ...(sys.DRY_RUN ? { dryRun: true } : {}),
   };
 }

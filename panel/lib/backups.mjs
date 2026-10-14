@@ -36,6 +36,13 @@ const MAIN_ID = "main";
 // main server backup is built in this process only when it runs on main.
 const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
 const mainLocalOf = (ctx) => (ctx.ha || HA_OFF).mainIsLocal !== false;
+// Database replication (docs/HA.md Phase 3): with replication on, ctx.mysql dumps and
+// restores over TCP on the current primary (fcc_admin), so database backups work from
+// any active panel; the Phase 2 refusal applies only while replication is off.
+const dbReachableOf = (ctx) => {
+  if (typeof ctx.mysql?.dbReachable === "function") return ctx.mysql.dbReachable();
+  return mainLocalOf(ctx);
+};
 const RESTORE_REMOTE = "Main server backups can only be restored while the main server runs the active panel.";
 const FORBIDDEN_ROOTS = ["/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run", "/var", "/root", "/home", "/srv", "/opt", "/tmp"];
 const DEFAULTS = {
@@ -510,7 +517,7 @@ export function register(router, ctx) {
   }
 
   function backupDatabase(databaseId, { trigger = "manual", adminId = null, admin = null, note = "" } = {}) {
-    if (!mainLocalOf(ctx)) throw httpError(503, DB_REMOTE, { available: false });
+    if (!dbReachableOf(ctx)) throw httpError(503, DB_REMOTE, { available: false });
     const dbRec = ctx.db.get("databases", databaseId);
     if (!dbRec) throw httpError(404, "Database not found.");
     const key = `db:${databaseId}`;
@@ -819,7 +826,7 @@ export function register(router, ctx) {
   }
 
   function restoreDatabase(b, admin) {
-    if (!mainLocalOf(ctx)) throw httpError(503, DB_REMOTE, { available: false });
+    if (!dbReachableOf(ctx)) throw httpError(503, DB_REMOTE, { available: false });
     const dbRec = ctx.db.get("databases", b.databaseId);
     if (!dbRec) throw httpError(409, "The database this backup belongs to no longer exists. Download the backup instead.");
     const key = `db:${dbRec.id}`;
@@ -960,7 +967,7 @@ export function register(router, ctx) {
       usage: { count: all.length, bytes: all.reduce((n, b) => n + (b.size || 0), 0) },
       localPath: root(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
-      ...(mainLocalOf(ctx) ? {} : { databases: { available: false, reason: DB_REMOTE } }),
+      ...(dbReachableOf(ctx) ? {} : { databases: { available: false, reason: DB_REMOTE } }),
     };
   }
 
@@ -1286,7 +1293,7 @@ export async function start(ctx) {
   async function runKind(kind) {
     const c = ctx.config.backups || {};
     if (kind === "database") {
-      if (!mainLocalOf(ctx)) {
+      if (!dbReachableOf(ctx)) {
         console.log(`[fcc] scheduled database backups skipped: ${DB_REMOTE}`);
         return;
       }
