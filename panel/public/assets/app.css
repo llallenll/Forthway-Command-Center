@@ -1335,3 +1335,48 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
   .ha-alert .card-head .right { margin-left: 50px; }
   .edge-row > .small { max-width: 45%; }
 }
+
+/* Panel failover (docs/HA.md, Phase 2): app-shell banner, Servers HA strip, panel node menu reasons */
+.page.ha-banner-wrap { padding-bottom: 0; }
+.ha-banner-wrap + .auth-banner-wrap:not([hidden]) { padding-top: 12px; }
+.ha-banner {
+  display: flex; align-items: center; gap: 12px; padding: 11px 14px 11px 16px; border-radius: 14px; font-size: 13px; color: var(--text);
+  background: linear-gradient(90deg, rgba(74, 114, 255, 0.12), rgba(74, 114, 255, 0.04)); border: 1px solid rgba(74, 114, 255, 0.28);
+}
+.ha-banner.warn { background: linear-gradient(90deg, rgba(255, 181, 71, 0.12), rgba(255, 181, 71, 0.05)); border-color: rgba(255, 181, 71, 0.3); }
+.ha-banner.ok { background: linear-gradient(90deg, rgba(61, 220, 151, 0.11), rgba(61, 220, 151, 0.04)); border-color: rgba(61, 220, 151, 0.26); }
+.ha-banner > .ico { flex: none; color: var(--blue-3); }
+.ha-banner.warn > .ico { color: var(--warn); }
+.ha-banner.ok > .ico { color: var(--ok); }
+.ha-banner > div { flex: 1; min-width: 0; line-height: 1.45; }
+.ha-banner .muted { font-size: 12px; }
+.ha-banner .rb-spin { width: 16px; height: 16px; flex: none; border-radius: 50%; border: 2px solid rgba(148, 166, 255, 0.25); border-top-color: #9db3ff; animation: spin 0.8s linear infinite; }
+.ha-banner .btn, .ha-banner .icon-btn { flex: none; }
+
+.ha-strip { padding: 12px 14px; margin-bottom: 18px; display: grid; gap: 12px; }
+.ha-strip.is-warn { border-color: rgba(255, 181, 71, 0.3); }
+.ha-strip-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.ha-strip .ha-ico, .ha-strip .ha-ico.warn { width: 30px; height: 30px; border-radius: 9px; }
+.ha-strip-t { flex: 1; min-width: 0; font-size: 13px; line-height: 1.45; }
+.ha-strip-t b { font-weight: 650; }
+.ha-short { color: #ffc46b; }
+.ha-strip-warns { padding-left: 2px; }
+.ha-node .edge-row-name .small { font-weight: 500; }
+.edge-row > .ha-node-meta { display: inline-flex; gap: 14px; flex: none; max-width: none; overflow: visible; white-space: nowrap; }
+.ha-node .btn { flex: none; }
+
+.menu-t { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.menu-why { display: block; max-width: 250px; font-size: 11.5px; font-weight: 500; line-height: 1.4; color: var(--muted); white-space: normal; }
+.menu button:disabled:has(.menu-why) { opacity: 1; color: var(--dim); }
+.menu button:disabled:has(.menu-why) .ico { opacity: 0.5; }
+
+@media (max-width: 640px) {
+  .ha-banner { flex-wrap: wrap; }
+  .ha-banner .btn { width: 100%; }
+  .ha-node { flex-wrap: wrap; row-gap: 8px; }
+  .ha-node .edge-row-name { flex-basis: calc(100% - 24px); }
+  .edge-row > .ha-node-meta { flex: 1 1 auto; margin-left: 18px; gap: 10px; max-width: none; }
+}
+.ha-head-t { flex: 1; min-width: 0; }
+@media (max-width: 640px) { .ha-alert .card-head .ha-head-t { flex-basis: calc(100% - 52px); } }
+@media (prefers-reduced-motion: reduce) { .ha-banner .rb-spin { animation: none; } }

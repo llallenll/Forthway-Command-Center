@@ -15,6 +15,10 @@
  * file that cannot be parsed is not silently replaced: the last good copy
  * (`db.json.bak`, taken at every boot) is tried, and if that fails too the
  * panel refuses to start and says why.
+ *
+ * Panel failover (docs/HA.md Phase 2): a standby panel node opens the store
+ * `readOnly` — only replication (lib/ha.mjs) writes its db.json, never this
+ * class — and `reload()` re-reads the file when the node is promoted.
  */
 
 import fs from "node:fs";
@@ -64,14 +68,24 @@ function matcher(filter) {
 }
 
 export class Store {
-  constructor(dataDir) {
+  constructor(dataDir, { readOnly = false } = {}) {
     this.file = path.join(dataDir, "db.json");
     this.data = {};
     this._timer = null;
+    // A standby panel node (docs/HA.md) must never write db.json itself.
+    this.readOnly = !!readOnly;
     this._load();
   }
 
-  _load() {
+  /** Re-read db.json from disk (promotion of a standby panel node). Pending writes are dropped. */
+  reload({ backup = true } = {}) {
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = null;
+    this.data = {};
+    this._load({ backup });
+  }
+
+  _load({ backup = true } = {}) {
     const parse = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
     let loaded = null;
     if (fs.existsSync(this.file)) {
@@ -95,7 +109,7 @@ export class Store {
     loaded = loaded && typeof loaded === "object" ? loaded : {};
     for (const c of COLLECTIONS) this.data[c] = Array.isArray(loaded[c]) ? loaded[c] : [];
     for (const [c, v] of Object.entries(loaded)) if (!(c in this.data) && Array.isArray(v)) this.data[c] = v;
-    if (fs.existsSync(this.file)) {
+    if (backup && fs.existsSync(this.file)) {
       try {
         fs.copyFileSync(this.file, `${this.file}.bak`);
         fs.chmodSync(`${this.file}.bak`, 0o600);
@@ -161,6 +175,7 @@ export class Store {
   }
 
   save({ immediate = false } = {}) {
+    if (this.readOnly) return;
     if (immediate) {
       if (this._timer) clearTimeout(this._timer);
       this._timer = null;
@@ -179,6 +194,7 @@ export class Store {
   }
 
   _write() {
+    if (this.readOnly) return;
     writeFileAtomic(this.file, JSON.stringify(this.data, null, 1));
   }
 }

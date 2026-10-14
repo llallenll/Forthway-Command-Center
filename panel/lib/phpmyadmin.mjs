@@ -54,6 +54,9 @@ const MAX_TOKENS = 200;
 const MAX_TARBALL = 200 * 1024 * 1024;
 const DEFAULT_PORT = 8081;
 const PACKAGES = ["php-fpm", "php-mysql", "php-mbstring", "php-xml", "php-zip", "php-gd", "php-curl", "php-intl"];
+// Panel failover (docs/HA.md Phase 2): phpMyAdmin, PHP-FPM and MySQL are on main.
+const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
+const DB_REMOTE = "Databases live on the main server, which is not running the active panel right now.";
 const RESERVED_PORTS = new Set([22, 25, 53, 80, 443, 3306, 33060]);
 
 // ------------------------------------------------------------ pure helpers
@@ -459,6 +462,10 @@ export function register(router, ctx) {
   };
 
   const tokens = new Map(); // sha256(token) → { databaseId, adminId, exp }
+  const mainLocal = () => (ctx.ha || HA_OFF).mainIsLocal !== false;
+  const guard = () => {
+    if (!mainLocal()) throw httpError(503, DB_REMOTE, { available: false });
+  };
   let latest = { at: 0, version: null, error: null };
   let busyJobId = null;
   let lastCheck = null; // { ok, status, at, error }
@@ -763,6 +770,22 @@ export function register(router, ctx) {
 
   async function statusView(req, { check = false } = {}) {
     const c = cfg();
+    if (!mainLocal()) {
+      // Nothing about this machine says anything about main's phpMyAdmin.
+      return {
+        available: false,
+        reason: DB_REMOTE,
+        installed: !!c.installed,
+        version: c.installed?.version || null,
+        installedAt: c.installed?.installedAt || null,
+        port: portOf(),
+        hostname: c.hostname || "",
+        url: null,
+        busyJobId: null,
+        warnings: [DB_REMOTE],
+        dryRun: DRY_RUN,
+      };
+    }
     const installed = isInstalled();
     if (check && !DRY_RUN && Date.now() - latest.at > 6 * 3600_000) {
       try {
@@ -1075,6 +1098,7 @@ export function register(router, ctx) {
   }
 
   function startJob(kind, body, admin) {
+    guard();
     const busy = jobBusy();
     if (busy) throw httpError(409, "A phpMyAdmin job is already running.", { jobId: busy });
     const version = body?.version ? String(body.version).trim() : "";
@@ -1098,6 +1122,7 @@ export function register(router, ctx) {
   }
 
   async function updateSettings(body, admin) {
+    guard();
     const c = cfg();
     const prev = { port: c.port, hostname: c.hostname };
     const changed = [];
@@ -1150,6 +1175,7 @@ export function register(router, ctx) {
   }
 
   function issueToken(databaseId, admin, req) {
+    guard();
     if (!isInstalled()) throw httpError(409, "phpMyAdmin isn't installed. Install it under Settings → phpMyAdmin.", { notInstalled: true });
     if (jobBusy()) throw httpError(409, "phpMyAdmin is being installed or updated — try again in a moment.");
     const rec = ctx.db.get("databases", databaseId);
@@ -1199,6 +1225,10 @@ export function register(router, ctx) {
     issueToken: (databaseId, admin) => issueToken(databaseId, admin, null),
     // for start()
     _refresh: async () => {
+      if (!mainLocal()) {
+        if (cfg().installed) console.log(`[fcc] phpmyadmin refresh skipped: ${DB_REMOTE}`);
+        return;
+      }
       if (!cfg().installed || !isInstalled()) return;
       if (fs.existsSync(appDir())) writeGenerated({ log: () => {} });
       const { content } = vhostContent();

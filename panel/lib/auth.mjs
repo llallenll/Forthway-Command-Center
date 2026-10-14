@@ -134,15 +134,29 @@ function fromLoopback(req) {
 // headers (CF-Connecting-IP, X-Forwarded-*). CLUSTER tells us their resolved
 // addresses whenever the edge set changes; only those exact socket addresses are
 // believed — a header alone never is.
+// Standby panel nodes (docs/HA.md Phase 2) proxy every request to the active
+// panel the same way; lib/ha.mjs reports their addresses under its own source
+// name, so the two lists are kept apart and the trusted set is their union.
+const proxySources = new Map(); // source -> Set<ip>
 let trustedProxies = new Set();
 
-/** Socket addresses (edge nodes) whose forwarded headers are believed, like loopback's. */
-export function setTrustedProxies(ips) {
-  trustedProxies = new Set((Array.isArray(ips) ? ips : []).map((ip) => String(ip).trim().replace(/^::ffff:/, "")).filter(Boolean));
+/**
+ * Socket addresses whose forwarded headers are believed, like loopback's.
+ * `source` names who reports them ("edges" — cluster.mjs, the default — or
+ * "panels" — ha.mjs); each call replaces that source's list only.
+ */
+export function setTrustedProxies(ips, source = "edges") {
+  proxySources.set(String(source), new Set((Array.isArray(ips) ? ips : []).map((ip) => String(ip).trim().replace(/^::ffff:/, "")).filter(Boolean)));
+  trustedProxies = new Set([...proxySources.values()].flatMap((set) => [...set]));
 }
 
 function trusted(req) {
   return TRUST_PROXY || fromLoopback(req) || (trustedProxies.size > 0 && trustedProxies.has(socketIp(req)));
+}
+
+/** Whether this request's forwarded headers are believed (the follower proxy passes them on only then). */
+export function trustedRequest(req) {
+  return trusted(req);
 }
 
 /** Client IP for throttling/audit: socket address unless the proxy is trusted. */

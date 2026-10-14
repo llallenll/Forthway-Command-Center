@@ -18,6 +18,12 @@
 # /var/lib/fcc-node/bin) and a self-signed certificate in /etc/fcc-node/edge-tls
 # (made with openssl). Nothing extra to install by hand — see docs/HA.md.
 #
+# Panel nodes (an edge that also runs a standby copy of the panel, docs/HA.md
+# Phase 2): the panel installs it itself with the panel.install task — code in
+# /opt/fcc (unpacked by the agent in JavaScript, no unzip needed), data in
+# /var/lib/fcc, the systemd service fcc. It needs nothing beyond what this
+# script installs (Node.js, pm2, nginx, openssl, tar, gzip).
+#
 # Options (environment):  FCC_PHP=1  also install php-fpm for PHP websites
 #                         FCC_SKIP_UFW=1  do not touch the firewall
 #

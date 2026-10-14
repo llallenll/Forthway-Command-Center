@@ -155,8 +155,79 @@ async function paintSidebarStatus() {
   const row = (label, ok, txt) => html`<div class="row"><span><span class="dot ${ok === null ? "off" : ok ? "ok" : "err"}"></span>${label}</span><span>${txt}</span></div>`;
   mount($("#sbStatus"), html`
     ${row("nginx", lb ? (lb.installed || lb.dryRun) && lb.configOk !== false : null, lb ? (lb.installed ? (lb.configOk === false ? "config error" : "running") : lb.dryRun ? "dry run" : "not installed") : "—")}
-    ${row("MySQL", my ? my.installed && my.running : null, my ? (my.installed ? (my.running ? "running" : "stopped") : "not installed") : "—")}
-    <div class="ver"><span>${shortName()}</span><span>v${state.version || "3.7.0"}</span></div>`);
+    ${my?.available === false ? row("MySQL", null, "unavailable") : row("MySQL", my ? my.installed && my.running : null, my ? (my.installed ? (my.running ? "running" : "stopped") : "not installed") : "—")}
+    <div class="ver"><span>${shortName()}</span><span>v${state.version || "3.8.0"}</span></div>`);
+}
+
+/* ───────── panel failover (docs/HA.md): a thin banner in the app shell ─────────
+   - "switching servers — retrying…" while API calls get 503 { haSwitching } (api.js retries them)
+   - "The panel moved to <name>." for a short while after the active panel changed
+   - "Waiting for the servers to vote…" while HA is on but not armed yet
+   An older panel has no /api/ha (404): nothing shows. */
+const ha = { info: null, off: false, switching: false, movedTo: null, movedTimer: null, lastLeader: null };
+const HA_LEADER_KEY = "fcc.ha.leader";
+function haLeaderSeen(id) {
+  // Remembered per tab, so the notice also shows after the page reloads onto the new active panel.
+  if (MOCK) { const prev = ha.lastLeader; ha.lastLeader = id; return prev; }
+  let prev = null;
+  try { prev = sessionStorage.getItem(HA_LEADER_KEY); sessionStorage.setItem(HA_LEADER_KEY, id); } catch {}
+  return prev;
+}
+export function haNodeName(i, id) {
+  return (i?.nodes || []).find((n) => n.serverId === id)?.name || (i?.votes || []).find((v) => v.serverId === id)?.name || id;
+}
+function haBannerEl() {
+  let el = $("#haBanner");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "haBanner"; el.className = "page ha-banner-wrap"; el.hidden = true;
+    $("#authBanner").before(el);
+  }
+  return el;
+}
+function paintHaBanner() {
+  const el = haBannerEl(), i = ha.info;
+  let b = null;
+  if (ha.switching) b = { tone: "info", spin: true, title: "The panel is switching servers — retrying…", msg: "Requests are retried on their own. This usually takes under a minute." };
+  else if (ha.movedTo) b = { tone: "ok", ico: "check", title: `The panel moved to ${ha.movedTo}.`, msg: "It runs the active panel now. Nothing else to do.", close: true };
+  else if (i?.enabled && i.armed === false) b = { tone: "warn", ico: "clock", title: "Waiting for the servers to vote…",
+    msg: `Failover protects the panel once ${i.majority && i.voters ? `${i.majority} of ${i.voters} servers` : "a majority of servers"} have voted for the active panel.`, link: true };
+  el.hidden = !b;
+  if (!b) return mount(el, html``);
+  mount(el, html`<div class="ha-banner ${b.tone}" role="status">${b.spin ? html`<span class="rb-spin" aria-hidden="true"></span>` : icon(b.ico)}
+    <div><div class="strong">${b.title}</div><div class="muted">${b.msg}</div></div>
+    ${b.link ? html`<a class="btn btn-sm" href="#/servers">${icon("server")}Servers</a>` : ""}
+    ${b.close ? html`<button class="icon-btn ghost sm" type="button" data-ha-dismiss aria-label="Dismiss">${icon("x", "sm")}</button>` : ""}</div>`);
+  $("[data-ha-dismiss]", el)?.addEventListener("click", () => { clearTimeout(ha.movedTimer); ha.movedTo = null; paintHaBanner(); });
+}
+async function loadHa() {
+  if (ha.off) return;
+  let i;
+  try { i = await get("/api/ha"); } catch (e) { if (e?.status === 404) { ha.off = true; ha.info = null; paintHaBanner(); } return; }
+  if (!i || typeof i !== "object") return;
+  ha.info = i;
+  if (i.enabled && i.leaderId) {
+    const prev = haLeaderSeen(i.leaderId);
+    if (prev && prev !== i.leaderId) {
+      ha.movedTo = haNodeName(i, i.leaderId);
+      clearTimeout(ha.movedTimer);
+      ha.movedTimer = setTimeout(() => { ha.movedTo = null; paintHaBanner(); }, 20_000);
+    }
+  }
+  paintHaBanner();
+  window.dispatchEvent(new CustomEvent("fcc:ha", { detail: i }));
+}
+function initHa() {
+  window.addEventListener("fcc:ha-switching", (e) => {
+    ha.switching = !!e.detail?.on;
+    paintHaBanner();
+    if (!ha.switching) loadHa();
+  });
+  onEvent("ha", debounce(loadHa, 400));
+  let prevStatus = eventStatus();
+  onStatus((st) => { if ((st === "live" || st === "polling") && prevStatus === "offline") loadHa(); prevStatus = st; });
+  setInterval(() => { if (!document.hidden) loadHa(); }, 30_000);
+  loadHa();
 }
 
 /* ───────── panel self-update: top-bar badge + restart watcher ───────── */
@@ -308,6 +379,7 @@ async function boot() {
 
   startEvents();
   initUpdates();
+  initHa();
   onStatus(paintLive);
   onEvent("lb", debounce(paintSidebarStatus, 500));
   onEvent("job", (j) => {

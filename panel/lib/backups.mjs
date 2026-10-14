@@ -27,11 +27,16 @@ import { pipeline } from "node:stream/promises";
 
 import { httpError } from "./http.mjs";
 import { run, which, forgetWhich, DRY_RUN } from "./sys.mjs";
-import { projectPrefix } from "./mysql.mjs";
+import { projectPrefix, DB_REMOTE } from "./mysql.mjs";
 import { createS3 } from "./s3.mjs";
 import { createSmb, smbInstalled, validServer, validShare, validFolder, validUsername, validPassword, validDomain, validPort, validMinProtocol } from "./smb.mjs";
 
 const MAIN_ID = "main";
+// Panel failover (docs/HA.md Phase 2): database backups need MySQL on main, and a
+// main server backup is built in this process only when it runs on main.
+const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
+const mainLocalOf = (ctx) => (ctx.ha || HA_OFF).mainIsLocal !== false;
+const RESTORE_REMOTE = "Main server backups can only be restored while the main server runs the active panel.";
 const FORBIDDEN_ROOTS = ["/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run", "/var", "/root", "/home", "/srv", "/opt", "/tmp"];
 const DEFAULTS = {
   database: { enabled: false, every: "daily", at: "03:00", day: 0, keep: 14 },
@@ -505,6 +510,7 @@ export function register(router, ctx) {
   }
 
   function backupDatabase(databaseId, { trigger = "manual", adminId = null, admin = null, note = "" } = {}) {
+    if (!mainLocalOf(ctx)) throw httpError(503, DB_REMOTE, { available: false });
     const dbRec = ctx.db.get("databases", databaseId);
     if (!dbRec) throw httpError(404, "Database not found.");
     const key = `db:${databaseId}`;
@@ -731,8 +737,15 @@ export function register(router, ctx) {
         async ({ log, signal }) => {
           const abs = absOf(rel);
           try {
-            if (serverId === MAIN_ID) await buildMainArchive(b, abs, inc, { log, signal });
-            else await runWorkerBackup(b, abs, inc, serverId, { log, signal });
+            if (serverId === MAIN_ID && mainLocalOf(ctx)) await buildMainArchive(b, abs, inc, { log, signal });
+            else {
+              if (serverId === MAIN_ID) {
+                // Not on main: main's agent builds and uploads the archive like any agent server's.
+                const left = [inc.panel && "panel data (this panel's data is replicated to every panel node)", inc.databases && "the database dump (MySQL is on the main server)"].filter(Boolean);
+                if (left.length) log(`The main server is not running the active panel — this archive leaves out ${left.join(" and ")}.`);
+              }
+              await runWorkerBackup(b, abs, inc, serverId, { log, signal });
+            }
             const done = await finalize(b, abs, log);
             audit(admin, "backup.server", { type: "server", id: serverId, name }, { backupId: b.id, trigger, include: inc, size: done.size });
             return { backupId: b.id, file: path.basename(rel), size: done.size, sha256: done.sha256 };
@@ -806,6 +819,7 @@ export function register(router, ctx) {
   }
 
   function restoreDatabase(b, admin) {
+    if (!mainLocalOf(ctx)) throw httpError(503, DB_REMOTE, { available: false });
     const dbRec = ctx.db.get("databases", b.databaseId);
     if (!dbRec) throw httpError(409, "The database this backup belongs to no longer exists. Download the backup instead.");
     const key = `db:${dbRec.id}`;
@@ -857,6 +871,7 @@ export function register(router, ctx) {
   function restoreServer(b, opts, admin) {
     if (b.serverId !== MAIN_ID)
       throw httpError(400, "Only main-server backups can be restored from the panel. Download this archive and extract it on the worker.");
+    if (!mainLocalOf(ctx)) throw httpError(409, RESTORE_REMOTE);
     const want = { sites: opts?.sites !== false, nginx: opts?.nginx !== false };
     if (!want.sites && !want.nginx) throw httpError(400, "Nothing selected to restore.");
     const key = "restore:main";
@@ -945,6 +960,7 @@ export function register(router, ctx) {
       usage: { count: all.length, bytes: all.reduce((n, b) => n + (b.size || 0), 0) },
       localPath: root(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+      ...(mainLocalOf(ctx) ? {} : { databases: { available: false, reason: DB_REMOTE } }),
     };
   }
 
@@ -1270,6 +1286,10 @@ export async function start(ctx) {
   async function runKind(kind) {
     const c = ctx.config.backups || {};
     if (kind === "database") {
+      if (!mainLocalOf(ctx)) {
+        console.log(`[fcc] scheduled database backups skipped: ${DB_REMOTE}`);
+        return;
+      }
       for (const d of ctx.db.list("databases")) {
         try {
           await waitJob(ctx.backups.backupDatabase(d.id, { trigger: "schedule" }));

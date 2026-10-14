@@ -37,6 +37,9 @@ import { httpError } from "./http.mjs";
 import { run, which, DRY_RUN } from "./sys.mjs";
 
 const MAIN_ID = "main";
+// Panel failover (docs/HA.md Phase 2): MySQL is on main; reachable only while the panel runs there.
+const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
+export const DB_REMOTE = "Databases live on the main server, which is not running the active panel right now.";
 const RESERVED = new Set(["mysql", "information_schema", "performance_schema", "sys", "test", "root", "mariadb.sys", "debian-sys-maint"]);
 const DB_NAME_MAX = 64;
 const USER_MAX = 32;
@@ -398,6 +401,11 @@ export function register(router, ctx) {
     } catch {}
   };
   const decrypt = (v) => (v ? ctx.secrets.decrypt(v) : "");
+  // Not on main: every MySQL operation is refused (503) until main leads again.
+  const mainLocal = () => (ctx.ha || HA_OFF).mainIsLocal !== false;
+  const guard = () => {
+    if (!mainLocal()) throw httpError(503, DB_REMOTE, { available: false });
+  };
 
   // ---------------------------------------------------------- connection
 
@@ -405,6 +413,7 @@ export function register(router, ctx) {
   let partialRevokes = null;
 
   async function rootConn({ fresh = false } = {}) {
+    guard();
     if (!fresh && connCache && Date.now() - connCache.at < 5 * 60_000) return connCache;
     const b = bin();
     if (!b && !DRY_RUN) throw httpError(503, "MySQL is not installed on this server.");
@@ -496,6 +505,9 @@ export function register(router, ctx) {
 
   let statusCache = null;
   async function status({ fresh = false } = {}) {
+    if (!mainLocal()) {
+      return { installed: false, running: false, rootOk: false, version: null, available: false, reason: DB_REMOTE, error: DB_REMOTE, ...hostInfo() };
+    }
     if (!fresh && statusCache && Date.now() - statusCache.at < 10_000) return { ...statusCache.value, ...hostInfo() };
     let value;
     if (DRY_RUN) {
@@ -704,7 +716,14 @@ export function register(router, ctx) {
   }
 
   let syncChain = Promise.resolve();
+  let remoteNoted = false;
   function syncRemoteHosts({ log } = {}) {
+    if (!mainLocal()) {
+      if (!remoteNoted) console.log(`[fcc] mysql host sync skipped: ${DB_REMOTE}`);
+      remoteNoted = true;
+      log?.(`Skipping MySQL host sync: ${DB_REMOTE}`);
+      return Promise.resolve({ changed: 0, error: DB_REMOTE });
+    }
     syncChain = syncChain.then(async () => {
       const dbs = ctx.db.list("databases");
       if (!dbs.length) return { changed: 0 };
@@ -789,7 +808,7 @@ export function register(router, ctx) {
 
   let sizesAt = 0;
   async function refreshSizes({ force = false } = {}) {
-    if (DRY_RUN) return;
+    if (DRY_RUN || !mainLocal()) return;
     if (!force && Date.now() - sizesAt < 60_000) return;
     sizesAt = Date.now();
     const dbs = ctx.db.list("databases");
@@ -811,6 +830,7 @@ export function register(router, ctx) {
   // ---------------------------------------------------------- operations
 
   async function createDatabase({ projectId, name, user, password, remoteAccess = false, charset, collation }, admin) {
+    guard();
     const project = ctx.db.get("projects", projectId);
     if (!project) throw httpError(404, "Project not found.");
     if (!name) throw httpError(400, "Give the database a name.");
@@ -879,6 +899,7 @@ export function register(router, ctx) {
   }
 
   async function setRemoteAccess(rec, remoteAccess, admin) {
+    guard();
     ctx.db.update("databases", rec.id, { remoteAccess: !!remoteAccess });
     await syncRemoteHosts();
     const fresh = ctx.db.get("databases", rec.id);
@@ -888,6 +909,7 @@ export function register(router, ctx) {
   }
 
   async function rotatePassword(rec, password, admin) {
+    guard();
     if (password != null && password !== "" && !validPassword(password))
       throw httpError(400, "Password must be 8–128 printable ASCII characters without spaces.");
     const pw = password || generatePassword(32);
@@ -961,6 +983,7 @@ export function register(router, ctx) {
   }
 
   async function dropDatabase(rec, admin) {
+    guard();
     const st = await status({ fresh: true });
     if (!st.rootOk) throw httpError(503, st.error || "MySQL is not available.");
     const hosts = (await existingHosts(rec.user)) ?? rec.hosts ?? ["localhost", "127.0.0.1"];
@@ -975,6 +998,7 @@ export function register(router, ctx) {
 
   /** Drop and re-create the schema (same charset); db-level grants survive since they're keyed by name. */
   async function recreate(databaseId, { log } = {}) {
+    guard();
     const rec = getRec(databaseId);
     const cs = CHARSETS[rec.charset] ? rec.charset : "utf8mb4";
     const coll = CHARSETS[cs].includes(rec.collation) ? rec.collation : CHARSETS[cs][0];
@@ -1031,6 +1055,7 @@ export function register(router, ctx) {
   const DUMP_FLAGS = ["--single-transaction", "--routines", "--triggers", "--events", "--hex-blob", "--default-character-set=utf8mb4"];
 
   async function dump(databaseId, { file, log, signal } = {}) {
+    guard();
     const rec = getRec(databaseId);
     if (!file) throw new Error("dump() needs a file");
     const c = DRY_RUN ? { args: ["-u", "root"], env: null, secret: null } : await rootConn();
@@ -1040,6 +1065,7 @@ export function register(router, ctx) {
   }
 
   async function dumpAll({ file, log, signal } = {}) {
+    guard();
     const c = DRY_RUN ? { args: ["-u", "root"], env: null, secret: null } : await rootConn();
     log?.("Dumping all databases…");
     return dumpTo([...c.args, ...DUMP_FLAGS, ...(await extraDumpFlags()), "--all-databases"], { file, log, signal, secret: c.secret, env: c.env, label: "all databases" });
@@ -1051,6 +1077,7 @@ export function register(router, ctx) {
    *      (uploaded imports — least privilege, so a dump can't touch other schemas).
    */
   async function restore(databaseId, { file, log, signal, as = "root" } = {}) {
+    guard();
     const rec = getRec(databaseId);
     quoteIdent(rec.name);
     if (!fs.existsSync(file)) throw new Error("The SQL file is missing.");
@@ -1108,6 +1135,7 @@ export function register(router, ctx) {
   }
 
   async function setRootPassword({ password, user }, admin) {
+    guard();
     const cfg = mcfg();
     if (password === "" || password == null) {
       delete cfg.rootPasswordEnc;
@@ -1197,6 +1225,7 @@ export function register(router, ctx) {
   }
 
   async function updateSettings(body, admin) {
+    guard();
     const cfg = mcfg();
     const before = envHostsSnapshot();
     const changed = [];
@@ -1263,6 +1292,7 @@ export function register(router, ctx) {
    * "local" → 127.0.0.1. Accounts are still per host, never '%'.
    */
   function setBind(mode, admin) {
+    guard();
     if (!["network", "local"].includes(mode)) throw httpError(400, 'mode must be "network" or "local".');
     const bind = mode === "network" ? "0.0.0.0" : "127.0.0.1";
     const job = ctx.jobs.start(

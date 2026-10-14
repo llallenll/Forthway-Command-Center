@@ -1,6 +1,6 @@
-import { html, raw, mount, frag, $, $$, on, ago, plural, emptyState, errorState, skeletonRows, debounce, toast, toastError, confirmDialog, openModal, openMenu, secretBox } from "../util.js";
+import { html, raw, mount, frag, $, $$, on, ago, plural, emptyState, errorState, skeletonRows, debounce, sleep, toast, toastError, confirmDialog, openModal, openMenu, secretBox } from "../util.js";
 import { icon } from "../icons.js";
-import { get, post, patch, del } from "../api.js";
+import { get, post, patch, del, MOCK } from "../api.js";
 import { sparkline } from "../charts.js";
 import { pageHead, serverKind, jobStarted, openJobLog, METHOD_LABEL, ubar } from "../components.js";
 import { serverBackupDialog } from "./backups.js";
@@ -77,7 +77,122 @@ async function edgeDialog(s0) {
   await m.result; off();
 }
 
-async function serverForm(s, { edgeSupported = true } = {}) {
+/* ───────── panel failover (docs/HA.md, Phase 2) ───────── */
+
+export const PANEL_HELP = "Runs a standby copy of the panel, so another server takes over if the active panel's server goes down.";
+const PANEL_MIN_AGENT = "3.2.0";
+const verLt = (a, b) => {
+  const pa = String(a || "0").split(/[.-]/).map((x) => parseInt(x, 10) || 0), pb = String(b).split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0);
+  return false;
+};
+/** Does this backend know about panel nodes? (/api/ha answered, or servers carry `panel`.) */
+const panelSupported = (ha, items) => !!ha || items.some((x) => "panel" in x || "panelRole" in x);
+const isPanelNode = (s, ha) => !!s?.panel?.enabled || !!s?.panelRole || (s?.role === "main" && !!ha?.enabled);
+const nodeName = (ha, items, id) => (ha?.nodes || []).find((n) => n.serverId === id)?.name || items.find((x) => x.id === id)?.name || id;
+const fmtLag = (ms) => (ms == null ? "—" : ms < 1000 ? `${(ms / 1000).toFixed(1)} s` : ms < 60_000 ? `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s` : `${Math.round(ms / 60_000)} min`);
+
+/** Role badge for a panel node: Active panel / Standby. */
+function panelBadge(s, ha) {
+  if (!isPanelNode(s, ha)) return "";
+  const role = s.panelRole || (ha?.leaderId ? (ha.leaderId === s.id ? "leader" : "follower") : s.role === "main" ? "leader" : "follower");
+  if (role === "leader") return html`<span class="badge ok" title="This server runs the active panel.">${icon("layers")}Active panel</span>`;
+  if (role === "candidate") return html`<span class="badge warn" title="Asking the other servers for votes to become the active panel.">${icon("layers")}Standby · electing</span>`;
+  return html`<span class="badge" title="${PANEL_HELP}">${icon("layers")}Standby</span>`;
+}
+
+/** Why this server can't be switched on/off as a panel node right now (null = it can). */
+export function panelBlock(s, ha, items, { edge } = {}) {
+  if (!s || s.role === "main") return "The main server is always a panel node.";
+  if (s.panel?.enabled) {
+    if (ha?.leaderId === s.id || s.panelRole === "leader") return "This server runs the active panel. Make another panel node active first.";
+    return null;
+  }
+  if (!(edge ?? s.edge?.enabled)) return "Turn on Edge node first. Panel nodes must be edges.";
+  if (!s.online) return `${s.name} is offline.`;
+  if (s.enabled === false) return `${s.name} is disabled.`;
+  if (ha?.canEnable && !ha.canEnable.ok) return ha.canEnable.reason || "Panel nodes can't be added right now.";
+  if (!ha?.canEnable) {
+    const on = items.filter((x) => x.enabled !== false);
+    if (on.length < 3) return "Needs at least 3 servers, so a majority can still vote when one is down.";
+    const bad = on.find((x) => x.role !== "main" && (!x.online || verLt(x.agentVersion, PANEL_MIN_AGENT)));
+    if (bad) return `${bad.name} must be online and run agent ${PANEL_MIN_AGENT} or newer.`;
+  }
+  return null;
+}
+
+/** Turn a panel node on/off: confirm, POST /api/servers/:id/panel, open the job log. Resolves true when started. */
+async function setPanelNode(s, enabled) {
+  const ok = await confirmDialog(enabled
+    ? { title: `Make ${s.name} a panel node?`, ico: "layers", confirmText: "Install the panel",
+      message: `${PANEL_HELP} ${s.name} downloads the panel code, starts a standby panel and joins the vote. Websites and the active panel keep running.` }
+    : { title: `Stop running the panel on ${s.name}?`, ico: "layers", danger: true, confirmText: "Remove panel node",
+      message: `${s.name} stops its standby panel. Its panel data is kept on the server in a renamed folder, because it holds secrets. Websites on it keep running.` });
+  if (!ok) return false;
+  try {
+    const job = await post(`/api/servers/${s.id}/panel`, { enabled });
+    if (job?.id) openJobLog(job.id); else toast(enabled ? "Panel node added" : "Panel node removed", "ok");
+    return true;
+  } catch (ex) { toastError(ex, enabled ? "Couldn't add the panel node" : "Couldn't remove the panel node"); return false; }
+}
+
+/** Planned switchover: confirm, POST /api/ha/handover, then wait (through 503s and dropped connections) until the leader changes. */
+async function makeActive(node, ha, ctx) {
+  const ok = await confirmDialog({ title: `Make ${node.name} the active panel?`, ico: "layers", confirmText: "Make active panel",
+    message: "The panel is unavailable for about 20 seconds while it switches. Websites keep running, and this page reloads when it's done." });
+  if (!ok) return;
+  const from = ha.leaderId;
+  const box = document.createElement("div");
+  box.className = "restart-banner"; box.setAttribute("role", "status");
+  document.body.appendChild(box);
+  const say = (title, msg, err = false) => { box.classList.toggle("err", err); mount(box, html`<span class="rb-spin" aria-hidden="true"></span><div><div class="strong">${title}</div><div class="muted small">${msg}</div></div>${err ? html`<button class="btn btn-sm" type="button" data-hreload>Reload</button>` : ""}`); $("[data-hreload]", box)?.addEventListener("click", () => location.reload()); };
+  say(`Switching the panel to ${node.name}…`, "The panel is unavailable for about 20 seconds.");
+  try { await post("/api/ha/handover", { serverId: node.serverId }); }
+  catch (ex) { box.remove(); toastError(ex, "Couldn't switch the panel"); return; }
+  const started = Date.now();
+  for (;;) {
+    await sleep(2000);
+    let now = null;
+    try { now = await get("/api/ha"); } catch { /* 503 haSwitching or connection refused while it switches */ }
+    if (now?.leaderId && now.leaderId !== from) {
+      say(`${nodeName(now, [], now.leaderId)} runs the active panel`, "Reloading…");
+      setTimeout(() => { box.remove(); if (MOCK) ctx.reload(); else location.reload(); }, 800);
+      return;
+    }
+    if (Date.now() - started > 120_000) { say("The switch is taking longer than expected", "Reload this page in a minute. If the old panel is still active, the switch was called off.", true); return; }
+  }
+}
+
+/** Servers page header strip: active panel, standbys, votes; standby rows with lag and "Make active panel". */
+function haStrip(ha, items) {
+  if (!ha?.enabled) return html``;
+  const leader = nodeName(ha, items, ha.leaderId);
+  const standbys = (ha.nodes || []).filter((n) => n.serverId !== ha.leaderId);
+  const votes = (ha.votes || []).filter((v) => v.votedFor === ha.leaderId && v.reachable !== false && (v.leaseLeftMs == null || v.leaseLeftMs > 0)).length;
+  const voters = ha.voters ?? (ha.votes || []).length;
+  const short = ha.majority && votes < ha.majority;
+  const warns = ha.warnings || [];
+  const tone = ha.armed === false || short ? "warn" : warns.length ? "warn" : "ok";
+  return html`<div class="card ha-strip ${tone === "warn" ? "is-warn" : ""}">
+    <div class="ha-strip-head">
+      <span class="ha-ico ${tone}">${icon("layers", "sm")}</span>
+      <div class="ha-strip-t"><b>Active panel: ${leader}</b><span class="muted"> · ${standbys.length ? `${standbys.length} ${standbys.length === 1 ? "standby" : "standbys"}` : "no standbys"} · </span><span class="${short ? "ha-short" : "muted"}" title="${ha.majority ? `A majority is ${ha.majority} of ${voters}.` : ""}">votes ${votes}/${voters}</span>
+        ${ha.armed === false ? html`<div class="muted small">Waiting for the servers to vote… Failover starts once a majority has voted.</div>` : ""}</div>
+    </div>
+    ${warns.length ? html`<ul class="ha-warns ha-strip-warns">${warns.map((w) => html`<li>${icon("alert", "xs")}<span>${w}</span></li>`)}</ul>` : ""}
+    ${standbys.length ? html`<div class="edge-rows ha-nodes">${standbys.map((n) => {
+      const can = n.online && ha.armed !== false;
+      return html`<div class="edge-row ha-node">
+        <span class="dot ${!n.online ? "err" : n.role === "candidate" ? "warn" : "ok"}"></span>
+        <span class="edge-row-name">${n.name}<span class="muted small"> · ${!n.online ? "offline" : n.role === "candidate" ? "electing" : "standby"}${n.version ? ` · v${n.version}` : ""}</span></span>
+        <span class="ha-node-meta muted small"><span title="How far its copy of the panel data is behind">lag ${n.online ? fmtLag(n.lagMs) : "—"}</span><span class="${n.codeInSync === false ? "ha-short" : ""}">${n.codeInSync === false ? "code updating" : "code in sync"}</span></span>
+        <button class="btn btn-sm" type="button" data-ha-active="${n.serverId}" ${can ? "" : raw("disabled")} title="${!n.online ? `${n.name} is offline.` : ha.armed === false ? "Wait until the servers have voted." : "Hand the active panel over to this server."}">Make active panel</button>
+      </div>`;
+    })}</div>` : ""}
+  </div>`;
+}
+
+async function serverForm(s, { edgeSupported = true, panel = null } = {}) {
   const isEdit = !!s;
   let result = null;
   const m = openModal({
@@ -91,11 +206,24 @@ async function serverForm(s, { edgeSupported = true } = {}) {
       <div class="field span-2"><label class="switch"><input type="checkbox" name="lbEligible" ${s?.lbEligible !== false ? raw("checked") : ""}/><span class="track"></span><span><b style="color:var(--text)">Available for load balancing</b> — offer this server when building load-balanced pools</span></label></div>
       ${!edgeSupported ? "" : s?.role === "main" ? html`<div class="field span-2"><div class="row" style="gap:10px;font-size:13px;color:var(--text-2)"><span class="badge blue">${icon("shield")}Edge</span><span><b style="color:var(--text)">Always an edge (front door)</b> — the main server runs nginx and the tunnel connectors</span></div></div>`
         : html`<div class="field span-2"><label class="switch"><input type="checkbox" name="edge" ${s?.edge?.enabled ? raw("checked") : ""}/><span class="track"></span><span><b style="color:var(--text)">Edge node</b> — ${EDGE_HELP}</span></label><div class="hint" style="padding-left:46px">Edges must reach each server's site ports (3000–3999) and main's panel port. The panel opens ufw automatically where it is active.</div></div>`}
+      ${panel && isEdit && s.role !== "main" ? html`<div class="field span-2" data-panel-field><label class="switch"><input type="checkbox" name="panel" ${s.panel?.enabled ? raw("checked") : ""} ${panel.block(s.edge?.enabled) ? raw("disabled") : ""}/><span class="track"></span><span><b style="color:var(--text)">Panel node</b> — ${PANEL_HELP}</span></label><div class="hint" style="padding-left:46px" data-panel-why>${panel.block(s.edge?.enabled) || (s.panel?.enabled ? "Turning it off removes the standby panel from this server." : "Saving installs the panel here and opens the job log.")}</div></div>` : ""}
       ${isEdit && s.role !== "main" ? html`<div class="field span-2"><label class="switch"><input type="checkbox" name="enabled" ${s?.enabled !== false ? raw("checked") : ""}/><span class="track"></span><span><b style="color:var(--text)">Enabled</b> — when off, nginx stops sending traffic here and no new sites can be placed on it</span></label></div>` : ""}
       <div class="error-box span-2" data-err hidden></div><button type="submit" hidden></button></form>`,
     foot: html`<button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok>${isEdit ? "Save changes" : html`${icon("plus")}Add server`}</button>`,
     onMount(el, close) {
       const form = $("form", el), btn = $("[data-ok]", el), err = $("[data-err]", el);
+      // Panel node needs Edge node: keep the two switches consistent while editing.
+      const syncPanel = () => {
+        const f = form.elements; if (!f.panel || !panel) return;
+        if (s.panel?.enabled && f.edge) { f.edge.disabled = true; f.edge.checked = true; }
+        const why = panel.block(f.edge ? f.edge.checked : s.edge?.enabled);
+        f.panel.disabled = !!why;
+        if (why && !s.panel?.enabled) f.panel.checked = false;
+        $("[data-panel-why]", el).textContent = why || (s.panel?.enabled ? "Turning it off removes the standby panel from this server." : "Saving installs the panel here and opens the job log.");
+      };
+      if (s?.panel?.enabled && form.elements.edge) $(".hint", form.elements.edge.closest(".field")).textContent = "Panel nodes must be edges. Remove the panel node first to turn this off.";
+      syncPanel();
+      form.addEventListener("change", (e) => { if (e.target.name === "edge" || e.target.name === "panel") syncPanel(); });
       const go = async (e) => {
         e?.preventDefault();
         const f = form.elements;
@@ -106,7 +234,16 @@ async function serverForm(s, { edgeSupported = true } = {}) {
         if (!body.host) { f.host.classList.add("invalid"); f.host.focus(); return; }
         btn.classList.add("loading"); err.hidden = true;
         try {
-          if (isEdit) { result = await patch(`/api/servers/${s.id}`, body); close(result); return; }
+          if (isEdit) {
+            result = await patch(`/api/servers/${s.id}`, body);
+            const f2 = form.elements;
+            if (f2.panel && !f2.panel.disabled && f2.panel.checked !== !!s.panel?.enabled) {
+              close(result);
+              await setPanelNode({ ...s, ...result }, f2.panel.checked);
+              return;
+            }
+            close(result); return;
+          }
           const r = await post("/api/servers", body);
           result = r.server;
           $(".modal-head h3", el).textContent = `Install the agent on ${r.server.name}`;
@@ -130,7 +267,7 @@ async function serverForm(s, { edgeSupported = true } = {}) {
   return result;
 }
 
-function serverCard(s) {
+function serverCard(s, ha) {
   const m = s.metrics || {};
   const memT = m.memTotal || s.info?.memTotal, diskT = m.diskTotal || s.info?.diskTotal;
   return html`<div class="ecard server-card ${s.online ? "" : "is-offline"}" data-server="${s.id}" style="--c:${s.online ? "#4a72ff" : "#46507a"}">
@@ -147,6 +284,7 @@ function serverCard(s) {
       ${s.enabled === false ? html`<span class="badge warn">Disabled</span>` : ""}
       ${s.lbEligible !== false ? html`<span class="badge badge-lb">${icon("balance")}LB pool</span>` : ""}
       ${isEdge(s) && s.edge ? html`<span class="badge blue" title="${s.role === "main" ? "Always an edge (front door)" : EDGE_HELP}">${icon("shield")}Edge</span>` : ""}
+      ${panelBadge(s, ha)}
     </div>
     ${s.role !== "main" && s.edge?.enabled ? edgeStrip(s) : ""}
     <div class="srv-meters ubars">
@@ -176,11 +314,15 @@ export default async function servers(ctx) {
   const { root } = ctx;
   ctx.crumbs([{ label: "Servers" }]);
   mount(root, html`${pageHead("Servers & load balancing", "The main server runs the panel, nginx and MySQL. Agent servers host websites — on their own or as part of a load-balanced pool.", html`<button class="btn btn-primary" data-add>${icon("plus")}Add server</button>`)}
+    <div data-ha></div>
     <div data-lb></div>
     <div class="section-head mt-24"><div><h2>Servers</h2><p data-sum>Loading…</p></div></div>
     <div data-list><div class="cards">${[1, 2, 3].map(() => html`<div class="skel" style="height:290px;border-radius:18px"></div>`)}</div></div>`);
-  const list = $("[data-list]", root), lbBox = $("[data-lb]", root);
-  let items = [], lb = null;
+  const list = $("[data-list]", root), lbBox = $("[data-lb]", root), haBox = $("[data-ha]", root);
+  let items = [], lb = null, ha = null;
+  const paintHa = () => mount(haBox, haStrip(ha, items));
+  // GET /api/ha: null on an older panel (404) — then nothing about panel nodes shows.
+  const getHa = () => get("/api/ha").catch(() => null);
   const sparks = {};
 
   const loadSpark = async (id) => {
@@ -218,7 +360,7 @@ export default async function servers(ctx) {
     const on_ = items.filter((s) => s.online).length;
     const edges = items.filter((s) => s.role !== "main" && s.edge?.enabled).length;
     $("[data-sum]", root).textContent = `${on_} of ${items.length} online · ${items.filter((s) => s.lbEligible !== false).length} available for load balancing${items.some((s) => s.edge) ? ` · ${edges ? plural(edges, "edge node") : "no edge nodes besides main"}` : ""}`;
-    mount(list, items.length ? html`<div class="cards">${items.map(serverCard)}
+    mount(list, items.length ? html`<div class="cards">${items.map((x) => serverCard(x, ha))}
       <button class="ecard" data-add style="align-items:center;justify-content:center;gap:10px;border-style:dashed;cursor:pointer;min-height:240px;color:var(--muted);font:inherit">
         <span class="e-ico" style="width:46px;height:46px;border-radius:14px;display:grid;place-items:center;background:rgba(74,114,255,.12);color:var(--blue-3)">${icon("plus")}</span>
         <b style="color:var(--text)">Add an agent server</b><span class="small" style="max-width:220px;text-align:center">One command on any Ubuntu or Debian box.</span></button></div>`
@@ -227,16 +369,18 @@ export default async function servers(ctx) {
   };
   const load = async () => {
     try {
-      const [s, l] = await Promise.all([get("/api/servers"), get("/api/loadbalancer").catch(() => null)]);
-      items = s.items || []; lb = l;
+      const [s, l, h] = await Promise.all([get("/api/servers"), get("/api/loadbalancer").catch(() => null), getHa()]);
+      items = s.items || []; lb = l; ha = h && typeof h === "object" ? h : null;
       if (!ctx.alive()) return;
-      paintLb(); paint();
+      paintHa(); paintLb(); paint();
     } catch (e) { if (ctx.alive()) { mount(list, errorState(e)); $("[data-retry]", list)?.addEventListener("click", load); } }
   };
   await load();
 
   const edgeSupported = () => items.some((x) => x.edge);
+  const panelOpts = (s) => (panelSupported(ha, items) ? { block: (edge) => panelBlock(s, ha, items, { edge }) } : null);
   on(root, "click", "[data-add]", async () => { if (await serverForm(null, { edgeSupported: edgeSupported() })) load(); });
+  on(root, "click", "[data-ha-active]", (e, b) => { const n = (ha?.nodes || []).find((x) => x.serverId === b.dataset.haActive); if (n) makeActive(n, ha, ctx); });
   on(root, "click", "[data-edge]", (e, b) => { const s = items.find((x) => x.id === b.dataset.edge); if (s) edgeDialog(s); });
   on(root, "click", "[data-apply]", async (e, b) => {
     b.classList.add("loading");
@@ -245,7 +389,14 @@ export default async function servers(ctx) {
   on(root, "click", "[data-smenu]", (e, b) => {
     const s = items.find((x) => x.id === b.dataset.smenu); if (!s) return;
     openMenu(b, [
-      { label: "Edit server", icon: "edit", onClick: async () => { if (await serverForm(s, { edgeSupported: edgeSupported() })) { toast("Server updated", "ok"); load(); } } },
+      { label: "Edit server", icon: "edit", onClick: async () => { if (await serverForm(s, { edgeSupported: edgeSupported(), panel: panelOpts(s) })) { toast("Server updated", "ok"); load(); } } },
+      s.role !== "main" && panelSupported(ha, items) && (() => {
+        const why = panelBlock(s, ha, items), on_ = !!s.panel?.enabled;
+        return { label: html`<span class="menu-t">${on_ ? "Remove panel node" : "Make panel node"}${why ? html`<small class="menu-why">${why}</small>` : ""}</span>`, icon: "layers", disabled: !!why,
+          onClick: async () => { if (await setPanelNode(s, !on_)) load(); } };
+      })(),
+      s.role !== "main" && ha?.enabled && s.panel?.enabled && s.id !== ha.leaderId && { label: "Make active panel", icon: "zap", disabled: !s.online || ha.armed === false,
+        onClick: () => { const n = (ha.nodes || []).find((x) => x.serverId === s.id) || { serverId: s.id, name: s.name }; makeActive(n, ha, ctx); } },
       s.role !== "main" && s.edge?.enabled && { label: "Edge node details", icon: "shield", onClick: () => edgeDialog(s) },
       s.role !== "main" && s.edge?.enabled && { label: "Sync edge now", icon: "refresh", disabled: !s.online, onClick: async () => {
         try { const job = await post(`/api/servers/${s.id}/edge/sync`); if (job?.id) openJobLog(job.id); else toast("Sync sent", "ok"); } catch (ex) { toastError(ex, "Couldn't sync"); } } },
@@ -272,7 +423,15 @@ export default async function servers(ctx) {
     const i = items.findIndex((x) => x.id === d.id);
     items[i] = { ...items[i], ...d };
     const el = $(`[data-server="${d.id}"]`, list);
-    if (el) { el.replaceWith(frag(serverCard(items[i]))); paintSpark(d.id); }
+    if (el) { el.replaceWith(frag(serverCard(items[i], ha))); paintSpark(d.id); }
   });
+  ctx.on("ha", debounce(async () => {
+    const h = await getHa();
+    if (!ctx.alive() || !h) return;
+    ha = h; paintHa();
+    // roles may have moved: repaint the cards' badges
+    const fresh = await get("/api/servers").catch(() => null);
+    if (fresh?.items && ctx.alive()) { items = fresh.items; paint(); }
+  }, 500));
   ctx.on(["lb", "site"], debounce(async () => { lb = await get("/api/loadbalancer").catch(() => lb); if (ctx.alive()) paintLb(); }, 500));
 }

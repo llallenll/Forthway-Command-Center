@@ -4,6 +4,7 @@ import { html, raw, mount, $, on, ago, toast, toastError, confirmDialog, debounc
 import { icon } from "../icons.js";
 import { get, post, put, del } from "../api.js";
 import { openJobLog, jobStarted } from "../components.js";
+import { dbUnavailable, unavailableState } from "./databases.js";
 
 const field = (label, control, hint) => html`<div class="field"><label>${label}</label>${control}${hint ? html`<div class="hint">${hint}</div>` : ""}</div>`;
 function setBusy(btn, busy) { if (!btn) return; btn.classList.toggle("loading", busy); btn.disabled = busy; }
@@ -17,9 +18,14 @@ const choice = (name, value, checked, ico, title, desc) => html`<label class="ch
 
 export async function mysqlSettings(box, ctx) {
   let s = null;
-  const load = async () => { s = await get("/api/mysql/settings"); if (ctx.alive()) paint(); };
+  const load = async () => {
+    try { s = await get("/api/mysql/settings"); } catch (e) { if (!dbUnavailable(e)) throw e; s = { available: false, reason: dbUnavailable(e) }; }
+    if (ctx.alive()) paint();
+  };
 
   const paint = () => {
+    const why = dbUnavailable(s);
+    if (why) return mount(box, unavailableState(why));
     const bindLocal = isLocalBind(s.bindAddress);
     const fallback = s.mainSitesVia === "panel" && s.mainSitesHost !== s.publicHost;
     mount(box, html`
@@ -96,9 +102,14 @@ export async function mysqlSettings(box, ctx) {
 
 export async function phpMyAdminSettings(box, ctx) {
   let s = null;
-  const load = async (check = false) => { s = await get(`/api/phpmyadmin${check ? "?check=1" : ""}`); if (ctx.alive()) paint(); };
+  const load = async (check = false) => {
+    try { s = await get(`/api/phpmyadmin${check ? "?check=1" : ""}`); } catch (e) { if (!dbUnavailable(e)) throw e; s = { available: false, reason: dbUnavailable(e) }; }
+    if (ctx.alive()) paint();
+  };
 
   const paint = () => {
+    const why = dbUnavailable(s);
+    if (why) return mount(box, unavailableState(why, { title: "phpMyAdmin is unavailable right now" }));
     const busy = !!s.busyJobId;
     const tone = s.installed ? (s.lastCheck && !s.lastCheck.ok ? "warn" : "ok") : "off";
     mount(box, html`

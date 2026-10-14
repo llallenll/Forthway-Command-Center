@@ -21,21 +21,26 @@ const db = {
   settings: { panelName: "Forthway", panelUrl: "https://panel.forthway.dev", githubTokenSet: true, githubTokenHint: "ghp_••••a91F" },
   servers: [
     { id: "main", name: "fcc-main", role: "main", host: "203.0.113.10", privateHost: "10.0.0.10", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.0.0",
-      edge: { enabled: true, implicit: true }, edgeStatus: null,
+      edge: { enabled: true, implicit: true }, edgeStatus: null, panel: { enabled: true, directUrl: "http://10.0.0.10:4000" },
       lastSeenAt: ago(4e3), online: true, info: { hostname: "fcc-main", os: "Ubuntu 24.04 LTS", cpus: 8, memTotal: 16 * GB, diskTotal: 320 * GB }, createdAt: iso(NOW - 90 * DAY),
       metrics: { cpu: 23, mem: 6.2 * GB, memTotal: 16 * GB, disk: 118 * GB, diskTotal: 320 * GB, load: 0.84, uptime: 38 * DAY, at: ago(4e3) } },
-    { id: "srv_fra1", name: "fra-agent-1", role: "worker", host: "203.0.113.21", privateHost: "10.0.0.21", weight: 2, enabled: true, lbEligible: true, agentVersion: "3.0.0",
+    { id: "srv_fra1", name: "fra-agent-1", role: "worker", host: "203.0.113.21", privateHost: "10.0.0.21", weight: 2, enabled: true, lbEligible: true, agentVersion: "3.2.0",
       edge: { enabled: true }, edgeStatus: null, // filled in below (edge nodes)
+      panel: { enabled: true, directUrl: "http://10.0.0.21:4000" }, // a standby panel (panel failover)
       lastSeenAt: ago(6e3), online: true, info: { hostname: "fra-agent-1", os: "Debian 12", cpus: 4, memTotal: 8 * GB, diskTotal: 160 * GB }, createdAt: iso(NOW - 60 * DAY),
       metrics: { cpu: 31, mem: 3.1 * GB, memTotal: 8 * GB, disk: 61 * GB, diskTotal: 160 * GB, load: 1.12, uptime: 21 * DAY, at: ago(6e3) } },
-    { id: "srv_fra2", name: "fra-agent-2", role: "worker", host: "203.0.113.22", privateHost: "10.0.0.22", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.0.0",
-      edge: { enabled: false }, edgeStatus: null,
+    { id: "srv_fra2", name: "fra-agent-2", role: "worker", host: "203.0.113.22", privateHost: "10.0.0.22", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.2.0",
+      edge: { enabled: false }, edgeStatus: null, panel: null,
       lastSeenAt: ago(3e3), online: true, info: { hostname: "fra-agent-2", os: "Ubuntu 22.04 LTS", cpus: 4, memTotal: 8 * GB, diskTotal: 160 * GB }, createdAt: iso(NOW - 45 * DAY),
       metrics: { cpu: 58, mem: 6.5 * GB, memTotal: 8 * GB, disk: 146 * GB, diskTotal: 160 * GB, load: 2.31, uptime: 9 * DAY, at: ago(3e3) } },
     { id: "srv_nyc1", name: "nyc-agent-1", role: "worker", host: "198.51.100.40", privateHost: null, weight: 1, enabled: true, lbEligible: false, agentVersion: "2.11.0",
-      edge: { enabled: false }, edgeStatus: null,
+      edge: { enabled: false }, edgeStatus: null, panel: null,
       lastSeenAt: ago(3 * HOUR + 12 * MIN), online: false, info: { hostname: "nyc-agent-1", os: "Ubuntu 22.04 LTS", cpus: 2, memTotal: 4 * GB, diskTotal: 80 * GB }, createdAt: iso(NOW - 20 * DAY),
       metrics: { cpu: 12, mem: 1.9 * GB, memTotal: 4 * GB, disk: 31 * GB, diskTotal: 80 * GB, load: 0.2, uptime: 2 * DAY, at: ago(3 * HOUR + 12 * MIN) } },
+    { id: "srv_ams1", name: "ams-agent-1", role: "worker", host: "203.0.113.31", privateHost: "10.0.0.31", weight: 1, enabled: true, lbEligible: false, agentVersion: "3.2.0",
+      edge: { enabled: true }, edgeStatus: null, panel: null,
+      lastSeenAt: ago(5e3), online: true, info: { hostname: "ams-agent-1", os: "Debian 12", cpus: 2, memTotal: 4 * GB, diskTotal: 80 * GB }, createdAt: iso(NOW - 6 * DAY),
+      metrics: { cpu: 9, mem: 1.2 * GB, memTotal: 4 * GB, disk: 14 * GB, diskTotal: 80 * GB, load: 0.18, uptime: 6 * DAY, at: ago(5e3) } },
   ],
   projects: [
     { id: "prj_acme", name: "Acme Storefront", description: "Customer-facing shop, admin console and a staging copy.", color: "blue", createdAt: iso(NOW - 80 * DAY) },
@@ -186,6 +191,26 @@ function linesFor(type, title, error) {
   return L.map(t);
 }
 
+/* ───────── mock switches ─────────
+   ?mockdb=off  databases unavailable (main doesn't run the active panel) · ?mockdb=on undoes it
+   ?mockha=open panel nodes can be added (otherwise nyc-agent-1, offline on agent 2.11, blocks it)
+   Or from the console: fccMock.dbDown(true), fccMock.haOpen(true), then reload the view. */
+const flags = { dbDown: false, haOpen: false };
+{
+  const q = new URLSearchParams(location.search);
+  const ssGet = (k) => { try { return sessionStorage.getItem(k); } catch { return null; } };
+  const ssSet = (k, v) => { try { v ? sessionStorage.setItem(k, "1") : sessionStorage.removeItem(k); } catch {} };
+  if (q.has("mockdb")) ssSet("fcc.mock.dbDown", q.get("mockdb") === "off");
+  if (q.has("mockha")) ssSet("fcc.mock.haOpen", q.get("mockha") === "open");
+  flags.dbDown = ssGet("fcc.mock.dbDown") === "1";
+  flags.haOpen = ssGet("fcc.mock.haOpen") === "1";
+  try { window.fccMock = { flags, dbDown: (on = true) => { flags.dbDown = !!on; ssSet("fcc.mock.dbDown", !!on); }, haOpen: (on = true) => { flags.haOpen = !!on; ssSet("fcc.mock.haOpen", !!on); } }; } catch {}
+}
+const DB_REASON = "Databases live on the main server, which is not running the active panel right now.";
+
+/* panel failover (docs/HA.md, Phase 2): main is the active panel, fra-agent-1 a standby */
+const ha = { enabled: true, armed: true, leaderId: "main", term: 7, switchingUntil: 0 };
+
 /* ───────── event bus ───────── */
 const listeners = new Set();
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
@@ -243,7 +268,7 @@ function activity(action, type, target, details) {
 
 /* ───────── views ───────── */
 function serverView(s) {
-  return { ...clone(s), siteCount: db.sites.filter((x) => targets(x).includes(s.id)).length };
+  return { ...clone(s), siteCount: db.sites.filter((x) => targets(x).includes(s.id)).length, panelRole: s.panel?.enabled ? (s.id === ha.leaderId ? "leader" : "follower") : null };
 }
 function lbSummary(s) { return { loadBalanced: !!s.loadBalanced, servers: targets(s).length, method: s.lbMethod }; }
 function upstreams(s) {
@@ -535,6 +560,7 @@ function appliedEdge(s, { shimError = null } = {}) {
 }
 // fra-agent-1: an edge in sync, both tunnels connected, phpMyAdmin shim failing (→ one warning on the dashboard)
 db.servers.find((x) => x.id === "srv_fra1").edgeStatus = { ...appliedEdge(null, { shimError: "connect ECONNREFUSED 10.0.0.10:8081" }), appliedAt: ago(7 * MIN) };
+db.servers.find((x) => x.id === "srv_ams1").edgeStatus = { ...appliedEdge(null), appliedAt: ago(12 * MIN) };
 function edgeSync(s) {
   if (s.edgeStatus) { s.edgeStatus.inSync = false; s.edgeStatus.hash = EDGE_HASH; }
   emit("server", serverView(s));
@@ -596,6 +622,75 @@ R("GET", "/api/cluster/ha", () => {
   return { edges, tunnelReplicasOnline: (mainUp ? 1 : 0) + edges.filter((e) => e.online && e.tunnelConnected).length, connectors: conns.length,
     mainOnlySites: db.sites.filter((x) => targets(x).length === 1 && targets(x)[0] === "main").map((x) => ({ id: x.id, name: x.name })), warnings };
 });
+
+// panel failover (docs/HA.md, Phase 2)
+const panelNodes = () => db.servers.filter((x) => x.panel?.enabled);
+function haCanEnable() {
+  if (flags.haOpen) return { ok: true, reason: null };
+  const on = db.servers.filter((x) => x.enabled !== false);
+  if (on.length < 3) return { ok: false, reason: "Panel nodes need at least 3 servers, so a majority can still vote when one is down." };
+  const bad = on.find((x) => x.role !== "main" && (!x.online || (x.agentVersion || "0") < "3.2.0"));
+  if (bad) return { ok: false, reason: `${bad.name} must be online and run agent 3.2.0 or newer before you add a panel node.` };
+  return { ok: true, reason: null };
+}
+function haView() {
+  const voters = db.servers.filter((x) => x.enabled !== false);
+  const majority = Math.floor(voters.length / 2) + 1;
+  const votes = voters.map((x) => ({ serverId: x.id, name: x.name, votedFor: x.online ? ha.leaderId : null, leaseLeftMs: x.online ? 9000 + Math.round(Math.random() * 3000) : 0, reachable: !!x.online }));
+  const nodes = panelNodes().map((x) => ({ serverId: x.id, name: x.name, role: x.id === ha.leaderId ? "leader" : "follower", directUrl: x.panel.directUrl, online: !!x.online,
+    version: "3.8.0", lagMs: x.id === ha.leaderId ? 0 : 400, codeInSync: true }));
+  const warnings = voters.filter((x) => !x.online).map((x) => `${x.name} is offline, so it can't vote. The panel keeps running while ${majority} of ${voters.length} servers vote.`);
+  return { enabled: ha.enabled, armed: ha.armed, leaderId: ha.leaderId, term: ha.term, localServerId: ha.leaderId, majority, voters: voters.length,
+    votes, nodes, committed: { term: ha.term, seq: 4182 }, warnings, canEnable: haCanEnable() };
+}
+R("GET", "/api/ha", () => haView());
+R("POST", "/api/ha/handover", (p, b) => {
+  const t = db.servers.find((x) => x.id === b.serverId);
+  if (!ha.enabled) err(409, "Panel failover is off.");
+  if (!t?.panel?.enabled) err(400, "That server isn't a panel node.");
+  if (t.id === ha.leaderId) err(409, `${t.name} already runs the active panel.`);
+  if (!t.online) err(409, `${t.name} is offline.`);
+  // Simulated switch: the API answers 503 { haSwitching } until the new leader takes over at ~3 s.
+  ha.switchingUntil = Date.now() + 3000;
+  setTimeout(() => {
+    ha.leaderId = t.id; ha.term += 1;
+    activity("ha.handover", "server", t, "Now the active panel");
+    emit("ha", { leaderId: ha.leaderId, term: ha.term });
+    for (const x of panelNodes()) emit("server", serverView(x));
+  }, 3000);
+  return { ok: true };
+});
+R("POST", "/api/servers/:id/panel", (p, b) => {
+  const s = find("servers", p.id);
+  if (s.role === "main") err(400, "The main server is always a panel node.");
+  const enabled = !!b.enabled;
+  if (enabled) {
+    if (s.panel?.enabled) err(409, `${s.name} is already a panel node.`);
+    if (!s.edge?.enabled) err(400, "Turn on Edge node first. Panel nodes must be edges.");
+    if (!s.online) err(409, `${s.name} is offline.`);
+    const c = haCanEnable(); if (!c.ok) err(409, c.reason);
+  } else {
+    if (!s.panel?.enabled) err(409, `${s.name} isn't a panel node.`);
+    if (s.id === ha.leaderId) err(409, "This server runs the active panel. Make another panel node active first.");
+  }
+  activity(enabled ? "server.panel.add" : "server.panel.remove", "server", s);
+  const dir = `http://${s.privateHost || s.host}:4000`;
+  return runJob({ type: enabled ? "panel.install" : "panel.remove", title: `${enabled ? "Install the panel on" : "Remove the panel from"} ${s.name}`, serverId: s.id }, {
+    lines: enabled
+      ? ["▸ Downloading the panel code from the active panel (/ha/code)", "  sha256 ok · 2,184 files", "▸ Unpacking to /opt/fcc", "▸ Writing /var/lib/fcc/ha-local.json", "▸ Writing fcc.service", "  systemctl enable --now fcc", `▸ ufw: allow 4000 from ${db.servers.filter((x) => x.id !== s.id).map((x) => x.privateHost || x.host).join(", ")}`, "▸ Waiting for the first copy of the panel data", "  replicated 9 files", "✓ Standby panel running"]
+      : ["▸ systemctl disable --now fcc", "▸ Removing fcc.service and /opt/fcc", `▸ Kept the panel data in /var/lib/fcc.removed-${iso(Date.now()).slice(0, 10)} (it holds secrets)`, "✓ Panel node removed"],
+    onDone() {
+      s.panel = enabled ? { enabled: true, directUrl: dir } : null;
+      ha.enabled = panelNodes().some((x) => x.role !== "main");
+      if (ha.enabled && !ha.leaderId) ha.leaderId = "main";
+      emit("server", serverView(s)); emit("ha", { leaderId: ha.leaderId });
+      return enabled ? { installed: true, version: "3.8.0" } : { removed: true };
+    },
+  });
+});
+// Databases only answer here while main runs the active panel (flags.dbDown simulates the opposite).
+R("GET", "/api/mysql/settings", () => (flags.dbDown ? { available: false, reason: DB_REASON } : err(404, "Mock: no route for GET /api/mysql/settings")));
+R("GET", "/api/phpmyadmin", () => (flags.dbDown ? { available: false, reason: DB_REASON } : err(404, "Mock: no route for GET /api/phpmyadmin")));
 
 // cluster
 R("GET", "/api/servers", () => ({ items: db.servers.map(serverView) }));
@@ -689,7 +784,7 @@ ${s.ssl?.status === "active" ? `
 }
 
 // data
-R("GET", "/api/mysql/status", () => clone(db.mysql));
+R("GET", "/api/mysql/status", () => (flags.dbDown ? { available: false, reason: DB_REASON } : clone(db.mysql)));
 R("POST", "/api/mysql/root", () => { db.mysql.rootOk = true; return clone(db.mysql); });
 R("GET", "/api/databases", (p, b, q) => ({ items: db.databases.filter((d) => !q.projectId || d.projectId === q.projectId).map(dbView) }));
 R("POST", "/api/projects/:projectId/databases", (p, b) => {
@@ -743,7 +838,7 @@ R("POST", "/api/backups/server", (p, b) => {
       db.backups.unshift(bk); emit("backup", bk); },
   });
 });
-R("GET", "/api/backups/settings", () => ({ ...clone(db.backupSettings), nextRun: { database: iso(Math.ceil(Date.now() / DAY) * DAY + 3 * HOUR), server: iso(Date.now() + 2.4 * DAY) }, lastRun: { database: ago(21 * HOUR), server: ago(4.6 * DAY) },
+R("GET", "/api/backups/settings", () => ({ ...clone(db.backupSettings), ...(flags.dbDown ? { database: { ...db.backupSettings.database, available: false, reason: DB_REASON } } : {}), nextRun: { database: iso(Math.ceil(Date.now() / DAY) * DAY + 3 * HOUR), server: iso(Date.now() + 2.4 * DAY) }, lastRun: { database: ago(21 * HOUR), server: ago(4.6 * DAY) },
   usage: { count: db.backups.length, bytes: db.backups.reduce((a, b) => a + (b.size || 0), 0) }, localPath: "/var/lib/fcc/backups", timezone: "Europe/Berlin" }));
 R("POST", "/api/backups/destination/test", (p, b) => { if (b.type !== "s3") return { ok: true }; if (!b.bucket || !b.accessKey) err(400, "Access denied: check the access key and bucket."); return { ok: true }; });
 R("PUT", "/api/backups/settings", (p, b) => { db.backupSettings = { ...db.backupSettings, ...b }; activity("backup.settings", "settings", { id: "backups", name: "Backup schedule" }); return clone(db.backupSettings); });
@@ -765,6 +860,9 @@ export async function handle(method, path, body) {
   const [pathname, search] = path.split("?");
   const q = Object.fromEntries(new URLSearchParams(search || ""));
   await new Promise((r) => setTimeout(r, 120 + Math.random() * 260));
+  // panel failover: while a simulated switch is under way, every API call gets what a panel node answers without a leader
+  if (Date.now() < ha.switchingUntil) err(503, "The panel is switching servers.", { haSwitching: true });
+  if (flags.dbDown && method !== "GET" && (/^\/api\/(mysql|phpmyadmin|databases)(\/|$)/.test(pathname) || /^\/api\/projects\/[^/]+\/databases$/.test(pathname))) err(503, DB_REASON);
   for (const rt of routes) {
     if (rt.method !== method) continue;
     const m = pathname.match(rt.re);

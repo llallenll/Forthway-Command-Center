@@ -11,6 +11,15 @@
  *   readEdgeState(dataDir)    what the last cluster.sync left behind
  *   edgeStatus(dataDir)       that state + live probes, for /agent/metrics
  *   edgeLogSites(dataDir)     site ids whose fcc-<siteId>.conf this server manages
+ *   panelInstall / panelRemove  tasks panel.install / panel.remove (Phase 2: panel nodes)
+ *
+ * Phase 2 (panel failover) adds two things to cluster.sync:
+ *   - `frontDoor: true` — sent only to main's embedded agent while another
+ *     server runs the active panel: `edge.files` are main's own front door
+ *     files (Let's Encrypt paths) and replace main's fcc-*.conf set; no
+ *     catch-all, no shims, no connectors; their access logs are shipped.
+ *   - `shims[].targets: [url, …]` — every panel node; rendered as an nginx
+ *     upstream with passive failover (the single `target` still works).
  *
  * Everything that shells out goes through panel/lib/sys.mjs: under
  * FCC_DRY_RUN=1 ufw/systemctl/openssl/nginx are only logged, nginx files go to
@@ -28,6 +37,8 @@ import os from "node:os";
 import net from "node:net";
 import http from "node:http";
 import https from "node:https";
+import crypto from "node:crypto";
+import { execFile } from "node:child_process";
 
 import { ensureDir, exists } from "./fsx.mjs";
 import { nginxConfDir, nginxIsLive, reloadNginx } from "./tasks.mjs";
@@ -50,6 +61,8 @@ const TOKEN_RE = /^[A-Za-z0-9+/=_-]{20,8192}$/;
 const SHIM_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$/;
 const TARGET_RE = /^(https?):\/\/([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):(\d{1,5})\/?$/;
 const HASH_RE = /^[A-Fa-f0-9]{8,128}$/;
+const PMA_FILE = "fcc-phpmyadmin.conf"; // DATA's phpMyAdmin vhost on main — never part of a front door set
+const MAX_SHIM_TARGETS = 16;
 
 const UFW_COMMENT = "fcc sites from edge";
 const SITE_PORTS = "3000:3999";
@@ -127,7 +140,10 @@ function checkPayload(payload) {
     } else ignored.push(s.slice(0, 60));
   }
 
-  if (payload.edge == null) return { hash, allowFrom, ignored, edge: null };
+  // frontDoor (docs/HA.md, Phase 2): sent only to main's embedded agent while
+  // another server runs the active panel — main's own front door files, nothing else.
+  const frontDoor = payload.frontDoor === true;
+  if (payload.edge == null) return { hash, allowFrom, ignored, notes: [], frontDoor, edge: null };
   const e = payload.edge;
   if (typeof e !== "object") throw bad("edge must be an object or null");
 
@@ -139,6 +155,7 @@ function checkPayload(payload) {
     if (!FILE_RE.test(name)) throw bad(`"${String(name).slice(0, 80)}" is not an allowed nginx file name`);
     if (name.startsWith("fcc-app-")) throw bad(`${name} is a local website vhost and cannot be set from the edge configuration`);
     if (name === DEFAULT_FILE || SHIM_RE.test(name)) throw bad(`${name} is generated on the edge itself`);
+    if (name === PMA_FILE) throw bad(`${name} is the phpMyAdmin vhost and is not part of the front door`);
     if (typeof content !== "string") throw bad(`${name} has no text`);
     if (Buffer.byteLength(content) > MAX_FILE_BYTES) throw bad(`${name} is larger than 2 MB`);
     if (content.includes("\0")) throw bad(`${name} contains a NUL byte`);
@@ -146,7 +163,7 @@ function checkPayload(payload) {
   }
 
   const connectors = [];
-  for (const c of Array.isArray(e.connectors) ? e.connectors : []) {
+  for (const c of frontDoor ? [] : Array.isArray(e.connectors) ? e.connectors : []) {
     const id = String(c?.id ?? "");
     if (!CONNECTOR_ID_RE.test(id)) throw bad(`"${id.slice(0, 40)}" is not a valid connector id`);
     if (connectors.some((x) => x.id === id)) throw bad(`connector ${id} is listed twice`);
@@ -158,21 +175,36 @@ function checkPayload(payload) {
   }
 
   const shims = [];
-  for (const s of Array.isArray(e.shims) ? e.shims : []) {
+  for (const s of frontDoor ? [] : Array.isArray(e.shims) ? e.shims : []) {
     const name = String(s?.name ?? "");
     if (!SHIM_NAME_RE.test(name)) throw bad(`"${name.slice(0, 40)}" is not a valid shim name`);
     const listenPort = checkPort(s.listenPort, `shim ${name}'s listenPort`);
     if (listenPort === 80 || listenPort === 443) throw bad(`shim ${name} cannot listen on port ${listenPort} (the front door uses it)`);
     if (shims.some((x) => x.listenPort === listenPort)) throw bad(`two shims listen on port ${listenPort}`);
-    const m = TARGET_RE.exec(String(s.target ?? ""));
-    if (!m) throw bad(`shim ${name}'s target must look like http(s)://host:port`);
-    const host = m[2].startsWith("[") ? m[2] : m[2].toLowerCase();
-    if (host.startsWith("[") && net.isIP(host.slice(1, -1)) !== 6) throw bad(`shim ${name}'s target has an invalid IPv6 address`);
-    const port = checkPort(m[3], `shim ${name}'s target`);
-    shims.push({ name, listenPort, listenTls: !!s.listenTls, target: `${m[1]}://${host}:${port}`, https: m[1] === "https" });
+    // `targets` (Phase 2: every panel node) or the single `target` of 3.7.0.
+    const raw = Array.isArray(s.targets) && s.targets.length ? s.targets : [s.target];
+    if (raw.length > MAX_SHIM_TARGETS) throw bad(`shim ${name} has more than ${MAX_SHIM_TARGETS} targets`);
+    const targets = [];
+    let scheme = null;
+    for (const t of raw) {
+      const m = TARGET_RE.exec(String(t ?? ""));
+      if (!m) throw bad(`shim ${name}'s target must look like http(s)://host:port`);
+      const host = m[2].startsWith("[") ? m[2] : m[2].toLowerCase();
+      if (host.startsWith("[") && net.isIP(host.slice(1, -1)) !== 6) throw bad(`shim ${name}'s target has an invalid IPv6 address`);
+      const port = checkPort(m[3], `shim ${name}'s target`);
+      if (scheme && scheme !== m[1]) throw bad(`shim ${name}'s targets mix http and https`);
+      scheme = m[1];
+      const url = `${m[1]}://${host}:${port}`;
+      if (!targets.includes(url)) targets.push(url);
+    }
+    shims.push({ name, listenPort, listenTls: !!s.listenTls, target: targets[0], targets, https: scheme === "https" });
+  }
+  const notes = [];
+  if (frontDoor && ((Array.isArray(e.shims) && e.shims.length) || (Array.isArray(e.connectors) && e.connectors.length))) {
+    notes.push("Front door mode: the shims and connectors in the payload are not used on the main server.");
   }
 
-  return { hash, allowFrom, ignored, edge: { files, connectors, shims } };
+  return { hash, allowFrom, ignored, notes, frontDoor, edge: { files, connectors, shims } };
 }
 
 // --------------------------------------------------------------- the task
@@ -198,13 +230,37 @@ export async function clusterSync(payload, o) {
     return { error: err.message };
   });
   if (p.ignored.length) log(`Ignored allowFrom entries that are not IP addresses: ${p.ignored.join(", ")}`);
+  for (const n of p.notes) log(n);
   checkAbort();
 
-  const state = { ...prev, edge: !!p.edge, hash: p.hash, appliedAt: new Date().toISOString() };
+  const state = { ...prev, edge: !!p.edge, frontDoor: !!p.edge && p.frontDoor, hash: p.hash, appliedAt: new Date().toISOString() };
   let connectors = [];
   let shims = [];
 
-  if (p.edge) {
+  if (p.edge && p.frontDoor) {
+    // 2'. Main's front door while another server runs the active panel: the
+    // panel's usual fcc-*.conf set (Let's Encrypt paths), written over main's
+    // own files. No catch-all, no shims, no connectors (main's panel process
+    // runs those itself when it is active again).
+    log("── nginx (main server front door) ──");
+    try {
+      const r = await applyEdgeFiles(P.conf, new Map(p.edge.files), frontDoorManaged(P.conf, prev), log);
+      state.files = [...p.edge.files.keys()].sort();
+      state.shims = [];
+      state.nginx = true;
+      log(r.changed ? `nginx: ${r.changed} file(s) changed${r.tested ? ", tested and reloaded" : ""}.` : "nginx configuration already up to date.");
+    } catch (err) {
+      if (err.aborted) throw err;
+      state.nginx = false;
+      errors.push(`nginx: ${err.message}`);
+      log(`!! ${err.message}`);
+    }
+    if (Object.keys(prev.connectors || {}).length) {
+      const r = await syncConnectors([], prev, P, o, log);
+      for (const c of r.results) if (c.error) errors.push(`connector ${c.id}: ${c.error}`);
+    }
+    state.connectors = {};
+  } else if (p.edge) {
     // 2. nginx front door
     log("── nginx ──");
     try {
@@ -224,7 +280,7 @@ export async function clusterSync(payload, o) {
       errors.push(`nginx: ${err.message}`);
       log(`!! ${err.message}`);
     }
-    shims = p.edge.shims.map((s) => ({ name: s.name, listenPort: s.listenPort, listenTls: s.listenTls, target: s.target }));
+    shims = p.edge.shims.map((s) => ({ name: s.name, listenPort: s.listenPort, listenTls: s.listenTls, target: s.target, ...(s.targets.length > 1 ? { targets: s.targets } : {}) }));
     if (state.nginx) state.shims = shims.map(({ name, listenPort, listenTls }) => ({ name, listenPort, listenTls }));
     checkAbort();
 
@@ -239,6 +295,15 @@ export async function clusterSync(payload, o) {
       state.connectors = r.ports;
       for (const c of connectors) if (c.error) errors.push(`connector ${c.id}: ${c.error}`);
     }
+  } else if (prev.frontDoor) {
+    // Main's own front door files are not ours to delete: the panel on main
+    // rewrites them itself once it is the active panel again.
+    log("── Front door mode ended ──");
+    log("Main's nginx files are left in place; the panel on this server manages them again.");
+    state.files = [];
+    state.shims = [];
+    state.connectors = {};
+    state.nginx = false;
   } else {
     // 4. Not an edge (any more): take everything down, leave local vhosts alone.
     log("── Removing edge configuration ──");
@@ -272,11 +337,12 @@ export async function clusterSync(payload, o) {
     log(`!! Could not save ${P.state}: ${err.message}`);
   }
   if (state.error) log(`Finished with problems:\n${state.error}`);
-  else log(p.edge ? "Edge configuration applied." : "Done.");
+  else log(p.edge ? (p.frontDoor ? "Front door configuration applied." : "Edge configuration applied.") : "Done.");
 
   return {
     hash: state.hash,
     appliedAt: state.appliedAt,
+    ...(state.frontDoor ? { frontDoor: true } : {}),
     nginx: !!p.edge && state.nginx,
     error: state.error,
     connectors,
@@ -289,6 +355,23 @@ export async function clusterSync(payload, o) {
 // --------------------------------------------------------------- firewall
 
 async function syncFirewall(allowFrom, log) {
+  const r = await syncUfwRules({ allowFrom, ports: SITE_PORTS, comment: UFW_COMMENT, log });
+  if (!r.active) return r;
+  const { added, removed } = r;
+  log(
+    added.length || removed.length
+      ? `Site ports ${SITE_PORTS}: opened to ${added.join(", ") || "nobody new"}; closed to ${removed.join(", ") || "nobody"}.`
+      : `Site ports ${SITE_PORTS} already open to ${allowFrom.length ? allowFrom.join(", ") : "no edge servers"}.`,
+  );
+  return { active: true, allowFrom, added, removed };
+}
+
+/**
+ * Make the ufw rules tagged `comment` be exactly "allow `ports`/tcp from each
+ * of `allowFrom`" (an empty list removes them all). Rules with other comments
+ * are never touched. Resolves { active, added, removed } or { skipped } / { active: false }.
+ */
+async function syncUfwRules({ allowFrom, ports, comment, log }) {
   if (process.env.FCC_SKIP_UFW === "1") {
     log("FCC_SKIP_UFW=1 — the firewall is left alone.");
     return { skipped: true };
@@ -303,30 +386,27 @@ async function syncFirewall(allowFrom, log) {
     return { active: false };
   }
   // "3000:3999/tcp   ALLOW   10.0.0.5   # fcc sites from edge"  (ALLOW IN with `ufw status verbose`)
-  const have = new Set();
+  const have = []; // [{ ip, ports }]
   for (const line of String(st.stdout || "").split("\n")) {
-    const m = /^\S+\s+ALLOW(?:\s+IN)?\s+(\S+)\s+#\s*(.*?)\s*$/.exec(line.trim());
-    if (m && m[2] === UFW_COMMENT && net.isIP(m[1])) have.add(m[1]);
+    const m = /^(\S+)\s+ALLOW(?:\s+IN)?\s+(\S+)\s+#\s*(.*?)\s*$/.exec(line.trim());
+    if (!m || m[3] !== comment || !net.isIP(m[2])) continue;
+    const p = m[1].replace(/\/tcp$/, "");
+    if (/^\d{1,5}(:\d{1,5})?$/.test(p)) have.push({ ip: m[2], ports: p });
   }
-  const rule = (ip) => ["from", ip, "to", "any", "port", SITE_PORTS, "proto", "tcp"];
+  const rule = (ip, p) => ["from", ip, "to", "any", "port", p, "proto", "tcp"];
   const added = [];
   const removed = [];
   for (const ip of allowFrom) {
-    if (have.has(ip)) continue;
-    await sys.run("ufw", ["allow", ...rule(ip), "comment", UFW_COMMENT], { timeoutMs: 30_000, log });
+    if (have.some((h) => h.ip === ip && h.ports === String(ports))) continue;
+    await sys.run("ufw", ["allow", ...rule(ip, String(ports)), "comment", comment], { timeoutMs: 30_000, log });
     added.push(ip);
   }
-  for (const ip of have) {
-    if (allowFrom.includes(ip)) continue;
-    await sys.run("ufw", ["--force", "delete", "allow", ...rule(ip)], { timeoutMs: 30_000, log });
-    removed.push(ip);
+  for (const h of have) {
+    if (allowFrom.includes(h.ip) && h.ports === String(ports)) continue;
+    await sys.run("ufw", ["--force", "delete", "allow", ...rule(h.ip, h.ports)], { timeoutMs: 30_000, log });
+    removed.push(h.ip);
   }
-  log(
-    added.length || removed.length
-      ? `Site ports ${SITE_PORTS}: opened to ${added.join(", ") || "nobody new"}; closed to ${removed.join(", ") || "nobody"}.`
-      : `Site ports ${SITE_PORTS} already open to ${allowFrom.length ? allowFrom.join(", ") : "no edge servers"}.`,
-  );
-  return { active: true, allowFrom, added, removed };
+  return { active: true, added, removed };
 }
 
 // ------------------------------------------------------------------ nginx
@@ -384,10 +464,19 @@ function renderEdgeDefault(version) {
 }
 
 function renderShim(s) {
+  const many = Array.isArray(s.targets) && s.targets.length > 1;
+  const upstream = `fcc_edge_shim_${s.listenPort}`;
   return [
     `# Managed by Forthway Command Center — do not edit by hand.`,
     `# Edge shim "${s.name}": tunnel routes for 127.0.0.1:${s.listenPort} reach this replica too,`,
-    `# so pass them on to the main server.`,
+    many ? `# so pass them on to a panel node (any of them works: standbys forward to the active one).` : `# so pass them on to the main server.`,
+    ...(many
+      ? [
+          `upstream ${upstream} {`,
+          ...s.targets.map((t) => `    server ${t.replace(/^https?:\/\//, "")} max_fails=1 fail_timeout=5s;`),
+          `}`,
+        ]
+      : []),
     `server {`,
     `    listen 127.0.0.1:${s.listenPort}${s.listenTls ? " ssl" : ""};`,
     `    server_name _;`,
@@ -397,7 +486,8 @@ function renderShim(s) {
     `    server_tokens off;`,
     ``,
     `    location / {`,
-    `        proxy_pass ${s.target};`,
+    `        proxy_pass ${many ? `${s.https ? "https" : "http"}://${upstream}` : s.target};`,
+    ...(many ? [`        proxy_connect_timeout 3s;`, `        proxy_next_upstream error timeout http_502 http_503;`] : []),
     `        proxy_http_version 1.1;`,
     `        proxy_set_header Host $host;`,
     `        proxy_set_header Upgrade $http_upgrade;`,
@@ -411,7 +501,7 @@ function renderShim(s) {
     `        proxy_request_buffering off;`,
     `        proxy_read_timeout 1h;`,
     `        proxy_send_timeout 1h;`,
-    ...(s.https ? [`        proxy_ssl_verify off;`, `        proxy_ssl_server_name on;`] : []),
+    ...(s.https ? [`        proxy_ssl_verify off;`, ...(many ? [] : [`        proxy_ssl_server_name on;`])] : []),
     `    }`,
     `}`,
     ``,
@@ -431,6 +521,22 @@ function managedFiles(dir, prev) {
     /* no dir yet */
   }
   for (const f of out) if (!FILE_RE.test(f) || f.startsWith("fcc-app-")) out.delete(f);
+  return out;
+}
+
+/**
+ * Files in conf.d that make up main's front door: every fcc-*.conf except the
+ * local website vhosts (fcc-app-*) and DATA's phpMyAdmin vhost — the same set
+ * panel/lib/loadbalancer.mjs owns on main — plus what the last sync wrote.
+ */
+function frontDoorManaged(dir, prev) {
+  const out = new Set(prev.files);
+  try {
+    for (const f of fs.readdirSync(dir)) if (FILE_RE.test(f)) out.add(f);
+  } catch {
+    /* no dir yet */
+  }
+  for (const f of out) if (!FILE_RE.test(f) || f.startsWith("fcc-app-") || f === PMA_FILE) out.delete(f);
   return out;
 }
 
@@ -768,7 +874,7 @@ export async function edgeStatus(dataDir) {
         return { name: String(x.name), listenPort: x.listenPort, ok: !r.error, error: r.error || null };
       }),
   );
-  return { hash: s.hash, appliedAt: s.appliedAt, error: s.error, nginx: !!s.nginx, connectors, shims };
+  return { hash: s.hash, appliedAt: s.appliedAt, error: s.error, nginx: !!s.nginx, connectors, shims, ...(s.frontDoor ? { frontDoor: true } : {}) };
 }
 
 /** Site ids whose front-door file (fcc-<siteId>.conf) this edge manages — for access-log shipping. */
@@ -784,3 +890,371 @@ export function edgeLogSites(dataDir) {
   return out;
 }
 
+
+// ============================================================ panel nodes
+//
+// Phase 2 (docs/HA.md, "Tasks"): an edge can also run a standby copy of the
+// panel. `panel.install` downloads the panel code from the active panel
+// (GET /ha/code with this agent's token), unpacks it into /opt/fcc the way
+// install.sh does (stage, check, swap), writes /var/lib/fcc/ha-local.json and
+// the same fcc.service unit install.sh writes, and starts it. The new panel
+// process boots as a follower and replicates everything else (db, config,
+// secrets) from the leader itself. `panel.remove` undoes it but keeps the data
+// directory (renamed), because it holds the panel's secrets.
+//
+// Under FCC_DRY_RUN=1 the code is still downloaded and checked, but everything
+// lands in <dataDir>/panel-dry-run and systemctl/ufw are only logged.
+
+const PANEL_CODE_DIR = "/opt/fcc";
+const PANEL_DATA_DIR = "/var/lib/fcc";
+const PANEL_SITES_DIR = "/srv/fcc/sites";
+const PANEL_UNIT_FILE = "/etc/systemd/system/fcc.service";
+const PANEL_USER_ENV = "/etc/fcc/fcc.env"; // install.sh's "extra environment" file — optional (EnvironmentFile=-)
+const PANEL_UNIT = "fcc.service";
+const PANEL_UFW_COMMENT = "fcc panel from cluster";
+const PANEL_CODE_ITEMS = ["panel", "node", "shared", "scripts", "patches", "docs", "README.md", "install.sh", "LICENSE"];
+const PANEL_REQUIRED = ["panel/server.mjs", "panel/lib/sys.mjs", "node/node-agent.mjs", "shared/tasks.mjs"];
+const PANEL_MAX_ZIP = 300 * 1024 * 1024;
+const CODE_URL_RE = /^\/ha\/code(?:\?[A-Za-z0-9=&._-]{0,200})?$/;
+const DIRECT_URL_RE = /^(https?):\/\/([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):(\d{1,5})\/?$/;
+
+function panelPaths(dataDir) {
+  const dry = sys.DRY_RUN ? path.join(dataDir, "panel-dry-run") : null;
+  return {
+    dry,
+    code: dry ? path.join(dry, "opt-fcc") : PANEL_CODE_DIR,
+    data: dry ? path.join(dry, "var-lib-fcc") : PANEL_DATA_DIR,
+    unit: dry ? path.join(dry, "systemd", PANEL_UNIT) : PANEL_UNIT_FILE,
+  };
+}
+
+function panelBad(msg) {
+  return new Error(`panel.install: ${msg} — nothing was changed on ${os.hostname()}.`);
+}
+
+function abortIf(signal) {
+  if (signal?.aborted) {
+    const err = new Error("Cancelled.");
+    err.aborted = true;
+    throw err;
+  }
+}
+
+function writeAtomic(file, content, mode) {
+  ensureDir(path.dirname(file));
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, content, { mode });
+  fs.chmodSync(tmp, mode);
+  fs.renameSync(tmp, file);
+}
+
+/** fcc.service exactly as install.sh writes it (minus what only main has: MySQL ordering, the panel domain). */
+function renderPanelUnit({ nodeBin, port, host }) {
+  return [
+    `# Managed by Forthway Command Center (panel.install on this panel node) — rewritten on every install.`,
+    `# Put your own additions in ${PANEL_USER_ENV} (or: systemctl edit fcc).`,
+    `[Unit]`,
+    `Description=Forthway Command Center`,
+    `After=network-online.target nginx.service pm2-root.service`,
+    `Wants=network-online.target pm2-root.service`,
+    ``,
+    `[Service]`,
+    `Type=simple`,
+    `User=root`,
+    `WorkingDirectory=${PANEL_CODE_DIR}`,
+    `Environment=NODE_ENV=production`,
+    `Environment=FCC_DIR=${PANEL_CODE_DIR}`,
+    `Environment=FCC_DATA_DIR=${PANEL_DATA_DIR}`,
+    `Environment=FCC_SITES_DIR=${PANEL_SITES_DIR}`,
+    `Environment=FCC_PORT=${port}`,
+    `Environment=FCC_HOST=${host}`,
+    `Environment=HOME=/root`,
+    `Environment=PM2_HOME=/root/.pm2`,
+    `Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+    `EnvironmentFile=-${PANEL_USER_ENV}`,
+    `ExecStart=${nodeBin} ${PANEL_CODE_DIR}/panel/server.mjs`,
+    `# Exit code 75 (fencing / restart on new code) is a failure on purpose: Restart=always brings it back.`,
+    `Restart=always`,
+    `RestartSec=3`,
+    `# Only the panel process is stopped on restart; websites run under pm2.`,
+    `KillMode=process`,
+    `TimeoutStopSec=20`,
+    `LimitNOFILE=65535`,
+    ``,
+    `[Install]`,
+    `WantedBy=multi-user.target`,
+    ``,
+  ].join("\n");
+}
+
+function checkPanelPayload(payload, o) {
+  if (!payload || typeof payload !== "object") throw panelBad("the payload is missing");
+  const codeUrl = String(payload.codeUrl ?? "/ha/code");
+  if (!CODE_URL_RE.test(codeUrl)) throw panelBad(`codeUrl must be /ha/code on the panel (got ${codeUrl.slice(0, 80)})`);
+  const m = DIRECT_URL_RE.exec(String(payload.directUrl ?? "").trim());
+  if (!m) throw panelBad("directUrl must look like http(s)://host:port");
+  const port = checkPort(payload.port ?? m[3], "port");
+  if (port === 80 || port === 443) throw panelBad(`the panel cannot listen on port ${port} (the front door uses it)`);
+  const host = String(payload.host ?? "0.0.0.0").trim();
+  if (!(net.isIP(host) || host === "localhost")) throw panelBad(`host must be an IP address (got ${host.slice(0, 60)})`);
+  const allowFrom = [];
+  for (const ip of Array.isArray(payload.allowFrom) ? payload.allowFrom : []) {
+    const s = String(ip ?? "").trim();
+    if (net.isIP(s) && !allowFrom.includes(s)) allowFrom.push(s);
+  }
+  if (!o.panelUrl) throw panelBad("this agent does not know the panel's address");
+  if (!o.authToken) throw panelBad("this agent has no token to download the code with");
+  if (!o.serverId) throw panelBad("this agent does not know its server id");
+  const directUrl = `${m[1]}://${m[2].toLowerCase()}:${Number(m[3])}`;
+  return { codeUrl, directUrl, port, host, allowFrom };
+}
+
+async function downloadPanelCode(url, token, signal, log) {
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener?.("abort", onAbort);
+  const timer = setTimeout(() => ctrl.abort(), 10 * 60_000);
+  try {
+    log(`Downloading the panel code from ${url.origin}${url.pathname}…`);
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": "fcc-node panel.install" }, signal: ctrl.signal });
+    if (!res.ok) {
+      let why = "";
+      try {
+        why = (await res.json())?.error || "";
+      } catch {
+        /* not json */
+      }
+      throw new Error(`could not download the panel code: HTTP ${res.status}${why ? ` (${why})` : ""}`);
+    }
+    const len = Number(res.headers.get("content-length"));
+    if (len > PANEL_MAX_ZIP) throw new Error("the panel code archive is unexpectedly large");
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > PANEL_MAX_ZIP) throw new Error("the panel code archive is unexpectedly large");
+    const want = String(res.headers.get("x-fcc-sha256") || "").toLowerCase();
+    const got = crypto.createHash("sha256").update(buf).digest("hex");
+    if (want && want !== got) throw new Error("the panel code failed its sha256 check");
+    log(`Downloaded ${Math.round(buf.length / 1024)} KB${want ? " (sha256 verified)" : ""}.`);
+    return buf;
+  } catch (err) {
+    if (signal?.aborted) abortIf(signal);
+    if (err.name === "AbortError") throw new Error("downloading the panel code timed out");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener?.("abort", onAbort);
+  }
+}
+
+function nodeCheck(file) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, ["--check", file], { timeout: 60_000 }, (err, _out, stderr) => {
+      if (err) reject(new Error(`${path.basename(file)} does not parse: ${String(stderr || err.message).trim().split("\n").slice(0, 3).join(" ")}`));
+      else resolve();
+    });
+  });
+}
+
+/** Replace each item present in `stage` inside `root` (rename, same filesystem); put everything back on failure. */
+function swapPanelCode(root, stage, items, log) {
+  const oldDir = path.join(root, `.install-old.${Date.now()}`);
+  fs.mkdirSync(oldDir, { recursive: true });
+  const done = [];
+  try {
+    for (const item of items) {
+      const from = path.join(stage, item);
+      if (!exists(from)) continue;
+      const live = path.join(root, item);
+      const had = exists(live);
+      if (had) fs.renameSync(live, path.join(oldDir, item));
+      done.push({ item, had });
+      fs.renameSync(from, live);
+    }
+  } catch (err) {
+    log(`!! Swapping the code in failed (${err.message}) — putting the previous files back.`);
+    for (const { item, had } of done.reverse()) {
+      try {
+        if (exists(path.join(oldDir, item)) || !had) fs.rmSync(path.join(root, item), { recursive: true, force: true });
+        if (had) fs.renameSync(path.join(oldDir, item), path.join(root, item));
+      } catch (e) {
+        log(`!! Could not put ${item} back: ${e.message}`);
+      }
+    }
+    fs.rmSync(oldDir, { recursive: true, force: true });
+    throw err;
+  }
+  fs.rmSync(oldDir, { recursive: true, force: true });
+  return done.map((d) => d.item);
+}
+
+export async function panelInstall(payload, o) {
+  const log = o.log || NOOP;
+  if (o.isMain) throw new Error("panel.install: the main server always runs the panel — nothing to install.");
+  const p = checkPanelPayload(payload, o);
+  const P = panelPaths(o.dataDir);
+  if (sys.DRY_RUN) log(`[dry-run] the panel is installed under ${P.dry} instead of ${PANEL_CODE_DIR} / ${PANEL_DATA_DIR}`);
+
+  // 1. Code: download, verify, stage, check, swap.
+  log("── Panel code ──");
+  const url = new URL(p.codeUrl, String(o.panelUrl).replace(/\/+$/, "") + "/");
+  const buf = await downloadPanelCode(url, o.authToken, o.signal, log);
+  abortIf(o.signal);
+  const { listZipEntries, extractZip, readZipFile } = await import("./zip.mjs");
+  let names;
+  try {
+    names = new Set(listZipEntries(buf).map((e) => e.name));
+  } catch (err) {
+    throw new Error(`the panel code is not a valid zip archive: ${err.message}`);
+  }
+  for (const rel of PANEL_REQUIRED) if (!names.has(rel)) throw new Error(`the panel code archive has no ${rel} — refusing to install it`);
+  const serverSrc = String(readZipFile(buf, "panel/server.mjs") || "");
+  const version = /version[a-z_]*\s*[:=]\s*"(\d+\.\d+\.\d+[^"]*)"/i.exec(serverSrc)?.[1] || null;
+
+  ensureDir(P.code);
+  fs.chmodSync(P.code, 0o755);
+  const stage = path.join(P.code, `.staging.${process.pid}.${Date.now()}`);
+  let swapped;
+  try {
+    fs.mkdirSync(stage, { recursive: true });
+    extractZip(buf, stage, { stripRoot: false });
+    const items = PANEL_CODE_ITEMS.filter((i) => exists(path.join(stage, i)));
+    const extra = fs.readdirSync(stage).filter((i) => !PANEL_CODE_ITEMS.includes(i));
+    if (extra.length) log(`Not installing unexpected top-level entries: ${extra.slice(0, 10).join(", ")}`);
+    await nodeCheck(path.join(stage, "panel", "server.mjs"));
+    await nodeCheck(path.join(stage, "node", "node-agent.mjs"));
+    abortIf(o.signal);
+    swapped = swapPanelCode(P.code, stage, items, log);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+  writeAtomic(
+    path.join(P.code, "version.json"),
+    JSON.stringify({ version: version || "unknown", source: "ha", from: url.origin, installedAt: new Date().toISOString() }, null, 2) + "\n",
+    0o644,
+  );
+  log(`Panel v${version || "?"} in ${P.code} (${swapped.join(", ")}).`);
+  abortIf(o.signal);
+
+  // 2. Local identity — never replicated; holds this server's token.
+  log("── Panel data ──");
+  ensureDir(P.data);
+  fs.chmodSync(P.data, 0o700);
+  const haFile = path.join(P.data, "ha-local.json");
+  let prevLocal = {};
+  try {
+    prevLocal = JSON.parse(fs.readFileSync(haFile, "utf8")) || {};
+  } catch {
+    /* new */
+  }
+  const local = { ...(prevLocal && typeof prevLocal === "object" && prevLocal.serverId === o.serverId ? prevLocal : {}), serverId: o.serverId, token: o.authToken, directUrl: p.directUrl };
+  writeAtomic(haFile, JSON.stringify(local, null, 2) + "\n", 0o600);
+  log(`Wrote ${haFile} (server ${o.serverId}, reachable at ${p.directUrl}).`);
+  if (!sys.DRY_RUN) ensureDir(PANEL_SITES_DIR);
+
+  // 3. fcc.service
+  log("── fcc.service ──");
+  const unit = renderPanelUnit({ nodeBin: process.execPath, port: p.port, host: p.host });
+  const unitChanged = writeIfChangedEnsuring(P.unit, unit, 0o644);
+  log(`${unitChanged ? "Wrote" : "Unchanged:"} ${P.unit}`);
+  let active = null;
+  if (sys.DRY_RUN || sys.which("systemctl")) {
+    const ctl = (args, extra = {}) => sys.run("systemctl", args, { allowFail: true, timeoutMs: 60_000, log, ...extra });
+    await ctl(["daemon-reload"]);
+    await ctl(["enable", PANEL_UNIT]);
+    const r = await ctl(["restart", PANEL_UNIT]);
+    if (!sys.DRY_RUN) {
+      if (r.code !== 0) throw new Error(`systemctl restart ${PANEL_UNIT} failed: ${(r.stderr || "").trim().split("\n").pop()}`);
+      await new Promise((res) => setTimeout(res, 2000));
+      const a = await ctl(["is-active", PANEL_UNIT], { log: NOOP });
+      active = a.stdout.trim() === "active";
+      log(active ? `${PANEL_UNIT} is running.` : `!! ${PANEL_UNIT} is ${a.stdout.trim() || "not active"} — see: journalctl -u fcc`);
+    } else active = true;
+  } else {
+    log("!! systemd is not available on this server — start the panel yourself.");
+  }
+
+  // 4. Firewall: the other servers must reach this panel's port (votes, replication, the follower proxy).
+  log("── Firewall ──");
+  const firewall = await syncUfwRules({ allowFrom: p.allowFrom, ports: String(p.port), comment: PANEL_UFW_COMMENT, log }).catch((err) => {
+    log(`!! firewall: ${err.message}`);
+    return { error: err.message };
+  });
+  if (firewall.active) {
+    log(firewall.added.length || firewall.removed.length
+      ? `Panel port ${p.port}: opened to ${firewall.added.join(", ") || "nobody new"}; closed to ${firewall.removed.join(", ") || "nobody"}.`
+      : `Panel port ${p.port} already open to ${p.allowFrom.join(", ") || "nobody"}.`);
+  }
+
+  return {
+    installed: true,
+    version,
+    directUrl: p.directUrl,
+    port: p.port,
+    host: p.host,
+    active,
+    codeDir: P.code,
+    dataDir: P.data,
+    firewall,
+    ...(sys.DRY_RUN ? { dryRun: true } : {}),
+  };
+}
+
+export async function panelRemove(payload, o) {
+  const log = o.log || NOOP;
+  if (o.isMain) throw new Error("panel.remove: the main server always runs the panel — it cannot be removed from it.");
+  const P = panelPaths(o.dataDir);
+  const own = path.resolve(o.dataDir || "");
+  if (own === path.resolve(P.data) || own.startsWith(path.resolve(P.data) + path.sep) || own === path.resolve(P.code) || own.startsWith(path.resolve(P.code) + path.sep)) {
+    throw new Error(`panel.remove: this agent keeps its own data in ${own}, inside the panel's directories — refusing.`);
+  }
+  if (sys.DRY_RUN) log(`[dry-run] working under ${P.dry}`);
+
+  log("── fcc.service ──");
+  if (sys.DRY_RUN || sys.which("systemctl")) {
+    const ctl = (args) => sys.run("systemctl", args, { allowFail: true, timeoutMs: 60_000, log });
+    await ctl(["disable", "--now", PANEL_UNIT]);
+    if (exists(P.unit)) {
+      fs.rmSync(P.unit, { force: true });
+      log(`Removed ${P.unit}`);
+    }
+    await ctl(["daemon-reload"]);
+  } else if (exists(P.unit)) {
+    fs.rmSync(P.unit, { force: true });
+    log(`Removed ${P.unit}`);
+  }
+  abortIf(o.signal);
+
+  log("── Panel code ──");
+  if (exists(P.code)) {
+    fs.rmSync(P.code, { recursive: true, force: true });
+    log(`Removed ${P.code}`);
+  } else log(`No code in ${P.code}.`);
+
+  log("── Panel data ──");
+  let keptData = null;
+  if (exists(P.data)) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+    keptData = `${P.data}.removed-${stamp}`;
+    fs.renameSync(P.data, keptData);
+    log(`Moved ${P.data} to ${keptData} — it holds the panel's secrets (encryption key, session secret, this server's token). Delete it when you no longer need it.`);
+  } else log(`No data in ${P.data}.`);
+
+  log("── Firewall ──");
+  const firewall = await syncUfwRules({ allowFrom: [], ports: "0", comment: PANEL_UFW_COMMENT, log }).catch((err) => {
+    log(`!! firewall: ${err.message}`);
+    return { error: err.message };
+  });
+  if (firewall.active) log(firewall.removed.length ? `Closed the panel port to ${firewall.removed.join(", ")}.` : "No panel firewall rules to remove.");
+
+  return {
+    removed: true,
+    keptData,
+    note: keptData ? `The panel's data was kept in ${keptData}: it holds secrets (encryption key, session secret, token). Delete it when you no longer need it.` : null,
+    firewall,
+    ...(sys.DRY_RUN ? { dryRun: true } : {}),
+  };
+}
+
+function writeIfChangedEnsuring(file, content, mode) {
+  ensureDir(path.dirname(file));
+  return writeIfChanged(file, content, mode);
+}

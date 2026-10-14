@@ -32,6 +32,15 @@
  * main included — is its privateHost || host), the self-signed edge-tls
  * certificate instead of Let's Encrypt's, and nothing that depends on files
  * only main has. Main's own rendering is untouched by any of this.
+ *
+ * Panel failover (docs/HA.md Phase 2): the local nginx, certbot and `nginx -V`
+ * are main's only while this process runs on main (ctx.ha.mainIsLocal). On
+ * another leader applyAll / syncSite / removeSite just tell CLUSTER, which
+ * ships main's own files (`mainFiles()`, main-style: Let's Encrypt paths, main
+ * as 127.0.0.1) to main's agent as a `frontDoor` cluster.sync; certificates
+ * cannot be changed then (409). What main's nginx looks like (version, IPv6,
+ * Let's Encrypt includes, real_ip) is remembered in config.cluster.mainNginx
+ * while main leads with HA on, so another leader renders the same files.
  */
 
 import fs from "node:fs";
@@ -59,6 +68,9 @@ const LE_LIVE = "/etc/letsencrypt/live";
 const EDGE_TLS = { cert: "/etc/fcc-node/edge-tls/edge.crt", key: "/etc/fcc-node/edge-tls/edge.key" };
 const EDGE_LOG_DIR = "/var/log/nginx"; // where the agent tails fcc-<siteId>.access.log
 
+const HA_OFF = Object.freeze({ enabled: false, localServerId: "main", mainIsLocal: true, isLeader: () => true });
+const CERTS_REMOTE = "Certificates can only be changed while the main server runs the active panel.";
+
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i;
 
 export function register(router, ctx) {
@@ -84,6 +96,10 @@ function createLb(ctx) {
   let nginxRealIpModule = null; // from `nginx -V` (null = unknown / not live)
   let realIpError = null; // set when nginx rejected fcc-00-realip.conf — it then stays disabled until restart
   const state = { lastAppliedAt: null, lastError: null, configOk: null };
+  // Panel failover: is this process running on main?
+  const mainLocal = () => (ctx.ha || HA_OFF).mainIsLocal !== false;
+  /** main's nginx facts, as recorded by a leader running on main (config.cluster.mainNginx). */
+  const mainFacts = () => (ctx.config?.cluster?.mainNginx && typeof ctx.config.cluster.mainNginx === "object" ? ctx.config.cluster.mainNginx : {});
 
   const serial = (fn) => {
     const p = chain.then(fn, fn);
@@ -158,8 +174,8 @@ function createLb(ctx) {
     return fs.existsSync(c.cert) && fs.existsSync(c.key);
   }
   const ipv6 = () => !nginxIsLive() || fs.existsSync("/proc/net/if_inet6");
-  function http2Directive() {
-    const v = (nginxVersion || "0.0.0").split(".").map(Number);
+  function http2Directive(version = nginxVersion) {
+    const v = (version || "0.0.0").split(".").map(Number);
     return v[0] > 1 || (v[0] === 1 && (v[1] > 25 || (v[1] === 25 && v[2] >= 1)));
   }
 
@@ -219,11 +235,11 @@ function createLb(ctx) {
 
   // ------------------------------------------------------------ render
 
-  function renderCommon() {
+  function renderCommon(escapeJson = logEscapeJson()) {
     return [
       "# Managed by Forthway Command Center — shared by every fcc-<siteId>.conf. Do not edit.",
       `log_format ${LEGACY_LOG_FORMAT} '$msec $status $request_time "$upstream_addr" "$host" "$request" $body_bytes_sent "$http_user_agent"';`,
-      `log_format ${LOG_FORMAT}${logEscapeJson() ? " escape=json" : ""} '$msec $status $request_time "$upstream_addr" "$host" "$request_method" "$request_uri" $body_bytes_sent "$http_user_agent" "$remote_addr" "$sent_http_content_type" "$http_referer" "$http_sec_fetch_dest" "$http_sec_purpose$http_purpose" fcc2';`,
+      `log_format ${LOG_FORMAT}${escapeJson ? " escape=json" : ""} '$msec $status $request_time "$upstream_addr" "$host" "$request_method" "$request_uri" $body_bytes_sent "$http_user_agent" "$remote_addr" "$sent_http_content_type" "$http_referer" "$http_sec_fetch_dest" "$http_sec_purpose$http_purpose" fcc2';`,
       `map $http_upgrade ${UPGRADE_MAP} {`,
       "    default upgrade;",
       "    ''      '';",
@@ -233,9 +249,9 @@ function createLb(ctx) {
   }
 
   // log_format escape= needs nginx ≥ 1.11.8 (unknown version → assume a current one).
-  function logEscapeJson() {
-    if (!nginxVersion) return true;
-    const v = nginxVersion.split(".").map(Number);
+  function logEscapeJson(version = nginxVersion) {
+    if (!version) return true;
+    const v = version.split(".").map(Number);
     return v[0] > 1 || (v[0] === 1 && (v[1] > 11 || (v[1] === 11 && v[2] >= 8)));
   }
 
@@ -316,8 +332,13 @@ function createLb(ctx) {
    */
   function render(site, { forServer = null } = {}) {
     const edge = forServer && forServer !== "main" ? forServer : null;
+    // Main's file rendered on another leader: main dials itself as 127.0.0.1,
+    // every other target on its privateHost || host; main's nginx facts come
+    // from config (this machine's nginx and files say nothing about main's).
+    const remote = !edge && !mainLocal();
+    const facts = remote ? mainFacts() : null;
     const up = upstreamName(site);
-    const pool = edge ? upstreamsFor(site, edge) : upstreams(site);
+    const pool = edge ? upstreamsFor(site, edge) : remote ? upstreamsFor(site, "main") : upstreams(site);
     const domains = domainsOf(site);
     const port = Number(site.port);
     const m = method(site);
@@ -351,23 +372,28 @@ function createLb(ctx) {
       return out.join("\n");
     }
     const names = domains.join(" ");
-    const ld = edge ? EDGE_LOG_DIR : logDir();
+    const ld = edge ? EDGE_LOG_DIR : remote ? facts.logDir || EDGE_LOG_DIR : logDir();
     const logs = [
       `    access_log ${ld}/fcc-${safeId(site.id)}.access.log ${LOG_FORMAT};`,
       `    error_log ${ld}/fcc-${safeId(site.id)}.error.log warn;`,
     ];
     const acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root /var/www/html;", "    }"];
-    const v6 = ipv6();
+    const v6 = remote ? facts.ipv6 !== false : ipv6();
     const common = [`    client_max_body_size ${bodySize(site)};`, "    server_tokens off;"];
 
-    if (sslActive(site)) {
+    if (remote ? !!site.ssl?.enabled : sslActive(site)) {
       const c = edge ? EDGE_TLS : certPaths(site);
       // An edge's nginx version is unknown here: `listen … ssl http2` is accepted by
       // every version (newer ones only warn), `http2 on;` fails before 1.25.1.
       // Let's Encrypt's include files exist only on main.
-      const h2 = !edge && http2Directive();
+      const h2 = !edge && (remote ? http2Directive(facts.version || "0.0.0") : http2Directive());
       const tlsOpts = edge
         ? ["    ssl_protocols TLSv1.2 TLSv1.3;"]
+        : remote
+        ? [
+            facts.leOptions ? "    include /etc/letsencrypt/options-ssl-nginx.conf;" : "    ssl_protocols TLSv1.2 TLSv1.3;",
+            facts.dhparam ? "    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;" : null,
+          ]
         : [
             fs.existsSync("/etc/letsencrypt/options-ssl-nginx.conf") ? "    include /etc/letsencrypt/options-ssl-nginx.conf;" : "    ssl_protocols TLSv1.2 TLSv1.3;",
             fs.existsSync("/etc/letsencrypt/ssl-dhparams.pem") ? "    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;" : null,
@@ -441,6 +467,54 @@ function createLb(ctx) {
     return files;
   }
 
+  /**
+   * Main's own front-door files, for CLUSTER's `frontDoor` cluster.sync to main
+   * while this process is not on main. null while it is (main applies its own).
+   */
+  function mainFiles() {
+    if (mainLocal()) return null;
+    const f = mainFacts();
+    const realIp = f.realIpBlocked
+      ? renderRealIpDisabled(f.realIpBlocked)
+      : renderRealIpConf(cloudflareRanges(ctx.dataDir));
+    const files = { [COMMON_FILE]: renderCommon(logEscapeJson(f.version || null)), [REALIP_FILE]: realIp };
+    const sites = allSites()
+      .slice()
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    for (const s of sites) files[`fcc-${safeId(s.id)}.conf`] = render(s);
+    return files;
+  }
+
+  /**
+   * While main leads with HA on, remember what main's nginx looks like so another
+   * leader can render main's files the same way (config.json is replicated).
+   */
+  function recordMainFacts() {
+    if (!mainLocal() || ctx.config?.ha?.enabled !== true) return;
+    const facts = {
+      version: nginxVersion,
+      ipv6: ipv6(),
+      logDir: logDir(),
+      leOptions: fs.existsSync("/etc/letsencrypt/options-ssl-nginx.conf"),
+      dhparam: fs.existsSync("/etc/letsencrypt/ssl-dhparams.pem"),
+      realIpBlocked: realIpBlocker(),
+    };
+    const cur = ctx.config.cluster?.mainNginx;
+    if (cur && JSON.stringify(cur) === JSON.stringify(facts)) return;
+    ctx.config.cluster = { ...(ctx.config.cluster || {}), mainNginx: facts };
+    try {
+      ctx.saveConfig?.();
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /** Not on main: nothing to write here — CLUSTER pushes main's files (debounced). */
+  function remoteApplied(log, what) {
+    log(`The main server is not running the active panel — ${what} reaches its nginx through the cluster sync to its agent.`);
+    ok();
+  }
+
   // ------------------------------------------------------------- apply
 
   async function testAndReload(log) {
@@ -501,6 +575,10 @@ function createLb(ctx) {
     return serial(async () => {
       const s = typeof site === "string" ? getSite(site) : site;
       if (!s?.id) throw new Error("syncSite: unknown site");
+      if (!mainLocal()) {
+        remoteApplied(log, `the configuration of ${s.name || s.id}`);
+        return { file: null, changed: false, remote: true };
+      }
       try {
         await ensureCommon(log);
         const r = await applyNginxFile(siteFile(s), render(s), { log });
@@ -519,6 +597,11 @@ function createLb(ctx) {
       const id = typeof site === "string" ? site : site?.id;
       if (!id) return { removed: false };
       for (const k of [...health.keys()]) if (k.startsWith(`${id}|`)) health.delete(k);
+      if (!mainLocal()) {
+        remoteApplied(log, "removing this website");
+        if (typeof site === "object" && site.ssl?.enabled) log("Its certificate stays on the main server until it is the active panel again.");
+        return { removed: false, remote: true };
+      }
       try {
         const r = await applyNginxFile(path.join(confDir(), `fcc-${safeId(id)}.conf`), null, { log });
         ok();
@@ -537,6 +620,10 @@ function createLb(ctx) {
   /** Regenerate every site file (one test + one reload); drop files of deleted sites. */
   function applyAll({ log = () => {} } = {}) {
     return serial(async () => {
+      if (!mainLocal()) {
+        remoteApplied(log, "the configuration");
+        return { changed: 0, sites: allSites().length, remote: true };
+      }
       try {
         return await applyAllOnce(log);
       } catch (err) {
@@ -583,6 +670,7 @@ function createLb(ctx) {
           }
           changed++;
         }
+        recordMainFacts();
         if (!changed) {
           log("nginx configuration already up to date.");
           ok();
@@ -609,6 +697,24 @@ function createLb(ctx) {
   }
 
   function status() {
+    if (!mainLocal()) {
+      const f = mainFacts();
+      const cf = cloudflareRanges(ctx.dataDir);
+      return {
+        installed: true,
+        version: f.version || null,
+        configOk: state.configOk,
+        lastAppliedAt: state.lastAppliedAt,
+        lastError: state.lastError,
+        live: false,
+        dryRun: sys.DRY_RUN,
+        confDir: null,
+        certbot: false,
+        remote: true,
+        note: "The main server is not running the active panel: its nginx is updated through the cluster sync to its agent, and certificates cannot be changed until it is the active panel again.",
+        realIp: { enabled: !f.realIpBlocked, reason: f.realIpBlocked || null, header: "CF-Connecting-IP", ranges: cf.source, fetchedAt: cf.fetchedAt, file: null },
+      };
+    }
     const installed = !!sys.which("nginx");
     return {
       installed,
@@ -631,6 +737,7 @@ function createLb(ctx) {
   // ------------------------------------------------------------ certbot
 
   async function issueCertificate(site, { log = () => {}, email, signal } = {}) {
+    if (!mainLocal()) throw httpError(409, CERTS_REMOTE);
     const s = typeof site === "string" ? getSite(site) : site;
     if (!s) throw new Error("Site not found");
     // Domains delivered through a Cloudflare Tunnel are left off the certificate:
@@ -686,6 +793,7 @@ function createLb(ctx) {
    * (the other order would leave nginx unable to reload).
    */
   async function deleteCertificate(site, { log = () => {}, signal } = {}) {
+    if (!mainLocal()) throw httpError(409, CERTS_REMOTE);
     const s = typeof site === "string" ? getSite(site) : site;
     if (!s) throw new Error("Site not found");
     const certName = `fcc-${safeId(s.id)}`;
@@ -819,11 +927,12 @@ function createLb(ctx) {
 
     router.get("/api/sites/:id/nginx", (req, res, { params }) => {
       const s = requireSite(params.id);
-      return { config: render(s), file: siteFile(s), upstreams: upstreams(s) };
+      return { config: render(s), file: mainLocal() ? siteFile(s) : `/etc/nginx/conf.d/fcc-${safeId(s.id)}.conf (on the main server)`, upstreams: upstreams(s) };
     });
 
     router.post("/api/sites/:id/ssl", (req, res, { params, body, admin }) => {
       const s = requireSite(params.id);
+      if (!mainLocal()) throw httpError(409, CERTS_REMOTE);
       if (!domainsOf(s).length) throw httpError(400, "Add a domain to this website first.");
       const email = body.email || admin?.email;
       const job = ctx.jobs.start(
@@ -836,6 +945,7 @@ function createLb(ctx) {
 
     router.delete("/api/sites/:id/ssl", (req, res, { params, admin }) => {
       const s = requireSite(params.id);
+      if (!mainLocal()) throw httpError(409, CERTS_REMOTE);
       if (!s.ssl?.enabled && !["failed", "pending"].includes(s.ssl?.status)) throw httpError(409, "This website has no certificate to delete.");
       const job = ctx.jobs.start(
         { type: "site.ssl.delete", title: `Delete SSL certificate for ${domainsOf(s)[0] || s.name}`, siteId: s.id, projectId: s.projectId, adminId: admin?.id },
@@ -859,7 +969,7 @@ function createLb(ctx) {
   }
 
   async function _start() {
-    if (sys.which("nginx") && !sys.DRY_RUN) {
+    if (mainLocal() && sys.which("nginx") && !sys.DRY_RUN) {
       const r = await sys.run("nginx", ["-V"], { allowFail: true, timeoutMs: 10_000 }).catch(() => null);
       const out = `${r?.stderr || ""}${r?.stdout || ""}`;
       nginxVersion = /nginx\/([\d.]+)/.exec(out)?.[1] || null;
@@ -909,6 +1019,7 @@ function createLb(ctx) {
     preview: (site, opts) => render(typeof site === "string" ? requireSite(site) : site, opts),
     render: (site, opts) => render(typeof site === "string" ? requireSite(site) : site, opts),
     edgeFiles,
+    mainFiles,
     upstreams: (site) => upstreams(typeof site === "string" ? getSite(site) : site),
     issueCertificate,
     deleteCertificate,

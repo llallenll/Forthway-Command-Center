@@ -27,7 +27,34 @@ export async function mock() { return (mockMod ||= await import("./mock.js")); }
 
 const rel = (p) => p.replace(/^\//, "");
 
-export async function api(method, path, body, { quiet401 = false } = {}) {
+/* Panel failover (docs/HA.md): while no panel is active, panel nodes answer 503 { haSwitching: true }.
+   Retry calmly instead of failing; the app shell shows "switching servers" meanwhile (event fcc:ha-switching). */
+export const isHaSwitching = (e) => e?.status === 503 && !!e?.body?.haSwitching;
+let haSwitching = false;
+function setHaSwitching(on) {
+  if (haSwitching === on) return;
+  haSwitching = on;
+  try { window.dispatchEvent(new CustomEvent("fcc:ha-switching", { detail: { on } })); } catch {}
+}
+
+export async function api(method, path, body, opts = {}) {
+  const until = Date.now() + 90_000;
+  for (let i = 1; ; i++) {
+    try {
+      const r = await request(method, path, body, opts);
+      setHaSwitching(false);
+      return r;
+    } catch (e) {
+      // A dropped connection while a switch is known to be under way is part of the same switch.
+      const retry = isHaSwitching(e) || (haSwitching && e?.status === 0 && method === "GET");
+      if (!retry || Date.now() > until) { if (retry) setHaSwitching(false); throw e; }
+      setHaSwitching(true);
+      await new Promise((r) => setTimeout(r, Math.min(1000 * i, 4000)));
+    }
+  }
+}
+
+async function request(method, path, body, { quiet401 = false } = {}) {
   if (MOCK) {
     const m = await mock();
     return m.handle(method, path, body);

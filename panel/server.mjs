@@ -14,6 +14,18 @@
  *      panel always comes up (docs/STANDALONE.md §3);
  *   4. one http(s) server: API routes through the Router, then static pages.
  *
+ * Panel failover (docs/HA.md Phase 2, lib/ha.mjs). With HA off nothing above
+ * changes. With HA on (config.ha.enabled, or ha-local.json naming an agent
+ * server) the process boots as a **standby**: config, secrets, a read-only
+ * Store and the HTTP server, which answers /ha/* itself and streams every
+ * other request to the active panel (503 "switching" when there is none). No
+ * module is registered or started. When ha.mjs wins a majority of the votes
+ * it calls promote(): db.json and config.json are re-read from disk (they are
+ * the replicated copies), interrupted jobs are failed, and the normal
+ * loadModules() runs in-process. Every demotion — lost lease, planned
+ * handover, new code — is `exit 75`; systemd restarts the process and it
+ * boots as a standby again.
+ *
  * Zero npm dependencies, Node 18+. Development on a laptop:
  *   FCC_DRY_RUN=1 FCC_DATA_DIR=./.devdata node panel/server.mjs
  */
@@ -31,6 +43,7 @@ import { Router, sendJson, send, redirect } from "./lib/http.mjs";
 import * as sys from "./lib/sys.mjs";
 import { Store, writeFileAtomic } from "./lib/store.mjs";
 import { createAuth, requestProto, requestHost, TRUST_PROXY } from "./lib/auth.mjs";
+import { createHa, readHaLocal } from "./lib/ha.mjs";
 import { createSecrets } from "./lib/secrets.mjs";
 import { createJobs } from "./lib/jobs.mjs";
 import { createActivity } from "./lib/core-routes.mjs";
@@ -38,7 +51,7 @@ import { createActivity } from "./lib/core-routes.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 const PUBLIC_DIR = path.join(HERE, "public");
-const VERSION = "3.7.0";
+const VERSION = "3.8.0";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
 const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "analytics", "usage"];
@@ -131,6 +144,22 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+
+/** Re-read config.json into the same object (promotion: it is the leader's replicated copy now). */
+function reloadConfig() {
+  const fresh = loadConfig();
+  for (const k of Object.keys(config)) delete config[k];
+  Object.assign(config, fresh);
+}
+
+// Panel failover: which server this process runs on, and whether it boots as a standby.
+let HA_LOCAL;
+try {
+  HA_LOCAL = readHaLocal(DATA_DIR);
+} catch (err) {
+  fatal(err.message);
+}
+const HA_STANDBY_BOOT = config.ha?.enabled === true || HA_LOCAL.serverId !== "main";
 
 function saveConfig() {
   writeFileAtomic(CONFIG_PATH, JSON.stringify(config, null, 2), 0o600);
@@ -283,14 +312,15 @@ function createEvents(db) {
 
 let db;
 try {
-  db = new Store(DATA_DIR);
+  db = new Store(DATA_DIR, { readOnly: HA_STANDBY_BOOT });
 } catch (err) {
   fatal(err.message);
 }
-const secrets = createSecrets(config.secretKey);
+let secrets = createSecrets(config.secretKey);
 const events = createEvents(db);
 const jobs = createJobs({ db, dataDir: DATA_DIR, events });
-const interrupted = jobs.recover();
+// A standby never writes db.json; the jobs are failed when (if) it takes over.
+let interrupted = HA_STANDBY_BOOT ? 0 : jobs.recover();
 const auth = createAuth({ db, config });
 
 function firstIPv4() {
@@ -332,6 +362,26 @@ const ctx = {
   // cluster, lb, sites, mysql, backups are attached by their modules.
 };
 ctx.activity = createActivity(ctx);
+
+// ------------------------------------------------------- panel failover
+
+/** "leader" (serving everything) | "standby" (proxying) | "promoting" | "fenced" */
+let mode = HA_STANDBY_BOOT ? "standby" : "leader";
+
+let ha;
+try {
+  ha = createHa(ctx, {
+    follower: HA_STANDBY_BOOT,
+    port: PORT,
+    tls: !!TLS,
+    onPromote: promote,
+    onFence: (reason) => exitForHa(75, reason, { flush: true }),
+    onExit: (code, reason) => exitForHa(code, reason, { flush: false }),
+  });
+} catch (err) {
+  fatal(`panel failover: ${err.message}`);
+}
+ctx.ha = ha;
 
 // ------------------------------------------------------------- modules
 
@@ -522,6 +572,11 @@ async function handler(req, res) {
   } catch {
     return sendJson(res, 400, { error: "Bad request" });
   }
+  // Panel failover: /ha/* is answered in every mode; a standby proxies the rest.
+  // With HA off and no panel node configured, /ha/* falls through exactly as before.
+  if (url.pathname.startsWith("/ha/") && (mode !== "leader" || ha._haActive())) return ha._handle(req, res, url);
+  if (mode === "standby") return ha._proxy(req, res, url);
+  if (mode !== "leader") return ha._switching(req, res, url);
   try {
     const handled = await router.handle(req, res, url, { authenticate: auth.authenticate });
     if (handled) return;
@@ -555,6 +610,62 @@ process.on("unhandledRejection", (err) => {
 
 // -------------------------------------------------------------- shutdown
 
+/**
+ * Take over as the active panel (called by ha.mjs once it holds a majority
+ * lease for a new term). The files on disk are the replicated ones; nothing
+ * of the standby's boot-time view survives.
+ */
+async function promote() {
+  mode = "promoting";
+  const t0 = Date.now();
+  reloadConfig();
+  db.reload();
+  db.readOnly = false;
+  secrets = createSecrets(config.secretKey);
+  ctx.secrets = secrets;
+  interrupted = jobs.recover();
+  ha._registerRoutes(router);
+  await loadModules();
+  mode = "leader";
+  console.log(`[fcc] active panel now — modules ${loaded.map((m) => m.name).join(", ")} (${((Date.now() - t0) / 1000).toFixed(1)} s)${interrupted ? `; ${interrupted} interrupted job(s) marked failed` : ""}`);
+}
+
+/**
+ * Leave so systemd restarts us as a standby (exit 75). A fenced leader flushes
+ * db.json first — it held the lease for everything in memory — and then makes
+ * the store read-only so nothing written while modules stop reaches the disk.
+ */
+let haExiting = false;
+async function exitForHa(code, reason, { flush }) {
+  if (haExiting) return;
+  haExiting = true;
+  mode = "fenced";
+  if (flush) {
+    try {
+      db.save({ immediate: true });
+    } catch (err) {
+      console.error("[fcc] could not flush db.json before stepping down:", err.message);
+    }
+  }
+  db.readOnly = true;
+  const force = setTimeout(() => process.exit(code), 2000);
+  force.unref?.();
+  try {
+    events.closeAll();
+    server.closeIdleConnections?.();
+  } catch { /* closing anyway */ }
+  await Promise.race([
+    Promise.allSettled([...loaded].reverse().map(({ mod }) => Promise.resolve().then(() => (typeof mod.stop === "function" ? mod.stop(ctx) : null)))),
+    new Promise((r) => setTimeout(r, 1500)),
+  ]);
+  try {
+    jobs.shutdown(`panel stepped down (${reason})`);
+  } catch { /* best effort */ }
+  ha._stop();
+  console.error(`[fcc] stepping down (${reason}) — exit ${code}`);
+  process.exit(code);
+}
+
 let stopping = false;
 async function shutdown(signal) {
   if (stopping) return;
@@ -571,6 +682,7 @@ async function shutdown(signal) {
   server.close();
   events.closeAll();
   server.closeIdleConnections?.();
+  ha._stop();
 
   for (const { name, mod } of [...loaded].reverse()) {
     if (typeof mod.stop !== "function") continue;
@@ -595,7 +707,11 @@ for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => shutdown(sig));
 
 // ----------------------------------------------------------------- boot
 
-await loadModules();
+if (!HA_STANDBY_BOOT) {
+  ha._registerRoutes(router);
+  await loadModules();
+}
+ha._start();
 
 server.listen(PORT, HOST, () => {
   const scheme = TLS ? "https" : "http";
@@ -605,9 +721,10 @@ server.listen(PORT, HOST, () => {
   console.log(`  open  ${fixed ? panelUrl() : `${scheme}://${HOST === "0.0.0.0" ? firstIPv4() : HOST}:${PORT}`}`);
   console.log(`  bind  ${HOST}:${PORT}${TRUST_PROXY ? " (trusting X-Forwarded-* from the proxy)" : ""}`);
   console.log(`  data  ${DATA_DIR}`);
-  console.log(`  mods  ${loaded.map((m) => m.name).join(", ")}`);
+  if (HA_STANDBY_BOOT) console.log(`  ha    standby panel node "${ha.localServerId}" (${ha.directUrl()}) — proxying to the active panel`);
+  else console.log(`  mods  ${loaded.map((m) => m.name).join(", ")}`);
   if (sys.DRY_RUN) console.log("  mode  DRY RUN — system commands are logged, not run");
   if (interrupted) console.log(`  jobs  ${interrupted} interrupted job(s) marked failed (panel restarted)`);
-  if (!db.list("admins").length) console.log(`\n  Not set up yet — open the address above; it asks for the setup code in ${path.join(DATA_DIR, "setup-code")}.`);
+  if (!HA_STANDBY_BOOT && !db.list("admins").length) console.log(`\n  Not set up yet — open the address above; it asks for the setup code in ${path.join(DATA_DIR, "setup-code")}.`);
   console.log("");
 });
