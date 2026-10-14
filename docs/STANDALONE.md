@@ -97,7 +97,7 @@ backups — `register()` for all, then `start()` for all. Use other modules'
 
 ```js
 ctx = {
-  version: "3.6.0",
+  version: "3.7.0",
   rootDir,                     // repo root
   dataDir,                     // FCC_DATA_DIR || /var/lib/fcc  (dev: ./.devdata)
   config,                      // object persisted at dataDir/config.json
@@ -1135,3 +1135,10 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     Settings gains **Security** (`views/settings-auth.js`, which now also holds Admins and Account);
     the app shell shows a "Password sign-in is being retired" banner while `authMode` is "password".
     Styles in `assets/auth.css` (not app.css).
+- **3.7.0 — edge nodes (high availability, phase 1).** Agent servers can be marked
+  `edge` and then run the nginx front door and a replica of every Cloudflare Tunnel
+  connector, so tunnelled websites survive the main server going down. New task
+  `cluster.sync` (shared/edge.mjs), `/agent/edge/logs`, `/api/servers/:id/edge/sync`,
+  `/api/cluster/ha`, `ctx.cluster.edgesChanged/edgeReplicas/edgeIps`,
+  `ctx.lb.edgeFiles`, `ctx.cloudflare.edgeConnectors/edgeShims`,
+  `auth.setTrustedProxies`. Full contract in docs/HA.md.

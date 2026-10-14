@@ -7,10 +7,16 @@
 #
 #   curl -fsSL "<panel>/install/node.sh?server=…&token=…" | sudo bash
 #
-# It installs Node.js 20 (if needed), pm2 and nginx, downloads the agent from
-# the panel into /opt/fcc-node, writes /etc/fcc-node/config.json (mode 600) and
-# runs the agent as the systemd service fcc-node. The agent only makes
-# outbound connections to the panel. Safe to re-run (it updates in place).
+# It installs Node.js 20 (if needed), pm2, nginx and openssl, downloads the
+# agent from the panel into /opt/fcc-node, writes /etc/fcc-node/config.json
+# (mode 600) and runs the agent as the systemd service fcc-node. The agent only
+# makes outbound connections to the panel. Safe to re-run (it updates in place).
+#
+# Edge nodes: when this server is marked "Edge node" in the panel, the agent
+# also runs the website front door (nginx), a Cloudflare Tunnel replica per
+# connector (systemd units fcc-cloudflared-<id>, cloudflared downloaded into
+# /var/lib/fcc-node/bin) and a self-signed certificate in /etc/fcc-node/edge-tls
+# (made with openssl). Nothing extra to install by hand — see docs/HA.md.
 #
 # Options (environment):  FCC_PHP=1  also install php-fpm for PHP websites
 #                         FCC_SKIP_UFW=1  do not touch the firewall
@@ -59,8 +65,9 @@ apt_install() {
 NEED=""
 for p in curl ca-certificates tar gzip; do dpkg -s "$p" >/dev/null 2>&1 || NEED="$NEED $p"; done
 have nginx || NEED="$NEED nginx"
+have openssl || NEED="$NEED openssl"
 [ -n "$NEED" ] && apt_install $NEED
-ok "curl, tar, nginx"
+ok "curl, tar, nginx, openssl"
 
 if [ "${FCC_PHP:-0}" = "1" ]; then
   if ! ls /run/php/php*-fpm.sock >/dev/null 2>&1; then

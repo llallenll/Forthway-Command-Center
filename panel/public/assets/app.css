@@ -1295,3 +1295,43 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
 .site-https svg { width: 12px; height: 12px; }
 .cf-row .li-right { gap: 8px; }
 .cf-row-tunnel { width: auto; max-width: 220px; height: 32px; font-size: 12.5px; padding: 0 30px 0 10px; background-position: right 9px center; background-size: 13px; }
+
+/* Edge nodes (docs/HA.md): server card strip, edge dialog rows, tunnel replicas, dashboard availability */
+.edge-strip { display: flex; align-items: center; gap: 9px; width: 100%; margin-top: 12px; padding: 8px 12px; border-radius: 10px; background: rgba(74, 114, 255, 0.06); border: 1px solid rgba(74, 114, 255, 0.16); color: var(--text-2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; transition: background 0.15s, border-color 0.15s; }
+.edge-strip:hover { background: rgba(74, 114, 255, 0.11); border-color: rgba(74, 114, 255, 0.28); }
+.edge-strip:focus-visible { outline: 2px solid var(--blue-3); outline-offset: 2px; }
+.edge-strip b { color: var(--text); font-weight: 650; }
+.edge-strip-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.edge-strip .ico { color: var(--muted); flex: none; }
+.edge-rows { display: grid; gap: 6px; }
+.edge-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(8, 13, 30, 0.3); font-size: 13px; min-width: 0; }
+.edge-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 550; }
+.edge-row > .small { flex: none; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cf-replicas { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.cf-replica { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 7px; border-radius: 999px; border: 1px solid var(--line-2); background: rgba(148, 166, 255, 0.05); font-size: 11.5px; color: var(--text-2); white-space: nowrap; }
+.cf-replica .dot { width: 6px; height: 6px; }
+.cf-mainonly { align-items: center; flex-wrap: wrap; }
+.cf-mainonly .btn { flex: none; margin-left: auto; }
+.ha-ico { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; flex: none; }
+.ha-ico.ok { background: rgba(61, 220, 151, 0.1); color: var(--ok); }
+.ha-ico.warn { width: 38px; height: 38px; border-radius: 11px; background: rgba(255, 181, 71, 0.14); color: var(--warn); }
+.ha-quiet { display: flex; align-items: center; gap: 12px; padding: 10px 14px 10px 12px; font-size: 13px; }
+.ha-quiet-t { flex: 1; min-width: 0; line-height: 1.45; }
+.ha-quiet-t a, .ha-body a:not(.ha-edge) { color: var(--text); font-weight: 600; }
+.ha-quiet .btn { flex: none; }
+.ha-alert { border-color: rgba(255, 181, 71, 0.32); background: linear-gradient(180deg, rgba(255, 181, 71, 0.07), rgba(13, 20, 44, 0.6)); }
+.ha-alert .card-head { flex-wrap: wrap; }
+.ha-body { display: grid; gap: 14px; }
+.ha-warns { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; color: var(--text); }
+.ha-warns li { display: flex; gap: 8px; align-items: flex-start; line-height: 1.45; }
+.ha-warns .ico { color: var(--warn); margin-top: 3px; flex: none; }
+.ha-edges { display: flex; flex-wrap: wrap; gap: 8px; }
+.ha-edge { display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px 5px 9px; border-radius: 999px; border: 1px solid var(--line-2); background: rgba(8, 13, 30, 0.35); font-size: 12.5px; font-weight: 600; color: var(--text); }
+.ha-edge .muted { font-weight: 500; }
+.ha-edge:hover { border-color: var(--line-3); }
+@media (max-width: 640px) {
+  .ha-quiet { flex-wrap: wrap; }
+  .ha-quiet .btn { margin-left: 42px; }
+  .ha-alert .card-head .right { margin-left: 50px; }
+  .edge-row > .small { max-width: 45%; }
+}

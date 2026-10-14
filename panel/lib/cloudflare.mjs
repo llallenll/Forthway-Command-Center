@@ -703,7 +703,7 @@ function createCloudflare(ctx) {
 
   function publicConnector(e) {
     const s = running.get(e.id)?.status() || { running: false, connections: 0, connected: false, startedAt: null, lastError: null, lastExit: null, fatal: false, simulated: false };
-    return { id: e.id, name: e.name || "Cloudflare Tunnel", cfId: e.cfId || "", accountId: e.accountId || parseConnectorToken(reveal(e.tokenEnc))?.accountTag || "", autoStart: e.autoStart !== false, hasToken: !!e.tokenEnc, tokenHint: hint(reveal(e.tokenEnc)), ...s };
+    return { id: e.id, name: e.name || "Cloudflare Tunnel", cfId: e.cfId || "", accountId: e.accountId || parseConnectorToken(reveal(e.tokenEnc))?.accountTag || "", autoStart: e.autoStart !== false, hasToken: !!e.tokenEnc, tokenHint: hint(reveal(e.tokenEnc)), ...s, replicas: replicasOf(e) };
   }
 
   async function startConnector(id) {
@@ -734,7 +734,68 @@ function createCloudflare(ctx) {
     if (typeof autoStart === "boolean") e.autoStart = autoStart;
     if (!existing) c.connectors.push(e);
     save();
+    edgesChanged();
     return { entry: e, existing: !!existing };
+  }
+
+  // -------------------------------------------------------------- edges
+
+  /**
+   * Edge nodes (docs/HA.md) run a replica of every connector the panel runs,
+   * so the tunnel survives main going down. CLUSTER re-renders and pushes each
+   * edge's cluster.sync payload (debounced, only where its hash changed).
+   */
+  function edgesChanged() {
+    try {
+      ctx.cluster?.edgesChanged?.();
+    } catch {
+      /* cluster not ready */
+    }
+  }
+
+  /**
+   * The connectors every edge replicates: [{ id, name, token, cfId }]. The token
+   * is revealed ONLY for CLUSTER's cluster.sync payload to an authenticated agent —
+   * never return this from an API route or put it in a log.
+   */
+  function edgeConnectors() {
+    const out = [];
+    for (const e of conf().connectors) {
+      if (e.autoStart === false || !e.tokenEnc) continue;
+      const token = reveal(e.tokenEnc);
+      if (!token) continue;
+      out.push({ id: e.id, name: e.name || "Cloudflare Tunnel", token, cfId: e.cfId || "" });
+    }
+    return out;
+  }
+
+  /**
+   * Local ports the tunnel routes reach on 127.0.0.1 besides nginx's 80/443:
+   * the panel itself and, when published through a tunnel, phpMyAdmin. An edge
+   * listens on the same 127.0.0.1:<port> and forwards to main, because
+   * Cloudflare may hand those hostnames' requests to the edge's replica.
+   */
+  function edgeShims() {
+    const out = [{ name: "panel", port: panelPort(), tls: panelTls() }];
+    if (conf().phpmyadmin?.hostname) {
+      const t = pmaTarget();
+      out.push({ name: "phpmyadmin", port: Number(t.port) || 8081, tls: !!t.tls });
+    }
+    return out;
+  }
+
+  /** Where each connector runs: main (the local Connector) first, then every edge node. */
+  function replicasOf(e) {
+    const main = db.get("servers", "main");
+    const st = running.get(e.id)?.status();
+    const out = [{ serverId: "main", serverName: main?.name || "Main", running: !!st?.running, connections: st?.connections || 0 }];
+    try {
+      const more = ctx.cluster?.edgeReplicas?.(e.id);
+      if (Array.isArray(more)) out.push(...more);
+    } catch {
+      /* cluster not ready */
+    }
+    return out;
   }
 
   // -------------------------------------------------------------- caches
@@ -1883,6 +1944,7 @@ function createCloudflare(ctx) {
       if (typeof body.autoStart === "boolean") e.autoStart = body.autoStart;
       save();
       audit(admin, "cloudflare.connector.update", { name: e.name, autoStart: e.autoStart !== false });
+      edgesChanged();
       emitStatusSoon();
       return publicConnector(e);
     });
@@ -1895,6 +1957,7 @@ function createCloudflare(ctx) {
       conf().connectors = conf().connectors.filter((x) => x.id !== e.id);
       save();
       audit(admin, "cloudflare.connector.remove", { name: e.name });
+      edgesChanged();
       emitStatusSoon();
       return { ok: true, note: "The tunnel itself stays in your Cloudflare account." };
     });
@@ -2081,6 +2144,7 @@ function createCloudflare(ctx) {
       }
       save();
       audit(admin, hostname ? "cloudflare.phpmyadmin.publish" : "cloudflare.phpmyadmin.unpublish", { hostname: hostname || null });
+      edgesChanged(); // the phpMyAdmin port shim on every edge comes or goes
       const job = ctx.jobs.start(
         { type: "cloudflare.sync", title: hostname ? `Publish phpMyAdmin on ${hostname}` : "Unpublish phpMyAdmin from Cloudflare", adminId: admin?.id || null, lock: false },
         ({ log }) => serial(() => reconcile("phpmyadmin", desiredForPhpMyAdmin(), { log })),
@@ -2134,6 +2198,7 @@ function createCloudflare(ctx) {
         }
       }
       audit(admin, "cloudflare.reset", { removed: removed.length });
+      edgesChanged();
       emitStatusSoon();
       return { ok: true, removed, remaining, tunnelStopped: wasRunning, note: "Websites set to Cloudflare Tunnel keep that setting; reconnect to manage their routes again." };
     });
@@ -2189,6 +2254,8 @@ function createCloudflare(ctx) {
       isTunnelHostname,
       phpmyadminHostname,
       syncPhpMyAdmin,
+      edgeConnectors,
+      edgeShims,
     },
   };
 }

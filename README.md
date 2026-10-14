@@ -339,6 +339,47 @@ A server that still hosts websites cannot be deleted; move them first.
 
 ---
 
+## Staying up when the main server goes down
+
+Out of the box the main server is the front door for everything: nginx and
+the Cloudflare Tunnel connector run there, so if it goes down, so does every
+tunnelled website — even ones hosted on agent servers. **Edge nodes** remove
+that single point of failure.
+
+Tick **Edge node** on any agent server (when adding it, or later from its
+page). The panel then keeps that server set up as a second front door:
+
+- **The same nginx front door** as the main server, with every website's
+  config rendered for that server, kept in sync automatically on every change.
+- **A replica of every Cloudflare Tunnel connector.** Replicas share the
+  tunnel; Cloudflare spreads visitors across them and stops using one that
+  disappears within seconds. Each replica runs as its own systemd service
+  (`fcc-cloudflared-<id>`), so it keeps running even when the agent or the
+  panel is down.
+- **The panel address too.** Requests for the panel's tunnel hostname that
+  land on an edge are forwarded to the main server.
+
+If the main server goes down, the edges keep serving with the last
+configuration they received, and nginx stops sending visitors to the main
+server's copies within seconds. What still goes down with it:
+
+- **Websites that run only on the main server.** Load balance anything that
+  matters across two or more servers; the dashboard lists the websites that
+  are main-only.
+- **The panel itself**, until main is back (panel failover is planned next).
+- **Databases**, which live on the main server (MySQL replication is planned).
+- **Domains not delivered through a Cloudflare Tunnel.** Their DNS points at
+  the main server only.
+
+Firewalls: an edge connects to every server's website ports (3000–3999) and to
+the panel port on the main server. Where `ufw` is active, the panel and the
+agents open those ports to the edges' addresses on their own.
+
+The dashboard's **Availability** card shows how many tunnel replicas are
+online and warns when the tunnel runs only on the main server.
+
+---
+
 ## SSL
 
 With `FCC_PANEL_DOMAIN` set, the installer gives the panel its own HTTPS vhost

@@ -24,6 +24,14 @@
  *     instead of answering 502 for certain).
  * nginx's own passive checks (max_fails=3 fail_timeout=10s) cover the gaps
  * between active checks.
+ *
+ * Edge nodes (docs/HA.md): the same files are rendered for every agent server
+ * marked as an edge (`edgeFiles(serverId)`, shipped by CLUSTER in the
+ * cluster.sync task). Only what differs as seen *from that edge* changes:
+ * upstream addresses (the edge itself is 127.0.0.1, every other target —
+ * main included — is its privateHost || host), the self-signed edge-tls
+ * certificate instead of Let's Encrypt's, and nothing that depends on files
+ * only main has. Main's own rendering is untouched by any of this.
  */
 
 import fs from "node:fs";
@@ -46,6 +54,10 @@ const LOG_FORMAT = "fcc_v2";
 const LEGACY_LOG_FORMAT = "fcc_main";
 const UPGRADE_MAP = "$fcc_connection_upgrade";
 const LE_LIVE = "/etc/letsencrypt/live";
+// Generated once on each edge by the agent (shared/tasks.mjs, cluster.sync); the
+// tunnel routes use noTLSVerify, so a self-signed pair is all an edge needs.
+const EDGE_TLS = { cert: "/etc/fcc-node/edge-tls/edge.crt", key: "/etc/fcc-node/edge-tls/edge.key" };
+const EDGE_LOG_DIR = "/var/log/nginx"; // where the agent tails fcc-<siteId>.access.log
 
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i;
 
@@ -189,6 +201,22 @@ function createLb(ctx) {
     return entries;
   }
 
+  /**
+   * The pool as seen from edge `edgeId`: same entries, same down flags (health
+   * is measured from main — the panel has no other vantage point), but the
+   * addresses an nginx running ON that edge must dial. Never 127.0.0.1 for a
+   * target that is not the edge itself; main is reached on its privateHost || host.
+   */
+  function upstreamsFor(site, edgeId) {
+    return upstreams(site)
+      .map((e) => {
+        if (e.serverId === edgeId) return { ...e, address: "127.0.0.1" };
+        const s = db.get("servers", e.serverId);
+        return { ...e, address: String(s?.privateHost || s?.host || "").trim() || null };
+      })
+      .filter((e) => e.address);
+  }
+
   // ------------------------------------------------------------ render
 
   function renderCommon() {
@@ -282,9 +310,14 @@ function createLb(ctx) {
     return out.filter((l) => l !== null);
   }
 
-  function render(site) {
+  /**
+   * `forServer`: render for that edge node instead of main (see upstreamsFor /
+   * EDGE_TLS). Omitted or "main" → main's file, exactly as always.
+   */
+  function render(site, { forServer = null } = {}) {
+    const edge = forServer && forServer !== "main" ? forServer : null;
     const up = upstreamName(site);
-    const pool = upstreams(site);
+    const pool = edge ? upstreamsFor(site, edge) : upstreams(site);
     const domains = domainsOf(site);
     const port = Number(site.port);
     const m = method(site);
@@ -318,16 +351,27 @@ function createLb(ctx) {
       return out.join("\n");
     }
     const names = domains.join(" ");
+    const ld = edge ? EDGE_LOG_DIR : logDir();
     const logs = [
-      `    access_log ${logDir()}/fcc-${safeId(site.id)}.access.log ${LOG_FORMAT};`,
-      `    error_log ${logDir()}/fcc-${safeId(site.id)}.error.log warn;`,
+      `    access_log ${ld}/fcc-${safeId(site.id)}.access.log ${LOG_FORMAT};`,
+      `    error_log ${ld}/fcc-${safeId(site.id)}.error.log warn;`,
     ];
     const acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root /var/www/html;", "    }"];
     const v6 = ipv6();
     const common = [`    client_max_body_size ${bodySize(site)};`, "    server_tokens off;"];
 
     if (sslActive(site)) {
-      const c = certPaths(site);
+      const c = edge ? EDGE_TLS : certPaths(site);
+      // An edge's nginx version is unknown here: `listen … ssl http2` is accepted by
+      // every version (newer ones only warn), `http2 on;` fails before 1.25.1.
+      // Let's Encrypt's include files exist only on main.
+      const h2 = !edge && http2Directive();
+      const tlsOpts = edge
+        ? ["    ssl_protocols TLSv1.2 TLSv1.3;"]
+        : [
+            fs.existsSync("/etc/letsencrypt/options-ssl-nginx.conf") ? "    include /etc/letsencrypt/options-ssl-nginx.conf;" : "    ssl_protocols TLSv1.2 TLSv1.3;",
+            fs.existsSync("/etc/letsencrypt/ssl-dhparams.pem") ? "    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;" : null,
+          ];
       out.push(
         "server {",
         "    listen 80;",
@@ -341,14 +385,13 @@ function createLb(ctx) {
         "}",
         "",
         "server {",
-        http2Directive() ? "    listen 443 ssl;" : "    listen 443 ssl http2;",
-        v6 ? (http2Directive() ? "    listen [::]:443 ssl;" : "    listen [::]:443 ssl http2;") : null,
-        http2Directive() ? "    http2 on;" : null,
+        h2 ? "    listen 443 ssl;" : "    listen 443 ssl http2;",
+        v6 ? (h2 ? "    listen [::]:443 ssl;" : "    listen [::]:443 ssl http2;") : null,
+        h2 ? "    http2 on;" : null,
         `    server_name ${names};`,
         `    ssl_certificate ${c.cert};`,
         `    ssl_certificate_key ${c.key};`,
-        fs.existsSync("/etc/letsencrypt/options-ssl-nginx.conf") ? "    include /etc/letsencrypt/options-ssl-nginx.conf;" : "    ssl_protocols TLSv1.2 TLSv1.3;",
-        fs.existsSync("/etc/letsencrypt/ssl-dhparams.pem") ? "    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;" : null,
+        ...tlsOpts,
         ...logs,
         ...common,
         ...proxyLocation(site, up),
@@ -370,6 +413,32 @@ function createLb(ctx) {
       );
     }
     return out.filter((l) => l !== null).join("\n");
+  }
+
+  /**
+   * fcc-00-realip.conf for an edge: Cloudflare's ranges unless main's nginx
+   * already rejected the directive (then the edge, built the same way, would too).
+   * Main's checks for an existing real_ip_header read main's files — they say
+   * nothing about the edge's, so they are not applied here.
+   */
+  function renderEdgeRealIp() {
+    if (realIpError) return renderRealIpDisabled(`the main server's nginx rejected it (${realIpError})`);
+    if (nginxRealIpModule === false) return renderRealIpDisabled("the main server's nginx was built without ngx_http_realip_module");
+    return renderRealIpConf(cloudflareRanges(ctx.dataDir));
+  }
+
+  /**
+   * Every front-door file for edge `serverId`, as { fileName: content } —
+   * shipped as one set by CLUSTER's cluster.sync. null for main or an unknown server.
+   */
+  function edgeFiles(serverId) {
+    if (!serverId || serverId === "main" || !db.get("servers", serverId)) return null;
+    const files = { [COMMON_FILE]: renderCommon(), [REALIP_FILE]: renderEdgeRealIp() };
+    const sites = allSites()
+      .slice()
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    for (const s of sites) files[`fcc-${safeId(s.id)}.conf`] = render(s, { forServer: serverId });
+    return files;
   }
 
   // ------------------------------------------------------------- apply
@@ -394,6 +463,13 @@ function createLb(ctx) {
     state.lastAppliedAt = new Date().toISOString();
     state.lastError = null;
     broadcast({ applied: state.lastAppliedAt });
+    // Edges carry the same front door: let CLUSTER re-render theirs (debounced,
+    // and only pushed where the payload hash actually changed).
+    try {
+      ctx.cluster?.edgesChanged?.();
+    } catch {
+      /* cluster not ready */
+    }
   }
   function fail(err) {
     state.lastError = err.message;
@@ -830,7 +906,9 @@ function createLb(ctx) {
     syncSite,
     removeSite,
     applyAll,
-    preview: (site) => render(typeof site === "string" ? requireSite(site) : site),
+    preview: (site, opts) => render(typeof site === "string" ? requireSite(site) : site, opts),
+    render: (site, opts) => render(typeof site === "string" ? requireSite(site) : site, opts),
+    edgeFiles,
     upstreams: (site) => upstreams(typeof site === "string" ? getSite(site) : site),
     issueCertificate,
     deleteCertificate,

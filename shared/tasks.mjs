@@ -6,11 +6,14 @@
  * Same code on both sides, so a site on main behaves exactly like a site on
  * any other machine.
  *
- *   executeTask(type, payload, { log, signal, dataDir, isMain, uploadFile, authToken, panelUrl })
+ *   executeTask(type, payload, { log, signal, dataDir, isMain, uploadFile, authToken, panelUrl, edgeAllow })
  *
  * Task types and their payload/result shapes are listed in docs/STANDALONE.md
  * (section 3, "ctx.cluster"). There is deliberately no "run a command" task:
  * site.script runs only `npm run <name>` for a script the deployed package.json defines.
+ *
+ * cluster.sync (edge nodes, docs/HA.md) lives in shared/edge.mjs and is only
+ * ever sent to Agent servers; main does the equivalent in-process.
  *
  * Everything that shells out goes through panel/lib/sys.mjs, so FCC_DRY_RUN=1
  * logs what would run instead of running it. The deploy engine spawns its own
@@ -21,6 +24,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import net from "node:net";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { execFile, spawn } from "node:child_process";
@@ -30,7 +34,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.0.0";
+export const TASKS_VERSION = "3.1.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -47,6 +51,7 @@ export const TASK_TYPES = [
   "server.metrics",
   "server.backup",
   "sites.usage",
+  "cluster.sync",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -68,6 +73,7 @@ export const TASK_TIMEOUTS_MS = {
   "server.metrics": 30_000,
   "server.backup": 6 * 60 * 60_000,
   "sites.usage": 60_000,
+  "cluster.sync": 10 * 60_000,
 };
 
 const NOOP = () => {};
@@ -84,6 +90,7 @@ export async function executeTask(type, payload = {}, opts = {}) {
     authToken: opts.authToken || null,
     panelUrl: opts.panelUrl || null,
     serverId: opts.serverId || null,
+    edgeAllow: edgeAllowOf(opts.edgeAllow),
   };
   if (o.signal?.aborted) throw abortError();
   switch (type) {
@@ -93,6 +100,9 @@ export async function executeTask(type, payload = {}, opts = {}) {
       return serverBackup(payload, o);
     case "sites.usage":
       return sitesUsage(payload);
+    case "cluster.sync":
+      // Loaded on demand: main never runs it. One at a time per server.
+      return withSiteLock("cluster:sync", async () => (await import("./edge.mjs")).clusterSync(payload, o));
     case "site.status":
       return siteStatus(payload, o);
     case "site.logs":
@@ -116,6 +126,12 @@ export async function executeTask(type, payload = {}, opts = {}) {
 
 function defaultDataDir() {
   return process.env.FCC_DATA_DIR || "/var/lib/fcc";
+}
+
+/** Edge peer IPs allowed to reach main's local static/php vhosts (docs/HA.md); anything that is not an IP is dropped. */
+function edgeAllowOf(list) {
+  if (!Array.isArray(list)) return [];
+  return [...new Set(list.map((ip) => String(ip ?? "").trim()).filter((ip) => net.isIP(ip)))];
 }
 
 function abortError(reason = "Cancelled.") {
@@ -869,10 +885,17 @@ async function reloadPhpFpm(log) {
   if (sys.which("systemctl")) await sys.run("systemctl", ["reload", unit], { allowFail: true, log, timeoutMs: 30_000 });
 }
 
-export function renderSiteVhost(spec, { isMain = false } = {}) {
+/**
+ * The local vhost of a static/php site. On main it listens on 127.0.0.1 only —
+ * unless edge nodes must reach it (`allowFrom`, docs/HA.md): then it listens on
+ * all interfaces and allows only loopback and those IPs.
+ */
+export function renderSiteVhost(spec, { isMain = false, allowFrom = [] } = {}) {
   const root = siteRoot(spec);
   const s = spec.settings || {};
-  const bind = isMain ? "127.0.0.1:" : "";
+  const allow = isMain ? edgeAllowOf(allowFrom) : [];
+  const bind = isMain && !allow.length ? "127.0.0.1:" : "";
+  const listen6 = allow.some((ip) => net.isIP(ip) === 6) && (!nginxIsLive() || exists("/proc/net/if_inet6"));
   const maxBody = /^\d+[kmg]?$/i.test(String(s.clientMaxBodySize || "")) ? s.clientMaxBodySize : "100m";
   const q = (v) => `"${String(v).replace(/["\\]/g, "\\$&")}"`;
   const lines = [
@@ -880,6 +903,7 @@ export function renderSiteVhost(spec, { isMain = false } = {}) {
     `# Local ${spec.type} vhost for site ${spec.name || ""} (${spec.siteId}); the front door on the main server proxies here.`,
     `server {`,
     `    listen ${bind}${spec.port};`,
+    ...(listen6 ? [`    listen [::]:${spec.port};`] : []),
     `    server_name _;`,
     `    root ${q(root)};`,
     `    index ${spec.type === "php" ? "index.php " : ""}index.html index.htm;`,
@@ -887,6 +911,9 @@ export function renderSiteVhost(spec, { isMain = false } = {}) {
     `    error_log /var/log/nginx/fcc-app-${spec.siteId}.error.log warn;`,
     `    client_max_body_size ${maxBody};`,
     `    server_tokens off;`,
+    ...(allow.length
+      ? [``, `    # the main server's own front door and the edge nodes only`, `    allow 127.0.0.1;`, `    allow ::1;`, ...allow.map((ip) => `    allow ${ip};`), `    deny all;`]
+      : []),
     ``,
     `    # never serve dotfiles (.env, .git) — except ACME/well-known`,
     `    location ~ /\\.(?!well-known) { deny all; }`,
@@ -928,7 +955,47 @@ export function renderSiteVhost(spec, { isMain = false } = {}) {
 async function writeSiteVhost(spec, o, { force = false } = {}) {
   const { file } = vhostFile(spec, o);
   ensureDir(spec.appDir);
-  return applyNginxFile(file, renderSiteVhost(spec, { isMain: o.isMain }), { log: o.log, force });
+  return applyNginxFile(file, renderSiteVhost(spec, { isMain: o.isMain, allowFrom: o.edgeAllow }), { log: o.log, force });
+}
+
+/**
+ * Re-render the local vhost of every static/php spec whose vhost file already
+ * exists (the edge set changed, so the allow list did). Never starts a
+ * stopped site. opts: { log, dataDir, isMain (default true — this is for
+ * main), edgeAllow }. Returns { refreshed: [siteId], errors: [{ siteId, error }] }.
+ */
+export async function refreshLocalVhosts(specs, opts = {}) {
+  const o = {
+    log: opts.log || NOOP,
+    dataDir: opts.dataDir || defaultDataDir(),
+    isMain: opts.isMain ?? true,
+    edgeAllow: edgeAllowOf(opts.edgeAllow),
+  };
+  const refreshed = [];
+  const errors = [];
+  for (const raw of Array.isArray(specs) ? specs : []) {
+    let spec;
+    try {
+      spec = checkSpec(raw);
+      siteIdOf({ spec });
+    } catch (err) {
+      errors.push({ siteId: raw?.siteId ?? null, error: err.message });
+      continue;
+    }
+    if (spec.type === "node") continue;
+    try {
+      const r = await withSiteLock(spec.siteId, async () => {
+        const { file } = vhostFile(spec, o);
+        if (!exists(file)) return null; // stopped (or never started) — leave it that way
+        return applyNginxFile(file, renderSiteVhost(spec, { isMain: o.isMain, allowFrom: o.edgeAllow }), { log: o.log });
+      });
+      if (r?.changed) refreshed.push(spec.siteId);
+    } catch (err) {
+      errors.push({ siteId: spec.siteId, error: err.message });
+      o.log(`!! ${spec.name || spec.siteId}: ${err.message}`);
+    }
+  }
+  return { refreshed, errors };
 }
 
 async function removeSiteVhost(spec, o) {
