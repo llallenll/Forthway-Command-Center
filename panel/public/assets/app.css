@@ -1522,3 +1522,20 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
   .ha-fo-presets { width: 100%; }
   .ha-fo-row .btn { width: 100%; justify-content: center; }
 }
+
+/* Availability bullets (3.10.1): one line each for panels, edge nodes and databases — dashboard card */
+.ha-bullets { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 3px; font-size: 12.5px; }
+.ha-bullets li { display: flex; align-items: center; gap: 8px; min-width: 0; line-height: 1.45; margin: 0; }
+.ha-bullets li > .dot { flex: none; }
+.ha-bullets b { font-weight: 600; color: var(--text); }
+.ha-alert .ha-bullets { margin-top: 6px; }
+@media (max-width: 640px) {
+  .ha-bullets li { align-items: flex-start; }
+  .ha-bullets li > .dot { margin-top: 5px; }
+}
+/* Servers page: database replication row in the HA strip, DB role badge on server cards */
+.ha-dbrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--line); font-size: 13px; }
+.ha-dbrow .ico { color: var(--muted); }
+.ha-dbrow-t { flex: 1; min-width: 0; }
+.ha-dbrow .ha-node-meta { display: inline-flex; gap: 14px; white-space: nowrap; }
+.ha-dbrow .ha-db-bar { flex: 1 1 100%; max-width: 320px; }
