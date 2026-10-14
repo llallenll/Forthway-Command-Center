@@ -1,12 +1,12 @@
 // Uptime monitoring + SMS alerts (server: panel/lib/monitor.mjs).
 //   uptimeTab()              website page → Uptime tab
-//   notificationsSettings()  Settings → Notifications (channels: Twilio SMS, Discord webhooks; alert rules)
+//   notificationsSettings()  Settings → Notifications (channels: Twilio SMS, Discord webhooks; alert rules; cluster alerts)
 //   bindUptime()             fills [data-uptime="<siteId>"] slots in website rows (Websites list, project page)
 //   downBanner()             dashboard: "N websites down" card (renders nothing while everything is up)
 // Every user-supplied string goes through html``.
 import { html, raw, mount, $, $$, on, ago, fmtDate, fmtTime, fmtDuration, plural, toast, toastError, confirmDialog, debounce, emptyState, skeletonRows, copyText, openModal, openMenu } from "../util.js";
 import { icon } from "../icons.js";
-import { get, put, post, del } from "../api.js";
+import { get, put, post, patch, del } from "../api.js";
 import { lineChart } from "../charts.js";
 
 /* ───────── shared bits ───────── */
@@ -412,6 +412,90 @@ function discordStatusOf(s) {
   return { tone: "ok", label: "Active", sub: `Active · ${plural(live.length, "webhook")} (${names(live)})${mentions.length ? ` · mentions ${mentions.join(" ")}` : ""}${s.dryRun && !d.testEndpoint ? " · dry run: posts are simulated" : ""}`, ready: true };
 }
 
+/* ───────── Cluster alerts (docs/HA.md, Phase 3) ─────────
+   GET/PATCH /api/notifications/cluster { enabled, sms, discord }; POST …/test. 404 on an older panel → nothing shows. */
+const CLUSTER_TRIGGERS = [
+  ["layers", "The active panel's server goes down and another panel node takes over."],
+  ["layers", "A planned switch of the active panel finishes.", "Discord only"],
+  ["server", "The server that went down is back as a standby. Use Make active panel to move the panel back."],
+  ["database", "The database replica takes over as the primary."],
+  ["alert", "Database replication has stopped with an error for 2 minutes."],
+  ["check", "A server becomes the database replica again."],
+];
+async function clusterAlerts(slot, ctx, notif) {
+  let c;
+  try { c = await get("/api/notifications/cluster"); } catch { return; }
+  if (!c || typeof c !== "object" || !ctx.alive()) return;
+  const smsLine = () => {
+    const n = notif(), nums = (n.defaults || []).length;
+    if (!n.configured && !n.dryRun) return html`<span class="cl-warn">Twilio isn't set up yet</span>`;
+    if (!nums) return html`<span class="cl-warn">No default numbers yet</span>`;
+    return html`${plural(nums, "default number")}${n.enabled ? "" : html` · <span class="cl-warn">text alerts are off</span>`}${n.dryRun ? " · dry run: simulated" : ""}`;
+  };
+  const discordLine = () => {
+    const live = (notif().discord?.webhooks || []).filter((w) => w.enabled && w.urlHint);
+    return live.length ? html`${plural(live.length, "webhook")} · ${live.map((w) => w.name).slice(0, 3).join(", ")}${live.length > 3 ? ` +${live.length - 3}` : ""}` : html`<span class="cl-warn">No enabled webhooks yet</span>`;
+  };
+  const paint = () => {
+    mount(slot, html`<form class="card" data-cluster novalidate>
+      <div class="card-head"><div style="flex:1;min-width:0"><h3>Cluster alerts</h3><div class="sub">An alert when the panel or the databases switch servers.</div></div>
+        <div class="right"><label class="switch"><input type="checkbox" name="enabled" ${c.enabled !== false ? raw("checked") : ""}/><span class="track"></span><span class="hide-sm">Send cluster alerts</span></label></div></div>
+      <div class="card-body">
+        <div class="cl-channels" data-cl-ch>
+          <label class="cl-ch"><span class="switch"><input type="checkbox" name="sms" ${c.sms !== false ? raw("checked") : ""}/><span class="track"></span></span>
+            <span class="li-ico nch-tile">${icon("message", "sm")}</span><span class="cl-ch-t"><b>Text the default numbers</b><span class="muted small">${smsLine()}</span></span></label>
+          <label class="cl-ch"><span class="switch"><input type="checkbox" name="discord" ${c.discord !== false ? raw("checked") : ""}/><span class="track"></span></span>
+            <span class="li-ico nch-tile discord">${icon("discord", "sm")}</span><span class="cl-ch-t"><b>Post to Discord</b><span class="muted small">${discordLine()}</span></span></label>
+        </div>
+        <div class="label mt-20" style="margin-bottom:8px">You get an alert when</div>
+        <ul class="cl-triggers">${CLUSTER_TRIGGERS.map(([ico, t, note]) => html`<li>${icon(ico, "xs")}<span>${t}${note ? html` <span class="muted">(${note})</span>` : ""}</span></li>`)}</ul>
+        <p class="hint mt-16" style="margin-bottom:0">Websites' own alert choices don't apply here: cluster alerts go to the default numbers and every enabled Discord webhook set up above. Each one is also logged in Activity.</p>
+        <div class="error-box mt-16" data-err hidden></div>
+      </div>
+      <div class="card-foot cl-foot"><span class="muted small" data-cl-state></span><span class="spacer"></span>
+        <button class="btn" type="button" data-cltest>${icon("bell")}Send test alert</button>
+        <button class="btn btn-primary" type="submit" data-save>${icon("check")}Save</button></div>
+    </form>`);
+    syncOff();
+  };
+  const syncOff = () => {
+    const f = $("[data-cluster]", slot)?.elements; if (!f) return;
+    f.sms.disabled = f.discord.disabled = !f.enabled.checked;
+    $("[data-cl-ch]", slot).classList.toggle("is-off", !f.enabled.checked);
+  };
+  paint();
+  on(slot, "change", "[data-cluster] input", (e, inp) => { if (inp.name === "enabled") syncOff(); $("[data-cl-state]", slot).textContent = "Unsaved changes"; });
+  on(slot, "submit", "[data-cluster]", async (e, form) => {
+    e.preventDefault();
+    const err = $("[data-err]", form), btn = $("[data-save]", form), f = form.elements;
+    showErr(err, ""); setBusy(btn, true);
+    try {
+      const r = await patch("/api/notifications/cluster", { enabled: f.enabled.checked, sms: f.sms.checked, discord: f.discord.checked });
+      c = r && typeof r === "object" && "enabled" in r ? r : { ...c, enabled: f.enabled.checked, sms: f.sms.checked, discord: f.discord.checked };
+      toast(c.enabled ? "Cluster alerts saved" : "Cluster alerts turned off", "ok");
+      paint();
+    } catch (ex) { showErr(err, ex.message); setBusy(btn, false); }
+  });
+  on(slot, "click", "[data-cltest]", async (e, b) => {
+    setBusy(b, true);
+    try {
+      const r = await post("/api/notifications/cluster/test", {});
+      const sent = Array.isArray(r?.sent) ? r.sent : null;
+      const bad = sent ? sent.filter((x) => x.ok === false) : [];
+      if (sent && !sent.length) toast("Nothing was sent", "warn", { msg: r?.reason || "Turn on a channel with numbers or webhooks, and save first." });
+      else if (bad.length) toast("Some test alerts failed", "err", { msg: bad.map((x) => `${x.channel === "discord" ? x.to || "Discord" : x.to}: ${x.error || "not accepted"}`).join(" · ") });
+      else if (r?.ok === false) toast("Test alert failed", "err", { msg: r.error || r.reason || "" });
+      else {
+        const nSms = sent ? sent.filter((x) => x.channel !== "discord").length : 0, nD = sent ? sent.length - nSms : 0;
+        toast(sent?.some((x) => x.simulated) || r?.simulated ? "Test alert simulated (dry run)" : "Test alert sent", "ok", sent ? { msg: [nSms ? plural(nSms, "text") : "", nD ? plural(nD, "Discord post") : ""].filter(Boolean).join(" · ") } : {});
+      }
+    } catch (ex) { toastError(ex, "Couldn't send the test alert"); }
+    finally { setBusy(b, false); }
+  });
+  // channel lines follow the Twilio / Discord settings above
+  ctx.on("monitor", debounce((d) => { if (d?.kind === "notifications" && ctx.alive() && !$("[data-cl-state]", slot)?.textContent) paint(); }, 800));
+}
+
 export async function notificationsSettings(box, ctx) {
   let s = await get("/api/notifications/settings");
   if (!ctx.alive()) return;
@@ -449,6 +533,7 @@ export async function notificationsSettings(box, ctx) {
       <div class="card-body" data-rules-body></div>
       <div class="card-foot"><span class="muted small" data-rules-state></span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save rules</button></div>
     </form>
+    <div data-cluster-slot style="display:contents"></div>
     <form class="card" data-legal novalidate>
       <div class="card-head"><div><h3>SMS compliance pages</h3><div class="sub">Public Privacy Policy and Terms &amp; Conditions pages for your Twilio campaign registration. Anyone can open them — no sign-in.</div></div></div>
       <div class="card-body" data-legal-body></div>
@@ -580,6 +665,7 @@ export async function notificationsSettings(box, ctx) {
       <div class="error-box span-2" data-err hidden></div></div>`);
   };
   paintLegal();
+  clusterAlerts($("[data-cluster-slot]", box), ctx, () => s); // renders nothing on a panel without cluster alerts
   /* SMS sign-ups (opt-ins from the public page) */
   let optins = null;
   const OPT_BADGE = { pending: ["warn", "Waiting for approval"], approved: ["ok", "Approved"], declined: ["", "Declined"], "opted-out": ["", "Opted out"] };

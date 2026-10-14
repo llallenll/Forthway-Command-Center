@@ -399,12 +399,43 @@ on a standby simply forwards you to the active one.
 - **No automatic switch back.** When the old server returns it rejoins as a
   standby. Move the panel back with **Make active panel** on the Servers page
   (about 20 seconds of downtime).
-- **While main is not running the panel**, databases, phpMyAdmin and
-  certificates are unavailable (they live on main), and the last few seconds
-  of changes before a failure may be lost. Local backup files are not copied
+- **While main is not running the panel**, phpMyAdmin and certificates are
+  unavailable (they live on main), databases too unless replication is on
+  (below), and the last few seconds of changes before a failure may be lost. Local backup files are not copied
   between panels: set an **S3** destination so backups survive a lost server.
 - Every panel node must be able to reach the others' panel port (4000 by
   default) — opened automatically where `ufw` is active.
+
+### Database replication
+
+**Settings → Databases → Replication** keeps a live copy of every database on
+a second server (pick a panel node). The panel prepares main's MySQL (binary
+log and GTID — MySQL restarts once, for a few seconds), installs the same
+MySQL or MariaDB on the replica, copies the data and starts replication.
+
+Websites then reach their database as `fcc-mysql.internal`, a name every
+server resolves to the current primary. If the primary stops answering — to
+the active panel and to the replica — for a minute, the replica is promoted
+and that name moves to it: websites reconnect on their own, without a restart.
+In **Manual** mode you get an alert and a **Promote** button instead.
+
+- A server that was primary comes back **read-only** and is rebuilt as the new
+  replica; its old data is first saved to
+  `/var/backups/fcc-mysql-before-rebuild-<date>.sql.gz` on that server.
+- **Switch primary** moves the primary back (planned, no data loss, about
+  ten seconds read-only).
+- Replication is asynchronous: a crash can lose the last moments of writes
+  that had not reached the replica yet.
+- Servers must reach the primary on port 3306 — opened automatically where
+  `ufw` is active.
+
+### Alerts
+
+The panel texts your **default SMS recipients** and posts to every enabled
+**Discord** webhook (the uptime alert channels) when the panel moves to
+another server after a failure, when the old server is back, and when the
+database fails over, breaks or is rebuilt. Turn channels on or off and send a
+test under **Cluster alerts** in the notification settings.
 
 ---
 

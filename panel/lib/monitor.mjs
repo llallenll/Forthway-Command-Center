@@ -44,6 +44,11 @@
  * Each website posts to every enabled panel webhook except the ones it skips
  * (`discordSkip`), unless `discordEnabled` is off. Posting runs beside SMS and
  * the check loop (its own lock, retries with backoff on 429/5xx) and never throws.
+ *
+ * Cluster alerts (docs/HA.md Phase 3): ctx.monitor.clusterAlert() sends one
+ * panel-wide alert (panel / database failover…) through the same senders — a
+ * text to the DEFAULT recipients only, a post to every enabled webhook.
+ * cluster-alerts.mjs decides what and when.
  */
 
 import fs from "node:fs";
@@ -56,7 +61,7 @@ import { requestIp } from "./auth.mjs";
 import { legalInfo, privacyPage, termsPage, optInPage, consentText, confirmationText } from "./legal.mjs";
 import * as sys from "./sys.mjs";
 import { writeFileAtomic } from "./store.mjs";
-import { parseWebhookUrl, canonicalWebhookUrl, webhookHint, parseMention, buildDiscordPayload, postWebhook, apiBase as discordApiBase, scrubSecret } from "./notify-discord.mjs";
+import { parseWebhookUrl, canonicalWebhookUrl, webhookHint, parseMention, buildDiscordPayload, postWebhook, apiBase as discordApiBase, scrubSecret, escapeMd } from "./notify-discord.mjs";
 
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
@@ -1173,6 +1178,136 @@ function createMonitor(ctx) {
     }
   }
 
+  // ---------------------------------------------------- cluster alerts
+
+  /**
+   * Cluster alerts (docs/HA.md Phase 3, used by cluster-alerts.mjs): one alert
+   * to the panel-wide channels — a text to every DEFAULT recipient (never the
+   * per-site ones) and a post to every enabled Discord webhook. Same senders,
+   * retries, secret scrubbing and DRY_RUN simulation as uptime alerts.
+   *   kind     "panel.failover" | … (logged, part of the SMS rate key)
+   *   subject  what it is about (server id…); one text per number per kind+subject per 10 min
+   *   title    short headline (Discord embed title)
+   *   text     plain-English body (Discord description; SMS when `smsText` is not given)
+   *   color    "danger" | "warn" | "ok" | "info" | 0xRRGGBB
+   *   sms / discord  false to skip that channel
+   *   mention  true: add each webhook's configured mention (serious alerts only)
+   *   fields   [{ name, value }] extra Discord fields (plain text)
+   * Never throws. Resolves { sms: { attempted, reason, results }, discord: { attempted, reason, results } };
+   * results never contain a token, a webhook URL or a full phone number.
+   */
+  const clusterHourly = new Map(); // phone -> [ms of cluster texts in the last hour]
+  const CLUSTER_SMS_PER_HOUR = 6;
+  const CLUSTER_COLORS = { danger: 0xff5d7a, warn: 0xf5a524, ok: 0x3ddc97, info: 0x4a72ff };
+
+  async function clusterAlert({ kind = "cluster", subject = "", title = "", text = "", smsText: smsBody = "", color = "info", sms = true, discord = true, mention = false, fields = [], panelPath = "" } = {}) {
+    const out = { sms: { attempted: false, reason: null, results: [] }, discord: { attempted: false, reason: null, results: [] } };
+    try {
+      const n = notif();
+      const k = cleanStr(kind, 40) || "cluster";
+      const subj = cleanStr(subject, 80);
+      const panelName = ctx.config.panelName || "Forthway Command Center";
+      let panelLink = null;
+      try {
+        panelLink = `${String(ctx.panelUrl?.() || "").replace(/\/+$/, "")}/${panelPath ? `#/${String(panelPath).replace(/^[#/]+/, "")}` : ""}`;
+        if (!/^https?:\/\//.test(panelLink)) panelLink = null;
+      } catch { /* no panel URL */ }
+
+      const smsJob = (async () => {
+        if (!sms) return void (out.sms.reason = "off for this alert");
+        if (!n.enabled) return void (out.sms.reason = "Text alerts are turned off in Settings → Notifications.");
+        const recipients = [];
+        const seen = new Set();
+        for (const r of n.defaults || []) {
+          const phone = normalizePhone(r?.phone);
+          if (phone && !seen.has(phone)) {
+            seen.add(phone);
+            recipients.push({ phone, name: r.name || "" });
+          }
+        }
+        if (!recipients.length) return void (out.sms.reason = "No default recipients in Settings → Notifications.");
+        out.sms.attempted = true;
+        const body = smsText(smsBody || `${title}${text ? `: ${text}` : ""}`);
+        for (const rcp of recipients) {
+          const now = Date.now();
+          const rkey = `cluster|${k}|${subj}|${rcp.phone}`;
+          const hour = (clusterHourly.get(rcp.phone) || []).filter((t) => now - t < HOUR);
+          let skip = null;
+          if (now - (Number(rate[rkey]) || 0) < SMS_MIN_GAP_MS) skip = `rate limited (one text per ${fmtDuration(SMS_MIN_GAP_MS)} per number for the same alert)`;
+          else if (hour.length >= CLUSTER_SMS_PER_HOUR) skip = `rate limited (at most ${CLUSTER_SMS_PER_HOUR} cluster texts per number per hour)`;
+          if (skip) {
+            out.sms.results.push({ to: maskPhone(rcp.phone), name: rcp.name, ok: false, skipped: true, simulated: false, error: skip });
+            continue;
+          }
+          rate[rkey] = now;
+          hour.push(now);
+          clusterHourly.set(rcp.phone, hour);
+          stateDirty = true;
+          const r = await sendSms(rcp.phone, body);
+          lastSend.sms = { at: iso(Date.now()), ok: !!r.ok, simulated: !!r.simulated, error: r.error || null };
+          if (!r.ok) console.warn(`[monitor] cluster alert text to ${maskPhone(rcp.phone)} failed: ${r.error}`);
+          out.sms.results.push({ to: maskPhone(rcp.phone), name: rcp.name, ok: !!r.ok, skipped: false, simulated: !!r.simulated, error: r.error || null, messageId: r.id || null });
+        }
+      })();
+
+      const discordJob = (async () => {
+        if (!discord) return void (out.discord.reason = "off for this alert");
+        const hooks = discordHooks().filter((w) => w.enabled && w.hook);
+        if (!hooks.length) return void (out.discord.reason = "No enabled Discord webhook in Settings → Notifications.");
+        out.discord.attempted = true;
+        const base = buildDiscordPayload("test", { panelName, panelLink });
+        const embed = base.embeds[0];
+        embed.title = cut(String(title || k), 256).replace(/~$/, "…");
+        embed.description = escapeMd(String(text || "")).slice(0, 4096);
+        embed.color = typeof color === "number" ? color : CLUSTER_COLORS[color] ?? CLUSTER_COLORS.info;
+        const extra = (Array.isArray(fields) ? fields : [])
+          .filter((f) => f && f.name && f.value != null && f.value !== "")
+          .slice(0, 10)
+          .map((f) => ({ name: cut(String(f.name), 256), value: escapeMd(cut(String(f.value), 1024)), inline: f.inline !== false }));
+        embed.fields = [...extra, ...(embed.fields || [])].slice(0, 25);
+        if (!embed.fields.length) delete embed.fields;
+        await Promise.all(hooks.map(async (w) => {
+          const payload = { ...base, embeds: [{ ...embed }], allowed_mentions: { parse: [] } };
+          if (mention && w.mention) {
+            try {
+              const m = parseMention(w.mention);
+              if (m.text) {
+                payload.content = m.text;
+                payload.allowed_mentions = m.allowed;
+              }
+            } catch { /* invalid stored mention: post without it */ }
+          }
+          const r = await postDiscord(w, payload);
+          lastSend.discord[w.id] = { at: iso(Date.now()), ok: !!r.ok, simulated: !!r.simulated, error: r.error || null };
+          stateDirty = true;
+          if (!r.ok) console.warn(`[monitor] cluster alert post to Discord "${w.name}" failed: ${r.error}`);
+          out.discord.results.push({ webhookId: w.id, to: w.name, ok: !!r.ok, simulated: !!r.simulated, error: r.error || null, status: r.status ?? null, attempts: r.attempts || 0, rateLimited: r.rateLimited || 0 });
+        }));
+      })();
+
+      await Promise.allSettled([smsJob, discordJob]);
+      try {
+        ctx.events?.broadcast("monitor", { kind: "notifications" }); // channel badges
+      } catch { /* no SSE */ }
+    } catch (err) {
+      console.warn(`[monitor] cluster alert failed: ${err.message}`);
+    }
+    return out;
+  }
+
+  /** What the cluster alert channels would reach right now (for the settings view). */
+  function clusterChannels() {
+    const n = notif();
+    const st = twilioStatus();
+    const defaults = (n.defaults || []).filter((r) => normalizePhone(r?.phone)).length;
+    const hooks = discordHooks().filter((w) => w.enabled && w.hook).length;
+    return {
+      sms: { enabled: !!n.enabled, configured: st.configured || sys.DRY_RUN, problem: st.configured ? null : st.problem, defaultRecipients: defaults, ready: !!n.enabled && (st.configured || sys.DRY_RUN) && defaults > 0 },
+      discord: { webhooks: hooks, ready: hooks > 0 },
+      dryRun: sys.DRY_RUN,
+    };
+  }
+
   // ------------------------------------------------------------ checks
 
   function openIncident(site, r, now, cause) {
@@ -1824,6 +1959,9 @@ function createMonitor(ctx) {
         return s ? runCheck(s) : Promise.resolve();
       },
       sendSms,
+      // cluster alerts (docs/HA.md Phase 3)
+      clusterAlert,
+      clusterChannels,
     },
   };
 }

@@ -51,10 +51,10 @@ import { createActivity } from "./lib/core-routes.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 const PUBLIC_DIR = path.join(HERE, "public");
-const VERSION = "3.8.0";
+const VERSION = "3.9.0";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
-const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "analytics", "usage"];
+const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "mysql-ha", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "cluster-alerts", "analytics", "usage"];
 const START_TIMEOUT_MS = 15_000;
 const SSE_PING_MS = 15_000;
 const SSE_PAD = `:${" ".repeat(2048)}\n\n`; // pushes the first bytes past proxy buffer thresholds
@@ -710,6 +710,31 @@ for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => shutdown(sig));
 if (!HA_STANDBY_BOOT) {
   ha._registerRoutes(router);
   await loadModules();
+} else if (ha.mainIsLocal) {
+  // Database fencing rule (3): main booting as a standby while another server is
+  // the database primary keeps its own MySQL read-only (mysql-ha.mjs does this
+  // for a leader; a standby loads no modules, so it is done here).
+  // Main's own config.json can be stale (it was down while the replica was
+  // promoted), so check again each time replication brings a newer one: the
+  // first copy from the active panel arrives within seconds, well before the
+  // leader's own fencing pass reaches main through its agent.
+  try {
+    const { fenceAtBoot } = await import(pathToFileURL(path.join(HERE, "lib", "mysql-ha.mjs")).href);
+    let fenced = (await fenceAtBoot({ config, dataDir: DATA_DIR })).fenced;
+    let seen = "";
+    const recheck = setInterval(async () => {
+      if (fenced || mode !== "standby") return clearInterval(recheck);
+      try {
+        const text = fs.readFileSync(CONFIG_PATH, "utf8");
+        if (text === seen) return;
+        seen = text;
+        fenced = (await fenceAtBoot({ config: JSON.parse(text), dataDir: DATA_DIR })).fenced;
+      } catch { /* mid-write or unreadable: next tick */ }
+    }, 2000);
+    recheck.unref?.();
+  } catch (err) {
+    console.warn(`[fcc] database fence at boot: ${err.message}`);
+  }
 }
 ha._start();
 

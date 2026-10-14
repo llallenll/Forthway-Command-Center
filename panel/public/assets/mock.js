@@ -24,12 +24,12 @@ const db = {
       edge: { enabled: true, implicit: true }, edgeStatus: null, panel: { enabled: true, directUrl: "http://10.0.0.10:4000" },
       lastSeenAt: ago(4e3), online: true, info: { hostname: "fcc-main", os: "Ubuntu 24.04 LTS", cpus: 8, memTotal: 16 * GB, diskTotal: 320 * GB }, createdAt: iso(NOW - 90 * DAY),
       metrics: { cpu: 23, mem: 6.2 * GB, memTotal: 16 * GB, disk: 118 * GB, diskTotal: 320 * GB, load: 0.84, uptime: 38 * DAY, at: ago(4e3) } },
-    { id: "srv_fra1", name: "fra-agent-1", role: "worker", host: "203.0.113.21", privateHost: "10.0.0.21", weight: 2, enabled: true, lbEligible: true, agentVersion: "3.2.0",
+    { id: "srv_fra1", name: "fra-agent-1", role: "worker", host: "203.0.113.21", privateHost: "10.0.0.21", weight: 2, enabled: true, lbEligible: true, agentVersion: "3.3.0",
       edge: { enabled: true }, edgeStatus: null, // filled in below (edge nodes)
       panel: { enabled: true, directUrl: "http://10.0.0.21:4000" }, // a standby panel (panel failover)
       lastSeenAt: ago(6e3), online: true, info: { hostname: "fra-agent-1", os: "Debian 12", cpus: 4, memTotal: 8 * GB, diskTotal: 160 * GB }, createdAt: iso(NOW - 60 * DAY),
       metrics: { cpu: 31, mem: 3.1 * GB, memTotal: 8 * GB, disk: 61 * GB, diskTotal: 160 * GB, load: 1.12, uptime: 21 * DAY, at: ago(6e3) } },
-    { id: "srv_fra2", name: "fra-agent-2", role: "worker", host: "203.0.113.22", privateHost: "10.0.0.22", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.2.0",
+    { id: "srv_fra2", name: "fra-agent-2", role: "worker", host: "203.0.113.22", privateHost: "10.0.0.22", weight: 1, enabled: true, lbEligible: true, agentVersion: "3.3.0",
       edge: { enabled: false }, edgeStatus: null, panel: null,
       lastSeenAt: ago(3e3), online: true, info: { hostname: "fra-agent-2", os: "Ubuntu 22.04 LTS", cpus: 4, memTotal: 8 * GB, diskTotal: 160 * GB }, createdAt: iso(NOW - 45 * DAY),
       metrics: { cpu: 58, mem: 6.5 * GB, memTotal: 8 * GB, disk: 146 * GB, diskTotal: 160 * GB, load: 2.31, uptime: 9 * DAY, at: ago(3e3) } },
@@ -37,7 +37,7 @@ const db = {
       edge: { enabled: false }, edgeStatus: null, panel: null,
       lastSeenAt: ago(3 * HOUR + 12 * MIN), online: false, info: { hostname: "nyc-agent-1", os: "Ubuntu 22.04 LTS", cpus: 2, memTotal: 4 * GB, diskTotal: 80 * GB }, createdAt: iso(NOW - 20 * DAY),
       metrics: { cpu: 12, mem: 1.9 * GB, memTotal: 4 * GB, disk: 31 * GB, diskTotal: 80 * GB, load: 0.2, uptime: 2 * DAY, at: ago(3 * HOUR + 12 * MIN) } },
-    { id: "srv_ams1", name: "ams-agent-1", role: "worker", host: "203.0.113.31", privateHost: "10.0.0.31", weight: 1, enabled: true, lbEligible: false, agentVersion: "3.2.0",
+    { id: "srv_ams1", name: "ams-agent-1", role: "worker", host: "203.0.113.31", privateHost: "10.0.0.31", weight: 1, enabled: true, lbEligible: false, agentVersion: "3.3.0",
       edge: { enabled: true }, edgeStatus: null, panel: null,
       lastSeenAt: ago(5e3), online: true, info: { hostname: "ams-agent-1", os: "Debian 12", cpus: 2, memTotal: 4 * GB, diskTotal: 80 * GB }, createdAt: iso(NOW - 6 * DAY),
       metrics: { cpu: 9, mem: 1.2 * GB, memTotal: 4 * GB, disk: 14 * GB, diskTotal: 80 * GB, load: 0.18, uptime: 6 * DAY, at: ago(5e3) } },
@@ -689,7 +689,152 @@ R("POST", "/api/servers/:id/panel", (p, b) => {
   });
 });
 // Databases only answer here while main runs the active panel (flags.dbDown simulates the opposite).
-R("GET", "/api/mysql/settings", () => (flags.dbDown ? { available: false, reason: DB_REASON } : err(404, "Mock: no route for GET /api/mysql/settings")));
+const mysqlSettings = { publicHostOverride: "", mainSitesVia: "panel" };
+function mysqlSettingsView() {
+  const host = mysqlSettings.publicHostOverride || "10.0.0.10";
+  return { publicHost: host, publicHostOverride: mysqlSettings.publicHostOverride, publicHostDefault: "10.0.0.10", publicHostSource: "the main server's private address",
+    mainSitesVia: mysqlSettings.mainSitesVia, mainSitesHost: mysqlSettings.mainSitesVia === "panel" ? host : "127.0.0.1", port: 3306, bindAddress: db.mysql.bindAddress,
+    bindConfigFile: "/etc/mysql/mysql.conf.d/zz-fcc-remote.cnf", sitesUsingDatabases: db.sites.filter((x) => (x.linkedDatabaseIds || []).length).length, dryRun: false };
+}
+R("GET", "/api/mysql/settings", () => (flags.dbDown ? { available: false, reason: DB_REASON } : mysqlSettingsView()));
+R("PUT", "/api/mysql/settings", (p, b) => {
+  const changed = [];
+  if (typeof b.publicHost === "string" && b.publicHost !== mysqlSettings.publicHostOverride) { mysqlSettings.publicHostOverride = b.publicHost; changed.push("publicHost"); }
+  if (b.mainSitesVia && b.mainSitesVia !== mysqlSettings.mainSitesVia) { mysqlSettings.mainSitesVia = b.mainSitesVia; changed.push("mainSitesVia"); }
+  if (changed.length) activity("mysql.settings", "settings", { id: "mysql", name: "Database host" }, changed.join(", "));
+  return { ...mysqlSettingsView(), changed, jobs: [] };
+});
+
+/* database replication (docs/HA.md, Phase 3)
+   ?mockrepl=on (default) | off | seeding | broken | promoted | rebuild | down
+   on: main → fra-agent-1, lag 0 · broken: SQL thread stopped with an error · promoted: fra-agent-1 took over, fcc-main needs a rebuild
+   rebuild: like promoted, but fcc-main is back online and can be rebuilt · down: main unreachable for 42 s, failover pending
+   Or from the console: fccMock.repl("broken"), then reload the view. */
+const replFlag = (() => { try { const q = new URLSearchParams(location.search); if (q.has("mockrepl")) sessionStorage.setItem("fcc.mock.repl", q.get("mockrepl")); return sessionStorage.getItem("fcc.mock.repl") || "on"; } catch { return "on"; } })();
+const repl = { enabled: true, mode: "auto", flavor: "mysql", primary: "main", replica: "srv_fra1", state: "replicating", lag: 0, io: true, sql: true, lastError: null,
+  seededAt: ago(6 * DAY), needsRebuild: [], downMs: 0, history: [
+    { at: ago(6 * DAY + 40 * MIN), event: "enabled", detail: "Replica fra-agent-1 · automatic failover" },
+    { at: ago(6 * DAY + 22 * MIN), event: "seeded", detail: "5 databases copied to fra-agent-1 (2.4 GB)" },
+  ] };
+const hist = (event, detail) => { repl.history.unshift({ at: iso(Date.now()), event, detail }); repl.history = repl.history.slice(0, 50); };
+const srvName = (id) => db.servers.find((x) => x.id === id)?.name || id;
+if (replFlag === "off") Object.assign(repl, { enabled: false, state: "off", replica: null, history: [] });
+if (replFlag === "seeding") Object.assign(repl, { state: "seeding", lag: null, io: false, sql: false, seededAt: null, history: [{ at: ago(3 * MIN), event: "enabled", detail: "Replica fra-agent-1 · automatic failover" }] });
+if (replFlag === "broken") {
+  Object.assign(repl, { state: "broken", lag: null, sql: false, lastError: "Error 'Duplicate entry '1042' for key 'orders.PRIMARY'' on query. Default database: 'acme_prod'. Query: 'INSERT INTO orders …'" });
+  repl.history.unshift({ at: ago(14 * MIN), event: "broken", detail: "SQL thread stopped with error 1062 on fra-agent-1" });
+}
+if (replFlag === "promoted") {
+  Object.assign(repl, { primary: "srv_fra1", replica: null, state: "promoted", needsRebuild: ["main"] });
+  repl.history.unshift({ at: ago(26 * MIN), event: "fenced", detail: "fcc-main set to read-only" }, { at: ago(27 * MIN), event: "promoted", detail: "fcc-main was unreachable for 60 s · fra-agent-1 is the primary" });
+}
+if (replFlag === "rebuild") { // promoted, and fcc-main is back online: ready to be rebuilt as the replica
+  Object.assign(repl, { primary: "srv_fra1", replica: null, state: "needs-rebuild", needsRebuild: ["main"], mainBack: true });
+  repl.history.unshift({ at: ago(3 * HOUR + 9 * MIN), event: "fenced", detail: "fcc-main set to read-only" }, { at: ago(3 * HOUR + 10 * MIN), event: "promoted", detail: "fcc-main was unreachable for 60 s · fra-agent-1 is the primary" });
+}
+if (replFlag === "down") repl.downMs = 42000;
+try { window.fccMock.repl = (v = "on") => { try { sessionStorage.setItem("fcc.mock.repl", v); } catch {} }; } catch {}
+const replCandidates = () => db.servers.filter((x) => x.role !== "main" && x.id !== repl.primary && x.online && x.enabled !== false && (x.agentVersion || "0") >= "3.3.0")
+  .map((x) => ({ serverId: x.id, name: x.name, panelNode: !!x.panel?.enabled, recommended: !!x.panel?.enabled }));
+function replView() {
+  const prim = db.servers.find((x) => x.id === repl.primary);
+  const cands = replCandidates();
+  return {
+    enabled: repl.enabled, mode: repl.mode, state: repl.state, flavor: repl.flavor,
+    primary: { serverId: repl.primary, name: srvName(repl.primary), address: prim ? prim.privateHost || prim.host : null, readOnly: false },
+    replica: repl.enabled && repl.replica ? { serverId: repl.replica, name: srvName(repl.replica), state: repl.state === "broken" ? "broken" : repl.state === "seeding" || repl.state === "preparing" ? "seeding" : "replicating",
+      lagSeconds: repl.lag, ioRunning: repl.io, sqlRunning: repl.sql, lastError: repl.lastError, seededAt: repl.seededAt } : null,
+    needsRebuild: repl.needsRebuild.map((id) => ({ serverId: id, name: srvName(id), online: id === "main" ? !!repl.mainBack : !!db.servers.find((x) => x.id === id)?.online })),
+    history: clone(repl.history),
+    canEnable: cands.length ? { ok: true, reason: null } : { ok: false, reason: "Add an agent server running agent 3.3.0 or newer to hold the replica." },
+    candidates: cands, detect: repl.downMs ? { primaryDownForMs: repl.downMs } : null,
+  };
+}
+const replChanged = () => emit("mysql-ha", replView());
+const replJob = (type, title, lines, onDone) => runJob({ type, title, serverId: repl.replica || null }, { lines, onDone() { onDone(); replChanged(); return replView(); } });
+R("GET", "/api/mysql/replication", () => replView());
+R("POST", "/api/mysql/replication", (p, b) => {
+  if (repl.enabled) err(409, "Replication is already on.");
+  const t = replCandidates().find((x) => x.serverId === b.replicaServerId) || err(400, "That server can't hold the replica.");
+  Object.assign(repl, { enabled: true, mode: b.mode === "manual" ? "manual" : "auto", replica: t.serverId, state: "seeding", lag: null, io: false, sql: false, lastError: null, seededAt: null });
+  hist("enabled", `Replica ${t.name} · ${repl.mode === "auto" ? "automatic" : "manual"} failover`);
+  activity("mysql.replication.enable", "settings", { id: "mysql-ha", name: "Database replication" }, `Replica ${t.name}`);
+  replChanged();
+  return replJob("mysql.replication.enable", `Turn on database replication to ${t.name}`, [
+    `▸ Preparing ${srvName(repl.primary)} as the primary: binlog ROW, GTID on, server_id 1`, "  wrote /etc/mysql/mysql.conf.d/fcc-replication.cnf · restarted MySQL", "▸ Users fcc_repl and fcc_admin created",
+    `▸ Setting up ${t.name}: installing mysql-server 8.0`, "▸ Copying 5 databases (mysqldump --single-transaction)", "  acme_prod 1.4 GB · northwind 640 MB · acme_staging 221 MB · wp_blog 96 MB · northwind_queue 38 MB",
+    "▸ CHANGE REPLICATION SOURCE TO … SOURCE_AUTO_POSITION=1", "▸ /etc/hosts: fcc-mysql.internal → 10.0.0.10 on 5 servers", "▸ Linked websites: DB_HOST=fcc-mysql.internal (5 env updates queued)", "✓ Replicating · lag 0 s"],
+  () => { Object.assign(repl, { state: "replicating", lag: 0, io: true, sql: true, seededAt: iso(Date.now()) }); hist("seeded", `5 databases copied to ${t.name}`); });
+});
+R("PATCH", "/api/mysql/replication", (p, b) => {
+  if (!repl.enabled) err(409, "Replication is off.");
+  if (b.mode && b.mode !== repl.mode) { repl.mode = b.mode === "manual" ? "manual" : "auto"; hist("mode", repl.mode === "auto" ? "Automatic failover" : "Manual failover"); replChanged(); }
+  return replView();
+});
+R("POST", "/api/mysql/replication/promote", (p, b) => {
+  if (!repl.replica) err(409, "There is no replica to promote.");
+  if (repl.state === "broken" && !b.force) err(409, "Replication is broken, so the replica may be missing data. Promote it with force to do it anyway.");
+  const from = repl.primary, to = repl.replica;
+  return replJob("mysql.replica.promote", `Promote ${srvName(to)} to database primary`, ["▸ Stopping the IO thread", "▸ Waiting for the SQL thread to apply everything received", "▸ RESET REPLICA ALL · read_only=OFF", `▸ /etc/hosts: fcc-mysql.internal → ${srvName(to)} on every server`, `▸ ${srvName(from)} set to read-only`, "✓ Promoted"],
+    () => { Object.assign(repl, { primary: to, replica: null, state: "promoted", lastError: null, io: true, sql: true, downMs: 0 }); repl.needsRebuild = [...new Set([...repl.needsRebuild, from])];
+      hist("promoted", `${srvName(to)} is the primary${b.force ? " (forced)" : ""}`); hist("fenced", `${srvName(from)} set to read-only`); });
+});
+R("POST", "/api/mysql/replication/switchover", () => {
+  if (!repl.replica || repl.state !== "replicating" || repl.lag !== 0) err(409, "Switching needs a healthy replica with no lag.");
+  const from = repl.primary, to = repl.replica;
+  return replJob("mysql.switchover", `Switch the database primary to ${srvName(to)}`, [`▸ ${srvName(from)}: read_only=ON`, `▸ Waiting for ${srvName(to)} to apply the primary's transactions`, "  caught up in 1.8 s", `▸ Promoting ${srvName(to)}`, `▸ ${srvName(from)} follows ${srvName(to)} as the replica`, "▸ /etc/hosts updated on every server", "✓ Switched · databases were read-only for 6 s"],
+    () => { Object.assign(repl, { primary: to, replica: from, state: "replicating", lag: 0 }); hist("switchover", `${srvName(from)} → ${srvName(to)}`); });
+});
+R("POST", "/api/mysql/replication/rebuild", (p, b) => {
+  if (!repl.needsRebuild.includes(b.serverId)) err(400, "That server doesn't need a rebuild.");
+  if (repl.replica) err(409, `${srvName(repl.replica)} is already the replica. Turn replication off and on again to pick another one.`);
+  const id = b.serverId, stamp = iso(Date.now()).slice(0, 16).replace(/[-:T]/g, "");
+  return replJob("mysql.rebuild", `Rebuild ${srvName(id)} as the database replica`, [`▸ Safety dump: /var/backups/fcc-mysql-before-rebuild-${stamp}.sql.gz (mode 600)`, "▸ Dropping 5 databases", `▸ Copying 5 databases from ${srvName(repl.primary)}`, "▸ Starting replication (auto-position)", "✓ Replicating · lag 0 s"],
+    () => { repl.needsRebuild = repl.needsRebuild.filter((x) => x !== id); Object.assign(repl, { replica: id, state: "replicating", lag: 0, io: true, sql: true, lastError: null, seededAt: iso(Date.now()) }); hist("rebuilt", `${srvName(id)} is the replica again`); });
+});
+R("DELETE", "/api/mysql/replication", () => {
+  if (!repl.enabled) err(409, "Replication is already off.");
+  const rep = repl.replica;
+  return replJob("mysql.replication.disable", "Turn off database replication", [rep ? `▸ ${srvName(rep)}: STOP REPLICA · RESET REPLICA ALL` : "▸ No replica to stop", "  its copy of the data is kept", "✓ Replication off"],
+    () => { Object.assign(repl, { enabled: false, state: "off", replica: null, needsRebuild: [], downMs: 0 }); hist("disabled", rep ? `${srvName(rep)} keeps its copy` : ""); });
+});
+
+/* notifications (Settings → Notifications) and cluster alerts (docs/HA.md, Phase 3) */
+const notif = {
+  enabled: true, configured: true, dryRun: false, api: "messages", accountSid: "AC4f2c9e0b7d1a", from: "+15557654321", authTokenSet: true, authTokenHint: "••••7e1c", authTokenUnreadable: false, problem: null,
+  defaults: [{ name: "Jordan", phone: "+15551234567" }, { name: "Sam", phone: "+15559876543" }], lastSend: { ok: true, at: ago(3 * DAY) },
+  discord: { testEndpoint: null, webhooks: [{ id: "dwh_ops", name: "#ops", enabled: true, urlHint: "…/9fA2", mention: "@here", last: { ok: true, at: ago(3 * DAY) } }, { id: "dwh_dev", name: "#dev-alerts", enabled: false, urlHint: "…/c71B", mention: "", last: null }] },
+  repeatMinutes: 60, notifyRecovery: true, minGapMinutes: 5,
+  legal: { brandName: "", contactEmail: "", brandShown: "Forthway", privacyUrl: "https://panel.forthway.dev/legal/privacy", termsUrl: "https://panel.forthway.dev/legal/terms", optInUrl: "https://panel.forthway.dev/sms/signup" },
+  cluster: { enabled: true, sms: true, discord: true },
+};
+const notifView = () => { const { cluster, ...rest } = notif; return clone(rest); };
+R("GET", "/api/notifications/settings", () => notifView());
+R("PUT", "/api/notifications/settings", (p, b) => {
+  const { authToken, clearAuthToken, legal, ...rest } = b;
+  Object.assign(notif, pick(rest, ["enabled", "defaults", "accountSid", "from", "repeatMinutes", "notifyRecovery"]));
+  if (legal) Object.assign(notif.legal, legal);
+  if (authToken) Object.assign(notif, { authTokenSet: true, authTokenHint: "••••" + authToken.slice(-4) });
+  if (clearAuthToken) Object.assign(notif, { authTokenSet: false, authTokenHint: "", configured: false });
+  emit("monitor", { kind: "notifications" });
+  return notifView();
+});
+R("GET", "/api/notifications/optins", () => ({ items: [] }));
+R("POST", "/api/notifications/test", (p, b) => ({ ok: true, to: b.to, messageId: "SM" + hex(32) }));
+R("GET", "/api/notifications/cluster", () => clone(notif.cluster));
+R("PATCH", "/api/notifications/cluster", (p, b) => {
+  Object.assign(notif.cluster, pick(b, ["enabled", "sms", "discord"]));
+  activity("notifications.cluster", "settings", { id: "cluster-alerts", name: "Cluster alerts" }, notif.cluster.enabled ? "On" : "Off");
+  return clone(notif.cluster);
+});
+R("POST", "/api/notifications/cluster/test", () => {
+  const c = notif.cluster, sent = [];
+  if (!c.enabled) return { ok: false, sent, reason: "Cluster alerts are off. Turn them on and save first." };
+  if (c.sms && notif.enabled) for (const d of notif.defaults) sent.push({ channel: "sms", to: d.phone, name: d.name, ok: true });
+  if (c.discord) for (const w of notif.discord.webhooks.filter((x) => x.enabled)) sent.push({ channel: "discord", to: w.name, ok: true });
+  activity("notifications.cluster.test", "settings", { id: "cluster-alerts", name: "Cluster alerts" }, `${sent.length} sent`);
+  return { ok: true, sent };
+});
 R("GET", "/api/phpmyadmin", () => (flags.dbDown ? { available: false, reason: DB_REASON } : err(404, "Mock: no route for GET /api/phpmyadmin")));
 
 // cluster

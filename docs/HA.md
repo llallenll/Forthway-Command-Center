@@ -468,3 +468,167 @@ SSE  "ha" event on role/leader/vote changes
 ## Changes
 
 - 3.8.0 — panel failover (this section).
+
+---
+
+# Phase 3: Database replication, cluster alerts, server dialog (v3.9.0)
+
+## Goal
+
+Databases keep working when main goes down: a MySQL/MariaDB **replica** on
+another server takes over as **primary**, websites follow without a restart,
+and the panel manages databases from whichever panel node is active. Admins
+get an SMS / Discord alert when the panel or the database fails over.
+
+## Data (replicated config.json)
+
+```js
+config.mysqlHa = {
+  enabled: false,
+  mode: "auto" | "manual",            // auto = promote after DETECT_MS of the primary being unreachable
+  flavor: "mysql" | "mariadb",        // of the primary; the replica installs the same
+  primary: "main" | "srv_…",          // the only writable server
+  replica: "srv_…" | null,            // one replica in this version
+  state: "off" | "preparing" | "seeding" | "replicating" | "broken" | "promoted" | "needs-rebuild",
+  replUserEnc, replPasswordEnc,       // fcc_repl — replication + seeding (encrypted with ctx.secrets)
+  adminPasswordEnc,                   // fcc_admin — the panel's remote root-equivalent user
+  needsRebuild: ["srv_…"],            // old primaries fenced read-only, waiting to become the replica
+  serverIds: { main: 1, "srv_…": 2 }, // MySQL server_id per server (stable, unique)
+  history: [{ at, event, detail }],   // last 50: enabled, seeded, promoted, switchover, rebuilt, broken, fenced
+}
+```
+Constants: `DETECT_MS = 60000`, `REPL_ALIAS = "fcc-mysql.internal"`, users `fcc_repl`, `fcc_admin`.
+
+## Database address
+
+When replication is enabled, every linked website's `DB_HOST` becomes
+`fcc-mysql.internal` (one-time env update jobs, like a password rotation).
+Every server gets an `/etc/hosts` managed block mapping the alias to the current
+primary — `127.0.0.1` on the primary itself, else the primary's
+`privateHost || host`. Failover only rewrites that block: no env change, no app
+restart (clients reconnect and resolve again; Node / PHP read /etc/hosts per lookup).
+Database users are granted from `localhost`, `127.0.0.1` and every server's
+addresses (existing `grantHosts` logic, extended with main's and the replica's).
+
+`cluster.sync` payload gains `hosts: { "fcc-mysql.internal": "<ip>" } | null`
+(null removes the block). Main applies the same block in-process (or through
+its embedded agent while it is a standby).
+
+## Tasks (shared/mysql-ha.mjs — AGENT-SIDE; run on agents and in-process on main)
+
+All SQL through the `mysql` CLI with stdin scripts and `MYSQL_PWD` env (never argv),
+socket root locally. Under FCC_DRY_RUN: log, simulate, write nothing outside dataDir.
+`TASKS_VERSION 3.3.0`, `AGENT_VERSION 3.3.0`.
+
+- `mysql.primary.prepare { serverId, replUser, replPassword, adminPassword, replicaIps, adminIps, allowFrom }`
+  Ensures binlog (ROW), `server_id`, GTID (MySQL: `gtid_mode=ON`,
+  `enforce_gtid_consistency=ON`; MariaDB: native GTID), `bind-address=0.0.0.0`
+  via a managed file (`/etc/mysql/mysql.conf.d/zzz-fcc-replication.cnf` or
+  `/etc/mysql/mariadb.conf.d/99-zz-fcc-replication.cnf` — named to load after the installer's file); restarts MySQL only if a
+  setting changed. Creates/updates `fcc_repl@<each replica ip>` (REPLICATION SLAVE,
+  REPLICATION CLIENT, SELECT, RELOAD, SHOW VIEW, EVENT, TRIGGER, LOCK TABLES, PROCESS)
+  and `fcc_admin@<each admin ip>` (ALL WITH GRANT OPTION). ufw (if active): 3306 from `allowFrom`.
+  → `{ flavor, version, restarted, gtid: true }`
+- `mysql.replica.setup { flavor, serverId, primaryHost, primaryPort, replUser, replPassword, adminPassword, adminIps, allowFrom }`
+  Installs the same flavor if missing (apt), writes the managed cnf (server_id,
+  binlog + `log_replica_updates`/`log_slave_updates`, GTID, `read_only=ON`,
+  `replicate-wild-ignore-table=mysql.%`, relay log, bind 0.0.0.0), restarts,
+  creates `fcc_admin` locally (with `sql_log_bin=0`), seeds every non-system
+  database from the primary (`mysqldump -h … --single-transaction --routines --events --triggers`
+  + GTID position: MySQL `--set-gtid-purged=ON` after `RESET MASTER`/`RESET BINARY LOGS AND GTIDS`;
+  MariaDB `--gtid --master-data` + `gtid_slave_pos`), then starts replication with
+  auto-position (MySQL `CHANGE REPLICATION SOURCE TO … SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1`
+  or `CHANGE MASTER TO … MASTER_AUTO_POSITION=1` on < 8.0.23; MariaDB `MASTER_USE_GTID=slave_pos`).
+  → `{ flavor, version, seededAt, databases, gtidExecuted }`
+- `mysql.status {}` → `{ installed, flavor, version, readOnly, role: "primary"|"replica"|"standalone",
+   replica: { ioRunning, sqlRunning, lagSeconds, lastError, sourceHost, retrievedGtid, executedGtid } | null }`
+   (also pushed every metrics tick by node-agent as `mysql` when MySQL is installed).
+- `mysql.replica.promote { waitMs = 30000 }` — stop the IO thread, wait until the
+  SQL thread has applied everything received (bounded by waitMs), `RESET REPLICA ALL`,
+  `read_only=OFF` (runtime + cnf). → `{ promoted: true, executedGtid, appliedAll: bool }`
+- `mysql.readonly { on }` — fence/unfence (runtime + cnf). Idempotent, fast (≤ 5 s).
+- `mysql.users.sync { users: [{ user, password, hosts, databases }], remove: [{ user, host }] }`
+  `CREATE USER IF NOT EXISTS / ALTER USER … IDENTIFIED BY / GRANT ALL ON db.*`,
+  with `SET sql_log_bin=0` when the server is a replica (no errant GTIDs).
+- `mysql.rebuild { …mysql.replica.setup payload }` — `mysqldump` every non-system
+  database to `/var/backups/fcc-mysql-before-rebuild-<stamp>.sql.gz` (mode 600),
+  drop them, then exactly `mysql.replica.setup`. → `{ safetyDump: path, …setup result }`
+- `panel.install` also installs the MySQL client of the cluster's flavor (for remote admin/dumps).
+
+## Panel (panel/lib/mysql-ha.mjs — new; mysql.mjs, backups.mjs changes)
+
+- **Remote admin**: when the primary is not this machine, mysql.mjs connects to
+  `REPL_ALIAS`/primary address over TCP as `fcc_admin` (password from config,
+  `MYSQL_PWD`). So databases, imports, rotations and database backups work from any
+  active panel; the Phase 2 `DB_REMOTE` 503s apply only when replication is off.
+  phpMyAdmin and certificates stay main-only.
+- **Enable** (`POST /api/mysql/replication { replicaServerId, mode }`, job): checks
+  (replica is an online agent ≥ 3.3.0, not the primary, enough disk), generates users,
+  prepare primary → setup replica → users.sync on the replica → hosts alias everywhere →
+  DB_HOST env update jobs → state `replicating`.
+- **Monitor** (every 10 s on the leader): from metrics / `mysql.status`. `broken`
+  when the SQL or IO thread has been stopped with an error for 2 min (alert once).
+- **Automatic failover** (`mode: "auto"`): the primary counts as down when, for
+  `DETECT_MS` continuously, (a) the primary server is offline to the panel
+  (agent/votes), (b) the leader cannot open a TCP connection to primary:3306, and
+  (c) the replica reports its IO thread not connected. Then: `mysql.replica.promote`
+  on the replica → `primary = replica`, `replica = null`, old primary into
+  `needsRebuild`, state `promoted` → hosts alias everywhere → users.sync on the new
+  primary → alert. Never promotes a replica whose last status showed `lastError` with
+  a stopped SQL thread (it may be missing data) unless done manually with `force`.
+  `mode: "manual"`: same detection, but only alerts; `POST /api/mysql/replication/promote { force? }`.
+- **Fencing**: (1) `ctx.ha.beforeFence(fn)` (ha.mjs hook, ≤ 3 s): when main fences
+  and main is the primary, set local MySQL `read_only=ON`. The leader turns it back
+  OFF when main is still the primary and leads/ is reachable again. (2) Any server in
+  `needsRebuild` or any non-primary server that reports `readOnly: false` gets
+  `mysql.readonly { on: true }` at once. (3) Main's panel at boot (follower or leader)
+  sets its local MySQL read-only when config says another server is primary; as a
+  standby it re-checks every replicated config.json (main's own copy is stale after
+  a failover it missed), so it fences within seconds of rejoining.
+- **Rebuild** (`POST /api/mysql/replication/rebuild { serverId }`, job; automatic
+  in auto mode when a needs-rebuild server comes back online and no replica exists):
+  `mysql.rebuild` on it → it becomes `replica`.
+- **Switchover** (`POST /api/mysql/replication/switchover`, job; needs a healthy
+  replica with lag 0): primary `read_only=ON` → wait for the replica to execute the
+  primary's GTID set → promote → old primary re-pointed as replica (`CHANGE … SOURCE_AUTO_POSITION`
+  via `mysql.replica.setup` with `seed: false`) → alias. No data loss, ~10 s of read-only.
+- **Disable** (`DELETE /api/mysql/replication`, job): stop replication on the replica,
+  keep its data, keep the alias pointing at the primary.
+- `GET /api/mysql/replication` → `{ enabled, mode, state, flavor, primary: { serverId, name, address, readOnly },
+  replica: { serverId, name, state, lagSeconds, ioRunning, sqlRunning, lastError, seededAt } | null,
+  needsRebuild: [{ serverId, name, online }], history, canEnable: { ok, reason },
+  candidates: [{ serverId, name, panelNode, recommended }], detect: { primaryDownForMs } | null }`
+- SSE event `mysql-ha` on every state change.
+
+## Cluster alerts (panel/lib/cluster-alerts.mjs — new module, listed after "monitor")
+
+Uses the uptime alert channels from monitor.mjs: every enabled Discord webhook and
+the **default** SMS recipients (not per-site ones), DRY_RUN simulated, never throws,
+same secret hygiene. monitor.mjs exports `ctx.monitor.clusterAlert({ kind, title, text, color })`.
+Settings: `config.notifications.cluster = { enabled: true, sms: true, discord: true }`,
+`GET/PATCH /api/notifications/cluster`. Events (each logged in Activity):
+
+| kind | when | sent by |
+|---|---|---|
+| `panel.failover` | a panel node promoted and the previous leader was lost (not a handover) — "Main went down. The panel is now running on <name>." | the new leader, once its modules started |
+| `panel.handover` | planned handover finished (Discord only) | the new leader |
+| `panel.recovered` | the previous leader's server is back online as a standby — "use Make active panel to move it back" | the leader |
+| `db.failover` | the database replica was promoted | the leader |
+| `db.broken` | replication stopped with an error for 2 min | the leader |
+| `db.rebuilt` | a server became the replica again | the leader |
+
+ha.mjs exposes `ctx.ha.on("promoted", ({ term, previousLeaderId, reason: "failover"|"handover" }))`
+and remembers the previous leader across the promotion so the alert can name it.
+
+## Server dialog (UI)
+
+The edit/add server dialog replaces its row of switches with three menus:
+- **Role**: Website host · Edge node · Edge + panel node (options disabled with the reason when
+  not allowed; picking a panel role explains that saving installs the panel).
+- **Load balancing**: In the pool · Not in the pool.
+- **Status** (edit only, not main): Enabled · Disabled.
+Main shows Role as "Main (front door, panel)" read-only.
+
+## Changes
+
+- 3.9.0 — database replication, cluster alerts, server dialog menus (this section).

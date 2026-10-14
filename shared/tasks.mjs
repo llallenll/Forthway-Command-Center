@@ -17,6 +17,9 @@
  * agent while another server runs the active panel. panel.install /
  * panel.remove (panel nodes, docs/HA.md Phase 2) live there too.
  *
+ * mysql.* (database replication, docs/HA.md Phase 3) live in shared/mysql-ha.mjs
+ * and run both on agents and in-process on main.
+ *
  * Everything that shells out goes through panel/lib/sys.mjs, so FCC_DRY_RUN=1
  * logs what would run instead of running it. The deploy engine spawns its own
  * build commands, so under DRY_RUN the site.* tasks are simulated end to end
@@ -36,7 +39,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.2.0";
+export const TASKS_VERSION = "3.3.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -56,6 +59,14 @@ export const TASK_TYPES = [
   "cluster.sync",
   "panel.install",
   "panel.remove",
+  // Database replication (docs/HA.md Phase 3) — shared/mysql-ha.mjs
+  "mysql.primary.prepare",
+  "mysql.replica.setup",
+  "mysql.status",
+  "mysql.replica.promote",
+  "mysql.readonly",
+  "mysql.users.sync",
+  "mysql.rebuild",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -80,6 +91,13 @@ export const TASK_TIMEOUTS_MS = {
   "cluster.sync": 10 * 60_000,
   "panel.install": 15 * 60_000,
   "panel.remove": 5 * 60_000,
+  "mysql.primary.prepare": 15 * 60_000, // may restart MySQL
+  "mysql.replica.setup": 6 * 60 * 60_000, // installs MySQL and copies every database from the primary
+  "mysql.status": 30_000,
+  "mysql.replica.promote": 2 * 60_000,
+  "mysql.readonly": 30_000,
+  "mysql.users.sync": 2 * 60_000,
+  "mysql.rebuild": 6 * 60 * 60_000, // safety dump + full copy
 };
 
 const NOOP = () => {};
@@ -115,6 +133,17 @@ export async function executeTask(type, payload = {}, opts = {}) {
       return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelInstall(payload, o));
     case "panel.remove":
       return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelRemove(payload, o));
+    case "mysql.status":
+    case "mysql.readonly":
+      // Never queued behind a long setup/rebuild: status is read-only and fencing must be fast.
+      return (await import("./mysql-ha.mjs")).runMysqlTask(type, payload, o);
+    case "mysql.primary.prepare":
+    case "mysql.replica.setup":
+    case "mysql.replica.promote":
+    case "mysql.users.sync":
+    case "mysql.rebuild":
+      // Database replication (docs/HA.md Phase 3); one change to the local MySQL at a time.
+      return withSiteLock("cluster:mysql", async () => (await import("./mysql-ha.mjs")).runMysqlTask(type, payload, o));
     case "site.status":
       return siteStatus(payload, o);
     case "site.logs":

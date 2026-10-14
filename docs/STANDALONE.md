@@ -1149,3 +1149,11 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   longer means "this machine": modules check `ctx.ha.mainIsLocal`. New tasks
   `panel.install` / `panel.remove`, `cluster.sync frontDoor`, `/ha/*`, `/api/ha`,
   `/api/ha/handover`, `POST /api/servers/:id/panel`. Contract in docs/HA.md.
+- **3.9.0 — database replication, cluster alerts, server dialog menus (HA phase 3).**
+  One MySQL/MariaDB replica (shared/mysql-ha.mjs tasks, panel/lib/mysql-ha.mjs
+  orchestration): websites use `DB_HOST=fcc-mysql.internal` (an /etc/hosts block on
+  every server), automatic or manual promotion, fencing of stale primaries, rebuild
+  with a safety dump, planned switchover; mysql.mjs manages a remote primary as
+  `fcc_admin`. panel/lib/cluster-alerts.mjs sends SMS/Discord on panel and database
+  failover (`ctx.ha.on("promoted")`, `ctx.ha.beforeFence`). The server dialog uses
+  Role / Load balancing / Status menus. Contract in docs/HA.md.

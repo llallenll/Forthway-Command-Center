@@ -1,0 +1,1620 @@
+/**
+ * Database replication — the agent side of docs/HA.md, Phase 3.
+ *
+ * Runs on agent servers (through node/node-agent.mjs) and in-process on main
+ * (shared/tasks.mjs → executeTask). Every task does one fixed job with
+ * validated inputs; there is no "run this SQL" task.
+ *
+ *   mysql.primary.prepare  binlog + GTID + server_id + bind 0.0.0.0, fcc_repl / fcc_admin accounts, ufw 3306
+ *   mysql.replica.setup    install the same flavor, replica settings, seed from the primary, start replication
+ *   mysql.status           flavor, version, read_only, role, replica threads / lag / GTIDs
+ *   mysql.replica.promote  drain the relay log, drop the replica settings, read_only OFF
+ *   mysql.readonly         fence / unfence (runtime + managed config file), fast
+ *   mysql.users.sync       create / re-password / grant / drop website users (sql_log_bin=0 on a replica)
+ *   mysql.rebuild          safety dump + drop every database, then exactly mysql.replica.setup
+ *
+ * How it talks to MySQL (same rules as panel/lib/mysql.mjs, whose helpers are
+ * mirrored here because agents only receive node/, shared/ and sys.mjs):
+ *   - the local server as root over the unix socket (`mysql -u root`, OS root);
+ *   - the primary over TCP as fcc_repl with the password in MYSQL_PWD;
+ *   - SQL — which may carry a password — only ever on the client's stdin, every
+ *     value through sqlString(), every identifier validated then backtick-quoted.
+ *   Passwords never reach argv and never a log line (errors are scrubbed, dry-run
+ *   SQL is printed with ••••).
+ *
+ * Managed configuration file (one per server, atomic, rewritten only when its
+ * content differs; MySQL is restarted only when something other than read_only
+ * changed, and the previous file is put back if the server does not come up):
+ *   MySQL    /etc/mysql/mysql.conf.d/zzz-fcc-replication.cnf
+ *   MariaDB  /etc/mysql/mariadb.conf.d/99-zz-fcc-replication.cnf
+ * The names sort after the installer's own drop-in (zz-fcc.cnf / 99-fcc.cnf,
+ * which sets bind-address), so our bind-address wins.
+ *
+ * FCC_DRY_RUN=1: every command and every SQL script (passwords masked) is
+ * logged with "[dry-run]"; nothing outside dataDir is written. The server's
+ * state is simulated in <dataDir>/mysql-ha-dry.json, so prepare / setup /
+ * promote / readonly change what mysql.status reports.
+ *
+ * Test hook (inert in production): when FCC_MYSQL_TEST_DEFAULTS names a JSON
+ * file and FCC_DRY_RUN is not set, "the local server" is whatever that file
+ * says — used only to run these tasks against throwaway mysqld instances:
+ *   { "client":  ["--socket=/tmp/a/mysql.sock", "-u", "root"],   // replaces ["-u", "root"]
+ *     "cnfFile": "/tmp/a/fcc-replication.cnf",                    // replaces the managed path
+ *     "restart": ["/bin/sh", "/tmp/a/restart.sh"] }               // replaces systemctl restart
+ * With the hook nothing is installed with apt. Nothing sets this variable in
+ * any unit file or installer; only someone who can already run commands as the
+ * agent's user could.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import net from "node:net";
+import zlib from "node:zlib";
+import { spawn } from "node:child_process";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
+import { ensureDir, exists } from "./fsx.mjs";
+import { syncUfwRules } from "./edge.mjs";
+import * as sys from "../panel/lib/sys.mjs";
+
+const NOOP = () => {};
+
+export const REPL_USER = "fcc_repl";
+export const ADMIN_USER = "fcc_admin";
+export const CNF_FILES = Object.freeze({
+  mysql: "/etc/mysql/mysql.conf.d/zzz-fcc-replication.cnf",
+  mariadb: "/etc/mysql/mariadb.conf.d/99-zz-fcc-replication.cnf",
+});
+export const SAFETY_DUMP_DIR = "/var/backups";
+const SERVICE = { mysql: "mysql", mariadb: "mariadb" };
+const PACKAGES = {
+  mysql: { server: ["mysql-server", "mysql-client"], client: ["mysql-client"] },
+  mariadb: { server: ["mariadb-server", "mariadb-client"], client: ["mariadb-client"] },
+};
+const UFW_COMMENT = "fcc mysql from cluster";
+const SYSTEM_DBS = new Set(["mysql", "information_schema", "performance_schema", "sys"]);
+const USER_RE = /^[a-z][a-z0-9_]{0,31}$/;
+const GRANT_DB_RE = /^[a-z][a-z0-9_]{0,63}$/; // panel-made database names (users.sync)
+const ANY_DB_RE = /^[A-Za-z0-9_$][A-Za-z0-9_$@#-]{0,63}$/; // existing databases we dump / drop
+const STATE_FILE = "mysql-ha.json";
+const DRY_STATE_FILE = "mysql-ha-dry.json";
+const DRY_PRIMARY_DBS = ["acme_shop", "acme_blog"]; // what a simulated primary holds
+const READY_WAIT_MS = 180_000;
+const RESTART_TIMEOUT_MS = 10 * 60_000;
+const PROGRESS_EVERY_MS = 15_000;
+const NOT_RUNNING_CODES = new Set([2002, 2003, 2006, 2013]);
+
+// Every script starts by making backslash escapes active, so sqlString's `\\` is one backslash.
+const PRELUDE = "SET SESSION sql_mode = (SELECT REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''));\n";
+
+// =================================================================== the syntax table
+//
+// THE one place that knows which statement / variable / dump option each
+// flavor and version uses. Everything else asks dialect(flavor, version).
+//
+//                       MySQL < 8.0.22   MySQL 8.0.22+     8.0.23+                 8.0.26+               8.2+ / 8.4 / 9.x       MariaDB 10.6 – 11.x
+//   status              SHOW SLAVE STATUS SHOW REPLICA STATUS                                                                     SHOW SLAVE STATUS
+//   start/stop/reset    START SLAVE …    START REPLICA …                                                                         START SLAVE …
+//   point at primary    CHANGE MASTER TO MASTER_AUTO_POSITION=1  CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION=1             CHANGE MASTER TO MASTER_USE_GTID=slave_pos
+//   wipe binlog+GTIDs   RESET MASTER                                                                      RESET BINARY LOGS AND GTIDS   RESET MASTER (+ gtid_slave_pos='')
+//   cnf: log updates    log_slave_updates                                        log_replica_updates                                log_slave_updates
+//   cnf: binlog_format  ROW (written)                                                                     (omitted: deprecated, ROW is the default)  ROW
+//   cnf: GTID           gtid_mode=ON + enforce_gtid_consistency=ON                                                              (native, nothing)
+//   dump position       --set-gtid-purged=ON --master-data=2                     --set-gtid-purged=ON --source-data=2           --gtid --master-data=1
+//   status fields       Slave_IO_Running, Seconds_Behind_Master, Master_Host …   (8.0.22+) Replica_IO_Running, Seconds_Behind_Source, Source_Host …   Slave_* + Gtid_IO_Pos / Gtid_Slave_Pos
+//   drain relay log     WAIT_FOR_EXECUTED_GTID_SET(set, s) → 0 ok, 1 timeout                                                    MASTER_GTID_WAIT(pos, s) → 0 ok, -1 timeout
+//   executed GTIDs      @@GLOBAL.gtid_executed                                                                                  @@GLOBAL.gtid_current_pos
+
+export function parseVersion(v) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(v || ""));
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+function atLeast(v, a, b, c) {
+  for (const [x, y] of [[v[0], a], [v[1], b], [v[2], c]]) {
+    if (x !== y) return x > y;
+  }
+  return true;
+}
+
+export function flavorOf(version) {
+  return /mariadb/i.test(String(version || "")) ? "mariadb" : "mysql";
+}
+
+export function dialect(flavor, version) {
+  if (flavor !== "mysql" && flavor !== "mariadb") throw new Error(`Unknown database flavor "${flavor}"`);
+  const v = parseVersion(version) || (flavor === "mariadb" ? [10, 6, 0] : [8, 0, 0]);
+  if (flavor === "mariadb") {
+    return {
+      flavor,
+      version: v.join("."),
+      showReplicaStatus: "SHOW SLAVE STATUS",
+      startReplica: "START SLAVE",
+      stopReplica: "STOP SLAVE",
+      stopIoThread: "STOP SLAVE IO_THREAD",
+      startIoThread: "START SLAVE IO_THREAD",
+      resetReplicaAll: "RESET SLAVE ALL",
+      resetBinlogs: "RESET MASTER",
+      clearGtidState: ["RESET MASTER", "SET GLOBAL gtid_slave_pos = ''"],
+      logReplicaUpdates: "log_slave_updates",
+      binlogFormatLine: true,
+      gtidCnf: [],
+      logBinCnf: "log_bin = mysql-bin",
+      dumpPositionFlags: ["--gtid", "--master-data=1"],
+      executedGtidExpr: "@@GLOBAL.gtid_current_pos",
+      sourceGtidExpr: "@@GLOBAL.gtid_binlog_pos",
+      setSeedGtid: (pos) => `SET GLOBAL gtid_slave_pos = ${sqlString(cleanGtid("mariadb", pos))}`,
+      fields: { io: "Slave_IO_Running", sql: "Slave_SQL_Running", lag: "Seconds_Behind_Master", source: "Master_Host", retrieved: "Gtid_IO_Pos", executed: "Gtid_Slave_Pos" },
+      waitForGtid: (pos, sec) => `SELECT MASTER_GTID_WAIT(${sqlString(cleanGtid("mariadb", pos))}, ${Math.max(0, Math.floor(sec))})`,
+      waitOk: (r) => String(r) === "0",
+      appliedCheck: (pos) => `SELECT IF(MASTER_GTID_WAIT(${sqlString(cleanGtid("mariadb", pos))}, 0) = 0, 1, 0)`,
+      superReadOnly: false,
+      clientExtra: [],
+      changeSource: ({ host, port, user, password, ssl }) =>
+        `CHANGE MASTER TO MASTER_HOST = ${sqlString(host)}, MASTER_PORT = ${Number(port)}, MASTER_USER = ${sqlString(user)}, MASTER_PASSWORD = ${sqlString(password)}, MASTER_USE_GTID = slave_pos, MASTER_CONNECT_RETRY = 10${ssl ? ", MASTER_SSL = 1" : ""}`,
+    };
+  }
+  const replicaKw = atLeast(v, 8, 0, 22);
+  const sourceKw = atLeast(v, 8, 0, 23);
+  const newNames = atLeast(v, 8, 0, 26);
+  const resetBinlogs = atLeast(v, 8, 2, 0) ? "RESET BINARY LOGS AND GTIDS" : "RESET MASTER";
+  return {
+    flavor,
+    version: v.join("."),
+    showReplicaStatus: replicaKw ? "SHOW REPLICA STATUS" : "SHOW SLAVE STATUS",
+    startReplica: replicaKw ? "START REPLICA" : "START SLAVE",
+    stopReplica: replicaKw ? "STOP REPLICA" : "STOP SLAVE",
+    stopIoThread: replicaKw ? "STOP REPLICA IO_THREAD" : "STOP SLAVE IO_THREAD",
+    startIoThread: replicaKw ? "START REPLICA IO_THREAD" : "START SLAVE IO_THREAD",
+    resetReplicaAll: replicaKw ? "RESET REPLICA ALL" : "RESET SLAVE ALL",
+    resetBinlogs,
+    clearGtidState: [resetBinlogs],
+    logReplicaUpdates: newNames ? "log_replica_updates" : "log_slave_updates",
+    binlogFormatLine: !atLeast(v, 8, 4, 0),
+    gtidCnf: ["gtid_mode = ON", "enforce_gtid_consistency = ON"],
+    logBinCnf: "log_bin = binlog",
+    dumpPositionFlags: ["--set-gtid-purged=ON", newNames ? "--source-data=2" : "--master-data=2"],
+    executedGtidExpr: "@@GLOBAL.gtid_executed",
+    sourceGtidExpr: "@@GLOBAL.gtid_executed",
+    setSeedGtid: (set) => `SET GLOBAL gtid_purged = ${sqlString(cleanGtid("mysql", set))}`,
+    fields: replicaKw
+      ? { io: "Replica_IO_Running", sql: "Replica_SQL_Running", lag: "Seconds_Behind_Source", source: "Source_Host", retrieved: "Retrieved_Gtid_Set", executed: "Executed_Gtid_Set" }
+      : { io: "Slave_IO_Running", sql: "Slave_SQL_Running", lag: "Seconds_Behind_Master", source: "Master_Host", retrieved: "Retrieved_Gtid_Set", executed: "Executed_Gtid_Set" },
+    waitForGtid: (set, sec) => `SELECT WAIT_FOR_EXECUTED_GTID_SET(${sqlString(cleanGtid("mysql", set))}, ${Math.max(0, Math.floor(sec))})`,
+    waitOk: (r) => String(r) === "0",
+    appliedCheck: (set) => `SELECT GTID_SUBSET(${sqlString(cleanGtid("mysql", set))}, @@GLOBAL.gtid_executed)`,
+    superReadOnly: true,
+    clientExtra: ["--get-server-public-key"],
+    changeSource: ({ host, port, user, password, ssl }) =>
+      sourceKw
+        ? `CHANGE REPLICATION SOURCE TO SOURCE_HOST = ${sqlString(host)}, SOURCE_PORT = ${Number(port)}, SOURCE_USER = ${sqlString(user)}, SOURCE_PASSWORD = ${sqlString(password)}, SOURCE_AUTO_POSITION = 1, GET_SOURCE_PUBLIC_KEY = 1, SOURCE_CONNECT_RETRY = 10${ssl ? ", SOURCE_SSL = 1" : ""}`
+        : `CHANGE MASTER TO MASTER_HOST = ${sqlString(host)}, MASTER_PORT = ${Number(port)}, MASTER_USER = ${sqlString(user)}, MASTER_PASSWORD = ${sqlString(password)}, MASTER_AUTO_POSITION = 1${atLeast(v, 8, 0, 4) ? ", GET_MASTER_PUBLIC_KEY = 1" : ""}, MASTER_CONNECT_RETRY = 10${ssl ? ", MASTER_SSL = 1" : ""}`,
+  };
+}
+
+/** A GTID set / position as reported by the server, checked before it goes back into SQL. */
+export function cleanGtid(flavor, s) {
+  const t = String(s ?? "").replace(/\s+/g, "");
+  const ok = flavor === "mariadb" ? /^[0-9,-]*$/.test(t) : /^[A-Za-z0-9_:,-]*$/.test(t);
+  if (!ok || t.length > 65_000) throw new Error("Refusing an unexpected GTID value from the server.");
+  return t;
+}
+
+// =================================================================== pure helpers (mirrors of panel/lib/mysql.mjs)
+
+/** SQL string literal: printable ASCII only, quotes and backslashes doubled. */
+export function sqlString(s) {
+  if (typeof s !== "string" || !/^[\x20-\x7e]*$/.test(s)) throw new Error("Refusing to quote a value with non-printable characters.");
+  return `'${s.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
+}
+
+/** Host part of an account / a server address: hostname, IPv4 or IPv6. No wildcards. */
+export function validHost(h) {
+  if (typeof h !== "string" || !h || h.length > 255) return false;
+  if (h === "localhost") return true;
+  if (net.isIP(h)) return true;
+  return /^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(h);
+}
+
+export function account(user, host) {
+  if (typeof user !== "string" || !USER_RE.test(user)) throw new Error(`Invalid MySQL user name: ${JSON.stringify(String(user).slice(0, 40))}`);
+  if (!validHost(host)) throw new Error(`Invalid host: ${JSON.stringify(String(host).slice(0, 80))}`);
+  return `${sqlString(user)}@${sqlString(host)}`;
+}
+
+/** Backtick-quote the name of an existing database (validated with ANY_DB_RE). */
+function quoteDb(name) {
+  if (!ANY_DB_RE.test(name)) throw new Error(`Refusing unsafe database name: ${JSON.stringify(name)}`);
+  return `\`${name}\``;
+}
+
+/** Database pattern for a db-level GRANT (escape `_` unless partial_revokes makes it literal). */
+export function grantDbPattern(name, partialRevokes = false) {
+  if (!GRANT_DB_RE.test(name) || SYSTEM_DBS.has(name)) throw new Error(`Refusing to grant on database ${JSON.stringify(name)}`);
+  return `\`${partialRevokes ? name : name.replace(/_/g, "\\_")}\``;
+}
+
+/** Parse `mysql --batch --skip-column-names` output (tab separated, backslash escaped). */
+export function parseRows(stdout) {
+  if (!stdout) return [];
+  const un = (v) => (v === "NULL" ? null : v.replace(/\\(.)/g, (_, c) => ({ n: "\n", t: "\t", 0: "\0", "\\": "\\" })[c] ?? c));
+  return stdout
+    .replace(/\n$/, "")
+    .split("\n")
+    .filter((l) => l.length)
+    .map((l) => l.split("\t").map(un));
+}
+
+/** `mysql --batch` output with a header line → [{ column: value }]. */
+function parseNamed(stdout) {
+  const rows = parseRows(stdout);
+  if (rows.length < 2) return [];
+  const [head, ...data] = rows;
+  return data.map((r) => Object.fromEntries(head.map((h, i) => [h, r[i] ?? null])));
+}
+
+function validPassword(p) {
+  return typeof p === "string" && p.length >= 8 && p.length <= 128 && /^[\x21-\x7e]+$/.test(p);
+}
+
+/** Replace every secret (raw and as sqlString escapes it) with ••••. */
+export function maskSecrets(text, secrets = []) {
+  let s = String(text ?? "");
+  for (const x of secrets) {
+    if (!x || x.length < 3) continue;
+    const esc = x.replace(/\\/g, "\\\\").replace(/'/g, "''");
+    s = s.split(esc).join("••••");
+    s = s.split(x).join("••••");
+  }
+  return s;
+}
+
+function scrub(err, secrets) {
+  const e = new Error(maskSecrets(err?.message || String(err), secrets));
+  e.mysqlCode = mysqlCodeOf(err);
+  if (err?.aborted) e.aborted = true;
+  return e;
+}
+
+function mysqlCodeOf(err) {
+  const m = /ERROR (\d{4})/.exec(String(err?.message || ""));
+  return m ? Number(m[1]) : null;
+}
+
+function abortError() {
+  const e = new Error("Cancelled.");
+  e.aborted = true;
+  return e;
+}
+
+function checkAbort(M) {
+  if (M.signal?.aborted) throw abortError();
+}
+
+const sleep = (ms, signal) =>
+  new Promise((res) => {
+    const t = setTimeout(res, ms);
+    signal?.addEventListener?.("abort", () => (clearTimeout(t), res()), { once: true });
+  });
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do {
+    n /= 1024;
+    i++;
+  } while (n >= 1024 && i < u.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${u[i]}`;
+}
+
+function writeAtomic(file, content, mode) {
+  ensureDir(path.dirname(file));
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, content, { mode });
+  fs.chmodSync(tmp, mode);
+  fs.renameSync(tmp, file);
+}
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// =================================================================== payload checks
+
+function bad(task, msg) {
+  return new Error(`${task}: ${msg} — nothing was changed on ${os.hostname()}.`);
+}
+
+function checkServerId(task, v) {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 4294967295) throw bad(task, `serverId must be a whole number from 1 to 4294967295 (got ${String(v).slice(0, 20)})`);
+  return n;
+}
+
+function checkPort(task, v, def = 3306) {
+  const n = Number(v ?? def);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) throw bad(task, `${String(v).slice(0, 20)} is not a valid port`);
+  return n;
+}
+
+function checkUser(task, v, def) {
+  const u = String(v ?? def);
+  if (!USER_RE.test(u) || u === "root") throw bad(task, `${JSON.stringify(u.slice(0, 40))} is not an allowed MySQL user name`);
+  return u;
+}
+
+function checkPassword(task, v, what) {
+  if (!validPassword(v)) throw bad(task, `${what} must be 8–128 printable characters without spaces`);
+  return v;
+}
+
+function checkHosts(task, list, what, { min = 0 } = {}) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const h = String(raw ?? "").trim();
+    if (!validHost(h)) throw bad(task, `${what}: ${JSON.stringify(h.slice(0, 80))} is not a host name or IP address`);
+    if (!out.includes(h)) out.push(h);
+  }
+  if (out.length < min) throw bad(task, `${what} must list at least ${min} address${min === 1 ? "" : "es"}`);
+  if (out.length > 200) throw bad(task, `${what} lists too many addresses`);
+  return out;
+}
+
+function checkIps(task, list, what) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const h = String(raw ?? "").trim();
+    if (!net.isIP(h)) throw bad(task, `${what}: ${JSON.stringify(h.slice(0, 80))} is not an IP address`);
+    if (!out.includes(h)) out.push(h);
+  }
+  return out;
+}
+
+function checkFlavor(task, v) {
+  if (v !== "mysql" && v !== "mariadb") throw bad(task, `flavor must be "mysql" or "mariadb" (got ${JSON.stringify(String(v).slice(0, 20))})`);
+  return v;
+}
+
+function checkDbList(task, list) {
+  if (list == null) return null;
+  if (!Array.isArray(list)) throw bad(task, "databases must be a list");
+  const out = [];
+  for (const d of list) {
+    const s = String(d ?? "");
+    if (!ANY_DB_RE.test(s) || SYSTEM_DBS.has(s.toLowerCase())) throw bad(task, `${JSON.stringify(s.slice(0, 70))} is not a database that can be copied`);
+    if (!out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+export function checkSetupPayload(payload, task = "mysql.replica.setup") {
+  if (!payload || typeof payload !== "object") throw bad(task, "the payload is missing");
+  const primaryHost = String(payload.primaryHost ?? "").trim();
+  if (!validHost(primaryHost) || primaryHost === "localhost") throw bad(task, "primaryHost must be the primary's host name or IP address");
+  return {
+    flavor: checkFlavor(task, payload.flavor),
+    serverId: checkServerId(task, payload.serverId),
+    primaryHost,
+    primaryPort: checkPort(task, payload.primaryPort),
+    replUser: checkUser(task, payload.replUser, REPL_USER),
+    replPassword: checkPassword(task, payload.replPassword, "replPassword"),
+    adminPassword: checkPassword(task, payload.adminPassword, "adminPassword"),
+    adminIps: checkHosts(task, payload.adminIps, "adminIps"),
+    allowFrom: checkIps(task, payload.allowFrom, "allowFrom"),
+    seed: payload.seed !== false,
+    databases: checkDbList(task, payload.databases),
+  };
+}
+
+function checkPreparePayload(payload) {
+  const task = "mysql.primary.prepare";
+  if (!payload || typeof payload !== "object") throw bad(task, "the payload is missing");
+  return {
+    serverId: checkServerId(task, payload.serverId),
+    replUser: checkUser(task, payload.replUser, REPL_USER),
+    replPassword: checkPassword(task, payload.replPassword, "replPassword"),
+    adminPassword: checkPassword(task, payload.adminPassword, "adminPassword"),
+    replicaIps: checkHosts(task, payload.replicaIps, "replicaIps", { min: 1 }),
+    adminIps: checkHosts(task, payload.adminIps, "adminIps"),
+    allowFrom: checkIps(task, payload.allowFrom, "allowFrom"),
+  };
+}
+
+// =================================================================== SQL builders (pure, exported for tests)
+
+/**
+ * Accounts script. `accounts`: [{ user, password, hosts, grants: ["…ON … "], grantOption }],
+ * `drop`: [{ user, host }]. Returns { script, secrets }.
+ */
+export function buildAccountsSql({ accounts = [], drop = [], noBinlog = false } = {}) {
+  const lines = [];
+  const secrets = [];
+  if (noBinlog) lines.push("SET SESSION sql_log_bin = 0;");
+  for (const a of accounts) {
+    secrets.push(a.password);
+    for (const h of a.hosts) {
+      const acct = account(a.user, h);
+      lines.push(`CREATE USER IF NOT EXISTS ${acct} IDENTIFIED BY ${sqlString(a.password)};`);
+      lines.push(`ALTER USER ${acct} IDENTIFIED BY ${sqlString(a.password)};`);
+      for (const g of a.grants || []) lines.push(`GRANT ${g} TO ${acct}${a.grantOption ? " WITH GRANT OPTION" : ""};`);
+    }
+  }
+  for (const d of drop) lines.push(`DROP USER IF EXISTS ${account(d.user, d.host)};`);
+  return { script: lines.join("\n") + "\n", secrets: secrets.filter(Boolean) };
+}
+
+export const REPL_GRANT = "REPLICATION SLAVE, REPLICATION CLIENT, SELECT, RELOAD, SHOW VIEW, EVENT, TRIGGER, LOCK TABLES, PROCESS ON *.*";
+export const ADMIN_GRANT = "ALL PRIVILEGES ON *.*";
+
+/** mysql.users.sync payload → validated plan + script. Throws on anything off. */
+export function buildUsersSyncSql(payload, { replica = false, partialRevokes = false } = {}) {
+  const task = "mysql.users.sync";
+  if (!payload || typeof payload !== "object") throw bad(task, "the payload is missing");
+  const users = Array.isArray(payload.users) ? payload.users : [];
+  const remove = Array.isArray(payload.remove) ? payload.remove : [];
+  if (users.length > 2000 || remove.length > 5000) throw bad(task, "too many users in one sync");
+  const accounts = [];
+  for (const u of users) {
+    const user = checkUser(task, u?.user);
+    const password = checkPassword(task, u?.password, `the password of ${user}`);
+    const hosts = checkHosts(task, u?.hosts, `hosts of ${user}`, { min: 1 });
+    const dbs = [];
+    for (const d of Array.isArray(u?.databases) ? u.databases : []) {
+      const s = String(d ?? "");
+      if (!GRANT_DB_RE.test(s) || SYSTEM_DBS.has(s)) throw bad(task, `${JSON.stringify(s.slice(0, 70))} is not a database a website user can be granted`);
+      if (!dbs.includes(s)) dbs.push(s);
+    }
+    accounts.push({ user, password, hosts, grants: dbs.map((d) => `ALL PRIVILEGES ON ${grantDbPattern(d, partialRevokes)}.*`) });
+  }
+  const drop = [];
+  for (const r of remove) {
+    const user = checkUser(task, r?.user);
+    const host = String(r?.host ?? "").trim();
+    if (!validHost(host)) throw bad(task, `remove: ${JSON.stringify(host.slice(0, 80))} is not a host`);
+    drop.push({ user, host });
+  }
+  return { ...buildAccountsSql({ accounts, drop, noBinlog: replica }), users: accounts.length, removed: drop.length };
+}
+
+/** Managed config file text. Only the read_only line may change without a restart. */
+export function renderCnf({ flavor, version, serverId, readOnly }) {
+  const d = dialect(flavor, version);
+  return [
+    "# Managed by Forthway Command Center (database replication, docs/HA.md Phase 3).",
+    "# Rewritten by the panel — local edits are lost. Put your own settings in another file.",
+    "[mysqld]",
+    `server_id = ${Number(serverId)}`,
+    d.logBinCnf,
+    ...(d.binlogFormatLine ? ["binlog_format = ROW"] : []),
+    `${d.logReplicaUpdates} = ON`,
+    "binlog_expire_logs_seconds = 604800",
+    ...d.gtidCnf,
+    "relay_log = relay-bin",
+    "relay_log_recovery = ON",
+    "replicate-wild-ignore-table = mysql.%",
+    "bind-address = 0.0.0.0",
+    `read_only = ${readOnly ? "ON" : "OFF"}`,
+    "",
+  ].join("\n");
+}
+
+const READ_ONLY_LINE = /^\s*read[_-]only\s*=.*$/m;
+
+function staticPart(text) {
+  return String(text || "")
+    .split("\n")
+    .filter((l) => !/^\s*read[_-]only\s*=/.test(l) && !/^\s*#/.test(l) && l.trim())
+    .join("\n");
+}
+
+function withReadOnly(text, on) {
+  const line = `read_only = ${on ? "ON" : "OFF"}`;
+  if (READ_ONLY_LINE.test(text)) return text.replace(READ_ONLY_LINE, line);
+  return `${text.replace(/\n*$/, "\n")}${line}\n`;
+}
+
+// =================================================================== the task context
+
+function testHook() {
+  const f = process.env.FCC_MYSQL_TEST_DEFAULTS;
+  if (!f || sys.DRY_RUN) return null;
+  const j = JSON.parse(fs.readFileSync(f, "utf8"));
+  const argOk = (a) => typeof a === "string" && /^[A-Za-z0-9_=/.:@+-]{1,300}$/.test(a);
+  if (!Array.isArray(j.client) || !j.client.every(argOk)) throw new Error("FCC_MYSQL_TEST_DEFAULTS: client must be a list of plain arguments");
+  if (typeof j.cnfFile !== "string" || !path.isAbsolute(j.cnfFile)) throw new Error("FCC_MYSQL_TEST_DEFAULTS: cnfFile must be an absolute path");
+  if (!Array.isArray(j.restart) || !j.restart.length || !path.isAbsolute(j.restart[0]) || !j.restart.every(argOk)) {
+    throw new Error("FCC_MYSQL_TEST_DEFAULTS: restart must be [absolute program, args…]");
+  }
+  return { client: j.client, cnfFile: j.cnfFile, restart: j.restart };
+}
+
+function ctxOf(o, task) {
+  const M = {
+    task,
+    o,
+    log: o.log || NOOP,
+    signal: o.signal || null,
+    dataDir: o.dataDir || process.env.FCC_DATA_DIR || "/var/lib/fcc",
+    dry: sys.DRY_RUN,
+    hook: testHook(),
+  };
+  if (M.hook) M.log(`TEST HOOK: FCC_MYSQL_TEST_DEFAULTS is set — the local server is ${M.hook.client.join(" ")}.`);
+  return M;
+}
+
+// ---- persisted state (role, server id) — real and simulated
+
+function statePath(M) {
+  return path.join(M.dataDir, STATE_FILE);
+}
+
+export function readHaState(dataDir) {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(dataDir, STATE_FILE), "utf8"));
+    return s && typeof s === "object" ? s : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveState(M, patch) {
+  const s = { ...readHaState(M.dataDir), ...patch, updatedAt: new Date().toISOString() };
+  try {
+    writeAtomic(statePath(M), JSON.stringify(s, null, 2) + "\n", 0o600);
+  } catch (err) {
+    M.log(`!! Could not save ${statePath(M)}: ${err.message}`);
+  }
+  return s;
+}
+
+function dryState(M) {
+  const blank = { installed: true, running: true, flavor: "mysql", version: "8.0.36-dry-run", readOnly: false, serverId: 1, role: "standalone", replica: null, uuid: "3e11fa47-71ca-11e1-9e33-c80aa9429562", seq: 120, databases: ["acme_shop", "acme_blog"] };
+  try {
+    return { ...blank, ...JSON.parse(fs.readFileSync(path.join(M.dataDir, DRY_STATE_FILE), "utf8")) };
+  } catch {
+    return blank;
+  }
+}
+
+function saveDry(M, patch) {
+  const s = { ...dryState(M), ...patch };
+  writeAtomic(path.join(M.dataDir, DRY_STATE_FILE), JSON.stringify(s, null, 2) + "\n", 0o600);
+  return s;
+}
+
+function dryGtid(s) {
+  return s.flavor === "mariadb" ? `0-${s.serverId}-${s.seq}` : `${s.uuid}:1-${s.seq}`;
+}
+
+// ---- clients
+
+function clientBin() {
+  return sys.which("mysql") || sys.which("mariadb") || "mysql";
+}
+
+function dumpBin() {
+  return sys.which("mysqldump") || sys.which("mariadb-dump") || "mysqldump";
+}
+
+function localArgs(M) {
+  return M.hook?.client || ["-u", "root"];
+}
+
+/** Run a script as local root on stdin. → rows (or named rows with { names: true }). */
+async function sqlLocal(M, script, { secrets = [], timeoutMs = 60_000, names = false, connectTimeout = 5, quietDry = false } = {}) {
+  const bin = clientBin();
+  const args = [...localArgs(M), "--batch", ...(names ? [] : ["--skip-column-names"]), "--default-character-set=utf8mb4", `--connect-timeout=${connectTimeout}`];
+  if (M.dry) {
+    if (!quietDry) {
+      M.log(`[dry-run] ${path.basename(bin)} ${args.join(" ")} <<SQL`);
+      for (const l of maskSecrets(script, secrets).trim().split("\n")) M.log(`[dry-run]   ${l}`);
+    }
+    return [];
+  }
+  try {
+    const r = await sys.run(bin, args, { input: PRELUDE + script, timeoutMs, signal: M.signal });
+    return names ? parseNamed(r.stdout) : parseRows(r.stdout);
+  } catch (e) {
+    if (M.signal?.aborted) throw abortError();
+    throw scrub(e, secrets);
+  }
+}
+
+/** One statement that may fail harmlessly with one of `okCodes` (e.g. "already stopped"). */
+async function sqlTolerant(M, stmt, okCodes = []) {
+  try {
+    await sqlLocal(M, `${stmt};\n`, { timeoutMs: 120_000 });
+  } catch (e) {
+    if (!okCodes.includes(e.mysqlCode)) throw e;
+    M.log(`(${stmt}: ${e.message.split("\n").pop()})`);
+  }
+}
+
+/** A script against the primary over TCP; the password travels in MYSQL_PWD. */
+async function sqlRemote(M, conn, script, { timeoutMs = 60_000 } = {}) {
+  const bin = clientBin();
+  const args = ["-h", conn.host, "-P", String(conn.port), "-u", conn.user, ...conn.extra, "--batch", "--skip-column-names", "--default-character-set=utf8mb4", "--connect-timeout=10"];
+  if (M.dry) {
+    M.log(`[dry-run] ${path.basename(bin)} ${args.join(" ")} (password in MYSQL_PWD) <<SQL`);
+    for (const l of script.trim().split("\n")) M.log(`[dry-run]   ${l}`);
+    return [];
+  }
+  try {
+    const r = await sys.run(bin, args, { input: PRELUDE + script, env: { MYSQL_PWD: conn.password }, timeoutMs, signal: M.signal });
+    return parseRows(r.stdout);
+  } catch (e) {
+    if (M.signal?.aborted) throw abortError();
+    throw scrub(e, [conn.password]);
+  }
+}
+
+// ---- server facts
+
+function serverBinary() {
+  for (const b of ["mariadbd", "mysqld"]) {
+    const p = sys.which(b) || [`/usr/sbin/${b}`, `/usr/bin/${b}`].find((f) => exists(f));
+    if (p) return p;
+  }
+  return null;
+}
+
+async function installedFlavor(M) {
+  // Simulated: a server that never ran a mysql.* task yet counts as "nothing installed" for setup.
+  if (M.dry) return exists(path.join(M.dataDir, DRY_STATE_FILE)) && dryState(M).installed ? dryState(M).flavor : null;
+  if (M.hook) return "unknown";
+  const bin = serverBinary();
+  if (!bin) return null;
+  if (/mariadbd$/.test(bin)) return "mariadb";
+  const r = await sys.run(bin, ["--version"], { allowFail: true, timeoutMs: 15_000 }).catch(() => null);
+  return /mariadb/i.test(`${r?.stdout || ""}${r?.stderr || ""}`) ? "mariadb" : "mysql";
+}
+
+/** { flavor, version, readOnly, serverId, logBin, gtidMode } of the running local server. Throws when it is not reachable. */
+async function serverInfo(M) {
+  if (M.dry) {
+    const s = dryState(M);
+    return { flavor: s.flavor, version: s.version, readOnly: !!s.readOnly, serverId: s.serverId, logBin: true, gtidMode: "ON" };
+  }
+  const rows = await sqlLocal(M, "SELECT VERSION(), @@GLOBAL.read_only, @@GLOBAL.server_id, @@GLOBAL.log_bin;\n", { timeoutMs: 15_000 });
+  const [version, ro, sid, logBin] = rows[0] || [];
+  if (!version) throw new Error("MySQL did not answer SELECT VERSION().");
+  const flavor = flavorOf(version);
+  let gtidMode = null;
+  if (flavor === "mysql") gtidMode = (await sqlLocal(M, "SELECT @@GLOBAL.gtid_mode;\n", { timeoutMs: 15_000 }))[0]?.[0] || null;
+  return { flavor, version, readOnly: ro === "1", serverId: Number(sid), logBin: logBin === "1", gtidMode };
+}
+
+async function executedGtid(M, d) {
+  if (M.dry) return dryGtid(dryState(M));
+  return ((await sqlLocal(M, `SELECT ${d.executedGtidExpr};\n`, { timeoutMs: 15_000 }))[0]?.[0] || "").replace(/\s+/g, "");
+}
+
+/** Normalised replica status, or null when no replication is configured. */
+async function replicaStatus(M, d) {
+  if (M.dry) {
+    const s = dryState(M);
+    return s.role === "replica" && s.replica ? { ...s.replica } : null;
+  }
+  const rows = await sqlLocal(M, `${d.showReplicaStatus};\n`, { names: true, timeoutMs: 15_000 });
+  const r = rows[0];
+  if (!r) return null;
+  const F = d.fields;
+  const lag = r[F.lag];
+  const ioState = r[F.io] || null;
+  return {
+    ioRunning: ioState === "Yes",
+    ioState,
+    sqlRunning: r[F.sql] === "Yes",
+    lagSeconds: lag == null || lag === "" ? null : Number(lag),
+    lastError: r.Last_SQL_Error || r.Last_IO_Error || r.Last_Error || null,
+    sqlError: r.Last_SQL_Error || null,
+    ioError: r.Last_IO_Error || null,
+    sourceHost: r[F.source] || null,
+    retrievedGtid: (r[F.retrieved] || "").replace(/\s+/g, ""),
+    executedGtid: (r[F.executed] || "").replace(/\s+/g, ""),
+  };
+}
+
+async function waitReady(M, ms = READY_WAIT_MS) {
+  if (M.dry) return;
+  const until = Date.now() + ms;
+  let last = null;
+  while (Date.now() < until) {
+    checkAbort(M);
+    try {
+      await sqlLocal(M, "SELECT 1;\n", { timeoutMs: 10_000, connectTimeout: 3 });
+      return;
+    } catch (e) {
+      last = e;
+    }
+    await sleep(1000, M.signal);
+  }
+  throw new Error(`MySQL did not accept connections within ${Math.round(ms / 1000)} s${last ? `: ${last.message}` : ""}`);
+}
+
+async function restartServer(M, flavor) {
+  if (M.hook) {
+    await sys.run(M.hook.restart[0], M.hook.restart.slice(1), { log: M.log, timeoutMs: RESTART_TIMEOUT_MS });
+  } else {
+    if (!M.dry && !sys.which("systemctl")) throw new Error("systemctl is not available, so MySQL cannot be restarted.");
+    await sys.run("systemctl", ["restart", SERVICE[flavor]], { log: M.log, timeoutMs: RESTART_TIMEOUT_MS, signal: M.signal });
+  }
+  await waitReady(M);
+}
+
+/** Make sure the local server runs; start it once if it does not answer. */
+async function requireRunning(M) {
+  try {
+    return await serverInfo(M);
+  } catch (e) {
+    if (!NOT_RUNNING_CODES.has(e.mysqlCode) || M.hook) {
+      if (e.mysqlCode === 1045 || e.mysqlCode === 1698) {
+        throw new Error("Cannot sign in to the local MySQL as root over the unix socket (socket authentication is off). Restore socket authentication for root on this server.");
+      }
+      throw e;
+    }
+    const flavor = await installedFlavor(M);
+    if (!flavor) throw new Error("MySQL is not installed on this server.");
+    M.log(`MySQL is not running — starting ${SERVICE[flavor]}…`);
+    await sys.run("systemctl", ["start", SERVICE[flavor]], { log: M.log, timeoutMs: RESTART_TIMEOUT_MS, allowFail: true });
+    await waitReady(M);
+    return serverInfo(M);
+  }
+}
+
+// ---- managed config file
+
+function cnfPath(M, flavor) {
+  if (M.hook) return M.hook.cnfFile;
+  if (M.dry) return path.join(M.dataDir, "mysql-dry-run", path.basename(CNF_FILES[flavor]));
+  return CNF_FILES[flavor];
+}
+
+/**
+ * Write the managed file when it differs. Restarts only when a setting other
+ * than read_only changed; if the server does not come back, the previous file
+ * is restored and the server restarted on it. → { changed, restarted, file }
+ */
+async function applyCnf(M, flavor, content) {
+  const file = cnfPath(M, flavor);
+  const old = readText(file);
+  if (old === content) {
+    M.log(`${file} is already up to date.`);
+    return { changed: false, restarted: false, file };
+  }
+  if (!M.dry && !M.hook && !exists(path.dirname(file))) {
+    throw new Error(`${path.dirname(file)} does not exist — this MySQL is not laid out like Debian/Ubuntu's.`);
+  }
+  writeAtomic(file, content, 0o644);
+  const restartNeeded = staticPart(old) !== staticPart(content);
+  M.log(`Wrote ${file}${restartNeeded ? " — restarting MySQL to apply it" : " (no restart needed)"}.`);
+  if (!restartNeeded) return { changed: true, restarted: false, file };
+  try {
+    await restartServer(M, flavor);
+  } catch (err) {
+    if (err.aborted) throw err;
+    M.log(`!! MySQL did not come back with the new settings (${err.message}) — restoring the previous file.`);
+    if (old == null) fs.rmSync(file, { force: true });
+    else writeAtomic(file, old, 0o644);
+    try {
+      await restartServer(M, flavor);
+      M.log("MySQL is running again on the previous settings.");
+    } catch (e2) {
+      M.log(`!! MySQL does not start on the previous settings either: ${e2.message}`);
+    }
+    throw new Error(`MySQL did not start with the replication settings: ${err.message}. The previous settings were restored.`);
+  }
+  M.log("MySQL restarted and accepts connections.");
+  return { changed: true, restarted: true, file };
+}
+
+/** Toggle only the read_only line of the managed file (create a minimal one if there is none). */
+function setCnfReadOnly(M, flavor, on) {
+  const file = cnfPath(M, flavor);
+  const old = readText(file);
+  const next =
+    old == null
+      ? `# Managed by Forthway Command Center (database replication, docs/HA.md Phase 3).\n[mysqld]\nread_only = ${on ? "ON" : "OFF"}\n`
+      : withReadOnly(old, on);
+  if (next === old) return { changed: false, file };
+  if (!M.dry && !M.hook && !exists(path.dirname(file))) return { changed: false, file, skipped: `${path.dirname(file)} does not exist` };
+  writeAtomic(file, next, 0o644);
+  return { changed: true, file };
+}
+
+// ---- install
+
+async function aptInstall(M, pkgs) {
+  const env = { DEBIAN_FRONTEND: "noninteractive" };
+  const args = ["install", "-y", "-q", "-o", "DPkg::Lock::Timeout=300", ...pkgs];
+  const r = await sys.run("apt-get", args, { log: M.log, env, timeoutMs: 30 * 60_000, allowFail: true, signal: M.signal });
+  if (r.code === 0) return;
+  await sys.run("apt-get", ["update", "-q", "-o", "DPkg::Lock::Timeout=300"], { log: M.log, env, timeoutMs: 15 * 60_000, signal: M.signal });
+  await sys.run("apt-get", args, { log: M.log, env, timeoutMs: 30 * 60_000, signal: M.signal });
+}
+
+async function ensureServerInstalled(M, flavor) {
+  if (M.hook) return { installedNow: false };
+  const have = await installedFlavor(M);
+  if (have && have !== flavor) {
+    throw new Error(`This server already runs ${have === "mariadb" ? "MariaDB" : "MySQL"}, but the primary runs ${flavor === "mariadb" ? "MariaDB" : "MySQL"}. Remove it first or pick another server.`);
+  }
+  if (have) {
+    M.log(`${flavor === "mariadb" ? "MariaDB" : "MySQL"} is already installed.`);
+    return { installedNow: false };
+  }
+  if (!M.dry && !sys.which("apt-get")) throw new Error("apt-get is not available — install the database server by hand.");
+  M.log(`Installing ${PACKAGES[flavor].server.join(" ")}…`);
+  try {
+    await aptInstall(M, PACKAGES[flavor].server);
+  } catch (err) {
+    if (err.aborted || M.signal?.aborted) throw abortError();
+    throw new Error(`Installing ${flavor === "mariadb" ? "MariaDB" : "MySQL"} failed: ${err.message}${flavor === "mysql" ? " (Debian 12 has no mysql-server package; use MariaDB on the primary or add Oracle's repository)" : ""}`);
+  }
+  sys.forgetWhich();
+  await sys.run("systemctl", ["enable", "--now", SERVICE[flavor]], { log: M.log, timeoutMs: RESTART_TIMEOUT_MS, allowFail: true });
+  if (M.dry) saveDry(M, { installed: true, flavor, version: flavor === "mariadb" ? "10.11.6-MariaDB-dry-run" : "8.0.36-dry-run" });
+  await waitReady(M);
+  return { installedNow: true };
+}
+
+/** panel.install helper: the client of the cluster's flavor, for remote admin and dumps. Never throws. */
+export async function ensureMysqlClient(flavor, { log = NOOP } = {}) {
+  if (flavor !== "mysql" && flavor !== "mariadb") return { installed: false, error: `unknown flavor ${String(flavor).slice(0, 20)}` };
+  const M = { log, dry: sys.DRY_RUN, signal: null };
+  try {
+    if (!sys.DRY_RUN) {
+      const bin = sys.which("mysql") || sys.which("mariadb");
+      if (bin) {
+        const r = await sys.run(bin, ["--version"], { allowFail: true, timeoutMs: 15_000 });
+        const have = /mariadb/i.test(`${r.stdout}${r.stderr}`) ? "mariadb" : "mysql";
+        if (have === flavor) {
+          log(`The ${flavor === "mariadb" ? "MariaDB" : "MySQL"} client is already installed.`);
+          return { installed: true, already: true };
+        }
+        const srv = serverBinary();
+        if (srv) {
+          log(`!! This server runs its own ${have} server; the ${flavor} client is not installed next to it.`);
+          return { installed: false, error: `a ${have} server is installed here` };
+        }
+      }
+      if (!sys.which("apt-get")) {
+        log("!! apt-get is not available — install the MySQL client by hand.");
+        return { installed: false, error: "apt-get is not available" };
+      }
+    }
+    await aptInstall(M, PACKAGES[flavor].client);
+    sys.forgetWhich();
+    log(`Installed ${PACKAGES[flavor].client.join(" ")}.`);
+    return { installed: true, ...(sys.DRY_RUN ? { dryRun: true } : {}) };
+  } catch (err) {
+    log(`!! Could not install the MySQL client: ${err.message}`);
+    return { installed: false, error: err.message };
+  }
+}
+
+// ---- firewall
+
+async function openFirewall(M, allowFrom) {
+  M.log("── Firewall ──");
+  try {
+    const r = await syncUfwRules({ allowFrom, ports: "3306", comment: UFW_COMMENT, log: M.log });
+    if (r.active) {
+      M.log(r.added.length || r.removed.length
+        ? `MySQL port 3306: opened to ${r.added.join(", ") || "nobody new"}; closed to ${r.removed.join(", ") || "nobody"}.`
+        : `MySQL port 3306 already open to ${allowFrom.join(", ") || "nobody"}.`);
+    }
+    return r;
+  } catch (err) {
+    M.log(`!! firewall: ${err.message}`);
+    return { error: err.message };
+  }
+}
+
+// ---- accounts
+
+async function existingHosts(M, user) {
+  if (M.dry) return [];
+  const rows = await sqlLocal(M, `SELECT Host FROM mysql.user WHERE User = ${sqlString(user)};\n`, { timeoutMs: 15_000 });
+  return rows.map((r) => r[0]).filter((h) => typeof h === "string");
+}
+
+/** Create / re-password the fcc accounts on this server only (sql_log_bin=0), dropping stale hosts. */
+async function syncFccAccounts(M, list) {
+  const accounts = [];
+  const drop = [];
+  for (const a of list) {
+    accounts.push(a);
+    if (a.exclusive) {
+      for (const h of await existingHosts(M, a.user)) {
+        if (!a.hosts.includes(h) && validHost(h)) drop.push({ user: a.user, host: h });
+      }
+    }
+  }
+  const { script, secrets } = buildAccountsSql({ accounts, drop, noBinlog: true });
+  await sqlLocal(M, script, { secrets, timeoutMs: 60_000 });
+  for (const a of accounts) M.log(`${a.user}@{${a.hosts.join(", ") || "—"}}: up to date.`);
+  if (drop.length) M.log(`Removed stale accounts: ${drop.map((d) => `${d.user}@${d.host}`).join(", ")}.`);
+}
+
+// =================================================================== tasks
+
+// ---- mysql.primary.prepare
+
+export async function primaryPrepare(payload, o) {
+  const M = ctxOf(o, "mysql.primary.prepare");
+  const p = checkPreparePayload(payload);
+  M.log("── MySQL server ──");
+  const info = await requireRunning(M);
+  const d = dialect(info.flavor, info.version);
+  M.log(`${info.flavor === "mariadb" ? "MariaDB" : "MySQL"} ${info.version} · server_id ${info.serverId} → ${p.serverId} · read_only ${info.readOnly ? "ON" : "OFF"}`);
+  checkAbort(M);
+
+  M.log("── Replication settings ──");
+  // read_only is kept as it is right now: preparing never fences or unfences.
+  const cnf = await applyCnf(M, info.flavor, renderCnf({ flavor: info.flavor, version: info.version, serverId: p.serverId, readOnly: info.readOnly }));
+  if (!M.dry) {
+    const now = await serverInfo(M);
+    const problems = [];
+    if (now.serverId !== p.serverId) problems.push(`server_id is ${now.serverId}, not ${p.serverId}`);
+    if (!now.logBin) problems.push("the binary log is off");
+    if (now.flavor === "mysql" && now.gtidMode !== "ON") problems.push(`gtid_mode is ${now.gtidMode}`);
+    if (problems.length) throw new Error(`After writing ${cnf.file}: ${problems.join(", ")} — another configuration file overrides it${cnf.restarted ? "" : ", or MySQL needs a restart"}.`);
+  }
+  checkAbort(M);
+
+  M.log("── Accounts ──");
+  await syncFccAccounts(M, [
+    { user: p.replUser, password: p.replPassword, hosts: p.replicaIps, grants: [REPL_GRANT], exclusive: true },
+    { user: ADMIN_USER, password: p.adminPassword, hosts: p.adminIps, grants: [ADMIN_GRANT], grantOption: true, exclusive: true },
+  ]);
+  const firewall = await openFirewall(M, p.allowFrom);
+
+  saveState(M, { role: "primary", flavor: info.flavor, serverId: p.serverId });
+  if (M.dry) saveDry(M, { role: "primary", serverId: p.serverId, replica: null });
+  M.log("This server is ready to be the primary.");
+  return {
+    flavor: info.flavor,
+    version: info.version,
+    serverId: p.serverId,
+    restarted: cnf.restarted,
+    cnfChanged: cnf.changed,
+    readOnly: info.readOnly,
+    gtid: true,
+    gtidExecuted: await executedGtid(M, d),
+    firewall,
+    ...(M.dry ? { dryRun: true } : {}),
+  };
+}
+
+// ---- mysql.replica.setup
+
+async function replicaSetupInner(M, p) {
+  M.log("── MySQL server ──");
+  const inst = await ensureServerInstalled(M, p.flavor);
+  if (M.dry && !inst.installedNow) {
+    const s = dryState(M);
+    if (s.flavor !== p.flavor) saveDry(M, { flavor: p.flavor, version: p.flavor === "mariadb" ? "10.11.6-MariaDB-dry-run" : "8.0.36-dry-run" });
+  }
+  const info = await requireRunning(M);
+  if (info.flavor !== p.flavor) throw new Error(`This server runs ${info.flavor} ${info.version}, but the primary runs ${p.flavor}.`);
+  const d = dialect(info.flavor, info.version);
+  M.log(`${info.flavor === "mariadb" ? "MariaDB" : "MySQL"} ${info.version} · server_id ${info.serverId} → ${p.serverId}`);
+  checkAbort(M);
+
+  M.log("── Replica settings ──");
+  const cnf = await applyCnf(M, info.flavor, renderCnf({ flavor: info.flavor, version: info.version, serverId: p.serverId, readOnly: true }));
+  await sqlLocal(M, "SET GLOBAL read_only = ON;\n", { timeoutMs: 15_000 });
+  checkAbort(M);
+
+  // The primary: reachable, same flavor, GTIDs on, a different server_id; TLS when it offers it.
+  M.log("── Primary ──");
+  const conn = { host: p.primaryHost, port: p.primaryPort, user: p.replUser, password: p.replPassword, extra: d.clientExtra };
+  let primary = { version: info.version, serverId: 0, ssl: false, gtid: "" };
+  let databases = [];
+  if (M.dry) {
+    databases = p.databases ?? DRY_PRIMARY_DBS;
+    await sqlRemote(M, conn, "SELECT VERSION(), @@GLOBAL.server_id, @@GLOBAL.log_bin;\nSHOW DATABASES;\n");
+  } else {
+    const rows = await sqlRemote(M, conn, `SELECT 'v', VERSION(), @@GLOBAL.server_id, @@GLOBAL.log_bin;\n${info.flavor === "mysql" ? "SELECT 'g', @@GLOBAL.gtid_mode;\n" : ""}SHOW SESSION STATUS LIKE 'Ssl_cipher';\n`);
+    const v = rows.find((r) => r[0] === "v") || [];
+    const g = rows.find((r) => r[0] === "g");
+    const ssl = rows.find((r) => r[0] === "Ssl_cipher");
+    primary = { version: v[1], serverId: Number(v[2]), logBin: v[3] === "1", gtidMode: g?.[1] ?? null, ssl: !!(ssl && ssl[1]) };
+    if (flavorOf(primary.version) !== info.flavor) throw new Error(`The primary runs ${primary.version}; this server runs ${info.version}. Both must be ${info.flavor}.`);
+    if (primary.serverId === p.serverId) throw new Error(`The primary already uses server_id ${p.serverId}; every server needs its own.`);
+    if (!primary.logBin) throw new Error("The primary has no binary log — run mysql.primary.prepare on it first.");
+    if (info.flavor === "mysql" && primary.gtidMode !== "ON") throw new Error(`The primary's gtid_mode is ${primary.gtidMode} — run mysql.primary.prepare on it first.`);
+    const pv = parseVersion(primary.version);
+    const lv = parseVersion(info.version);
+    if (pv && lv && (lv[0] < pv[0] || (lv[0] === pv[0] && lv[1] < pv[1]))) {
+      M.log(`!! This server (${info.version}) is older than the primary (${primary.version}); replication from a newer server is not supported by ${info.flavor}.`);
+    }
+    const all = (await sqlRemote(M, conn, "SHOW DATABASES;\n")).map((r) => r[0]).filter((n) => n && !SYSTEM_DBS.has(n.toLowerCase()));
+    const unsafe = all.filter((n) => !ANY_DB_RE.test(n));
+    if (p.databases) {
+      databases = p.databases.filter((n) => all.includes(n));
+      const missing = p.databases.filter((n) => !all.includes(n));
+      if (missing.length) M.log(`!! Not on the primary (skipped): ${missing.join(", ")}`);
+    } else {
+      if (unsafe.length) throw new Error(`The primary has databases whose names cannot be copied safely: ${unsafe.map((n) => JSON.stringify(n)).join(", ")}. Rename them first.`);
+      databases = all;
+    }
+  }
+  M.log(`Primary ${p.primaryHost}:${p.primaryPort} — ${primary.version}${primary.ssl ? ", TLS" : ""}.`);
+  checkAbort(M);
+
+  M.log("── Accounts on this server ──");
+  // fcc_admin for the panel; fcc_repl from the primary's address so the roles can be swapped later.
+  const replHosts = net.isIP(p.primaryHost) ? [p.primaryHost] : [];
+  await syncFccAccounts(M, [
+    { user: ADMIN_USER, password: p.adminPassword, hosts: p.adminIps, grants: [ADMIN_GRANT], grantOption: true, exclusive: true },
+    ...(replHosts.length ? [{ user: p.replUser, password: p.replPassword, hosts: replHosts, grants: [REPL_GRANT], exclusive: false }] : []),
+  ]);
+  const firewall = await openFirewall(M, p.allowFrom);
+  checkAbort(M);
+
+  let seededAt = null;
+  if (p.seed) {
+    M.log("── Copying the databases from the primary ──");
+    await sqlTolerant(M, d.stopReplica, [1198, 1199, 1200, 1255, 3084, 3085]);
+    await sqlTolerant(M, d.resetReplicaAll, [1198, 1200, 1201]);
+    for (const stmt of d.clearGtidState) await sqlLocal(M, `${stmt};\n`, { timeoutMs: 120_000 });
+    if (!databases.length) {
+      M.log("The primary has no databases yet — taking its GTID position.");
+      const pos = M.dry ? "" : (await sqlRemote(M, conn, `SELECT ${d.sourceGtidExpr};\n`))[0]?.[0] || "";
+      if (pos) await sqlLocal(M, `${d.setSeedGtid(pos)};\n`, { timeoutMs: 60_000 });
+    } else {
+      M.log(`Databases: ${databases.join(", ")}`);
+      const r = await seedFromPrimary(M, d, conn, databases);
+      M.log(`Copied ${fmtBytes(r.bytes)} in ${Math.round(r.ms / 1000)} s.`);
+    }
+    seededAt = new Date().toISOString();
+  } else {
+    M.log("── Re-pointing replication (no copy) ──");
+    await sqlTolerant(M, d.stopReplica, [1198, 1199, 1200, 1255, 3084, 3085]);
+    await sqlTolerant(M, d.resetReplicaAll, [1198, 1200, 1201]);
+    if (info.flavor === "mariadb") {
+      // An old primary's own transactions are in gtid_binlog_pos; continue from there.
+      await sqlLocal(M, "SET GLOBAL gtid_slave_pos = IF(@@GLOBAL.gtid_binlog_pos = '', @@GLOBAL.gtid_slave_pos, @@GLOBAL.gtid_binlog_pos);\n", { timeoutMs: 60_000 });
+    }
+  }
+  checkAbort(M);
+
+  M.log("── Starting replication ──");
+  const change = `${d.changeSource({ host: p.primaryHost, port: p.primaryPort, user: p.replUser, password: p.replPassword, ssl: primary.ssl })};\n${d.startReplica};\n`;
+  await sqlLocal(M, change, { secrets: [p.replPassword], timeoutMs: 60_000 });
+  if (M.dry) {
+    const s = dryState(M);
+    saveDry(M, {
+      role: "replica",
+      readOnly: true,
+      serverId: p.serverId,
+      databases,
+      replica: { ioRunning: true, ioState: "Yes", sqlRunning: true, lagSeconds: 0, lastError: null, sqlError: null, ioError: null, sourceHost: p.primaryHost, retrievedGtid: dryGtid(s), executedGtid: dryGtid(s) },
+    });
+  }
+  const st = await waitReplicating(M, d);
+  M.log(`Replicating from ${p.primaryHost}: IO ${st.ioState}, SQL ${st.sqlRunning ? "Yes" : "No"}, ${st.lagSeconds ?? "?"} s behind.`);
+
+  saveState(M, { role: "replica", flavor: info.flavor, serverId: p.serverId, primaryHost: p.primaryHost, primaryPort: p.primaryPort, ...(seededAt ? { seededAt } : {}) });
+  return {
+    flavor: info.flavor,
+    version: info.version,
+    serverId: p.serverId,
+    restarted: cnf.restarted,
+    installed: inst.installedNow,
+    seeded: p.seed,
+    seededAt,
+    databases,
+    gtidExecuted: await executedGtid(M, d),
+    sourceSsl: primary.ssl,
+    replica: st,
+    firewall,
+    ...(M.dry ? { dryRun: true } : {}),
+  };
+}
+
+async function waitReplicating(M, d, ms = 45_000) {
+  const until = Date.now() + ms;
+  let st = null;
+  while (Date.now() < until) {
+    checkAbort(M);
+    st = await replicaStatus(M, d);
+    if (!st) throw new Error("Replication is not configured after CHANGE … SOURCE — this should not happen.");
+    if (st.ioRunning && st.sqlRunning) return st;
+    if (!st.sqlRunning && st.sqlError) throw new Error(`Replication's SQL thread stopped: ${st.sqlError}`);
+    if (st.ioState === "No" && st.ioError) throw new Error(`Replication cannot connect to the primary: ${st.ioError}`);
+    await sleep(1000, M.signal);
+  }
+  throw new Error(`Replication did not start within ${Math.round(ms / 1000)} s (IO ${st?.ioState || "?"}${st?.lastError ? `: ${st.lastError}` : ""}).`);
+}
+
+/**
+ * mysqldump on the primary | mysql here, streamed (no buffering), with
+ * progress lines; the abort signal kills both processes.
+ */
+async function seedFromPrimary(M, d, conn, databases) {
+  const dumpArgs = [
+    "-h", conn.host, "-P", String(conn.port), "-u", conn.user, ...conn.extra,
+    "--single-transaction", "--quick", "--routines", "--events", "--triggers",
+    "--hex-blob", "--no-tablespaces", "--add-drop-database",
+    "--default-character-set=utf8mb4", "--max-allowed-packet=1073741824",
+    ...d.dumpPositionFlags,
+    "--databases", ...databases,
+  ];
+  const loadBin = clientBin();
+  const loadArgs = [...localArgs(M), "--batch", "--default-character-set=utf8mb4", "--max-allowed-packet=1073741824"];
+  // The copy never goes into this server's binary log (no GTIDs of its own).
+  const prelude = PRELUDE + "SET SESSION sql_log_bin = 0;\n";
+  return streamPipe(M, {
+    from: { bin: dumpBin(), args: dumpArgs, env: { MYSQL_PWD: conn.password }, secrets: [conn.password] },
+    to: { bin: loadBin, args: loadArgs, prelude },
+    label: "copied",
+  });
+}
+
+/**
+ * Spawn `from` and pipe its stdout into `to` (a process, or a file via
+ * `toFile` with optional gzip). Resolves { bytes, ms }.
+ */
+function streamPipe(M, { from, to, toFile, label }) {
+  const fromShown = `${path.basename(from.bin)} ${from.args.join(" ")}`;
+  if (M.dry) {
+    M.log(`[dry-run] ${fromShown}${from.env?.MYSQL_PWD ? " (password in MYSQL_PWD)" : ""}`);
+    if (to) M.log(`[dry-run]   | ${path.basename(to.bin)} ${to.args.join(" ")}  (stdin starts with: SET SESSION sql_log_bin = 0)`);
+    if (toFile) M.log(`[dry-run]   | gzip > ${toFile.file}`);
+    return Promise.resolve({ bytes: 0, ms: 0, dryRun: true });
+  }
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env, ...(from.env || {}) };
+    const src = spawn(from.bin, from.args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const dst = to ? spawn(to.bin, to.args, { env: process.env, stdio: ["pipe", "pipe", "pipe"] }) : null;
+    let bytes = 0;
+    let lastLog = Date.now();
+    let srcErr = "";
+    let dstErr = "";
+    const codes = {};
+    let aborted = false;
+    let settled = false;
+    const counter = new Transform({
+      transform(chunk, _e, cb) {
+        bytes += chunk.length;
+        if (Date.now() - lastLog >= PROGRESS_EVERY_MS) {
+          lastLog = Date.now();
+          M.log(`… ${fmtBytes(bytes)} ${label} (${fmtBytes(Math.round(bytes / Math.max(1, (Date.now() - started) / 1000)))}/s)`);
+        }
+        cb(null, chunk);
+      },
+    });
+    // Kill both and tear the pipe down: a paused, backpressured stdout would
+    // otherwise never end, and the child's 'close' event would never come.
+    const killAll = () => {
+      for (const c of [src, dst]) {
+        try {
+          if (c && c.exitCode == null && c.signalCode == null) c.kill("SIGTERM");
+        } catch {
+          /* gone */
+        }
+      }
+      for (const st of [src.stdout, counter, dst?.stdin]) {
+        try {
+          st?.destroy();
+        } catch {
+          /* already closed */
+        }
+      }
+    };
+    const onAbort = () => {
+      aborted = true;
+      killAll();
+    };
+    M.signal?.addEventListener?.("abort", onAbort, { once: true });
+
+    let fileDone = toFile ? null : Promise.resolve();
+    if (dst) {
+      dst.stdin.on("error", () => {}); // EPIPE when mysql exits early; its exit code tells the story
+      dst.stdin.write(to.prelude || "");
+      src.stdout.pipe(counter).pipe(dst.stdin);
+      dst.stdout.resume();
+      dst.stderr.on("data", (b) => {
+        const s = b.toString("utf8");
+        dstErr = (dstErr + s).slice(-8192);
+        for (const l of s.split("\n")) if (l.trim()) M.log(`mysql: ${maskSecrets(l, from.secrets)}`);
+      });
+    } else {
+      const stages = [src.stdout, counter];
+      if (toFile.gzip) stages.push(zlib.createGzip({ level: 6 }));
+      stages.push(fs.createWriteStream(toFile.file, { mode: 0o600 }));
+      fileDone = pipeline(...stages);
+      fileDone.catch(() => killAll());
+    }
+    src.stderr.on("data", (b) => {
+      const s = b.toString("utf8");
+      srcErr = (srcErr + s).slice(-8192);
+      for (const l of s.split("\n")) if (l.trim()) M.log(l.startsWith(path.basename(from.bin)) ? maskSecrets(l, from.secrets) : `${path.basename(from.bin)}: ${maskSecrets(l, from.secrets)}`);
+    });
+
+    const tail = (t) => maskSecrets(t, from.secrets).trim().split("\n").slice(-4).join(" | ");
+    const finish = async () => {
+      if (settled) return;
+      if (!("src" in codes) || (dst && !("dst" in codes))) return;
+      settled = true;
+      let fileErr = null;
+      try {
+        await fileDone;
+      } catch (e) {
+        fileErr = e;
+      }
+      M.signal?.removeEventListener?.("abort", onAbort);
+      if (aborted || M.signal?.aborted) return reject(abortError());
+      if (codes.src !== 0) return reject(new Error(`${path.basename(from.bin)} failed (exit ${codes.src})${srcErr ? `: ${tail(srcErr)}` : ""}`));
+      if (dst && codes.dst !== 0) return reject(new Error(`Loading into the local MySQL failed (exit ${codes.dst})${dstErr ? `: ${tail(dstErr)}` : ""}`));
+      if (fileErr) return reject(new Error(`Writing ${toFile.file} failed: ${fileErr.message}`));
+      resolve({ bytes, ms: Date.now() - started });
+    };
+    const mark = (k, code) => {
+      if (k in codes) return;
+      codes[k] = code;
+      if (code !== 0) killAll();
+      finish();
+    };
+    src.on("error", (e) => {
+      srcErr += e.code === "ENOENT" ? `${from.bin} is not installed` : e.message;
+      mark("src", -1);
+    });
+    src.on("close", (code) => mark("src", code ?? -1));
+    if (dst) {
+      dst.on("error", (e) => {
+        dstErr += e.code === "ENOENT" ? `${to.bin} is not installed` : e.message;
+        mark("dst", -1);
+      });
+      dst.on("close", (code) => mark("dst", code ?? -1));
+    }
+  });
+}
+
+export async function replicaSetup(payload, o) {
+  const M = ctxOf(o, "mysql.replica.setup");
+  const p = checkSetupPayload(payload);
+  return replicaSetupInner(M, p);
+}
+
+// ---- mysql.status
+
+export async function mysqlStatus(_payload, o) {
+  const M = ctxOf(o || {}, "mysql.status");
+  const st = readHaState(M.dataDir);
+  if (M.dry) {
+    const s = dryState(M);
+    const role = s.role === "replica" && s.replica ? "replica" : s.role === "primary" ? "primary" : "standalone";
+    return {
+      installed: !!s.installed,
+      running: true,
+      flavor: s.flavor,
+      version: s.version,
+      readOnly: !!s.readOnly,
+      serverId: s.serverId,
+      role,
+      gtidExecuted: dryGtid(s),
+      replica: role === "replica" ? { ...s.replica } : null,
+      managed: exists(cnfPath(M, s.flavor)),
+      dryRun: true,
+    };
+  }
+  if (!M.hook && !serverBinary()) return { installed: false, running: false, flavor: null, version: null, readOnly: null, role: "standalone", replica: null };
+  let info;
+  try {
+    info = await serverInfo(M);
+  } catch (e) {
+    return {
+      installed: true,
+      running: !NOT_RUNNING_CODES.has(e.mysqlCode),
+      flavor: st.flavor || null,
+      version: null,
+      readOnly: null,
+      role: st.role === "primary" || st.role === "replica" ? st.role : "standalone",
+      replica: null,
+      error: e.message,
+    };
+  }
+  const d = dialect(info.flavor, info.version);
+  const [gtid, rep] = await Promise.all([executedGtid(M, d).catch(() => null), replicaStatus(M, d).catch((e) => ({ error: e.message }))]);
+  const replica = rep && !rep.error ? rep : null;
+  const role = replica ? "replica" : st.role === "primary" ? "primary" : "standalone";
+  return {
+    installed: true,
+    running: true,
+    flavor: info.flavor,
+    version: info.version,
+    readOnly: info.readOnly,
+    serverId: info.serverId,
+    role,
+    gtidExecuted: gtid,
+    replica,
+    managed: exists(cnfPath(M, info.flavor)),
+    ...(rep?.error ? { error: rep.error } : {}),
+  };
+}
+
+let statusCache = null;
+let statusInflight = null;
+/** For node-agent metrics: null when no database server is installed; refreshed at most every maxAgeMs. */
+export async function mysqlStatusCached(dataDir, maxAgeMs = 30_000) {
+  if (sys.DRY_RUN) {
+    if (!exists(path.join(dataDir, DRY_STATE_FILE))) return null;
+  } else if (!process.env.FCC_MYSQL_TEST_DEFAULTS && !serverBinary()) return null;
+  if (statusCache && statusCache.dataDir === dataDir && Date.now() - statusCache.at < maxAgeMs) return statusCache.value;
+  if (!statusInflight) {
+    statusInflight = mysqlStatus({}, { dataDir })
+      .catch((e) => ({ installed: true, running: false, error: e.message, role: "standalone", replica: null }))
+      .then((value) => {
+        statusCache = { at: Date.now(), dataDir, value };
+        return value;
+      })
+      .finally(() => {
+        statusInflight = null;
+      });
+  }
+  return statusInflight;
+}
+
+function forgetStatus() {
+  statusCache = null;
+}
+
+// ---- mysql.replica.promote
+
+export async function replicaPromote(payload, o) {
+  const M = ctxOf(o, "mysql.replica.promote");
+  const waitMs = Math.min(Math.max(Number(payload?.waitMs ?? 30_000) || 0, 0), 100_000);
+  forgetStatus();
+  const info = await requireRunning(M);
+  const d = dialect(info.flavor, info.version);
+  let st = await replicaStatus(M, d);
+  const done = [];
+  const where = { ioStopped: false, replicationRemoved: false, writable: false };
+
+  const fail = async (step, err) => {
+    if (err.aborted) M.log("-- cancelled in the middle of promoting");
+    let state;
+    if (!where.replicationRemoved) {
+      let restarted = false;
+      if (where.ioStopped) {
+        try {
+          await sqlLocal(M, `${d.startReplica};\n`, { timeoutMs: 20_000 });
+          restarted = true;
+        } catch (e2) {
+          M.log(`!! Could not restart replication: ${e2.message}`);
+        }
+      }
+      state = restarted || !where.ioStopped
+        ? "still a read-only replica — replication is running again and nothing was changed"
+        : "still a read-only replica, but replication is STOPPED (its settings are intact): start it again with mysql.replica.setup { seed: false } or retry the promotion";
+    } else if (!where.writable) {
+      state = "replication settings are already REMOVED but the server is still READ-ONLY: run mysql.replica.promote again (safe to repeat) or mysql.readonly { on: false }";
+    } else {
+      state = "promoted and writable";
+    }
+    const e = new Error(`Promotion failed while ${step}: ${err.message}. This server is ${state}.`);
+    e.aborted = !!err.aborted;
+    e.result = { promoted: where.writable, state, steps: done, ...where };
+    M.log(`!! ${e.message}`);
+    throw e;
+  };
+
+  if (!st) {
+    M.log("No replication is configured here — only making the server writable.");
+  } else {
+    M.log(`Replica of ${st.sourceHost}: IO ${st.ioState}, SQL ${st.sqlRunning ? "Yes" : "No"}${st.lastError ? `, last error: ${st.lastError}` : ""}.`);
+    try {
+      await sqlLocal(M, `${d.stopIoThread};\n`, { timeoutMs: 20_000 });
+      where.ioStopped = true;
+      done.push("io-stopped");
+      M.log("Stopped receiving from the old primary.");
+    } catch (err) {
+      await fail("stopping the IO thread", err);
+    }
+  }
+
+  let appliedAll = true;
+  if (st) {
+    try {
+      st = (await replicaStatus(M, d)) || st;
+      const pending = st.retrievedGtid;
+      const appliedNow = async () => (M.dry ? true : (await sqlLocal(M, `${d.appliedCheck(pending)};\n`, { timeoutMs: 15_000 }))[0]?.[0] === "1");
+      if (!pending) {
+        appliedAll = true;
+      } else if (!st.sqlRunning || waitMs < 1000) {
+        if (!st.sqlRunning) M.log(`!! The SQL thread is not running${st.sqlError ? ` (${st.sqlError})` : ""} — checking whether everything received was applied.`);
+        appliedAll = await appliedNow();
+        M.log(appliedAll ? "Everything received from the old primary is applied." : "!! Some received transactions were NOT applied.");
+      } else {
+        M.log(`Waiting up to ${Math.round(waitMs / 1000)} s for everything received to be applied…`);
+        const r = await sqlLocal(M, `${d.waitForGtid(pending, waitMs / 1000)};\n`, { timeoutMs: waitMs + 15_000 });
+        appliedAll = M.dry ? true : d.waitOk(r[0]?.[0]);
+        M.log(appliedAll ? "Everything received from the old primary is applied." : "!! Timed out — some received transactions were not applied yet.");
+      }
+      done.push("drained");
+      await sqlTolerant(M, d.stopReplica, [1198, 1199, 1200, 1255, 3084, 3085]);
+      await sqlLocal(M, `${d.resetReplicaAll};\n`, { timeoutMs: 30_000 });
+      where.replicationRemoved = true;
+      done.push("replication-removed");
+      M.log("Replication settings removed.");
+    } catch (err) {
+      await fail(where.replicationRemoved ? "removing the replication settings" : "draining the relay log", err);
+    }
+  }
+
+  try {
+    await sqlLocal(M, d.superReadOnly ? "SET GLOBAL super_read_only = OFF;\nSET GLOBAL read_only = OFF;\n" : "SET GLOBAL read_only = OFF;\n", { timeoutMs: 15_000 });
+    where.writable = true;
+    done.push("writable");
+    M.log("read_only is OFF — this server is the primary now.");
+  } catch (err) {
+    await fail("turning read_only off", err);
+  }
+
+  let cnfWarning = null;
+  try {
+    const c = setCnfReadOnly(M, info.flavor, false);
+    if (c.skipped) cnfWarning = c.skipped;
+    else M.log(c.changed ? `${c.file}: read_only = OFF.` : `${c.file} already says read_only = OFF.`);
+  } catch (err) {
+    cnfWarning = `could not update the configuration file: ${err.message} — MySQL would come back read-only after a restart`;
+    M.log(`!! ${cnfWarning}`);
+  }
+  saveState(M, { role: "primary", flavor: info.flavor, promotedAt: new Date().toISOString() });
+  if (M.dry) saveDry(M, { role: "primary", readOnly: false, replica: null, seq: dryState(M).seq + 1 });
+  return {
+    promoted: true,
+    wasReplica: !!st,
+    appliedAll,
+    executedGtid: await executedGtid(M, d).catch(() => null),
+    steps: done,
+    ...(cnfWarning ? { warning: cnfWarning } : {}),
+    ...(M.dry ? { dryRun: true } : {}),
+  };
+}
+
+// ---- mysql.readonly
+
+export async function setReadOnly(payload, o) {
+  const M = ctxOf(o, "mysql.readonly");
+  if (typeof payload?.on !== "boolean") throw bad("mysql.readonly", "on must be true or false");
+  const on = payload.on;
+  forgetStatus();
+  let flavor = readHaState(M.dataDir).flavor;
+  let before = null;
+  if (M.dry) {
+    const s = dryState(M);
+    flavor = s.flavor;
+    before = !!s.readOnly;
+  } else {
+    const rows = await sqlLocal(M, "SELECT VERSION(), @@GLOBAL.read_only;\n", { timeoutMs: 4000, connectTimeout: 2 });
+    flavor = flavorOf(rows[0]?.[0]);
+    before = rows[0]?.[1] === "1";
+  }
+  const sql = on ? "SET GLOBAL read_only = ON;\n" : flavor === "mysql" ? "SET GLOBAL super_read_only = OFF;\nSET GLOBAL read_only = OFF;\n" : "SET GLOBAL read_only = OFF;\n";
+  await sqlLocal(M, sql, { timeoutMs: 4000, connectTimeout: 2 });
+  let cnf = null;
+  try {
+    cnf = setCnfReadOnly(M, flavor, on);
+  } catch (err) {
+    cnf = { error: err.message };
+    M.log(`!! ${err.message}`);
+  }
+  if (M.dry) saveDry(M, { readOnly: on });
+  M.log(`read_only ${on ? "ON" : "OFF"}${before === on ? " (it already was)" : ""}${cnf?.changed ? `; ${cnf.file} updated` : ""}.`);
+  return { readOnly: on, changed: before !== on, cnfChanged: !!cnf?.changed, ...(cnf?.error || cnf?.skipped ? { warning: cnf.error || cnf.skipped } : {}), ...(M.dry ? { dryRun: true } : {}) };
+}
+
+// ---- mysql.users.sync
+
+export async function usersSync(payload, o) {
+  const M = ctxOf(o, "mysql.users.sync");
+  let replica = false;
+  let partialRevokes = false;
+  if (M.dry) {
+    replica = dryState(M).role === "replica";
+  } else {
+    const info = await serverInfo(M);
+    const d = dialect(info.flavor, info.version);
+    replica = !!(await replicaStatus(M, d));
+    if (info.flavor === "mysql") {
+      try {
+        partialRevokes = (await sqlLocal(M, "SELECT @@GLOBAL.partial_revokes;\n", { timeoutMs: 15_000 }))[0]?.[0] === "1";
+      } catch {
+        partialRevokes = false;
+      }
+    }
+  }
+  const plan = buildUsersSyncSql(payload, { replica, partialRevokes });
+  if (!plan.users && !plan.removed) return { users: 0, removed: 0, replica };
+  M.log(`${plan.users} user(s) to create/update, ${plan.removed} to remove${replica ? " — this server is a replica, so nothing goes into its binary log" : ""}.`);
+  await sqlLocal(M, plan.script, { secrets: plan.secrets, timeoutMs: 120_000 });
+  return { users: plan.users, removed: plan.removed, replica, noBinlog: replica, ...(M.dry ? { dryRun: true } : {}) };
+}
+
+// ---- mysql.rebuild
+
+export async function rebuild(payload, o) {
+  const M = ctxOf(o, "mysql.rebuild");
+  const p = checkSetupPayload(payload, "mysql.rebuild");
+  p.seed = true; // a rebuild always copies everything again
+  forgetStatus();
+  M.log("── Safety copy of this server's databases ──");
+  const info = await requireRunning(M);
+  const d = dialect(info.flavor, info.version);
+  let dbs;
+  if (M.dry) dbs = dryState(M).databases || [];
+  else dbs = (await sqlLocal(M, "SHOW DATABASES;\n", { timeoutMs: 30_000 })).map((r) => r[0]).filter((n) => n && !SYSTEM_DBS.has(n.toLowerCase()));
+  const unsafe = dbs.filter((n) => !ANY_DB_RE.test(n));
+  if (unsafe.length) throw new Error(`mysql.rebuild: databases with names that cannot be handled safely: ${unsafe.map((n) => JSON.stringify(n)).join(", ")} — nothing was changed.`);
+
+  // Fence first: nothing may write here while it is copied and dropped.
+  await sqlLocal(M, "SET GLOBAL read_only = ON;\n", { timeoutMs: 15_000 });
+  let safetyDump = null;
+  if (dbs.length) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+    const dir = M.dry ? path.join(M.dataDir, "mysql-dry-run", "backups") : M.hook ? path.dirname(M.hook.cnfFile) : SAFETY_DUMP_DIR;
+    ensureDir(dir);
+    safetyDump = path.join(dir, `fcc-mysql-before-rebuild-${stamp}.sql.gz`);
+    const tmp = `${safetyDump}.partial`;
+    const args = [...localArgs(M), "--single-transaction", "--quick", "--routines", "--events", "--triggers", "--hex-blob", "--no-tablespaces", "--default-character-set=utf8mb4", "--max-allowed-packet=1073741824", ...(info.flavor === "mysql" ? ["--set-gtid-purged=OFF"] : []), "--databases", ...dbs];
+    M.log(`Dumping ${dbs.join(", ")} to ${safetyDump}…`);
+    try {
+      const r = await streamPipe(M, { from: { bin: dumpBin(), args, secrets: [] }, toFile: { file: tmp, gzip: true }, label: "dumped" });
+      if (M.dry) fs.writeFileSync(tmp, zlib.gzipSync(`-- dry-run safety dump of ${dbs.join(", ")}\n`), { mode: 0o600 });
+      fs.chmodSync(tmp, 0o600);
+      fs.renameSync(tmp, safetyDump);
+      M.log(`Safety copy: ${safetyDump} (${fmtBytes(fs.statSync(safetyDump).size)}${r.bytes ? ` from ${fmtBytes(r.bytes)} of SQL` : ""}).`);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      const e = new Error(`mysql.rebuild: the safety copy ${err.aborted ? "was cancelled" : `failed (${err.message})`} — no database was dropped; the server stays read-only.`);
+      e.aborted = !!err.aborted;
+      throw e;
+    }
+    checkAbort(M);
+    M.log("── Dropping the old databases ──");
+    await sqlTolerant(M, d.stopReplica, [1198, 1199, 1200, 1255, 3084, 3085]);
+    await sqlLocal(M, `SET SESSION sql_log_bin = 0;\n${dbs.map((n) => `DROP DATABASE IF EXISTS ${quoteDb(n)};`).join("\n")}\n`, { timeoutMs: 30 * 60_000 });
+    M.log(`Dropped ${dbs.length} database(s).`);
+  } else {
+    M.log("This server has no databases of its own — nothing to keep.");
+  }
+  if (M.dry) saveDry(M, { databases: [] });
+  checkAbort(M);
+  const r = await replicaSetupInner(M, p);
+  return { safetyDump, droppedDatabases: dbs, ...r };
+}
+
+// =================================================================== dispatcher (shared/tasks.mjs)
+
+export const MYSQL_TASKS = {
+  "mysql.primary.prepare": primaryPrepare,
+  "mysql.replica.setup": replicaSetup,
+  "mysql.status": mysqlStatus,
+  "mysql.replica.promote": replicaPromote,
+  "mysql.readonly": setReadOnly,
+  "mysql.users.sync": usersSync,
+  "mysql.rebuild": rebuild,
+};
+
+export async function runMysqlTask(type, payload, o) {
+  const fn = MYSQL_TASKS[type];
+  if (!fn) throw new Error(`Unknown task type "${type}"`);
+  try {
+    return await fn(payload || {}, o);
+  } finally {
+    if (type !== "mysql.status") forgetStatus();
+  }
+}

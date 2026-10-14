@@ -14,7 +14,8 @@
  *
  * Protocol (see panel/lib/cluster.mjs): hello → long-poll for tasks → stream
  * each task's log → post its result; metrics pushed every ~15s (with the edge
- * status when this server is an edge node, docs/HA.md). An edge node also
+ * status when this server is an edge node, docs/HA.md, and the `mysql` status
+ * when a database server is installed, Phase 3). An edge node also
  * ships its front-door access logs to POST /agent/edge/logs every 15s.
  *
  * Panel failover (docs/HA.md, Phase 2): when the hello says `ha: true` the
@@ -44,8 +45,9 @@ import { StringDecoder } from "node:string_decoder";
 import { executeTask, collectMetrics, systemInfo, TASK_TYPES } from "../shared/tasks.mjs";
 import { edgeStatus, edgeLogSites } from "../shared/edge.mjs";
 import { createVoter, cleanPanels } from "../shared/ha-voter.mjs";
+import { mysqlStatusCached } from "../shared/mysql-ha.mjs";
 
-export const AGENT_VERSION = "3.2.0";
+export const AGENT_VERSION = "3.3.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
@@ -587,6 +589,10 @@ async function metricsLoop() {
         log(`edge status failed: ${err.message}`);
         return null;
       });
+      // Database replication (docs/HA.md Phase 3): mysql.status, refreshed at most every 30 s,
+      // only when a MySQL/MariaDB server is installed here.
+      const my = await mysqlStatusCached(cfg.dataDir, 30_000).catch(() => null);
+      if (my) m.mysql = my;
       await api("POST", "/agent/metrics", m, { timeoutMs: 15_000 });
     } catch (err) {
       if (err.status && err.status !== 401 && !err.failover) log(`metrics push failed: ${err.message}`);

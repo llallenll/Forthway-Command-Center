@@ -1,10 +1,10 @@
 // Settings → Databases (MySQL connection address) and Settings → phpMyAdmin.
 // Kept in its own file so settings.js only needs two SECTIONS entries.
-import { html, raw, mount, $, on, ago, toast, toastError, confirmDialog, debounce, plural } from "../util.js";
+import { html, raw, mount, $, $$, on, ago, fmtDate, fmtDuration, toast, toastError, confirmDialog, openModal, debounce, plural } from "../util.js";
 import { icon } from "../icons.js";
-import { get, post, put, del } from "../api.js";
+import { get, post, put, patch, del } from "../api.js";
 import { openJobLog, jobStarted } from "../components.js";
-import { dbUnavailable, unavailableState } from "./databases.js";
+import { dbUnavailable, unavailableState, getReplication, replBadge, fmtLagS, replicaBroken } from "./databases.js";
 
 const field = (label, control, hint) => html`<div class="field"><label>${label}</label>${control}${hint ? html`<div class="hint">${hint}</div>` : ""}</div>`;
 function setBusy(btn, busy) { if (!btn) return; btn.classList.toggle("loading", busy); btn.disabled = busy; }
@@ -16,7 +16,11 @@ const choice = (name, value, checked, ico, title, desc) => html`<label class="ch
 
 /* ───────── Databases (MySQL connection) ───────── */
 
-export async function mysqlSettings(box, ctx) {
+export async function mysqlSettings(outer, ctx) {
+  // Replication card first, then the connection settings. display:contents keeps the section's card spacing.
+  mount(outer, html`<div data-repl-slot style="display:contents"></div><div data-conn-slot style="display:contents"></div>`);
+  const box = $("[data-conn-slot]", outer);
+  replicationCard($("[data-repl-slot]", outer), ctx); // renders nothing on a panel without replication
   let s = null;
   const load = async () => {
     try { s = await get("/api/mysql/settings"); } catch (e) { if (!dbUnavailable(e)) throw e; s = { available: false, reason: dbUnavailable(e) }; }
@@ -96,6 +100,185 @@ export async function mysqlSettings(box, ctx) {
   const reload = debounce(() => load().catch(() => {}), 600);
   ctx.on(["database"], reload);
   ctx.on(["job"], (j) => { if (String(j?.type || "").startsWith("mysql.")) reload(); });
+}
+
+/* ───────── Replication (docs/HA.md, Phase 3) ───────── */
+
+const MODE = {
+  auto: { label: "Automatic failover", desc: "The replica takes over when the primary has been unreachable for 1 minute." },
+  manual: { label: "Manual", desc: "You get an alert when the primary is down, and promote the replica yourself." },
+};
+const HIST = { enabled: "Replication turned on", seeded: "Replica copied", promoted: "Replica promoted to primary", switchover: "Primary switched",
+  rebuilt: "Rebuilt as the replica", broken: "Replication broke", fenced: "Old primary set to read-only", disabled: "Replication turned off", mode: "Failover mode changed" };
+const thread = (on, err) => (on ? html`<span class="status"><span class="dot ok"></span>Running</span>` : html`<span class="status"><span class="dot ${err ? "err" : "off"}"></span>Stopped</span>`);
+
+async function startJob(btn, req, fail) {
+  setBusy(btn, true);
+  try { const job = await req(); if (job?.id) openJobLog(job.id); else toast("Done", "ok"); return true; }
+  catch (ex) { toastError(ex, fail); return false; }
+  finally { setBusy(btn, false); }
+}
+
+/** Enable dialog: pick the replica (recommended first, panel nodes marked) and the failover mode. */
+function enableDialog(r) {
+  const cands = [...(r.candidates || [])].sort((a, b) => (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0));
+  const first = cands[0]?.serverId;
+  return openModal({
+    title: "Turn on database replication", ico: "database", size: "lg",
+    sub: `${r.primary?.name || "The main server"} stays the primary. The server you pick keeps a live copy of every database.`,
+    body: html`<form class="form-stack" novalidate>
+      <div class="field"><label>Replica server</label>
+        ${cands.length ? html`<div class="choice-grid" data-pick>${cands.map((c) => choice("replica", c.serverId, c.serverId === first, "server", c.name,
+          html`${c.recommended ? html`<span class="badge ok">Recommended</span> ` : ""}${c.panelNode ? html`<span class="badge">${icon("layers")}Panel node</span>` : ""}${!c.recommended && !c.panelNode ? "Agent server" : ""}`))}</div>
+          <div class="hint">A panel node is a good choice: the panel and the databases can then fail over to the same server.</div>`
+        : html`<div class="note warn">${icon("alert")}<div>No server can hold the replica yet. It needs an online agent server running agent 3.3.0 or newer, with enough free disk for a copy of the databases.</div></div>`}</div>
+      <div class="field"><label>When the primary goes down</label>
+        <div class="choice-grid" data-pick>${choice("mode", "auto", true, "zap", MODE.auto.label, MODE.auto.desc)}${choice("mode", "manual", false, "bell", MODE.manual.label, MODE.manual.desc)}</div></div>
+      <div class="note">${icon("info")}<div>Copying the databases to the replica takes a while for large databases; websites keep running. Linked websites get the database address <span class="mono">fcc-mysql.internal</span> once, so they follow the primary on their own after that.</div></div>
+      <div class="error-box" data-err hidden></div></form>`,
+    foot: html`<button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok ${cands.length ? "" : raw("disabled")}>${icon("database")}Turn on replication</button>`,
+    onMount(el, close) {
+      on(el, "change", "[data-pick] input", (e, inp) => $$(".choice", inp.closest("[data-pick]")).forEach((c) => c.classList.toggle("selected", $("input", c).checked)));
+      $("[data-ok]", el).onclick = async (e) => {
+        const b = e.currentTarget, f = $("form", el), err = $("[data-err]", el);
+        const replicaServerId = $("[name=replica]:checked", f)?.value, mode = $("[name=mode]:checked", f)?.value || "auto";
+        if (!replicaServerId) return showErr(err, "Pick a replica server.");
+        showErr(err, ""); setBusy(b, true);
+        try { const job = await post("/api/mysql/replication", { replicaServerId, mode }); close(true); if (job?.id) openJobLog(job.id); else toast("Replication turned on", "ok"); }
+        catch (ex) { showErr(err, ex.message); setBusy(b, false); }
+      };
+    },
+  }).result;
+}
+
+/** Settings → Databases → Replication card. Live on SSE `mysql-ha`. */
+export async function replicationCard(box, ctx) {
+  let r = null, showAll = false;
+  const load = async () => { r = await getReplication(); if (ctx.alive()) paint(); };
+
+  const histList = () => {
+    const h = [...(r.history || [])].sort((a, b) => new Date(b.at) - new Date(a.at));
+    if (!h.length) return "";
+    const shown = showAll ? h : h.slice(0, 4);
+    return html`<div class="repl-sec"><div class="label">History</div>
+      <ul class="repl-hist">${shown.map((x) => html`<li><span class="repl-hist-at muted" title="${fmtDate(x.at)}">${ago(x.at)}</span><span class="repl-hist-t"><b>${HIST[x.event] || x.event}</b>${x.detail ? html`<span class="muted"> · ${x.detail}</span>` : ""}</span></li>`)}</ul>
+      ${h.length > 4 ? html`<button class="btn btn-sm btn-ghost repl-more" type="button" data-rhist>${showAll ? "Show less" : `Show all ${h.length}`}</button>` : ""}</div>`;
+  };
+
+  const paintOff = () => {
+    const can = r.canEnable || { ok: true };
+    mount(box, html`<div class="card repl-card">
+      <div class="card-head"><span class="repl-ico">${icon("database")}</span><div class="repl-head-t"><h3>Replication</h3><div class="sub">Off</div></div></div>
+      <div class="card-body">
+        <p class="repl-intro">Keep a live copy of every database on one more server, the replica. If ${r.primary?.name || "the main server"} goes down, websites switch to the replica automatically, with no restart.</p>
+        ${!can.ok ? html`<div class="note warn mt-16">${icon("info")}<div>${can.reason || "Replication can't be turned on right now."}</div></div>` : ""}
+        ${histList()}
+      </div>
+      <div class="card-foot"><span class="muted small">One replica per cluster.</span><span class="spacer"></span><button class="btn btn-primary" data-renable ${can.ok ? "" : raw("disabled")} title="${can.ok ? "" : can.reason || ""}">${icon("database")}Turn on replication…</button></div>
+    </div>`);
+  };
+
+  const paint = () => {
+    if (!r) return mount(box, html``);
+    if (!r.enabled) return paintOff();
+    const p = r.primary || {}, rep = r.replica, broken = replicaBroken(r);
+    const flavor = r.flavor === "mariadb" ? "MariaDB" : "MySQL";
+    const down = r.detect?.primaryDownForMs;
+    const seeding = !!rep && (r.state === "seeding" || r.state === "preparing" || rep.state === "seeding");
+    const canSwitch = !!rep && !down && r.state === "replicating" && rep.lagSeconds === 0 && rep.ioRunning !== false && rep.sqlRunning !== false;
+    const switchWhy = !rep ? "There is no replica." : down ? `${p.name} isn't answering. Promote the replica instead.` : canSwitch ? "" : "Needs a healthy replica with no lag.";
+    const repState = rep ? rep.state || r.state : null;
+    mount(box, html`<div class="card repl-card">
+      <div class="card-head"><span class="repl-ico on">${icon("database")}</span>
+        <div class="repl-head-t"><h3>Replication</h3><div class="sub">${MODE[r.mode]?.label || r.mode} · ${flavor}</div></div>
+        <div class="right">${replBadge(r.state)}</div></div>
+      ${down ? html`<div class="card-body" style="padding-bottom:0"><div class="note err">${icon("alert")}<div><b>${p.name} hasn't answered for ${fmtDuration(down)}.</b> ${r.mode === "auto" && rep ? `${rep.name} takes over once it has been down for 1 minute, unless it answers again.` : rep ? "Promote the replica if it stays down." : ""}</div></div></div>` : ""}
+      <div class="card-body">
+        <div class="repl-pair">
+          <div class="repl-node">
+            <div class="repl-node-h"><span class="label">Primary</span><span class="badge ${p.readOnly ? "warn" : "ok"}">${p.readOnly ? "Read-only" : "Writable"}</span></div>
+            <div class="repl-node-name">${p.name || p.serverId || "—"}</div>
+            ${p.address ? html`<div class="mono muted small">${p.address}</div>` : ""}
+            <p class="hint" style="margin:10px 0 0">The only server websites write to.</p>
+          </div>
+          <div class="repl-node ${broken ? "is-err" : ""}">
+            ${rep ? html`<div class="repl-node-h"><span class="label">Replica</span>${repState !== r.state ? replBadge(repState) : ""}</div>
+              <div class="repl-node-name">${rep.name}</div>
+              <dl class="kv repl-kv">
+                <dt>Lag</dt><dd>${rep.ioRunning === false || rep.sqlRunning === false ? html`<span class="muted">—</span>` : fmtLagS(rep.lagSeconds)}</dd>
+                <dt>IO thread</dt><dd>${thread(rep.ioRunning, rep.lastError)}</dd>
+                <dt>SQL thread</dt><dd>${thread(rep.sqlRunning, rep.lastError)}</dd>
+                <dt>Last copied</dt><dd>${rep.seededAt ? html`<span title="${fmtDate(rep.seededAt)}">${ago(rep.seededAt)}</span>` : html`<span class="muted">Not yet</span>`}</dd>
+              </dl>
+              ${rep.lastError ? html`<div class="error-box mt-12">${icon("alert")}<div class="mono small">${rep.lastError}</div></div>` : ""}`
+            : html`<div class="repl-node-h"><span class="label">Replica</span></div>
+              <div class="repl-node-name muted">None</div>
+              <p class="hint" style="margin:10px 0 0">${(r.needsRebuild || []).length ? "Rebuild the old primary below to get a live copy again." : "There is no live copy of the databases right now."}</p>`}
+          </div>
+        </div>
+        ${(r.needsRebuild || []).length ? html`<div class="repl-sec"><div class="label">Needs rebuild</div><div class="edge-rows">${r.needsRebuild.map((n) => html`<div class="edge-row repl-rb">
+            <span class="dot ${n.online ? "warn" : "off"}"></span>
+            <span class="edge-row-name">${n.name}<span class="muted small"> · ${n.online ? "read-only, waiting to become the replica" : "offline, rebuild it once it's back"}</span></span>
+            <button class="btn btn-sm" type="button" data-rrebuild="${n.serverId}" ${n.online && !rep ? "" : raw("disabled")} title="${!n.online ? `${n.name} is offline.` : rep ? `${rep.name} is already the replica. There is one replica per cluster.` : ""}">${icon("refresh")}Rebuild ${n.name}</button></div>`)}</div></div>` : ""}
+        <div class="repl-sec repl-mode">
+          <div class="field"><label for="repl-mode">Failover</label>
+            <select class="select" id="repl-mode" data-rmode>${Object.entries(MODE).map(([k, v]) => html`<option value="${k}" ${k === r.mode ? raw("selected") : ""}>${v.label}</option>`)}</select>
+            <div class="hint" data-rmode-desc>${MODE[r.mode]?.desc || ""}</div></div>
+        </div>
+        ${histList()}
+      </div>
+      <div class="card-foot repl-foot">
+        ${rep ? html`<button class="btn" data-rswitch ${canSwitch ? "" : raw("disabled")} title="${switchWhy}">${icon("refresh")}Switch primary</button>
+          ${seeding ? "" : html`<button class="btn btn-danger" data-rpromote>${icon("zap")}Promote replica now</button>`}` : ""}
+        <span class="spacer"></span>
+        <button class="btn btn-ghost" data-rdisable>${icon("power")}Turn off replication</button>
+      </div>
+    </div>`);
+  };
+
+  try { await load(); } catch { r = null; }
+
+  on(box, "click", "[data-rhist]", () => { showAll = !showAll; paint(); });
+  on(box, "click", "[data-renable]", async () => { if (await enableDialog(r)) load(); });
+  on(box, "change", "[data-rmode]", async (e, sel) => {
+    const mode = sel.value; $("[data-rmode-desc]", box).textContent = MODE[mode]?.desc || "";
+    sel.disabled = true;
+    try { const res = await patch("/api/mysql/replication", { mode }); if (res && typeof res === "object" && "enabled" in res) r = res; else r = { ...r, mode }; toast(mode === "auto" ? "Automatic failover is on" : "Failover is manual now", "ok"); }
+    catch (ex) { toastError(ex, "Couldn't change the failover mode"); }
+    finally { if (ctx.alive()) paint(); }
+  });
+  on(box, "click", "[data-rswitch]", async (e, b) => {
+    const p = r.primary?.name, rep = r.replica?.name;
+    const ok = await confirmDialog({ title: `Make ${rep} the primary?`, ico: "refresh", confirmText: "Switch primary",
+      message: `Databases are read-only for about 10 seconds while ${rep} catches up and takes over. Nothing is lost. ${p} then becomes the replica.` });
+    if (ok) startJob(b, () => post("/api/mysql/replication/switchover", {}), "Couldn't switch the primary");
+  });
+  on(box, "click", "[data-rpromote]", async (e, b) => {
+    const p = r.primary?.name, rep = r.replica?.name, broken = replicaBroken(r);
+    const res = await confirmDialog({ title: `Promote ${rep} now?`, danger: true, confirmText: "Promote replica",
+      message: `${rep} becomes the primary right away and websites switch to it. If ${p} is still up, anything written to it that hasn't reached ${rep} yet is lost, and ${p} is set read-only until you rebuild it. When both servers are healthy, use Switch primary instead.`,
+      extra: broken ? html`<div class="note err mt-16">${icon("alert")}<div>Replication is broken, so ${rep} may be missing data.
+        <label class="check mt-12"><input type="checkbox" name="force" data-extra/>Promote it anyway</label></div></div>` : undefined });
+    if (!res) return;
+    if (broken && !res.force) { toast("Not promoted", "warn", { msg: `Tick "Promote it anyway" to promote a replica whose replication is broken.` }); return; }
+    startJob(b, () => post("/api/mysql/replication/promote", broken ? { force: true } : {}), "Couldn't promote the replica");
+  });
+  on(box, "click", "[data-rrebuild]", async (e, b) => {
+    const n = (r.needsRebuild || []).find((x) => x.serverId === b.dataset.rrebuild); if (!n) return;
+    const ok = await confirmDialog({ title: `Rebuild ${n.name} as the replica?`, ico: "refresh", confirmText: `Rebuild ${n.name}`,
+      message: `Its databases are replaced with a fresh copy from ${r.primary?.name}, and it then follows the primary as the replica. First, a safety dump of what it holds now is saved on ${n.name} in /var/backups.` });
+    if (ok) startJob(b, () => post("/api/mysql/replication/rebuild", { serverId: n.serverId }), `Couldn't rebuild ${n.name}`);
+  });
+  on(box, "click", "[data-rdisable]", async (e, b) => {
+    const rep = r.replica?.name;
+    const ok = await confirmDialog({ title: "Turn off replication?", danger: true, confirmText: "Turn off replication",
+      message: `${rep ? `Replication stops on ${rep}. Its copy of the databases stays there but is no longer updated. ` : ""}Websites keep using ${r.primary?.name}. If it goes down, there is no copy to switch to.` });
+    if (ok) startJob(b, () => del("/api/mysql/replication"), "Couldn't turn off replication");
+  });
+  const reload = debounce(() => load().catch(() => {}), 400);
+  ctx.on("mysql-ha", reload);
+  ctx.on("server", (d) => { if (r?.needsRebuild?.some((n) => n.serverId === d?.id && n.online !== !!d.online)) reload(); });
+  ctx.on("job", (j) => { if (String(j?.type || "").startsWith("mysql.") && j.status !== "running" && j.status !== "queued") reload(); });
 }
 
 /* ───────── phpMyAdmin ───────── */
