@@ -510,6 +510,25 @@ R("GET", "/api/sites/:id/logs", (p, b, q) => {
   }
   return { text: `== ${s.name} on ${srv.name} (pm2: fcc-${s.name}) ==\n` + lines.join("\n") };
 });
+R("GET", "/api/sites/:id/scripts", (p, b, q) => {
+  const s = find("sites", p.id);
+  const tg = targets(s), sid = q.serverId || tg[0];
+  const deployed = !!s.currentReleaseId;
+  return { serverId: sid, servers: tg.map((id) => ({ id, name: db.servers.find((x) => x.id === id)?.name || id, online: !!db.servers.find((x) => x.id === id)?.online })), loadBalanced: !!s.loadBalanced, deployed,
+    source: deployed ? "deployed" : null, version: db.releases.find((r) => r.id === s.currentReleaseId)?.version || null, hasNodeModules: true, note: null,
+    scripts: deployed ? [
+      { name: "db:push", command: "prisma db push", kind: "task", runnable: true, risky: true },
+      { name: "build", command: "next build", kind: "task", runnable: true, risky: false },
+      { name: "start", command: "next start", kind: "app", runnable: false, risky: false },
+    ] : [] };
+});
+R("POST", "/api/sites/:id/scripts/run", (p, b) => {
+  const s = find("sites", p.id);
+  const label = b.command != null ? String(b.command).trim() : `npm run ${b.script}`;
+  if (b.command != null && (!label || /[\r\n]/.test(label))) err(400, "Type a command on one line (at most 2000 characters).");
+  const where = b.allServers ? `all ${targets(s).length} servers` : db.servers.find((x) => x.id === (b.serverId || targets(s)[0]))?.name;
+  return runJob({ type: "site.script", title: `${label} on ${where}`, siteId: s.id, projectId: s.projectId }, { lines: [`$ ${label}`, `in /srv/sites/${s.name}/app`, "  done", `✓ ${label} finished in 1.2s`] });
+});
 R("GET", "/api/sites/:id/env", (p) => {
   const s = find("sites", p.id);
   return { env: clone(s.env), linked: s.linkedDatabaseIds.map((id) => db.databases.find((d) => d.id === id)).filter(Boolean).map((d) => ({ databaseId: d.id, name: d.name,

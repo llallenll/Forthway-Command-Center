@@ -12,9 +12,9 @@
  * token that comes with each deploy task). The main server gets the local
  * file path as well, so it never has to download from itself.
  *
- * There is deliberately no "run a command" feature here. Logs are read-only.
- * The one exception is named: `npm run <script>` for a script that the deployed
- * package.json defines (POST /api/sites/:id/scripts/run → task site.script).
+ * Logs are read-only. Things run in a site's folder only through the Scripts
+ * tab (POST /api/sites/:id/scripts/run → task site.script): `npm run <script>`
+ * for a script the deployed package.json defines, or an admin's own command.
  */
 
 import fs from "node:fs";
@@ -36,7 +36,7 @@ import {
 import { inspectZip, readZipFile } from "../../shared/zip.mjs";
 import { isEnvKey, cleanEnvValue, parseEnvText } from "../../shared/env.mjs";
 import { ensureDir, humanBytes } from "../../shared/fsx.mjs";
-import { validScriptName } from "../../shared/tasks.mjs";
+import { validScriptName, validCommand } from "../../shared/tasks.mjs";
 
 export const SITE_TYPES = ["node", "static", "php"];
 export const LB_METHODS = ["round_robin", "least_conn", "ip_hash"];
@@ -2012,7 +2012,7 @@ export function register(router, ctx) {
     }
   });
 
-  // ---- package.json scripts (named actions, never a free-form command)
+  // ---- package.json scripts and custom commands
 
   const isDeployed = (site) => !!site.currentReleaseId || Object.values(site.state || {}).some((x) => x?.releaseId);
   /** The release most likely on `sid`: its own, else the site's current, else any deployed one. */
@@ -2072,9 +2072,14 @@ export function register(router, ctx) {
 
   router.post("/api/sites/:id/scripts/run", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
-    const name = typeof body.script === "string" ? body.script.trim() : "";
-    if (!validScriptName(name)) throw httpError(400, "That is not a valid script name.");
-    if (scriptKind(name, {}) === "app") throw httpError(400, `"${name}" runs the app itself — use Start or Restart instead.`);
+    const command = typeof body.command === "string" ? body.command.trim() : null;
+    const name = command == null && typeof body.script === "string" ? body.script.trim() : "";
+    if (command != null) {
+      if (!validCommand(command)) throw httpError(400, "Type a command on one line (at most 2000 characters).");
+    } else {
+      if (!validScriptName(name)) throw httpError(400, "That is not a valid script name.");
+      if (scriptKind(name, {}) === "app") throw httpError(400, `"${name}" runs the app itself — use Start or Restart instead.`);
+    }
     if (!isDeployed(site)) throw httpError(409, "Deploy this website first — scripts run in the deployed app folder.");
     const ids = targets(site);
     let run;
@@ -2086,7 +2091,7 @@ export function register(router, ctx) {
       run = [sid];
     }
     const rel = releaseOn(site, run[0]);
-    if (rel?.scripts && name.length <= 60 && !Object.prototype.hasOwnProperty.call(rel.scripts, name)) {
+    if (command == null && rel?.scripts && name.length <= 60 && !Object.prototype.hasOwnProperty.call(rel.scripts, name)) {
       throw httpError(400, `The deployed release's package.json has no "${name}" script.`);
     }
     const offline = run.filter((id) => !isOnline(id));
@@ -2094,8 +2099,9 @@ export function register(router, ctx) {
 
     const multi = run.length > 1;
     const where = multi ? `all ${run.length} servers` : serverName(run[0]);
-    const job = siteJob(site, admin, { type: "site.script", title: `npm run ${name} on ${where}`, serverId: multi ? null : run[0] }, async ({ log, signal }) => {
-      if (multi) log(`Running npm run ${name} on ${run.map(serverName).join(", ")} — one server at a time.`);
+    const label = command != null ? (command.length > 60 ? command.slice(0, 57) + "…" : command) : `npm run ${name}`;
+    const job = siteJob(site, admin, { type: "site.script", title: `${label} on ${where}`, serverId: multi ? null : run[0] }, async ({ log, signal }) => {
+      if (multi) log(`Running ${label} on ${run.map(serverName).join(", ")} — one server at a time.`);
       const results = [];
       for (const sid of run) {
         if (signal?.aborted) throw new Error("Cancelled.");
@@ -2103,7 +2109,7 @@ export function register(router, ctx) {
         try {
           assertOnline(sid);
           const spec = await specForAsync(getSite(site.id) || site, sid);
-          const r = await runTask(sid, "site.script", { spec, script: name }, { log: prefixed(log, sid, multi), signal });
+          const r = await runTask(sid, "site.script", command != null ? { spec, command } : { spec, script: name }, { log: prefixed(log, sid, multi), signal });
           results.push({ serverId: sid, code: r?.code ?? 0, durationMs: r?.durationMs ?? null });
         } catch (err) {
           if (!multi || err.aborted) throw err;
@@ -2112,9 +2118,9 @@ export function register(router, ctx) {
           throw e;
         }
       }
-      return { script: name, servers: results };
+      return { ...(command != null ? { command } : { script: name }), servers: results };
     });
-    audit(admin, "site.script", site, { script: name, servers: run });
+    audit(admin, "site.script", site, { ...(command != null ? { command } : { script: name }), servers: run });
     return job;
   });
 
