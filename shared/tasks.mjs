@@ -14,8 +14,9 @@
  * for a final state, which is never dropped).
  *
  * Task types and their payload/result shapes are listed in docs/STANDALONE.md
- * (section 3, "ctx.cluster"). There is deliberately no "run a command" task:
- * site.script runs only `npm run <name>` for a script the deployed package.json defines.
+ * (section 3, "ctx.cluster"). site.script runs `npm run <name>` for a script the
+ * deployed package.json defines, or (3.5.0) an admin's own shell command
+ * (`payload.command`) in the app folder — see siteScript.
  *
  * cluster.sync (edge nodes, docs/HA.md) lives in shared/edge.mjs and is only
  * ever sent to Agent servers — and, with `frontDoor: true`, to main's embedded
@@ -44,7 +45,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.4.0";
+export const TASKS_VERSION = "3.5.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -657,11 +658,20 @@ async function siteLogs(payload, o) {
 
 // ------------------------------------------------------- package.json scripts
 //
-// Not a terminal: the only thing that can run is `npm run <name>`, where <name>
-// is a key of "scripts" in the package.json that is deployed on THIS server,
-// checked against a strict pattern, and passed to npm as its own argument
-// (no shell on our side). npm puts node_modules/.bin on PATH, so devDependency
-// tools (prisma, drizzle-kit, knex…) work as they do on a laptop.
+// Two ways in: `npm run <name>`, where <name> is a key of "scripts" in the
+// package.json that is deployed on THIS server, checked against a strict
+// pattern and passed to npm as its own argument (no shell); or `command`, a
+// shell command an admin typed on the Scripts tab, run with sh -c in the app
+// folder. npm puts node_modules/.bin on PATH and so do we for commands, so
+// devDependency tools (prisma, drizzle-kit, knex…) work as they do on a laptop.
+
+/** Longest custom command accepted (site.script `command`). */
+export const MAX_COMMAND_LENGTH = 2000;
+
+/** A custom command: one non-empty line of text, without NUL. */
+export function validCommand(cmd) {
+  return typeof cmd === "string" && cmd.trim().length > 0 && cmd.length <= MAX_COMMAND_LENGTH && !/[\0\r\n]/.test(cmd);
+}
 
 /** Letters, digits and : . _ + - ; must not start with "-" or "." (no flags, no paths). */
 export const SCRIPT_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9:._+-]{0,99}$/;
@@ -711,22 +721,42 @@ function scriptEnv(spec) {
 async function siteScript(payload, o) {
   const spec = checkSpec(payload.spec);
   const { log, signal } = o;
-  const name = payload.script;
-  if (!validScriptName(name)) throw new Error(`"${String(name).slice(0, 60)}" is not a valid script name.`);
-  const pkg = readPackageScripts(spec.appDir);
-  if (pkg.error && !sys.DRY_RUN) throw new Error(pkg.error);
-  if (pkg.scripts && !Object.prototype.hasOwnProperty.call(pkg.scripts, name)) {
-    throw new Error(`The package.json deployed on ${os.hostname()} has no "${name}" script.`);
+  const command = payload.command != null ? payload.command : null;
+  const name = command == null ? payload.script : null;
+  let label, bin, args, env;
+  if (command != null) {
+    if (!validCommand(command)) throw new Error("That is not a valid command (one line, at most 2000 characters).");
+    if (!exists(spec.appDir) && !sys.DRY_RUN) throw new Error(`${spec.appDir} does not exist on ${os.hostname()} — deploy the website first.`);
+    label = command.length > 80 ? command.slice(0, 77) + "…" : command;
+    log(`$ ${command}`);
+  } else {
+    if (!validScriptName(name)) throw new Error(`"${String(name).slice(0, 60)}" is not a valid script name.`);
+    const pkg = readPackageScripts(spec.appDir);
+    if (pkg.error && !sys.DRY_RUN) throw new Error(pkg.error);
+    if (pkg.scripts && !Object.prototype.hasOwnProperty.call(pkg.scripts, name)) {
+      throw new Error(`The package.json deployed on ${os.hostname()} has no "${name}" script.`);
+    }
+    const body = pkg.scripts?.[name];
+    label = `npm run ${name}`;
+    log(`$ npm run ${name}${body ? `   # ${body}` : ""}`);
+    if (!pkg.hasNodeModules && !sys.DRY_RUN) log("Note: there is no node_modules folder here, so tools from devDependencies may be missing.");
   }
   const started = Date.now();
-  const body = pkg.scripts?.[name];
-  log(`$ npm run ${name}${body ? `   # ${body}` : ""}`);
+  const result = (extra) => ({ ...(command != null ? { command } : { script: name }), ...extra });
   log(`in ${spec.appDir} on ${os.hostname()}`);
   if (sys.DRY_RUN) {
-    log(`[dry-run] would run npm run ${name} with the website's environment (${Object.keys(spec.env || {}).length} variable(s) + PORT)`);
-    return { script: name, code: 0, durationMs: Date.now() - started, dryRun: true };
+    log(`[dry-run] would run ${label} with the website's environment (${Object.keys(spec.env || {}).length} variable(s) + PORT)`);
+    return result({ code: 0, durationMs: Date.now() - started, dryRun: true });
   }
-  if (!pkg.hasNodeModules) log("Note: there is no node_modules folder here, so tools from devDependencies may be missing.");
+  env = scriptEnv(spec);
+  if (command != null) {
+    bin = exists("/bin/bash") ? "/bin/bash" : "/bin/sh";
+    args = ["-c", command];
+    env.PATH = [path.join(spec.appDir, "node_modules", ".bin"), env.PATH].filter(Boolean).join(path.delimiter);
+  } else {
+    bin = sys.which("npm") || "npm";
+    args = ["run", name];
+  }
 
   // Scripts like `prisma db push` read .env for themselves: make sure the
   // managed block holds the current variables (no write when unchanged).
@@ -739,12 +769,11 @@ async function siteScript(payload, o) {
     }
   }
 
-  const npm = sys.which("npm") || "npm";
   const timeoutMs = SCRIPT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const child = spawn(npm, ["run", name], {
+    const child = spawn(bin, args, {
       cwd: spec.appDir,
-      env: scriptEnv(spec),
+      env,
       detached: true, // own process group: cancel/timeout stop everything it started
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -769,7 +798,7 @@ async function siteScript(payload, o) {
     const stop = (reason) => {
       if (stopReason) return;
       stopReason = reason;
-      log(`!! ${reason} — stopping npm run ${name}`);
+      log(`!! ${reason} — stopping ${label}`);
       killGroup(child, "SIGTERM");
       killTimer = setTimeout(() => killGroup(child, "SIGKILL"), 5000);
     };
@@ -787,18 +816,18 @@ async function siteScript(payload, o) {
       for (const key of ["out", "err"]) if (partial[key]) (log(partial[key]), tail.push(partial[key]));
       partial = { out: "", err: "" };
       const durationMs = Date.now() - started;
-      if (err) return reject(err.code === "ENOENT" ? new Error(`npm is not installed on ${os.hostname()}.`) : err);
+      if (err) return reject(err.code === "ENOENT" ? new Error(`${command != null ? bin : "npm"} is not installed on ${os.hostname()}.`) : err);
       if (stopReason) {
         const e = new Error(`${stopReason}.`);
         if (signal?.aborted) e.aborted = true;
         return reject(e);
       }
       if (code === 0) {
-        log(`✓ npm run ${name} finished in ${(durationMs / 1000).toFixed(1)}s`);
-        return resolve({ script: name, code, durationMs });
+        log(`✓ ${label} finished in ${(durationMs / 1000).toFixed(1)}s`);
+        return resolve(result({ code, durationMs }));
       }
       const last = tail.filter((l) => l.trim()).slice(-12).join("\n");
-      const e = new Error(`npm run ${name} exited with code ${code}.${last ? `\n${last}` : ""}`);
+      const e = new Error(`${label} exited with code ${code}.${last ? `\n${last}` : ""}`);
       e.code = code;
       e.durationMs = durationMs;
       reject(e);

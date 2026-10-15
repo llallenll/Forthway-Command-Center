@@ -173,7 +173,7 @@ Task types handled by `shared/tasks.mjs` (payload → result):
 | `site.remove` | `{ spec, deleteFiles }` | |
 | `site.logs` | `{ spec, lines }` | `{ text }` (read-only app logs) |
 | `site.scripts` | `{ spec }` | `{ scripts: { name: command } \| null, packageName, version, hasNodeModules, appDir, hostname, error? }` (deployed package.json on that server) |
-| `site.script` | `{ spec, script }` | `{ script, code: 0, durationMs }`; `npm run <script>` in appDir, only if the deployed package.json defines it; non-zero exit = failure with the output tail |
+| `site.script` | `{ spec, script }` or `{ spec, command }` | `{ script \| command, code: 0, durationMs }`; `npm run <script>` in appDir, only if the deployed package.json defines it, or (tasks 3.5.0) `bash -c <command>` in appDir; non-zero exit = failure with the output tail |
 | `server.metrics` | `{}` | `{ cpu, mem, memTotal, disk, diskTotal, load, uptime, hostname, os }` |
 | `server.backup` | `{ include, upload: { url, token } }` | `{ file, size, sha256 }` (worker uploads archive to panel) |
 | `sites.usage` | `{ specs: [{ siteId, type, appDir, port, pm2Name, restart: { mode, service } }] }` | `{ at, cores, memTotal, simulated?, sites: { [siteId]: { cpu, mem, procs, source, disk, diskAt } } }` |
@@ -308,7 +308,7 @@ POST   /api/sites/:id/restart|stop|start|rollback          → job
 GET    /api/sites/:id/status                     { [serverId]: { running, healthy, version, checkedAt } }  (refreshes)
 GET    /api/sites/:id/logs?serverId&lines        { text }
 GET    /api/sites/:id/scripts?serverId           { scripts: [{ name, command, kind, risky, runnable }], source: "deployed"|"release"|null, serverId, servers, note }
-POST   /api/sites/:id/scripts/run { script, serverId? | allServers? }  → job (type site.script, locked per site)
+POST   /api/sites/:id/scripts/run { script | command, serverId? | allServers? }  → job (type site.script, locked per site)
 GET    /api/sites/:id/env         PUT /api/sites/:id/env { env }   (linked DB vars shown read-only)
 GET    /api/sites/:id/releases
 POST   /api/sites/:id/releases/upload?filename=  raw zip body (≤ 500 MB) → release
@@ -845,6 +845,13 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     command text, Run buttons, server picker + "run on every server" checkbox for LB sites, confirm (danger for risky),
     output in the standard job log modal, "Recent script runs" (`/api/jobs?siteId&type=site.script`). components.js:
     `site.script` job icon + activity verb. (views/sites.js has no row menu, so nothing was added there.)
+  - **Custom commands (3.11.0).** The Scripts tab's "Run a command" box sends `{ command, serverId? | allServers? }` to the
+    same route (one line, ≤ 2000 chars, no NUL/CR/LF; 400 otherwise). Same job type, lock, env, `.env` refresh, timeout
+    and server choice as scripts; the task runs `bash -c` (or `sh -c`) in appDir with `node_modules/.bin` prepended to
+    PATH. Job title is the command (cut at 60 chars) + " on <server>"; audit `site.script { command, servers }`. No
+    confirm dialog (the admin typed it). The last 6 commands are kept per site in the browser (`localStorage`
+    `fcc.cmds.<siteId>`) as click-to-fill chips. Agents need tasks 3.5.0 (they self-update from the panel); an older
+    agent fails the job with "not a valid script name".
 - **MONITOR — uptime monitoring + SMS alerts via Twilio (`panel/lib/monitor.mjs`, module `monitor`, new).**
   - **Checks** from the main server (default every 60 s, timeout 10 s; `node:http(s)`, no redirects followed, response time = time to
     headers). Target: per-site custom `url` → first domain (`https` when `ssl.status === "active"` or the domain is a Cloudflare tunnel

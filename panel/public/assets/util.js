@@ -22,6 +22,7 @@ export function html(strings, ...vals) {
   return new Safe(out);
 }
 export function mount(el, safe) {
+  if (safe == null || safe === "" || safe === false) safe = new Safe(""); // `cond ? html`…` : ""` clears the element
   if (!(safe instanceof Safe)) throw new Error("mount() needs html``");
   el.innerHTML = safe.s;
   return el;

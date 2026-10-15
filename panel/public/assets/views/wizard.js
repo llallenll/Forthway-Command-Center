@@ -219,7 +219,7 @@ export default async function wizard(ctx) {
       mount(body, html`<h2>Database & environment</h2><p class="lead">Linked databases inject <span class="mono">DB_HOST</span>, <span class="mono">DB_NAME</span>, <span class="mono">DB_USER</span>, <span class="mono">DB_PASSWORD</span> and <span class="mono">DATABASE_URL</span> automatically.</p>
         <div class="label" style="margin-bottom:10px">Link databases</div>
         ${pdbs.length ? html`<div class="choice-grid">${pdbs.map((d) => html`<label class="choice checkbox ${W.linked.includes(d.id) ? "selected" : ""}"><input type="checkbox" data-link value="${d.id}" ${W.linked.includes(d.id) ? raw("checked") : ""}/><span class="c-mark"></span>
-          <span class="c-title"><span class="c-ico">${icon("database")}</span><span class="mono" style="font-size:13px">${d.name}</span></span><span class="c-desc">${fmtBytes(d.sizeBytes)} · user ${d.user}</span></label>`)}</div>`
+          <span class="c-title"><span class="c-ico">${icon("database")}</span><span class="mono clip" style="font-size:13px" title="${d.name}">${d.name}</span></span><span class="c-desc">${fmtBytes(d.sizeBytes)} · user ${d.user}</span></label>`)}</div>`
         : html`<div class="note">${icon("info")}<div>This project has no databases yet. You can create one later and link it from the website's Environment tab.</div></div>`}
         <div class="divider"></div>
         <div class="label" style="margin-bottom:10px">Environment variables</div>

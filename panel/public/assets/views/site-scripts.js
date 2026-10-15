@@ -1,7 +1,7 @@
 /**
  * Website → Scripts tab: the app's own package.json scripts as named actions
- * (`npm run <name>`), never a free-form command. Lives in its own file so
- * site.js only needs a tab entry and one call.
+ * (`npm run <name>`), plus a box to run your own command in the app folder.
+ * Lives in its own file so site.js only needs a tab entry and one call.
  */
 import { html, raw, mount, $, on, plural, emptyState, errorState, skeletonRows, toastError, confirmDialog } from "../util.js";
 import { icon } from "../icons.js";
@@ -9,6 +9,17 @@ import { get, post } from "../api.js";
 import { jobItem, bindJobClicks, openJobLog } from "../components.js";
 
 const SEL = "height:32px;width:auto;font-size:12.5px";
+const MAX_COMMAND = 2000;
+const RECENT_MAX = 6;
+
+// Recent commands are a per-browser convenience; storage can be missing or blocked.
+const recentKey = (id) => `fcc.cmds.${id}`;
+function readRecent(id) {
+  try { const v = JSON.parse(localStorage.getItem(recentKey(id)) || "[]"); return Array.isArray(v) ? v.filter((x) => typeof x === "string").slice(0, RECENT_MAX) : []; } catch { return []; }
+}
+function saveRecent(id, list) {
+  try { localStorage.setItem(recentKey(id), JSON.stringify(list.slice(0, RECENT_MAX))); } catch { /* storage unavailable */ }
+}
 
 export async function scriptsTab(ctx, box, S) {
   const base = `#/sites/${S.id}`;
@@ -22,9 +33,19 @@ export async function scriptsTab(ctx, box, S) {
         <div data-notes></div>
         <div class="list" data-list>${skeletonRows(3, 56)}</div>
         <div class="card-foot" data-foot hidden></div></div>
+      <div class="card"><div class="card-head" style="flex-wrap:wrap"><h3>Run a command</h3><span class="sub" data-cmdwhere></span></div>
+        <form class="card-body stack" style="gap:10px" data-cmdform autocomplete="off">
+          <div class="input-group"><div class="input-affix" style="flex:1;min-width:0"><span class="ico mono" aria-hidden="true">$</span><input class="input mono" style="width:100%" name="command" maxlength="${MAX_COMMAND}" placeholder="npx prisma migrate deploy" spellcheck="false" aria-label="Command"/></div><button class="btn" type="submit" data-cmdrun>${icon("play")}Run</button></div>
+          <div class="muted small">Runs in the app folder with this website's environment${S.linkedDatabaseIds?.length ? " and linked database" : ""}. <span class="mono">node_modules/.bin</span> is on the PATH. Stopped after 15 minutes.</div>
+          <div class="chips" data-recent></div>
+        </form></div>
       <div class="card"><div class="card-head"><h3>Recent script runs</h3><span class="sub">Click a run to see its output</span></div><div class="list" data-jobs></div></div>
     </div>`);
   const list = $("[data-list]", box), notes = $("[data-notes]", box), foot = $("[data-foot]", box);
+  const cmdForm = $("[data-cmdform]", box), cmdInput = cmdForm.elements.command;
+  let recent = readRecent(S.id);
+  const paintRecent = () => mount($("[data-recent]", box), recent.length ? html`<span class="muted small">Recent:</span>${recent.map((c) => html`<button type="button" class="badge mono" data-recentcmd="${c}" title="${c}" style="cursor:pointer;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c}</button>`)}` : "");
+  paintRecent();
 
   const serverName = (id) => data?.servers?.find((s) => s.id === id)?.name || id;
   const where = () => (lb && allServers ? `all ${data.servers.length} servers, one at a time` : serverName(serverId || data?.serverId));
@@ -33,6 +54,8 @@ export async function scriptsTab(ctx, box, S) {
     if (!data) return;
     const sel = serverId || data.serverId;
     mount($("[data-srvwrap]", box), data.servers.length > 1 ? html`<select class="select" data-srv style="${SEL}" aria-label="Server">${data.servers.map((s) => html`<option value="${s.id}" ${s.id === sel ? raw("selected") : ""}>${s.name}${s.online ? "" : " (offline)"}</option>`)}</select>` : "");
+    mount($("[data-cmdwhere]", box), data.deployed ? html`on ${where()}` : "deploy this website first");
+    $("[data-cmdrun]", box).disabled = !data.deployed;
     mount($("[data-src]", box), data.source === "deployed" ? html`read from ${serverName(data.serverId)}${data.version ? html` · <span class="mono">v${data.version}</span>` : ""}` : data.source === "release" ? html`from the current release${data.version ? html` · <span class="mono">v${data.version}</span>` : ""}` : "");
 
     const n = [];
@@ -76,7 +99,7 @@ export async function scriptsTab(ctx, box, S) {
   };
 
   on(box, "change", "[data-srv]", (e) => { serverId = e.target.value; load(); });
-  on(box, "change", "[data-all]", (e) => (allServers = e.target.checked));
+  on(box, "change", "[data-all]", (e) => { allServers = e.target.checked; paint(); });
   on(box, "click", "[data-reload]", load);
   on(box, "click", "[data-toggle]", () => { showAll = !showAll; paint(); });
   on(box, "click", "[data-run]", async (e, b) => {
@@ -93,6 +116,23 @@ export async function scriptsTab(ctx, box, S) {
       const job = await post(`/api/sites/${S.id}/scripts/run`, lb && allServers ? { script: s.name, allServers: true } : { script: s.name, serverId: sid });
       if (job?.id) openJobLog(job.id);
     } catch (ex) { toastError(ex, `Couldn't run ${s.name}`); } finally { b.classList.remove("loading"); }
+  });
+
+  on(box, "click", "[data-recentcmd]", (e, b) => { cmdInput.value = b.dataset.recentcmd; cmdInput.focus(); });
+  cmdForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const command = cmdInput.value.trim();
+    if (!command || !data?.deployed) return cmdInput.focus();
+    const b = $("[data-cmdrun]", box);
+    b.classList.add("loading");
+    try {
+      const job = await post(`/api/sites/${S.id}/scripts/run`, lb && allServers ? { command, allServers: true } : { command, serverId: serverId || data.serverId });
+      recent = [command, ...recent.filter((c) => c !== command)];
+      saveRecent(S.id, recent);
+      paintRecent();
+      cmdInput.value = "";
+      if (job?.id) openJobLog(job.id);
+    } catch (ex) { toastError(ex, "Couldn't run that command"); } finally { b.classList.remove("loading"); }
   });
 
   // recent runs
