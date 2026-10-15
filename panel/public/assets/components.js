@@ -1,6 +1,6 @@
 // Shared UI pieces used by several views.
 import { html, raw, $, $$, on, frag, mount, ago, fmtDate, fmtBytes, fmtUsage, fmtDuration, pct, toneFor, initials, plural,
-  toast, toastError, openModal, confirmDialog, openMenu, secretBox, emptyState, colorOf } from "./util.js";
+  toast, toastError, openModal, confirmDialog, openMenu, secretBox, emptyState, colorOf, copyText } from "./util.js";
 import { icon } from "./icons.js";
 import { api, get, post, patch, del, upload, uploadChunked, getText, download } from "./api.js";
 import { onEvent } from "./events.js";
@@ -269,6 +269,18 @@ export function serverPicker(container, { servers, mode = "single", selected = [
 
 /* ───────── env editor ───────── */
 
+/** Rows as .env text; values that need it are double-quoted with \\ \" \n escapes. */
+function envText(rows) {
+  const q = (v) => (/^[^\s#"'\\]*$/.test(v) ? v : `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, "\\n")}"`);
+  return rows.filter((r) => r.k).map((r) => `${r.k}=${q(r.v)}`).join("\n");
+}
+/** A value from a .env line: "…" unescapes \\ \" \n; '…' is taken as is. */
+function envUnquote(v) {
+  if (v.length >= 2 && v[0] === '"' && v.endsWith('"')) return v.slice(1, -1).replace(/\\(.)/g, (_, c) => (c === "n" ? "\n" : c));
+  if (v.length >= 2 && v[0] === "'" && v.endsWith("'")) return v.slice(1, -1);
+  return v;
+}
+
 export function envEditor(container, env = {}, { onDirty } = {}) {
   let rows = Object.entries(env || {}).map(([k, v]) => ({ k, v: String(v ?? "") }));
   let reveal = false;
@@ -298,19 +310,21 @@ export function envEditor(container, env = {}, { onDirty } = {}) {
     else if (e.target.closest("[data-rm]")) { rows.splice(+e.target.closest(".env-row").dataset.i, 1); render(); onDirty?.(); }
     else if (e.target.closest("[data-reveal]")) { reveal = !reveal; render(); }
     else if (e.target.closest("[data-paste]")) {
-      const mm = openModal({ title: "Paste .env", sub: "KEY=value lines. Existing keys are overwritten.", ico: "fileText", size: "lg",
-        body: html`<textarea class="textarea mono" style="min-height:220px" placeholder="NODE_ENV=production&#10;API_URL=https://…"></textarea>`,
-        foot: html`<button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok>Import</button>`,
+      const mm = openModal({ title: "Paste .env", sub: "KEY=value lines. Importing replaces every variable with what's in the box.", ico: "fileText", size: "lg",
+        body: html`<textarea class="textarea mono" style="min-height:260px" spellcheck="false" placeholder="NODE_ENV=production&#10;API_URL=https://…">${envText(rows)}</textarea>`,
+        foot: html`<button class="btn btn-ghost" data-copyenv type="button">${icon("copy")}Copy all</button><span class="spacer"></span><button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok>Import</button>`,
         onMount(el, close) {
+          $("[data-copyenv]", el).onclick = () => copyText($("textarea", el).value);
           $("[data-ok]", el).onclick = () => {
-            const txt = $("textarea", el).value;
-            for (const line of txt.split(/\r?\n/)) {
-              const mt = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+            const next = [];
+            for (const line of $("textarea", el).value.split(/\r?\n/)) {
+              const mt = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
               if (!mt) continue;
-              let v = mt[2]; if (/^(['"]).*\1$/.test(v)) v = v.slice(1, -1);
-              const ex = rows.find((r) => r.k === mt[1]);
-              ex ? (ex.v = v) : rows.push({ k: mt[1], v });
+              const v = envUnquote(mt[2]);
+              const ex = next.find((r) => r.k === mt[1]);
+              ex ? (ex.v = v) : next.push({ k: mt[1], v });
             }
+            rows = next;
             close(true); render(); onDirty?.();
           };
         } });
