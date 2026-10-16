@@ -453,7 +453,9 @@ R("GET", "/api/sites/:id", (p) => {
 R("PATCH", "/api/sites/:id", (p, b) => {
   const s = find("sites", p.id);
   if (b.loadBalanced && (b.serverIds || s.serverIds).length < 2) err(400, "Load balancing needs at least 2 servers.");
+  const prevGithub = s.github || {};
   Object.assign(s, pick(b, ["name", "type", "domains", "loadBalanced", "serverIds", "lbMethod", "healthPath", "port", "github", "linkedDatabaseIds"]));
+  if (b.github) s.github = { ...prevGithub, ...b.github }; // merged like the real server's sanitizeGithub
   if (b.settings) s.settings = { ...s.settings, ...b.settings, build: { ...(s.settings.build || {}), ...(b.settings.build || {}) }, restart: { ...(s.settings.restart || {}), ...(b.settings.restart || {}) } };
   for (const sid of targets(s)) if (!s.state[sid]) { const srv = db.servers.find((x) => x.id === sid); s.state[sid] = { running: !!srv?.online, healthy: !!srv?.online, version: db.releases.find((r) => r.id === s.currentReleaseId)?.version, checkedAt: iso(Date.now()) }; }
   activity("site.update", "site", s); emit("site", siteView(s));

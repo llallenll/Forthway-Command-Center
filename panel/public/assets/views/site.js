@@ -230,7 +230,7 @@ export default async function site(ctx) {
           <div data-up hidden><div class="row small" style="justify-content:space-between;margin-bottom:8px"><span class="strong ellipsis" data-upname></span><span class="muted num" data-uppct>0%</span></div><div class="progress"><div style="width:0%"></div></div></div></div></div>
         <div class="card"><div class="card-head"><h3>Pull from GitHub</h3>${S.github?.repo ? html`<span class="sub mono">${S.github.repo}</span>` : ""}</div><div class="card-body">
           ${S.github?.repo ? html`<div class="form-stack"><div class="field"><label>Branch, tag or commit</label><div class="input-group"><input class="input mono" data-ref value="${S.github.branch || "main"}" list="refs_dl" spellcheck="false"/><button class="btn btn-primary" data-pull>${icon("github")}Pull</button></div><datalist id="refs_dl"></datalist>
-            <div class="hint">Downloads the archive and creates a release.</div></div>
+            <div class="row" style="gap:8px;flex-wrap:wrap;justify-content:space-between;margin-top:6px"><span class="hint" style="margin:0">Downloads the archive and creates a release.</span><button class="btn btn-sm btn-ghost" type="button" data-saveref hidden>${icon("check")}Save as default branch</button></div></div>
             <label class="check"><input type="checkbox" data-pulldeploy/>Deploy it right away</label></div>`
           : emptyState({ ico: "github", title: "No repository set", text: "Connect a GitHub repository in Settings to pull releases.", sm: true, action: html`<a class="btn btn-sm" href="${base}/settings">${icon("settings")}Open settings</a>` })}
         </div></div>
@@ -257,6 +257,22 @@ export default async function site(ctx) {
         const dl = $("#refs_dl", box); if (!dl) return;
         mount(dl, html`${[...(r.branches || []), ...(r.tags || [])].map(refName).map((b) => html`<option value="${b}"></option>`)}`);
       }).catch(() => {});
+      // The default branch is what this box starts with and what "update available" tracks (Settings → GitHub).
+      const savedRef = () => S.github?.branch || "main";
+      const syncSaveRef = () => { const v = $("[data-ref]", box).value.trim(); $("[data-saveref]", box).hidden = !v || v === savedRef(); };
+      on(box, "input", "[data-ref]", syncSaveRef);
+      on(box, "change", "[data-ref]", syncSaveRef);
+      on(box, "click", "[data-saveref]", async (e, b) => {
+        const branch = $("[data-ref]", box).value.trim();
+        if (!branch) return;
+        b.classList.add("loading");
+        try {
+          await patch(`/api/sites/${S.id}`, { github: { branch } });
+          await loadSite();
+          syncSaveRef();
+          toast("Default branch saved", "ok", { msg: `${S.name} now pulls and tracks ${S.github?.branch || branch}.` });
+        } catch (ex) { toastError(ex, "Couldn't save the branch"); } finally { b.classList.remove("loading"); }
+      });
       on(box, "click", "[data-pull]", async (e, b) => {
         b.classList.add("loading");
         try { const dep = $("[data-pulldeploy]", box).checked;
