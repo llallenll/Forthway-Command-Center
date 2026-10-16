@@ -15,6 +15,7 @@ const NAV = [
   { id: "databases", label: "Databases", icon: "database", href: "#/databases" },
   { id: "backups", label: "Backups", icon: "archive", href: "#/backups" },
   { id: "servers", label: "Servers", icon: "server", href: "#/servers" },
+  { id: "ci", label: "CI", icon: "shield", href: "#/ci" },
 ];
 const NAV_BOTTOM = [
   { id: "activity", label: "Activity", icon: "activity", href: "#/activity" },
@@ -34,6 +35,8 @@ const ROUTES = [
   ["/backups", "backups", "backups"],
   ["/backups/:tab", "backups", "backups"],
   ["/servers", "servers", "servers"],
+  ["/ci", "ci", "ci"],
+  ["/ci/:id", "ci-run", "ci"],
   ["/activity", "activity", "activity"],
   ["/settings", "settings", "settings"],
   ["/settings/:tab", "settings", "settings"],

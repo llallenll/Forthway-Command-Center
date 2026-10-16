@@ -7,6 +7,8 @@ import { siteUrl } from "./sites.js";
 import { scriptsTab } from "./site-scripts.js";
 import { uptimeTab } from "./monitor.js"; // Uptime tab (monitoring + SMS alerts)
 import { trafficTab } from "./site-traffic.js"; // Traffic tab (visitors, page views — panel/lib/analytics.mjs)
+import { ciTab } from "./site-ci.js"; // CI tab (panel/lib/ci.mjs)
+import { ciChip, deployThroughCi, ciStarted } from "../ci-ui.js";
 import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts, savedDelivery } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
@@ -15,6 +17,7 @@ const TABS = [
   { id: "traffic", label: "Traffic", icon: "users" },
   { id: "uptime", label: "Uptime", icon: "activity" },
   { id: "deployments", label: "Deployments", icon: "rocket" },
+  { id: "ci", label: "CI", icon: "shield" },
   { id: "environment", label: "Environment", icon: "key" },
   { id: "scripts", label: "Scripts", icon: "zap" },
   { id: "domains", label: "Domains & SSL", icon: "lock" },
@@ -54,10 +57,17 @@ export default async function site(ctx) {
     const u = S.update;
     return u ? [u.version && u.version !== u.currentVersion ? `v${u.version}` : u.shortSha, u.message].filter(Boolean).join(" — ") : "";
   };
+  /** CI chip in the header: the newest run (an update being checked, or the verdict on it). */
+  const headCi = () => {
+    const c = S.ci;
+    const l = c?.latest;
+    if (!c || c.mode === "off" || !l) return "";
+    return ciChip({ status: l.status, counts: l.counts, overrides: l.overrides }, { href: `#/ci/${l.id}` });
+  };
   const paintHead = () => mount(head, html`<div class="site-head">
       ${typeIco(S.type)}
       <div style="min-width:0;flex:1">
-        <h1>${S.name} ${lbBadge(S, serversById())} ${updateBadge(S)}</h1>
+        <h1>${S.name} ${lbBadge(S, serversById())} ${updateBadge(S)} ${headCi()}</h1>
         <div class="sh-meta">${healthChip(S)}<span class="dim">·</span>
           ${project ? html`<a href="#/projects/${project.id}" class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(project.color)}"></span>${project.name}</a><span class="dim">·</span>` : ""}
           ${(S.domains || []).slice(0, 2).map((d, i) => html`${i ? html`<span class="dim">·</span>` : ""}<a href="${siteUrl(S, d) || "#"}" target="_blank" rel="noopener noreferrer" class="row" style="gap:5px">${d}${icon("external", "xs")}</a>`)}
@@ -90,8 +100,13 @@ export default async function site(ctx) {
       return;
     }
     try {
-      const job = await post(`/api/sites/${S.id}/${act}`, act === "deploy" ? { releaseId: opts.releaseId } : opts.serverId ? { serverId: opts.serverId } : {});
-      jobStarted(job, `${verbs[act]} started${one ? ` on ${one}` : ""}${S.loadBalanced && act === "deploy" ? " — rolling, one server at a time" : ""}`);
+      if (act === "deploy") {
+        const releaseId = opts.releaseId || (S.releases || [])[0]?.id;
+        await deployThroughCi(S, releaseId, (extra) => post(`/api/sites/${S.id}/deploy`, { releaseId: opts.releaseId, ...extra }), `Deploy started${S.loadBalanced ? " — rolling, one server at a time" : ""}`);
+        return;
+      }
+      const job = await post(`/api/sites/${S.id}/${act}`, opts.serverId ? { serverId: opts.serverId } : {});
+      jobStarted(job, `${verbs[act]} started${one ? ` on ${one}` : ""}`);
     } catch (e) { toastError(e, `Couldn't ${verbs[act].toLowerCase()}`); }
   };
   on(head, "click", "[data-act]", (e, b) => runAction(b.dataset.act));
@@ -105,7 +120,9 @@ export default async function site(ctx) {
     b?.classList.add("loading");
     try {
       const job = await post(`/api/sites/${S.id}/releases/github`, { deploy: true });
-      jobStarted(job, `Pulling ${S.github.branch || "the default branch"} & deploying${S.loadBalanced ? " — rolling, one server at a time" : ""}`);
+      jobStarted(job, S.ci?.mode === "required"
+        ? `Pulling ${S.github.branch || "the default branch"} — CI checks it, then it deploys if it passes`
+        : `Pulling ${S.github.branch || "the default branch"} & deploying${S.loadBalanced ? " — rolling, one server at a time" : ""}`);
     } catch (e) { toastError(e, "Couldn't pull & deploy"); }
     finally { b?.classList.remove("loading"); }
   };
@@ -143,6 +160,7 @@ export default async function site(ctx) {
   const refresh = debounce(async () => {
     try { await loadSite(); if (!ctx.alive()) return; paintHead(); if (tab === "overview") paintOverview(); if (tab === "deployments") paintReleases?.(); } catch {}
   }, 300);
+  ctx.on("ci", (d) => { if (d?.siteId === S.id) refresh(); });
   ctx.on("site", (d) => { if (d?.id === S.id) { if (d.deleted) { toast(`${S.name} was deleted`, "warn"); location.hash = "#/sites"; } else refresh(); } });
   ctx.on("server", debounce(async () => { servers = (await get("/api/servers").catch(() => ({ items: servers }))).items || servers; }, 2000));
 
@@ -286,13 +304,14 @@ export default async function site(ctx) {
       mount($("[data-rel]", box), rels.length ? html`<div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Release</th><th>Source</th><th class="hide-sm">Size</th><th class="hide-sm">Created</th><th></th></tr></thead><tbody>
         ${rels.map((r) => {
           const live = r.id === S.currentReleaseId, prev = r.id === S.previousReleaseId;
-          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}</div>
+          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}${S.ci?.mode !== "off" ? ciChip(r.ci || { status: "none" }, { href: r.ci?.runId ? `#/ci/${r.ci.runId}` : undefined }) : ""}</div>
             <div class="t-sub mono ellipsis" style="max-width:300px">${r.filename}</div></td>
             <td>${r.source === "github" ? html`<span class="row small" style="gap:7px">${icon("github", "sm")}<span class="mono">${r.commit || "—"}</span></span>` : html`<span class="row small" style="gap:7px">${icon("upload", "sm")}Upload</span>`}</td>
             <td class="hide-sm num">${fmtBytes(r.size)}</td>
             <td class="hide-sm"><div class="small">${fmtDate(r.createdAt)}</div><div class="t-sub">${ago(r.createdAt)}</div></td>
             <td class="actions"><div class="btn-row">
               ${r.available === false ? "" : live ? html`<button class="btn btn-sm" data-rdeploy="${r.id}">${icon("restart")}Redeploy</button>` : html`<button class="btn btn-sm btn-primary" data-rdeploy="${r.id}">${icon("rocket")}Deploy</button>`}
+              ${r.available === false || S.ci?.mode === "off" ? "" : html`<button class="icon-btn sm" data-rci="${r.id}" title="Run CI on this release">${icon("shield")}</button>`}
               <button class="icon-btn sm" data-rpin="${r.id}" title="${r.pinned ? "Unpin" : "Pin"}" style="${r.pinned ? "color:var(--violet)" : ""}">${icon("pin")}</button>
               <button class="icon-btn sm" data-rdel="${r.id}" title="Delete" ${live ? raw("disabled style='opacity:.35;pointer-events:none'") : ""}>${icon("trash")}</button></div></td></tr>`;
         })}</tbody></table></div></div>`
@@ -300,6 +319,10 @@ export default async function site(ctx) {
     };
     paintReleases();
     on(box, "click", "[data-rdeploy]", (e, b) => runAction("deploy", { releaseId: b.dataset.rdeploy }));
+    on(box, "click", "[data-rci]", async (e, b) => {
+      b.classList.add("loading");
+      try { ciStarted(await post("/api/ci/runs", { siteId: S.id, releaseId: b.dataset.rci })); } catch (ex) { toastError(ex, "Couldn't start CI"); } finally { b.classList.remove("loading"); }
+    });
     on(box, "click", "[data-rpin]", async (e, b) => {
       const r = S.releases.find((x) => x.id === b.dataset.rpin);
       try { await patch(`/api/releases/${r.id}`, { pinned: !r.pinned }); r.pinned = !r.pinned; paintReleases(); toast(r.pinned ? "Release pinned" : "Release unpinned", "ok"); } catch (ex) { toastError(ex); }
@@ -580,6 +603,7 @@ export default async function site(ctx) {
 
   /* ── scripts (views/site-scripts.js) ── */
   if (tab === "scripts") await scriptsTab(ctx, box, S);
+  if (tab === "ci") await ciTab(ctx, box, S);
   if (tab === "uptime") await uptimeTab(box, ctx, S);
   if (tab === "traffic") await trafficTab(ctx, box, S);
 

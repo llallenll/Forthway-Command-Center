@@ -256,6 +256,89 @@ variables appear alongside them, read-only (see below).
 
 ---
 
+## Continuous Integration (CI)
+
+Every update — a new release, pulled from GitHub or uploaded — can be tested
+before it reaches production. Open **CI** in the sidebar for the live view, or a
+website's **CI** tab for its settings.
+
+```
+ update ──▶ PANEL: plan ─────────▶ AGENT SERVERS: checkouts (in parallel) ─────▶ REPORT
+            diff vs live release     Build & smoke test   on agent-east              low · medium
+            import graph             Types & lint         on agent-west              high · extreme
+            routes · tests · suites  Tests 1/2, 2/2       on agent-east, agent-west  → deploy, or blocked
+            static scan              … files deleted when each checkout finishes
+```
+
+**What gets tested.** CI compares the new release with the one that is live,
+file by file, then follows imports backwards from every changed file (relative
+imports, `@/…` and other tsconfig `paths`, CSS `@import`). Change
+`components/Nav.tsx` and every page that renders the nav is in scope; change a
+`layout.tsx` and every page under it is. From that it picks:
+
+- the **routes** to smoke test — Next.js App Router and Pages Router pages and
+  API routes; dynamic routes (`/blog/[slug]`) need a *sample path*;
+- the **tests** that import what changed (vitest, jest or `node --test`; with
+  only an `npm test` script, the whole suite runs);
+- the files to **lint**, and whether to **type check**;
+- your **critical suites**: what must never break — payments, sign-in,
+  checkout. A suite runs on every update or only when an update touches its
+  paths, runs a command and/or HTTP checks against the freshly built app, and
+  carries a severity (default *extreme*). Define them on the website's CI tab
+  or in an `fcc-ci.json` at the root of the repository.
+
+A change to `package.json`, the lockfile, `tsconfig`, `next.config` or
+`middleware` means a full check. So does a website's first deploy.
+
+**Checkouts.** The work is split into checkouts — *Build & smoke test*,
+*Types & lint*, *Tests 1/n* — and the panel hands each to the least loaded CI
+server with a free slot (two per server by default). On that server a checkout
+downloads the release like a deploy does, unpacks it into a folder of its own
+(never a live website's folder), installs, builds, starts the app on a
+throwaway port to probe the affected routes, runs its tests, and then **deletes
+the folder**. The CI page shows each server as a lane with what it is running,
+step by step; a run's report shows which server ran what and that its files
+were deleted. Agent servers do this work; the main server joins only when no
+agent server is online (Settings on the CI page: *every agent server* or a
+chosen list, main *fallback / always / never*, checkouts per server).
+
+**Without any test setup.** A codebase with no tests still gets the impact
+analysis, install & build, a smoke test of every affected route, your critical
+suites, and a static scan of the changed lines: typos in UI text and docs
+(low), `console.log` (low), `debugger` (medium), merge-conflict markers (high),
+committed secrets such as a live Stripe or AWS key (extreme). The CI tab's
+**Readiness** card shows what the codebase brings and what to add, and offers
+a starter `fcc-ci.json`.
+
+**Severity and the gate.** Findings are ranked **low · medium · high ·
+extreme**. Each website has a CI mode:
+
+| Mode | What happens |
+|---|---|
+| **Required** (default) | A release deploys only when CI passed it — nothing at the website's threshold (default *high*) or worse. **Update** pulls the branch, runs CI and deploys by itself if it passes. |
+| **Advisory** | CI runs and reports, never stops a deploy. |
+| **Off** | No CI. |
+
+You stay in charge: **Bypass CI** deploys a release without testing it, and
+**Override** deploys one that CI blocked — after typing the website's name when
+the report has extreme findings. Both are recorded in Activity, on the run and
+in the deploy's log. Rollbacks are never gated.
+
+**Environment.** Checkouts get the website's environment variables (switch it
+off on the CI tab) plus **CI variables**, which override them inside checkouts
+only — put test payment keys and a test database there. `CI=1` and `FCC_CI=1`
+are always set.
+
+**Keeping it fresh.** *Start CI on every new release* is on by default; *test
+new commits as soon as they land* pulls each new commit on the tracked branch
+and runs CI on it without deploying.
+
+> Checkouts run the repository's own install and build scripts, as root, on
+> your CI servers — the same trust a deploy already gives that code. Run CI on
+> agent servers you would deploy that website to.
+
+---
+
 ## Databases
 
 Each project can have any number of MySQL databases. Creating one creates the
@@ -518,6 +601,11 @@ mysql, certbot, pm2, tar) is logged instead of run, so the whole UI can be
 clicked through safely. Modules report missing programs as "not installed"
 rather than failing. `.devdata/` is git-ignored; delete it to start over.
 
+CI checkouts are simulated in dry-run mode (each step is logged, then passes).
+Add `FCC_CI_REAL=1` to run them for real — install, build, smoke test, tests —
+against an actual repository on your machine. The CI planner has unit tests:
+`node --test scripts/`.
+
 ---
 
 ## Layout
@@ -526,7 +614,7 @@ rather than failing. `.devdata/` is git-ignored; delete it to start over.
 install.sh                  installer for the main server (also: --uninstall)
 panel/                      the panel — runs on the MAIN server only
   server.mjs                boot, HTTP, static files, live events
-  lib/                      auth, store, jobs, sites, cluster, load balancer,
+  lib/                      auth, store, jobs, sites, ci, cluster, load balancer,
                             mysql, backups, github, s3 — one module each
   public/                   the dashboard (vanilla JS, no build step)
   templates/node-install.sh the agent server installer, filled in per server
@@ -535,9 +623,11 @@ node/
 shared/
   deployer.mjs              the deploy engine
   tasks.mjs                 site/server tasks — run by agents, and in-process on main
+  ci-impact.mjs ci.mjs      CI: impact analysis + planning (panel), checkouts (servers)
   env.mjs fsx.mjs zip.mjs zipwrite.mjs
 scripts/
   make-release.mjs          package a folder into a release zip
+  ci-impact.test.mjs        unit tests for CI planning (node --test scripts/)
 patches/                    health and version routes to add to Next.js sites
 docs/STANDALONE.md          architecture and module contract
 ```

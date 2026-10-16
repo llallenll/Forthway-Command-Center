@@ -12,6 +12,11 @@
  * token that comes with each deploy task). The main server gets the local
  * file path as well, so it never has to download from itself.
  *
+ * CI (panel/lib/ci.mjs): every deploy goes through ctx.ci.authorizeDeploy — a
+ * website in "required" mode deploys a release only after a CI run passed it,
+ * or when an admin bypasses / overrides CI (recorded in Activity). A pull with
+ * "deploy" on such a website starts a CI run that deploys when it passes.
+ *
  * Logs are read-only. Things run in a site's folder only through the Scripts
  * tab (POST /api/sites/:id/scripts/run → task site.script): `npm run <script>`
  * for a script the deployed package.json defines, or an admin's own command.
@@ -454,6 +459,7 @@ export function register(router, ctx) {
       })(),
       state: Object.fromEntries(t.map((id) => [id, { ...(site.state?.[id] || {}), serverName: serverName(id), online: isOnline(id) }])),
       update: updateFor(site),
+      ci: ciSafe(() => ctx.ci?.siteSummary?.(site)),
       busyJobId: busyJob(site.id),
       deleting: !!site.deleting,
       createdAt: site.createdAt,
@@ -501,9 +507,19 @@ export function register(router, ctx) {
       isCurrent: site?.currentReleaseId === r.id,
       isPrevious: site?.previousReleaseId === r.id,
       deployedOn,
+      ci: ciSafe(() => ctx.ci?.releaseSummary?.(r.id)),
       available: fs.existsSync(releaseFile(r.id)),
       createdAt: r.createdAt,
     };
+  }
+
+  /** CI summaries are decoration on a site/release view: never let them break one. */
+  function ciSafe(fn) {
+    try {
+      return fn() ?? null;
+    } catch {
+      return null;
+    }
   }
 
   function emit(siteOrId) {
@@ -1393,7 +1409,20 @@ export function register(router, ctx) {
     }
     const now = heads.get(siteId);
     if (!prev || prev.sha !== now.sha || prev.error !== now.error) emit(siteId);
+    if (now.sha && prev?.sha !== now.sha) ciPrecheck(siteId);
     return now;
+  }
+
+  /** CI setting "Test new commits as they land": pull a new branch head and run CI on it (never deploys). */
+  function ciPrecheck(siteId) {
+    const site = getSite(siteId);
+    const u = site && updateFor(site);
+    if (!u || u.kind !== "github" || !site.ci?.autoPull || !ctx.ci?.wantsAutoRun?.(site) || busyJob(siteId)) return;
+    try {
+      startGithubJob(site, null, { repo: normalizeRepo(site.github.repo), ref: u.ref || "", deploy: false, base: panelBase(), trigger: "ci" });
+    } catch {
+      /* the next check tries again */
+    }
   }
 
   /** A pull of the tracked branch saw its head: remember it, so the update badge clears without waiting for a check. */
@@ -1560,6 +1589,123 @@ export function register(router, ctx) {
     });
   }
 
+  // ---------------------------------------------------------- deploys + CI
+
+  function ciLine(ci) {
+    if (!ci) return null;
+    const run = ci.gate?.run;
+    const what = run ? `run ${run.id}: ${run.status}${run.worst ? ` (worst: ${run.worst})` : ""}` : "no run";
+    return {
+      passed: `CI passed this release (${what}).`,
+      advisory: `CI is advisory for this website — ${what}. Deploying regardless.`,
+      off: null,
+      bypass: `CI BYPASSED for this deploy (${what}).`,
+      override: `CI OVERRIDDEN for this deploy — the report has ${Object.entries(ci.gate?.counts || {}).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(", ") || "blocking issues"} (${what}).`,
+    }[ci.mode];
+  }
+
+  /** The one way a release gets deployed: CI gate, then the deploy job. body.ci / body.confirm: see ctx.ci.authorizeDeploy. */
+  function startDeployJob(site, release, admin, base, body = {}) {
+    if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
+    assertIdle(site.id);
+    const ci = ctx.ci?.authorizeDeploy ? ctx.ci.authorizeDeploy(site, release, body || {}, admin) : null;
+    const note = ci?.mode === "bypass" ? " (CI bypassed)" : ci?.mode === "override" ? " (CI overridden)" : "";
+    const job = siteJob(site, admin, { type: "site.deploy", title: `Deploy ${site.name} ${release.version ? `v${release.version}` : release.id}${note}` }, ({ log, signal }) => {
+      const line = ciLine(ci);
+      if (line) log(line);
+      return deployRelease(site.id, release, { log, signal, base, afterDeploy: true });
+    });
+    audit(admin, "site.deploy", site, { releaseId: release.id, version: release.version, ...(ci && ci.mode !== "off" ? { ci: ci.mode, ciRunId: ci.runId || null } : {}) });
+    return job;
+  }
+
+  /** A new release exists: start CI on it by itself when the website wants that. Never throws. */
+  function autoCi(siteId, releaseId, admin, base, log = null) {
+    const site = getSite(siteId);
+    if (!site || !ctx.ci?.wantsAutoRun?.(site)) return null;
+    try {
+      const run = ctx.ci.startRun(siteId, releaseId, { trigger: "auto", admin, base });
+      log?.(`CI started on this release (run ${run.id}) — see the CI tab for the report.`);
+      return run;
+    } catch (err) {
+      log?.(`CI could not start: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Pull a branch/tag/commit from GitHub into a release, optionally deploying it.
+   * With CI required, "deploy" starts a CI run that deploys when it passes
+   * (ciChoice "bypass" deploys straight away, recorded as a bypass).
+   */
+  function startGithubJob(site, admin, { repo, ref = "", deploy = false, ciChoice = null, base, trigger = null }) {
+    const token = githubToken(site);
+    return siteJob(
+      site,
+      admin,
+      { type: "site.github", title: `Pull ${repo}${ref ? `@${ref}` : ""} for ${site.name}${deploy ? " and deploy" : ""}${trigger === "ci" ? " (CI pre-check)" : ""}` },
+      async ({ log, signal }) => {
+        let useRef = ref || getSite(site.id)?.github?.branch || "";
+        if (!useRef) {
+          const info = await repoInfo(repo, token, { signal });
+          useRef = info.defaultBranch;
+          log(`Using the default branch: ${useRef}`);
+        }
+        const commit = await resolveCommit(repo, useRef, token, { signal });
+        noteHead(site.id, repo, useRef, commit);
+        if (commit) log(`${repo}@${useRef} is at ${commit.shortSha}: ${commit.message}${commit.author ? ` — ${commit.author}` : ""}`);
+        const already = commit?.sha ? listReleases(site.id).find((r) => (r.github?.sha || r.commit) === commit.sha && fs.existsSync(releaseFile(r.id))) : null;
+        let rec;
+        if (already && trigger === "ci") {
+          rec = already;
+          log(`Release ${rec.id} already has this commit.`);
+        } else {
+          const part = path.join(releasesDir(), `.github-${crypto.randomBytes(6).toString("hex")}.part`);
+          log("Downloading the archive from GitHub…");
+          const { size, sha256 } = await downloadZipballToFile(repo, commit?.sha || useRef, token, part, {
+            signal,
+            maxBytes: MAX_RELEASE_BYTES,
+            onProgress: (n) => log(`  … ${humanBytes(n)}`),
+          });
+          log(`Downloaded ${humanBytes(size)}.`);
+          rec = finalizeRelease(site.id, part, {
+            filename: `${repo.split("/")[1]}-${commit?.shortSha || slugify(useRef) || "head"}.zip`,
+            source: "github",
+            size,
+            sha256,
+            commit: commit?.sha || null,
+            github: { repo, ref: useRef, sha: commit?.sha || null, message: commit?.message || "", author: commit?.author || null, htmlUrl: commit?.htmlUrl || `https://github.com/${repo}` },
+            adminId: admin?.id || null,
+          });
+          log(`Release ${rec.id} created (${rec.version ? `v${rec.version}` : "unversioned"}).`);
+          for (const w of rec.warnings) log(`note: ${w}`);
+        }
+        const now_ = getSite(site.id);
+        if (!deploy) {
+          const run = autoCi(site.id, rec.id, admin, base, log);
+          return { releaseId: rec.id, version: rec.version, ciRunId: run?.id || null };
+        }
+        if (ctx.ci?.requiresCi?.(now_) && ciChoice !== "bypass") {
+          const g = ctx.ci.gate(now_, rec.id);
+          if (g.status === "passed" || (g.status === "warning" && !g.blocking)) {
+            log(`CI already passed this release (run ${g.run.id}).`);
+          } else {
+            const run = ctx.ci.startRun(site.id, rec.id, { trigger: "update", admin, deployOnPass: true, base });
+            log(`CI is required before ${site.name} deploys. Run ${run.id} is checking this update on the CI servers and deploys it automatically if it passes.`);
+            return { releaseId: rec.id, version: rec.version, ciRunId: run.id, deployOnPass: true };
+          }
+        }
+        const ci = ctx.ci?.authorizeDeploy ? ctx.ci.authorizeDeploy(now_, rec, ciChoice ? { ci: ciChoice } : {}, admin) : null;
+        const line = ciLine(ci);
+        if (line) log(line);
+        if (ci?.mode === "advisory") autoCi(site.id, rec.id, admin, base, log);
+        const out = await deployRelease(site.id, rec, { log, signal, base, afterDeploy: true });
+        return { ...out, releaseId: rec.id };
+      },
+      { lock: deploy },
+    );
+  }
+
   // ------------------------------------------------------------- API
 
   ctx.sites = {
@@ -1589,6 +1735,15 @@ export function register(router, ctx) {
     },
     refreshStatus: (id) => refreshStatus(id),
     checkUpdate: (id, o) => checkUpdate(id, o),
+    /** CI: what a server needs to download a release (short-lived token; main gets the local file). */
+    releasePayload: (release, serverId, base) => releasePayload(release, serverId, (base || panelBase()).replace(/\/+$/, "")),
+    /** CI: deploy a release through the CI gate. opts.body = { ci, confirm }. Returns the job. */
+    startDeploy: (siteId, releaseId, { admin = null, base = null, body = {} } = {}) => {
+      const site = mustSite(siteId);
+      const release = db.get("releases", releaseId);
+      if (!release || release.siteId !== site.id) throw httpError(404, "Release not found.");
+      return startDeployJob(site, release, admin, (base || panelBase()).replace(/\/+$/, ""), body);
+    },
   };
 
   function startEnvJob(site, admin, { restart = true } = {}) {
@@ -1903,19 +2058,14 @@ export function register(router, ctx) {
 
   // ---- operations
 
+  // body.ci: "bypass" | "override" (+ body.confirm) — see ctx.ci.authorizeDeploy.
   router.post("/api/sites/:id/deploy", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
     const release = body.releaseId ? db.get("releases", body.releaseId) : listReleases(site.id)[0];
     if (!release || release.siteId !== site.id) {
       throw httpError(body.releaseId ? 404 : 409, body.releaseId ? "Release not found." : "This website has no releases yet. Upload a zip or pull from GitHub first.");
     }
-    if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
-    const base = panelBase(req);
-    const job = siteJob(site, admin, { type: "site.deploy", title: `Deploy ${site.name} ${release.version ? `v${release.version}` : release.id}` }, ({ log, signal }) =>
-      deployRelease(site.id, release, { log, signal, base, afterDeploy: true }),
-    );
-    audit(admin, "site.deploy", site, { releaseId: release.id, version: release.version });
-    return job;
+    return startDeployJob(site, release, admin, panelBase(req), body);
   });
 
   // `serverId` (optional): only that one of the website's servers, e.g. one upstream of a load-balanced site.
@@ -2188,7 +2338,8 @@ export function register(router, ctx) {
     req.res = res;
     const rec = await receiveUpload(req, site.id, cleanFilename(query.filename), admin);
     audit(admin, "release.upload", site, { releaseId: rec.id, version: rec.version, size: rec.size });
-    return publicRelease(rec);
+    autoCi(site.id, rec.id, admin, panelBase(req));
+    return publicRelease(db.get("releases", rec.id) || rec);
   });
 
   router.post("/api/sites/:id/update-check", async (req, res, { params }) => {
@@ -2205,49 +2356,8 @@ export function register(router, ctx) {
     if (!repo) throw httpError(400, "This website has no GitHub repository set. Add one in its settings first.");
     const ref = cleanRef(body.ref);
     if (ref === null) throw httpError(400, "That branch, tag or commit name is not valid.");
-    const deploy = !!body.deploy;
-    const base = panelBase(req);
-    const token = githubToken(site);
-    const job = siteJob(
-      site,
-      admin,
-      { type: "site.github", title: `Pull ${repo}${ref ? `@${ref}` : ""} for ${site.name}${deploy ? " and deploy" : ""}` },
-      async ({ log, signal }) => {
-        let useRef = ref || getSite(site.id)?.github?.branch || "";
-        if (!useRef) {
-          const info = await repoInfo(repo, token, { signal });
-          useRef = info.defaultBranch;
-          log(`Using the default branch: ${useRef}`);
-        }
-        const commit = await resolveCommit(repo, useRef, token, { signal });
-        noteHead(site.id, repo, useRef, commit);
-        if (commit) log(`${repo}@${useRef} is at ${commit.shortSha}: ${commit.message}${commit.author ? ` — ${commit.author}` : ""}`);
-        const part = path.join(releasesDir(), `.github-${crypto.randomBytes(6).toString("hex")}.part`);
-        log("Downloading the archive from GitHub…");
-        const { size, sha256 } = await downloadZipballToFile(repo, commit?.sha || useRef, token, part, {
-          signal,
-          maxBytes: MAX_RELEASE_BYTES,
-          onProgress: (n) => log(`  … ${humanBytes(n)}`),
-        });
-        log(`Downloaded ${humanBytes(size)}.`);
-        const rec = finalizeRelease(site.id, part, {
-          filename: `${repo.split("/")[1]}-${commit?.shortSha || slugify(useRef) || "head"}.zip`,
-          source: "github",
-          size,
-          sha256,
-          commit: commit?.sha || null,
-          github: { repo, ref: useRef, sha: commit?.sha || null, message: commit?.message || "", author: commit?.author || null, htmlUrl: commit?.htmlUrl || `https://github.com/${repo}` },
-          adminId: admin?.id || null,
-        });
-        log(`Release ${rec.id} created (${rec.version ? `v${rec.version}` : "unversioned"}).`);
-        for (const w of rec.warnings) log(`note: ${w}`);
-        if (!deploy) return { releaseId: rec.id, version: rec.version };
-        const out = await deployRelease(site.id, rec, { log, signal, base, afterDeploy: true });
-        return { ...out, releaseId: rec.id };
-      },
-      { lock: deploy },
-    );
-    audit(admin, "release.github", site, { repo, ref: ref || null, deploy });
+    const job = startGithubJob(site, admin, { repo, ref, deploy: !!body.deploy, ciChoice: body.ci === "bypass" ? "bypass" : null, base: panelBase(req) });
+    audit(admin, "release.github", site, { repo, ref: ref || null, deploy: !!body.deploy, ci: body.ci === "bypass" ? "bypass" : null });
     return job;
   });
 

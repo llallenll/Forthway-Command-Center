@@ -125,7 +125,7 @@ export function bindJobClicks(root) {
   return () => { offClick(); offKey(); };
 }
 
-function logLineHTML(l) {
+export function logLineHTML(l) {
   const cls = /✗|ERROR|error:|failed/i.test(l) ? "err" : /✓/.test(l) ? "ok" : /▸|━━|^\s*──/.test(l) ? "step" : "";
   return html`<div class="log-line ${cls}">${l}</div>`;
 }

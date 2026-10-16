@@ -1099,6 +1099,86 @@ R("DELETE", "/api/backups/:id", (p) => { const bk = find("backups", p.id); db.ba
 
 function pick(o, keys) { const r = {}; for (const k of keys) if (o && k in o) r[k] = o[k]; return r; }
 
+
+/* ───────── CI (panel/lib/ci.mjs) ───────── */
+const CI_STEPS = {
+  build: [["fetch", "Fetch release", 1], ["install", "Install dependencies", 14], ["build", "Build", 22], ["smoke", "Smoke test 4 routes", 6]],
+  verify: [["fetch", "Fetch release", 1], ["install", "Install dependencies", 13], ["typecheck", "Type check", 8], ["lint", "Lint 9 files", 5]],
+  tests: [["fetch", "Fetch release", 1], ["install", "Install dependencies", 14], ["tests", "6 related test files", 9], ["suite-payments", "Payments", 7]],
+};
+const ciSev = () => ({ low: 0, medium: 0, high: 0, extreme: 0 });
+function ciCheckout(key, name, kind, serverId, startedMs, outcome = "passed") {
+  const srv = db.servers.find((x) => x.id === serverId);
+  const elapsed = (Date.now() - startedMs) / 1000;
+  let t = 0;
+  const steps = CI_STEPS[kind].map(([id, label, dur]) => {
+    const st = { id, label, kind: id, durationMs: null, summary: "" };
+    if (elapsed >= t + dur) { st.status = outcome === "failed" && id === "suite-payments" ? "failed" : "passed"; st.durationMs = dur * 1000; }
+    else if (elapsed >= t) st.status = "running";
+    else st.status = "pending";
+    t += dur;
+    return st;
+  });
+  const done = steps.every((x) => x.status === "passed" || x.status === "failed");
+  return { id: key, key, name, kind, status: done ? (steps.some((x) => x.status === "failed") ? "failed" : "passed") : "running", serverId, serverName: srv?.name, hostname: srv?.name, steps, current: steps.find((x) => x.status === "running")?.label || null, findings: outcome === "failed" && done ? 1 : 0, cleaned: done ? true : null, attempts: 1, startedAt: iso(startedMs), finishedAt: done ? iso(startedMs + t * 1000) : null };
+}
+const ciRuns = [
+  { id: "ci_live1", siteId: "site_acmeweb", started: NOW, version: "2.8.0", baseVersion: "2.7.3", shortSha: "4be19c2", message: "Checkout: show saved cards first", trigger: "update", deployOnPass: true, layout: [["build", "Build & smoke test", "build", "srv_fra1"], ["verify", "Types & lint", "verify", "srv_fra2"], ["tests-1", "Tests", "tests", "srv_ams1"]] },
+  { id: "ci_block1", siteId: "site_acmeadmin", started: NOW - 2 * HOUR, version: "1.4.0", baseVersion: "1.3.9", shortSha: "a91f03d", message: "Refactor stripe webhook handler", trigger: "auto", outcome: "failed", layout: [["build", "Build & smoke test", "build", "srv_fra1"], ["tests-1", "Tests", "tests", "srv_fra2"]] },
+  { id: "ci_pass1", siteId: "site_nwhooks", started: NOW - 5 * HOUR, version: "0.9.2", baseVersion: "0.9.1", shortSha: "77ce0b1", message: "Retry webhooks with backoff", trigger: "update", layout: [["build", "Build & smoke test", "build", "srv_ams1"], ["verify", "Types & lint", "verify", "srv_fra2"]] },
+];
+function ciRunView(r, full = false) {
+  const site = db.sites.find((x) => x.id === r.siteId);
+  const checkouts = r.layout.map(([k, n, kind, sid]) => ciCheckout(k, n, kind, sid, r.started + 1500, r.outcome));
+  const live = checkouts.some((c) => c.status === "running");
+  const findings = r.outcome === "failed" && !live ? [
+    { id: "f1", severity: "extreme", check: "suite", title: "Payments failed", detail: "$ npm run test:payments\n✗ charges the saved card once\n  Expected 1 call to stripe.paymentIntents.create, got 2", file: null, line: null, serverName: "fra-agent-2" },
+    { id: "f2", severity: "high", check: "smoke", title: "/api/webhooks/stripe returns 500", detail: "API route /api/webhooks/stripe crashes on GET.", file: "app/api/webhooks/stripe/route.ts", serverName: "fra-agent-1" },
+    { id: "f3", severity: "low", check: "scan", title: 'Typo: "recieved" → "received"', detail: '"Payment recieved"', file: "app/billing/page.tsx", line: 42, serverName: "Panel" },
+  ] : !live && r.id === "ci_pass1" ? [{ id: "f4", severity: "low", check: "lint", title: "@typescript-eslint/no-unused-vars: 'attempt' is defined but never used.", file: "lib/retry.ts", line: 12, serverName: "fra-agent-2" }] : [];
+  const counts = ciSev(); findings.forEach((f) => counts[f.severity]++);
+  const status = live ? "running" : findings.some((f) => ["high", "extreme"].includes(f.severity)) ? "failed" : findings.length ? "warning" : "passed";
+  const out = { id: r.id, siteId: r.siteId, siteName: site?.name || r.siteId, releaseId: `rel_${r.id}`, version: r.version, baseVersion: r.baseVersion, shortSha: r.shortSha, message: r.message, trigger: r.trigger, adminName: me.name, deployOnPass: !!r.deployOnPass,
+    status, counts, worst: ["extreme", "high", "medium", "low"].find((k) => counts[k]) || null, blocking: live || status === "failed", blockOn: "high", scope: "targeted", changedCount: 3,
+    checkouts: { total: checkouts.length, done: checkouts.filter((c) => c.status !== "running").length, running: checkouts.filter((c) => c.status === "running").length }, servers: [...new Set(checkouts.map((c) => c.serverName))],
+    deploy: status === "passed" && r.deployOnPass ? { mode: "auto", at: iso(Date.now()) } : null, overrides: [], createdAt: iso(r.started), startedAt: iso(r.started), finishedAt: live ? null : iso(r.started + 60e3), durationMs: live ? null : 52e3 };
+  if (!full) return out;
+  return { ...out, checkouts, findings, isLive: false, release: { id: out.releaseId, version: r.version, available: true }, site: { id: r.siteId, name: out.siteName, mode: "required" },
+    plan: { scope: "targeted", changedCount: 3, affectedCount: 5, changed: [{ path: "components/checkout/SavedCards.tsx", kind: "modified" }, { path: "lib/payments/charge.ts", kind: "modified" }, { path: "app/billing/page.tsx", kind: "modified" }], affected: ["app/checkout/page.tsx", "app/billing/page.tsx", "app/api/checkout/route.ts", "lib/payments/index.ts", "components/checkout/index.ts"],
+      routes: [{ route: "/checkout", kind: "page", reason: "imports components/checkout/SavedCards.tsx", file: "app/checkout/page.tsx" }, { route: "/billing", kind: "page", reason: "changed", file: "app/billing/page.tsx" }, { route: "/api/checkout", kind: "api", reason: "imports lib/payments/charge.ts", file: "app/api/checkout/route.ts" }, { route: "/orders/[id]", kind: "page", dynamic: true, reason: "imports lib/payments/charge.ts", file: "app/orders/[id]/page.tsx" }],
+      probes: [{ route: "/checkout" }, { route: "/billing" }, { route: "/api/checkout" }], tests: ["lib/payments/charge.test.ts", "components/checkout/SavedCards.test.tsx"],
+      suites: [{ id: "payments", name: "Payments", severity: "extreme", reason: "touches lib/payments/charge.ts", source: "panel" }, { id: "health", name: "Health", severity: "extreme", reason: "always runs", source: "repo" }, { id: "auth", name: "Sign-in", severity: "extreme", reason: null, source: "panel" }],
+      notes: ["Dynamic route /orders/[id] not smoke tested — add a sample path for it under CI → Sample paths (or \"samples\" in fcc-ci.json)."], caps: { testRunner: "vitest" } } };
+}
+const ciSettings = { runners: "auto", useMain: "fallback", perServer: 2 };
+const ciSite = {};
+R("GET", "/api/ci/overview", () => {
+  const runs = ciRuns.map((r) => ciRunView(r));
+  const runners = db.servers.filter((s) => s.role !== "main").map((s) => ({ id: s.id, name: s.name, role: s.role, online: s.online, available: s.online, why: s.online ? "" : "offline", metrics: s.metrics, info: s.info, slots: ciSettings.perServer, active: [] }));
+  runners.push({ id: "main", name: "fcc-main", role: "main", online: true, available: false, fallback: true, why: "standby — used only when no agent server is online", metrics: db.servers[0].metrics, info: db.servers[0].info, slots: ciSettings.perServer, active: [] });
+  for (const r of ciRuns) {
+    const v = ciRunView(r, true);
+    for (const c of v.checkouts.filter((x) => x.status === "running")) runners.find((x) => x.id === c.serverId)?.active.push({ runId: r.id, checkoutId: c.id, siteId: r.siteId, siteName: v.siteName, version: r.version, name: c.name, kind: c.kind, status: c.status, current: c.current, done: c.steps.filter((x) => x.status === "passed").length, total: c.steps.length, startedAt: c.startedAt, findings: 0 });
+  }
+  return { settings: ciSettings, runners, queue: [], active: runs.filter((r) => r.status === "running"), recent: runs, stats: { runs24h: runs.length, passRate7d: 67, week: 3, activeCheckouts: runners.reduce((n, r) => n + r.active.length, 0), queued: 0, runnersOnline: runners.filter((r) => r.available).length, blockedDeploys: 0 } };
+});
+R("GET", "/api/ci/runs", (p, b, q) => ({ items: ciRuns.filter((r) => !q.siteId || r.siteId === q.siteId).map((r) => ciRunView(r)) }));
+R("GET", "/api/ci/runs/:id", (p) => ciRunView(ciRuns.find((r) => r.id === p.id) || err(404, "CI run not found."), true));
+R("POST", "/api/ci/runs", (p, b) => { const r = { id: nid("ci"), siteId: b.siteId, started: Date.now(), version: "next", shortSha: hex(7), message: "Manual run", trigger: "manual", deployOnPass: !!b.deployOnPass, layout: [["build", "Build & smoke test", "build", "srv_fra1"], ["verify", "Types & lint", "verify", "srv_ams1"]] }; ciRuns.unshift(r); emit("ci", ciRunView(r)); return ciRunView(r); });
+R("POST", "/api/ci/runs/:id/rerun", (p) => { const o = ciRuns.find((r) => r.id === p.id) || err(404, "Not found"); const r = { ...o, id: nid("ci"), started: Date.now(), trigger: "rerun", outcome: undefined }; ciRuns.unshift(r); return ciRunView(r); });
+R("POST", "/api/ci/runs/:id/cancel", (p) => ciRunView(ciRuns.find((r) => r.id === p.id)));
+R("PATCH", "/api/ci/runs/:id", (p, b) => { const r = ciRuns.find((x) => x.id === p.id); r.deployOnPass = !!b.deployOnPass; return ciRunView(r); });
+R("POST", "/api/ci/runs/:id/deploy", (p, b) => { const r = ciRunView(ciRuns.find((x) => x.id === p.id), true); if (r.blocking && !b.override) err(409, "CI blocked this release.", { code: "ci_blocked", ci: { mode: "required", enforced: true, blockOn: "high", status: r.status, blocking: true, worst: r.worst, counts: r.counts, run: r } }); if (r.worst === "extreme" && b.confirm !== r.siteName) err(409, "Type the website's name to deploy anyway.", { code: "ci_confirm", ci: { status: r.status, worst: r.worst, counts: r.counts, run: r, blockOn: "high" } }); return { id: nid("job"), type: "site.deploy", title: `Deploy ${r.siteName}`, status: "running" }; });
+R("GET", "/api/ci/settings", () => ({ ...ciSettings, servers: db.servers.map((s) => ({ id: s.id, name: s.name, role: s.role, online: s.online, available: s.role !== "main" && s.online })) }));
+R("PUT", "/api/ci/settings", (p, b) => Object.assign(ciSettings, b));
+R("GET", "/api/sites/:id/ci", (p) => ({
+  settings: { mode: "required", blockOn: "high", autoRun: true, autoPull: false, inheritEnv: true, env: {}, suites: [{ id: "payments", name: "Payments", severity: "extreme", always: false, paths: ["lib/payments/**", "app/api/checkout/**"], command: "npm run test:payments", probes: [{ method: "POST", path: "/api/checkout", expect: 400, contains: "" }] }], samples: { "/orders/[id]": "/orders/1001" }, ignore: ["**/*.md"], timeoutMin: 30, maxCheckouts: 4, ...(ciSite[p.id] || {}) },
+  readiness: { releaseId: "rel_x", version: "2.8.0", caps: { build: true, start: true, typescript: true, typecheckScript: "typecheck", lint: true, testRunner: "vitest", testFiles: 14, healthRoute: true, fccCi: { present: true, suites: 1 } }, tips: [], repoSuites: [{ id: "health", name: "Health", severity: "extreme", always: true, paths: [], command: "", probes: [{}] }] },
+  runners: db.servers.map((s) => ({ id: s.id, name: s.name, role: s.role, available: s.role !== "main" && s.online, why: s.role === "main" ? "standby — used only when no agent server is online" : s.online ? "" : "offline" })),
+  runs: ciRuns.filter((r) => r.siteId === p.id).map((r) => ciRunView(r)), live: null, gate: null,
+}));
+R("PUT", "/api/sites/:id/ci", (p, b) => { ciSite[p.id] = { ...(ciSite[p.id] || {}), ...b }; return { mode: "required", blockOn: "high", autoRun: true, autoPull: false, inheritEnv: true, env: {}, suites: [], samples: {}, ignore: [], timeoutMin: 30, maxCheckouts: 4, ...ciSite[p.id] }; });
+
 /* ───────── entry points ───────── */
 export async function handle(method, path, body) {
   const [pathname, search] = path.split("?");
@@ -1122,5 +1202,6 @@ export async function handleText(path) {
   await new Promise((r) => setTimeout(r, 120));
   const m = path.match(/^\/api\/jobs\/([^/]+)\/log/);
   if (m) return (db.logs[m[1]] || []).join("\n");
+  if (/^\/api\/ci\/runs\/[^/]+\/checkouts\//.test(path)) return "── Fetch release ──\n✓ Fetch release — 214 files, 1.8 MB (0.4s)\n── Install dependencies ──\n$ npm install --no-audit --no-fund --include=dev\nadded 412 packages in 13s\n✓ Install dependencies (13.2s)\nCheckout files deleted from fra-agent-1.";
   return "";
 }

@@ -45,7 +45,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.5.0";
+export const TASKS_VERSION = "3.6.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -74,6 +74,7 @@ export const TASK_TYPES = [
   "mysql.users.sync",
   "mysql.rebuild",
   "mysql.probe", // 3.4.0: the replica's TCP view of the primary (fast failover)
+  "ci.checkout", // 3.6.0: one slice of a CI run — shared/ci.mjs
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -106,6 +107,7 @@ export const TASK_TIMEOUTS_MS = {
   "mysql.users.sync": 2 * 60_000,
   "mysql.rebuild": 6 * 60 * 60_000, // safety dump + full copy
   "mysql.probe": 10_000,
+  "ci.checkout": 75 * 60_000, // the checkout enforces the run's own time limit; this is the backstop
 };
 
 const NOOP = () => {};
@@ -194,6 +196,9 @@ export async function executeTask(type, payload = {}, opts = {}) {
     case "mysql.rebuild":
       // Database replication (docs/HA.md Phase 3); one change to the local MySQL at a time.
       return withSiteLock("cluster:mysql", async () => (await import("./mysql-ha.mjs")).runMysqlTask(type, payload, o));
+    case "ci.checkout":
+      // CI (shared/ci.mjs): a throwaway folder of its own, never a live website — no site lock.
+      return (await import("./ci.mjs")).runCheckout(payload, o);
     case "site.status":
       return siteStatus(payload, o);
     case "site.logs":

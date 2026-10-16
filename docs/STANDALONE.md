@@ -176,6 +176,7 @@ Task types handled by `shared/tasks.mjs` (payload → result):
 | `site.script` | `{ spec, script }` or `{ spec, command }` | `{ script \| command, code: 0, durationMs }`; `npm run <script>` in appDir, only if the deployed package.json defines it, or (tasks 3.5.0) `bash -c <command>` in appDir; non-zero exit = failure with the output tail |
 | `server.metrics` | `{}` | `{ cpu, mem, memTotal, disk, diskTotal, load, uptime, hostname, os }` |
 | `server.backup` | `{ include, upload: { url, token } }` | `{ file, size, sha256 }` (worker uploads archive to panel) |
+| `ci.checkout` | `{ runId, checkout: { id, key, name, kind, steps[] }, release: { id, url, token, sha256, file? }, env, ciEnv, timeoutMs }` | `{ checkoutId, hostname, steps: [{ id, label, kind, status, durationMs, summary }], findings: [{ severity, check, step, title, detail, file, line }], cleaned, durationMs }` — shared/ci.mjs; runs in `<dataDir>/ci/<runId>-<checkoutId>/`, deleted when done (tasks 3.6.0) |
 | `sites.usage` | `{ specs: [{ siteId, type, appDir, port, pm2Name, restart: { mode, service } }] }` | `{ at, cores, memTotal, simulated?, sites: { [siteId]: { cpu, mem, procs, source, disk, diskAt } } }` |
 
 `spec` is produced by `ctx.sites.specFor(site)` — everything the node needs:
@@ -209,6 +210,21 @@ sites.specFor(site, serverId?)       // task spec (see above), env merged incl. 
 sites.get(id); sites.list({ projectId })
 sites.targets(site)                  // serverIds it runs on: loadBalanced ? site.serverIds : [site.serverIds[0] || "main"]
 ```
+
+### `ctx.ci` (CI — panel/lib/ci.mjs, 3.12.0)
+
+```js
+ci.gate(site, releaseId)             // { mode, enforced, blockOn, status: none|planning|queued|running|passed|warning|failed|error|cancelled, blocking, worst, counts, run, bypassed }
+ci.authorizeDeploy(site, release, body, admin)  // → { mode: passed|advisory|off|bypass|override, runId } or throws 409 { code: ci_required|ci_running|ci_blocked|ci_incomplete|ci_confirm, ci }
+                                     // body.ci = "bypass" | "override" (+ body.confirm = site name when the worst finding is extreme)
+ci.startRun(siteId, releaseId, { trigger, admin, deployOnPass, base })  // → run (light); an active run for that release is reused
+ci.siteSummary(site) / ci.releaseSummary(releaseId) / ci.wantsAutoRun(site) / ci.requiresCi(site) / ci.siteSettings(site)
+```
+
+`ctx.sites` gains `releasePayload(release, serverId, base)` and
+`startDeploy(siteId, releaseId, { admin, base, body })` — every deploy path
+(POST deploy, pull-and-deploy, CI's deploy-on-pass) goes through
+`ctx.ci.authorizeDeploy`.
 
 ### `ctx.mysql` (DATA)
 
@@ -250,7 +266,19 @@ database { id, projectId, name, user, passwordEnc, charset, collation, remoteAcc
 backup   { id, kind: "database"|"server", projectId?, databaseId?, serverId?, include?, file, size, sha256,
            status: "running"|"ok"|"failed", trigger: "manual"|"schedule", pinned, note, error, createdAt }
 activity { id, at, adminId, adminName, action, target: { type, id, name }, details }
+ci_run   { id, siteId, projectId, releaseId, baseReleaseId, version, baseVersion, commit, shortSha, message,
+           trigger: "auto"|"update"|"manual"|"rerun", adminId, deployOnPass, deployBy,
+           status: "planning"|"queued"|"running"|"passed"|"warning"|"failed"|"error"|"cancelled",
+           plan: { scope, changed, changedCount, affected, affectedCount, routes, probes, tests, suites, caps, tips, notes },
+           checkouts: [{ id, key, name, kind, plan, status, serverId, serverName, steps, findings, cleaned, attempts, error, … }],
+           findings: [{ id, severity: "low"|"medium"|"high"|"extreme", check, title, detail, file, line, checkoutId, serverName, alsoIn }],
+           overrides: [{ mode: "bypass"|"override", at, by, adminId, status, worst, counts }], deploy, jobId, startedAt, finishedAt }
+site.ci  { mode: "required"|"advisory"|"off", blockOn, autoRun, autoPull, inheritEnv, env, suites: [{ id, name, severity, always, paths, command, needsBuild, probes }],
+           samples: { route: path | [paths] }, ignore: [globs], timeoutMin, maxCheckouts }
+release.ciBypass { mode, at, by, … }   // a deploy that skipped CI
 ```
+
+`config.ci = { runners: "auto" | [serverIds], useMain: "fallback"|"always"|"never", perServer }`.
 
 Defaults: appDir `/srv/fcc/sites/<projectSlug>/<siteSlug>`; ports auto-assigned
 from 3001 upward, unique across all sites; backups in `dataDir/backups/`.
@@ -335,6 +363,20 @@ GET    /install/files/*                          public  node-agent.mjs + shared
 POST   /agent/hello  GET /agent/poll  POST /agent/tasks/:id/log  POST /agent/tasks/:id/result
 POST   /agent/metrics  POST /agent/upload/:taskId              agent routes (Bearer server token)
 ```
+
+### CI
+```
+GET    /api/ci/overview                          { settings, runners: [{ …server, available, why, slots, active: [checkout refs] }], queue, active, recent, stats }
+GET    /api/ci/runs?siteId&limit                 POST /api/ci/runs { siteId, releaseId?, deployOnPass? } → run
+GET    /api/ci/runs/:id                          full run (plan, checkouts, findings, release, site, isLive)
+PATCH  /api/ci/runs/:id { deployOnPass }         POST /api/ci/runs/:id/cancel   POST /api/ci/runs/:id/rerun
+POST   /api/ci/runs/:id/deploy { override?, confirm?, bypass? } → job (through the gate)
+GET    /api/ci/runs/:id/checkouts/:cid/log       text/plain
+GET    /api/ci/settings   PUT /api/ci/settings { runners, useMain, perServer }
+GET    /api/sites/:id/ci  PUT /api/sites/:id/ci { …site.ci }   GET /api/sites/:id/ci/starter (fcc-ci.json)
+```
+SSE: `ci` (light run on every change). POST /api/sites/:id/deploy and
+POST /api/sites/:id/releases/github take `ci: "bypass" | "override"` (+ `confirm`).
 
 ### DATA
 ```
@@ -1189,3 +1231,14 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   `pushEdgesNow()` and `lastSeenMs(id)`; `ctx.mysqlHa` gains `dbCutover()` and `timings()`.
   New task `mysql.probe { host, port, timeoutMs }`; cluster.sync gains `dbCutover
   { blockIps, port }` (iptables/nft TCP-reset rule + `ss -K`). Details in docs/HA.md.
+- **3.12.0 — Continuous Integration (tasks 3.6.0).** New module panel/lib/ci.mjs
+  (`ctx.ci`, collection `ci_runs`, SSE `ci`, routes under /api/ci and
+  /api/sites/:id/ci), shared/ci-impact.mjs (release diff by CRC, import graph with
+  tsconfig paths, Next.js route mapping, related tests, critical suites, static scan,
+  checkout plan) and shared/ci.mjs (task `ci.checkout`: throwaway folder per checkout,
+  install/build/smoke/typecheck/lint/tests/suites, findings, folder deleted). Checkout
+  progress uses the flat `progress` contract (`states`, `durations`, `current`,
+  `findings`). sites.mjs routes every deploy through `ctx.ci.authorizeDeploy`; a
+  pull-and-deploy on a "required" website starts a run with `deployOnPass`; new
+  releases start CI when `site.ci.autoRun`; `site.ci.autoPull` pulls new branch heads
+  for CI only. `publicSite.ci` and `publicRelease.ci` summarise where they stand.
