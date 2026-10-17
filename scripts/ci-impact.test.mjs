@@ -200,3 +200,20 @@ test("plan: a layout change reaches the pages under it, not API routes", () => {
   assert.ok(routes.includes("/") && routes.includes("/about") && routes.includes("/pricing"));
   assert.ok(!routes.includes("/api/health") && !routes.includes("/api/checkout"));
 });
+
+test("plan: a Prisma app generates its client in every checkout, like a deploy does", () => {
+  const files = { ...BASE, "prisma/schema.prisma": "generator client { provider = \"prisma-client-js\" }" };
+  const plan = planRun({ next: zip(files), prev: null, site: { type: "node" }, ci: {}, runners: 3 });
+  for (const c of plan.checkouts) {
+    const ids = c.steps.map((s) => s.id);
+    assert.deepEqual(ids.slice(0, 2), ["install", "prepare"], c.key);
+    assert.equal(c.steps[1].cmd, "npx prisma generate");
+  }
+  // An explicit prepare command wins; autoPrepare off means none.
+  const custom = planRun({ next: zip(files), prev: null, site: { type: "node" }, ci: {}, runners: 1, buildCommands: { prepare: "npm run codegen" } });
+  assert.equal(custom.checkouts[0].steps[1].cmd, "npm run codegen");
+  const off = planRun({ next: zip(files), prev: null, site: { type: "node" }, ci: {}, runners: 1, buildCommands: { autoPrepare: false } });
+  assert.ok(!off.checkouts[0].steps.some((s) => s.id === "prepare"));
+  // No schema, no prepare.
+  assert.notEqual(planRun({ next: zip(BASE), prev: null, site: { type: "node" }, ci: {}, runners: 1 }).checkouts[0].steps[1].id, "prepare");
+});
