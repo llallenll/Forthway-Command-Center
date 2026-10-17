@@ -62,6 +62,23 @@ export function fleet(o, { compact = false } = {}) {
   </div>`;
 }
 
+/** Centre the Panel card (and its wire) on the first row of server lanes, however tall that row is. */
+function alignHub(root) {
+  const fleetEl = root.querySelector(".ci-fleet");
+  const card = fleetEl?.querySelector(".ci-hub-card");
+  const wire = fleetEl?.querySelector(".ci-wire");
+  const lane = fleetEl?.querySelector(".ci-lane");
+  if (!card) return;
+  card.style.marginTop = "";
+  if (wire) wire.style.top = "";
+  if (!lane || matchMedia("(max-width: 960px)").matches) return; // stacked layout: the card sits above the lanes
+  const col = card.parentElement.getBoundingClientRect();
+  const l = lane.getBoundingClientRect();
+  const offset = Math.max(0, Math.round(l.top - col.top + l.height / 2 - card.offsetHeight / 2));
+  card.style.marginTop = `${offset}px`;
+  if (wire) wire.style.top = `${offset + Math.round(card.offsetHeight / 2)}px`;
+}
+
 async function settingsDialog(onSaved) {
   let s;
   try { s = await get("/api/ci/settings"); } catch (e) { toastError(e); return; }
@@ -117,6 +134,7 @@ export default async function ci(ctx) {
       <div class="mini-stat"><div class="ms-l">${icon("activity", "xs")}Runs · 24 h</div><div class="ms-v">${s.runs24h}</div><div class="ms-s">${s.blockedDeploys ? `${plural(s.blockedDeploys, "override")} recorded` : "No overrides"}</div></div>`);
     mount($("[data-live]", root), o.stats.activeCheckouts || o.queue.length ? html`<span class="badge blue"><span class="dot run" style="width:6px;height:6px"></span>Live</span>` : html`<span class="badge">Idle</span>`);
     mount($("[data-fleet]", root), fleet(o));
+    alignHub(root);
     const runs = o.recent;
     const counts = { all: runs.length, active: runs.filter((r) => ["planning", "queued", "running"].includes(r.status)).length, blocked: runs.filter((r) => ["failed", "error"].includes(r.status)).length, passed: runs.filter((r) => ["passed", "warning"].includes(r.status)).length };
     mount($("[data-f]", root), html`${[["all", "All"], ["active", "Running"], ["blocked", "Blocked"], ["passed", "Passed"]].map(([k, l]) => html`<button class="pill ${filter === k ? "active" : ""}" data-fk="${k}">${l}<span class="n">${counts[k]}</span></button>`)}`);
@@ -135,7 +153,9 @@ export default async function ci(ctx) {
   // Elapsed clocks tick without refetching; a slow poll covers progress between events.
   const tick = setInterval(() => root.querySelectorAll("[data-since]").forEach((x) => { if (x.dataset.since) x.textContent = fmtDuration(Date.now() - new Date(x.dataset.since)); }), 1000);
   const poll = setInterval(() => { if (o && (o.stats.activeCheckouts || o.queue.length || o.active.length)) load(); }, 5000);
-  ctx.cleanup(() => (clearInterval(tick), clearInterval(poll)));
+  const onResize = debounce(() => alignHub(root), 100);
+  window.addEventListener("resize", onResize);
+  ctx.cleanup(() => (clearInterval(tick), clearInterval(poll), window.removeEventListener("resize", onResize)));
 }
 
 export { ciStatusBadge };

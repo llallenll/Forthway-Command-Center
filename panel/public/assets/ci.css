@@ -31,8 +31,8 @@
 /* ── fleet: the panel planning, every CI server's slots ── */
 .ci-fleet-card .card-body { padding: 20px; }
 .ci-fleet { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 0; align-items: stretch; }
+/* views/ci.js alignHub() sets the card's margin-top and the wire's top so both sit on the middle of the first row of lanes. */
 .ci-hub { position: relative; display: flex; align-items: flex-start; }
-.ci-hub-card { position: sticky; top: 84px; }
 .ci-hub-card {
   position: relative; z-index: 1; width: 196px; padding: 16px; border-radius: 16px; text-align: center;
   background: radial-gradient(120% 100% at 50% 0%, rgba(74, 114, 255, 0.22), rgba(13, 20, 44, 0.9) 70%);

@@ -426,6 +426,7 @@ export function register(router, ctx) {
         buildCommands: {
           install: b.install || undefined,
           prepare: b.prepare || "",
+          autoPrepare: spec?.settings?.autoPrepare,
           build: typeof b.build === "string" ? b.build : undefined,
           start: spec?.settings?.restart?.start || site.settings?.start || undefined,
           healthPath: site.healthPath || null,

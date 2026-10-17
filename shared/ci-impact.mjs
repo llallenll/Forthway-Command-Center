@@ -703,14 +703,22 @@ export function planRun({ next, prev = null, site = {}, ci = {}, runners = 1, bu
   const checkouts = [];
   const b = buildCommands;
   const install = b.install ?? "npm install --no-audit --no-fund --include=dev";
+  // Mirror the deploy engine: with no prepare command set, a release that has
+  // prisma/schema.prisma gets `npx prisma generate` (deployer autoPrepare).
+  // Without it the build, the type check and the tests all fail on a missing
+  // Prisma client that a real deploy would have generated.
+  const prepare = b.prepare || (b.autoPrepare !== false && next.files.has("prisma/schema.prisma") ? "npx prisma generate" : "");
+  const setup = () => [
+    { id: "install", label: "Install dependencies", kind: "install", cmd: install, gate: true },
+    ...(prepare ? [{ id: "prepare", label: prepare === "npx prisma generate" ? "Generate Prisma client" : "Prepare", kind: "command", cmd: prepare, gate: true, severity: "high" }] : []),
+  ];
   const node = type !== "php" && caps.packageJson;
   const lintable = [...inScope].filter((p) => isCode(p) && !p.endsWith(".d.ts") && !SKIP_DIR_RE.test(p) && next.files.has(p)).sort();
   const suiteCommands = selected.filter((s) => s.command);
   const suiteProbes = selected.filter((s) => s.probes.length);
 
   if (node) {
-    const buildSteps = [{ id: "install", label: "Install dependencies", kind: "install", cmd: install, gate: true }];
-    if (b.prepare) buildSteps.push({ id: "prepare", label: "Prepare", kind: "command", cmd: b.prepare, gate: true, severity: "high" });
+    const buildSteps = setup();
     const buildCmd = b.build ?? (caps.build ? "npm run build" : "");
     if (buildCmd) buildSteps.push({ id: "build", label: "Build", kind: "build", cmd: buildCmd, gate: true });
     const canStart = type === "node" && (caps.start || b.start);
@@ -737,7 +745,7 @@ export function planRun({ next, prev = null, site = {}, ci = {}, runners = 1, bu
       const files = lintable.slice(0, 300);
       verify.push({ id: "lint", label: `Lint ${files.length} file${files.length === 1 ? "" : "s"}`, kind: "lint", cmd: `npx --no-install eslint -f json ${files.map(sh).join(" ")}` });
     }
-    if (verify.length) checkouts.push({ key: "verify", name: verify.length === 2 ? "Types & lint" : verify[0].label, kind: "verify", steps: [{ id: "install", label: "Install dependencies", kind: "install", cmd: install, gate: true }, ...verify] });
+    if (verify.length) checkouts.push({ key: "verify", name: verify.length === 2 ? "Types & lint" : verify[0].label, kind: "verify", steps: [...setup(), ...verify] });
 
     // Tests, split across as many checkouts as there are servers to run them.
     const plainSuites = suiteCommands.filter((x) => !x.needsBuild);
@@ -747,7 +755,7 @@ export function planRun({ next, prev = null, site = {}, ci = {}, runners = 1, bu
     if (testRun === "files") tests.forEach((t, i) => buckets[i % shards].tests.push(t));
     plainSuites.forEach((s, i) => buckets[(i + (testRun === "files" ? 0 : 0)) % shards].suites.push(s));
     buckets.forEach((bk, i) => {
-      const steps = [{ id: "install", label: "Install dependencies", kind: "install", cmd: install, gate: true }];
+      const steps = setup();
       if (testRun === "all" && i === 0) steps.push({ id: "tests", label: "Test suite", kind: "tests", runner: "script", cmd: "npm test", files: [] });
       if (bk.tests.length) {
         const out = ".fcc-ci/tests.json";
@@ -759,7 +767,7 @@ export function planRun({ next, prev = null, site = {}, ci = {}, runners = 1, bu
         steps.push({ id: "tests", label: `${bk.tests.length} related test file${bk.tests.length === 1 ? "" : "s"}`, kind: "tests", runner: caps.testRunner, cmd, files: bk.tests, report: out, severityOf: Object.fromEntries(bk.tests.map((t) => [t, testSeverity(t)])) });
       }
       for (const s of bk.suites) steps.push({ id: `suite-${s.id}`, label: s.name, kind: "suite", cmd: s.command, severity: s.severity, suite: s.id });
-      if (steps.length > 1) checkouts.push({ key: `tests-${i + 1}`, name: shards > 1 ? `Tests ${i + 1}/${shards}` : "Tests", kind: "tests", steps });
+      if (steps.length > setup().length) checkouts.push({ key: `tests-${i + 1}`, name: shards > 1 ? `Tests ${i + 1}/${shards}` : "Tests", kind: "tests", steps });
     });
     if (caps.testRunner && caps.testRunner !== "script" && !tests.length && caps.testFiles) notes.push("No test file imports anything this update changed, so no unit tests were picked.");
   } else if (type === "php" || caps.php) {
