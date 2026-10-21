@@ -537,7 +537,7 @@ export function databasesTable(items, { projectsById = {}, showProject = true, m
     <thead><tr><th>Database</th>${showProject ? html`<th class="hide-sm">Project</th>` : ""}<th class="hide-sm">User</th><th>Size</th><th class="hide-sm">Last backup</th><th class="hide-sm">Used by</th><th></th></tr></thead>
     <tbody>${items.map((d) => {
       const p = projectsById[d.projectId];
-      return html`<tr class="${older ? "bk-older" : more ? "bk-top" : ""}" ${older ? raw(`data-bk-of="${k.replace(/"/g, "")}"`) : ""} ${older && !open ? raw("hidden") : ""}>
+      return html`<tr>
         <td><div class="row"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(51,212,193,.1);color:#5fe0cf">${icon("database", "sm")}</span>
           <div><div class="t-main mono">${d.name}</div><div class="t-sub">${d.charset || "utf8mb4"}${d.remoteAccess ? " · agent access" : ""}</div>
           ${d.remoteAccess && bindLocal ? html`<span class="badge warn mt-8" title="MySQL listens on ${mysql.bindAddress} only, so agent servers can't reach it.">${icon("alert")}Agents can't connect</span>` : ""}</div></div></td>
