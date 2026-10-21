@@ -207,6 +207,75 @@ async function makeActive(node, ha, ctx) {
   }
 }
 
+/* ───────── change the main server (3.12.0, panel/lib/main-switch.mjs) ───────── */
+
+const MS_DOT = { ok: "ok", auto: "run", todo: "warn", warn: "warn", blocked: "err" };
+const MS_TAG = { ok: "Ready", auto: "Automatic", todo: "Do this first", warn: "Note", blocked: "Blocked" };
+
+function mainSwitchBody(pf) {
+  const old = pf.oldMain?.name || "the main server";
+  return html`<p class="muted small" style="margin:0 0 12px;line-height:1.55">${pf.target.name} takes over everything ${old} does: the website front door, Cloudflare Tunnels, certificates and the panel. ${old} is then retired and removed from this list. Websites behind Cloudflare Tunnels stay up throughout; the panel is unavailable for about a minute at the end while it restarts.</p>
+    <div class="edge-rows ms-steps">${pf.steps.map((st) => html`<div class="edge-row ms-step">
+      <span class="dot ${MS_DOT[st.state] || "off"}"></span>
+      <div class="ms-step-t"><div><b>${st.title}</b> <span class="muted small">· ${MS_TAG[st.state] || st.state}</span></div>${st.detail ? html`<div class="muted small">${st.detail}</div>` : ""}</div>
+    </div>`)}</div>
+    ${pf.ok ? html`<div class="field mt-16"><label>Type <b class="mono" style="color:var(--text)">${pf.oldMain?.name || "Main"}</b> to retire it and make ${pf.target.name} the main server</label><input class="input" data-ms-confirm autocomplete="off" spellcheck="false"/></div>`
+      : html`<div class="note warn mt-16">${icon("alert")}<div>Finish the steps marked <b>Do this first</b> or <b>Blocked</b>, then open this again.</div></div>`}`;
+}
+
+/** Wait (through the restart) until /api/servers shows the new main server, then reload. */
+async function waitForNewMain(job, targetName) {
+  const box = document.createElement("div");
+  box.className = "restart-banner"; box.setAttribute("role", "status");
+  document.body.appendChild(box);
+  const say = (title, msg, err = false) => { box.classList.toggle("err", err); mount(box, html`<span class="rb-spin" aria-hidden="true"></span><div><div class="strong">${title}</div><div class="muted small">${msg}</div></div>${err ? html`<button class="btn btn-sm" type="button" data-hreload>Reload</button>` : ""}`); $("[data-hreload]", box)?.addEventListener("click", () => location.reload()); };
+  say(`Making ${targetName} the main server…`, "Copying backups and certificates from the old main server. You can watch the job log.");
+  const j = await waitForJob(job.id, 8 * 60 * 60_000);
+  if (j && j.status !== "succeeded") { say("The main server was not changed", j.error || "See the job log.", true); return; }
+  say(`${targetName} is the main server`, "The panel is restarting — this page reloads when it is back.");
+  const started = Date.now();
+  for (;;) {
+    await sleep(3000);
+    const list = await get("/api/servers").catch(() => null);
+    const main = list?.items?.find((x) => x.role === "main");
+    if (main?.name === targetName && Date.now() - started > 5000) { box.remove(); location.reload(); return; }
+    if (Date.now() - started > 5 * 60_000) { say("The panel is taking a while to come back", "Reload this page in a minute. If it doesn't load, check: journalctl -u fcc on the new main server.", true); return; }
+  }
+}
+
+async function makeMainDialog(s) {
+  let pf;
+  try { pf = await get(`/api/servers/${s.id}/make-main`); } catch (ex) { toastError(ex, "Couldn't check the server"); return; }
+  const old = pf.oldMain?.name || "Main";
+  const m = openModal({
+    title: `Make ${s.name} the main server`, sub: `Replaces ${old}`, ico: "server", size: "lg",
+    body: mainSwitchBody(pf),
+    foot: html`<button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-ghost" data-ms-refresh>${icon("refresh")}Check again</button>${pf.ok ? html`<button class="btn btn-danger" data-ms-go disabled>Make ${s.name} the main server</button>` : ""}`,
+    onMount(el, close) {
+      const wire = () => {
+        const inp = $("[data-ms-confirm]", el), go = $("[data-ms-go]", el);
+        if (inp && go) inp.oninput = () => { go.disabled = inp.value.trim() !== old; };
+      };
+      wire();
+      $("[data-ms-refresh]", el).onclick = async (e) => {
+        const b = e.currentTarget; b.classList.add("loading");
+        try { pf = await get(`/api/servers/${s.id}/make-main`); mount($(".modal-body", el), mainSwitchBody(pf)); wire(); if (pf.ok && !$("[data-ms-go]", el)) close("recheck"); }
+        catch (ex) { toastError(ex, "Couldn't check the server"); } finally { b.classList.remove("loading"); }
+      };
+      const go = $("[data-ms-go]", el);
+      if (go) go.onclick = async () => {
+        go.classList.add("loading");
+        try {
+          const job = await post(`/api/servers/${s.id}/make-main`, { confirm: $("[data-ms-confirm]", el).value.trim() });
+          close("started");
+          if (job?.id) { openJobLog(job.id); waitForNewMain(job, s.name); }
+        } catch (ex) { toastError(ex, "Couldn't start"); go.classList.remove("loading"); }
+      };
+    },
+  });
+  if ((await m.result) === "recheck") makeMainDialog(s); // became ready: reopen with the confirm field
+}
+
 /** Servers page header strip: active panel, standbys, votes; standby rows with lag and "Make active panel". */
 /* ───────── failover speed (3.10, docs/HA.md "Failover speed") ───────── */
 
@@ -550,6 +619,7 @@ export default async function servers(ctx) {
       })(),
       s.role !== "main" && ha?.enabled && s.panel?.enabled && s.id !== ha.leaderId && { label: "Make active panel", icon: "zap", disabled: !s.online || ha.armed === false,
         onClick: () => { const n = (ha.nodes || []).find((x) => x.serverId === s.id) || { serverId: s.id, name: s.name }; makeActive(n, ha, ctx); } },
+      s.role !== "main" && { label: "Make main server", icon: "server", onClick: () => makeMainDialog(s) },
       s.role !== "main" && s.edge?.enabled && { label: "Edge node details", icon: "shield", onClick: () => edgeDialog(s) },
       s.role !== "main" && s.edge?.enabled && { label: "Sync edge now", icon: "refresh", disabled: !s.online, onClick: async () => {
         try { const job = await post(`/api/servers/${s.id}/edge/sync`); if (job?.id) openJobLog(job.id); else toast("Sync sent", "ok"); } catch (ex) { toastError(ex, "Couldn't sync"); } } },

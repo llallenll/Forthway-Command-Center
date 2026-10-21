@@ -476,7 +476,7 @@ function createCluster(ctx) {
       const id = db.newId("tsk");
       // server.backup and a site.deploy that packages its build (build once,
       // ship everywhere) send a file back through /agent/upload/:taskId.
-      const uploads = type === "server.backup" || (type === "site.deploy" && payload?.package);
+      const uploads = type === "server.backup" || type === "main.handoff" || (type === "site.deploy" && payload?.package);
       let p = uploads ? { ...payload, upload: { url: `/agent/upload/${id}` } } : payload;
       // Main's embedded agent (main not running the panel) still needs the edge
       // allow-list for its local static/php vhosts, like the in-process path above.
@@ -2000,6 +2000,15 @@ function createCluster(ctx) {
     return patch;
   }
 
+  /**
+   * After the main server changed (main-switch.mjs), every agent is told the
+   * address to use from now on (agents ≥ 3.5.0 save it in their config file).
+   */
+  function agentPanelUrlFor(s) {
+    const u = ctx.config?.agentPanelUrl;
+    return typeof u === "string" && u && s?.id !== MAIN_ID ? { panelUrl: u } : {};
+  }
+
   function routes(router) {
     // --------------------------------------------------- admin API
     router.get("/api/servers", () => ({ items: listServers() }));
@@ -2257,6 +2266,7 @@ function createCluster(ctx) {
         panels: panelNodeList(),
         // 3.10: the vote heartbeat (and lease) of the configured failover speed (voters ≥ 3.4.0 adopt it).
         ...(haOn() ? { haTimings: haAdvertised(ctx.config?.ha?.failoverSeconds) } : {}),
+        ...agentPanelUrlFor(s),
       };
     });
 
@@ -2264,7 +2274,7 @@ function createCluster(ctx) {
       const s = node(req);
       // Every reply carries the failover state, so an agent that connected
       // before HA was turned on (or off) starts (or stops) voting without a reconnect.
-      const withHa = (r) => (r && typeof r === "object" ? { ...r, ha: haOn(), panels: haOn() ? panelNodeList() : [], ...(haOn() ? { haTimings: haAdvertised(ctx.config?.ha?.failoverSeconds) } : {}) } : r);
+      const withHa = (r) => (r && typeof r === "object" ? { ...r, ha: haOn(), panels: haOn() ? panelNodeList() : [], ...(haOn() ? { haTimings: haAdvertised(ctx.config?.ha?.failoverSeconds) } : {}), ...agentPanelUrlFor(s) } : r);
       const running = new Set(String(query.running || "").split(",").filter(Boolean));
       reconcile(s.id, running);
       // Out of date and idle: have it reconnect (which updates it) before it
@@ -2402,7 +2412,9 @@ function createCluster(ctx) {
       // panel asked for it — releases/<releaseId>-built.zip — never at a path
       // the agent chooses. Only once per task.
       const isBuild = t?.type === "site.deploy" && !!t.payload?.package && !t.uploaded;
-      if (!t || t.serverId !== s.id || !(t.type === "server.backup" || isBuild) || t.status !== "sent") {
+      // Changing the main server: the old main sends one backup archive or its /etc/letsencrypt.
+      const isHandoff = t?.type === "main.handoff" && s.id === MAIN_ID && !t.uploaded;
+      if (!t || t.serverId !== s.id || !(t.type === "server.backup" || isBuild || isHandoff) || t.status !== "sent") {
         throw httpError(404, "No task is waiting for this upload.");
       }
       const max = Number(ctx.config?.cluster?.maxUploadBytes) || DEFAULT_MAX_UPLOAD;
@@ -2411,7 +2423,20 @@ function createCluster(ctx) {
 
       let dir;
       let name;
-      if (isBuild) {
+      if (isHandoff) {
+        if (t.payload.kind === "backup") {
+          const root = path.join(ctx.dataDir, "backups");
+          const rel = String(t.payload.file || "");
+          const abs = path.resolve(root, rel);
+          if (!/^[\w][\w./-]{0,300}$/.test(rel) || !abs.startsWith(root + path.sep)) throw httpError(400, "Not a backup file name.");
+          if (fs.existsSync(abs)) throw httpError(409, "That backup archive is already on this server.");
+          dir = path.dirname(abs);
+          name = path.basename(abs);
+        } else {
+          dir = path.join(ctx.dataDir, "tmp");
+          name = `handoff-letsencrypt-${t.id}.tar.gz`;
+        }
+      } else if (isBuild) {
         const rid = String(t.payload.package.releaseId || "");
         if (!/^[\w-]{1,80}$/.test(rid)) throw httpError(400, "The task does not name a valid release for the packaged build.");
         dir = path.join(ctx.dataDir, "releases");
