@@ -523,6 +523,17 @@ export function register(router, ctx) {
             if (!pf.dbPlan.startsWith("switchover")) log("── Databases ──");
             await waitJob(ctx.mysqlHa.disable(admin), "Turning off database replication", log);
           }
+          // The databases stay on another server: the new main manages them over TCP and needs a MySQL client.
+          const mh = ctx.config.mysqlHa || {};
+          if (mh.primary && mh.primary !== x.id && mh.primary !== MAIN_ID && (mh.enabled || mh.aliasKept) && !sys.which("mysql") && !sys.which("mariadb")) {
+            log("── MySQL client ──");
+            log(`The databases live on ${nameOf(mh.primary)}; installing the MySQL client here so the panel can manage them.`);
+            const { ensureMysqlClient } = await import("../../shared/mysql-ha.mjs");
+            const r = await ensureMysqlClient(mh.flavor === "mariadb" ? "mariadb" : "mysql", { log: (l) => log(`  ${l}`) });
+            sys.forgetWhich();
+            if (!r.installed) log(`  !! ${r.error} — install ${mh.flavor === "mariadb" ? "mariadb" : "mysql"}-client on ${x.name} by hand.`);
+          }
+
           // Transfer
           log("── Copy from the old main server ──");
           const transferResult = await transfer(pf, { log, signal });

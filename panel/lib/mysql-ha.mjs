@@ -48,7 +48,8 @@ import { httpError } from "./http.mjs";
 import { DRY_RUN } from "./sys.mjs";
 import { REPL_ALIAS, ADMIN_USER, validHost, cleanHost, generatePassword } from "./mysql.mjs";
 import * as sharedTasks from "../../shared/tasks.mjs";
-import { gtidDiffCount } from "../../shared/mysql-ha.mjs";
+import { gtidDiffCount, ensureMysqlClient } from "../../shared/mysql-ha.mjs";
+import { which, forgetWhich } from "./sys.mjs";
 import { haTimings, timingSummary } from "../../shared/ha-timing.mjs";
 
 /** Default detection window (failoverSeconds 15); the live one is timings().detectMs. */
@@ -1389,6 +1390,51 @@ function createMysqlHa(ctx) {
     }
   }
 
+  /**
+   * New servers: fcc_admin / firewall on the primary must include them — also after
+   * replication was turned off while the primary stays on another machine (aliasKept):
+   * the active panel still manages the databases there over TCP.
+   */
+  async function syncAdminIps(c, primary) {
+    if (op || Date.now() - adminIpsCheckedAt <= 60_000 || !serverOnline(primary)) return;
+    adminIpsCheckedAt = Date.now();
+    const key = crypto.createHash("sha256").update(JSON.stringify(await allServerIps())).digest("hex").slice(0, 16);
+    if (c.adminIpsKey && c.adminIpsKey !== key) {
+      try {
+        const creds = await credentials();
+        await ctx.cluster.runTask(primary, "mysql.primary.prepare", await preparePayload(primary, c.replica ? [c.replica] : [], creds), {});
+        c.adminIpsKey = key;
+        save();
+        console.log("[mysql-ha] server addresses changed — primary re-prepared (fcc_admin hosts, firewall)");
+      } catch (err) {
+        console.error(`[mysql-ha] re-preparing the primary for new server addresses failed: ${err.message}`);
+      }
+    } else if (!c.adminIpsKey) {
+      c.adminIpsKey = key;
+      save();
+    }
+  }
+
+  /**
+   * This panel manages databases that live on another server (mysql.mjs connects as
+   * fcc_admin over TCP), so it needs the MySQL client of the primary's flavor. Panel
+   * nodes that never held a database role (or a new main server) may not have one:
+   * install it. At most once every 10 minutes.
+   */
+  let clientTriedAt = 0;
+  async function ensureLocalClient() {
+    const c = cfg();
+    if (!isLeader() || !c.primary || !(c.enabled || c.aliasKept) || c.primary === localServerId()) return;
+    if (DRY_RUN || which("mysql") || which("mariadb")) return;
+    if (Date.now() - clientTriedAt < 10 * 60_000) return;
+    clientTriedAt = Date.now();
+    const flavor = c.flavor === "mariadb" ? "mariadb" : "mysql";
+    console.log(`[mysql-ha] the databases live on ${nameOf(c.primary)} and this server has no MySQL client — installing the ${flavor} client`);
+    const r = await ensureMysqlClient(flavor, { log: (l) => console.log(`[mysql-ha]   ${l}`) });
+    forgetWhich();
+    if (!r.installed) console.error(`[mysql-ha] could not install the MySQL client (${r.error}); install ${flavor}-client on this server by hand`);
+  }
+
   async function tickOnce() {
     if (!isLeader()) {
       detect.since = null;
@@ -1397,6 +1443,8 @@ function createMysqlHa(ctx) {
       return;
     }
     const c = cfg();
+    await ensureLocalClient().catch((err) => console.error(`[mysql-ha] MySQL client: ${err.message}`));
+    if (!c.enabled && c.aliasKept && c.primary && c.primary !== localServerId() && tasksReady()) await syncAdminIps(c, c.primary);
     if (!c.enabled || !tasksReady()) {
       detect.since = null;
       if (!op && progress) progressClear();
@@ -1468,25 +1516,7 @@ function createMysqlHa(ctx) {
       await flushUsers();
     }
 
-    // --- new servers: fcc_admin / firewall on the primary must include them
-    if (!op && Date.now() - adminIpsCheckedAt > 60_000 && serverOnline(primary)) {
-      adminIpsCheckedAt = Date.now();
-      const key = crypto.createHash("sha256").update(JSON.stringify(await allServerIps())).digest("hex").slice(0, 16);
-      if (c.adminIpsKey && c.adminIpsKey !== key) {
-        try {
-          const creds = await credentials();
-          await ctx.cluster.runTask(primary, "mysql.primary.prepare", await preparePayload(primary, c.replica ? [c.replica] : [], creds), {});
-          c.adminIpsKey = key;
-          save();
-          console.log("[mysql-ha] server addresses changed — primary re-prepared (fcc_admin hosts, firewall)");
-        } catch (err) {
-          console.error(`[mysql-ha] re-preparing the primary for new server addresses failed: ${err.message}`);
-        }
-      } else if (!c.adminIpsKey) {
-        c.adminIpsKey = key;
-        save();
-      }
-    }
+    await syncAdminIps(c, primary);
 
     if (Date.now() - (lastAliasRefresh || 0) > 5 * 60_000) {
       lastAliasRefresh = Date.now();
