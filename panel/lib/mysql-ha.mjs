@@ -960,7 +960,9 @@ function createMysqlHa(ctx) {
     if (!replica) throw httpError(400, "Choose the server for the replica (replicaServerId).");
     const primary = c.primary || MAIN_ID;
     if (replica === primary) throw httpError(400, "The replica must be a different server from the primary.");
-    if (replica === MAIN_ID) throw httpError(400, "Pick an agent server for the replica.");
+    // The main server can be the replica while the primary is elsewhere (after the main server changed):
+    // a switchover then brings the databases home, with the agent server as the failover copy.
+    if (replica === MAIN_ID && ha().mainIsLocal === false && !agentOk(MAIN_ID)) throw httpError(409, "The main server can only become the replica while it runs the active panel.");
     requireAgent(replica, "a database replica");
     requireSeedAgent(replica);
     if (primary !== MAIN_ID || ha().mainIsLocal === false) requireAgent(primary, "the database primary");
@@ -1657,14 +1659,15 @@ function createMysqlHa(ctx) {
   function candidates() {
     const c = cfg();
     const list = enabledServers()
-      .filter((s) => s.id !== MAIN_ID && s.role !== "main" && s.id !== c.primary)
+      .filter((s) => s.id !== c.primary && (s.id !== MAIN_ID || (c.primary && c.primary !== MAIN_ID)))
       .map((s) => {
         const online = serverOnline(s.id);
         const ok = online && agentOk(s.id);
         const reason = !online ? "offline" : !agentOk(s.id) ? `agent v${s.agentVersion || "?"} (needs ${MIN_AGENT})` : null;
         return { serverId: s.id, name: s.name, panelNode: !!s.panel?.enabled, online, ok, reason, recommended: false };
       });
-    const pick = list.find((x) => x.ok && x.panelNode) || list.find((x) => x.ok);
+    // Databases away from the main server: the main server is the natural replica (then switch over).
+    const pick = list.find((x) => x.ok && x.serverId === MAIN_ID) || list.find((x) => x.ok && x.panelNode) || list.find((x) => x.ok);
     if (pick) pick.recommended = true;
     return list;
   }

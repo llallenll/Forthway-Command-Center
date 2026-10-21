@@ -1223,6 +1223,10 @@ export function register(router, ctx) {
     /** For the Cloudflare module: where a tunnel reaches phpMyAdmin's vhost. */
     tunnelTarget: () => ({ port: portOf(), tls: cfg().vhost?.tls || null }),
     issueToken: (databaseId, admin) => issueToken(databaseId, admin, null),
+    /** main-switch.mjs: the new main server reinstalls what the old main had. */
+    wasInstalled: () => !!cfg().installed,
+    isInstalled: () => isInstalled(),
+    install: (admin = null) => startJob("install", {}, admin),
     // for start()
     _refresh: async () => {
       if (!mainLocal()) {
