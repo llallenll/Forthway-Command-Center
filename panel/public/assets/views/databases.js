@@ -127,7 +127,8 @@ export default async function databases(ctx) {
   const paintMysql = () => {
     const box = $("[data-mysql]", root);
     if (!mysql) return mount(box, html``);
-    if (!mysql.installed) return mount(box, html`<div class="note err" style="margin-bottom:16px">${icon("alert")}<div><b>MySQL isn't installed on the main server.</b> Run the panel installer again or install <span class="mono">mysql-server</span>, then reload this page.</div></div>`);
+    // Say what the panel actually found (no local MySQL, no client for a remote primary, databases unreachable).
+    if (!mysql.installed) return mount(box, html`<div class="note err" style="margin-bottom:16px">${icon("alert")}<div><b>${mysql.reason || mysql.error || "MySQL isn't installed on the main server."}</b>${mysql.reason ? "" : html` Run the panel installer again or install <span class="mono">mysql-server</span>, then reload this page.`}</div></div>`);
     if (!mysql.running) return mount(box, html`<div class="note err" style="margin-bottom:16px">${icon("alert")}<div><b>MySQL is not running.</b> ${mysql.error || ""}</div></div>`);
     if (mysql.rootOk === false) return mount(box, html`<div class="note warn" style="margin-bottom:16px;align-items:center">${icon("key")}<div style="flex:1">The panel can't log in to MySQL as root. Enter the root password once so it can manage databases.</div><button class="btn btn-sm" data-root>Set root password</button></div>`);
     const bindLocal = /^(127\.|localhost|::1)/.test(mysql.bindAddress || "");

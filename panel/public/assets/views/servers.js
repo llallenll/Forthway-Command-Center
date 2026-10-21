@@ -303,51 +303,98 @@ function failoverBox(f) {
   </div>`;
 }
 
-/** Database replication row in the HA strip: primary → replica, state and lag (null when replication is off). */
-function dbRow(repl) {
-  const sum = replSummary(repl);
-  if (!sum) return "";
-  const rep_ = repl?.replica, prog = repl?.progress;
-  const lag = !rep_ || replicaBroken(repl) || syncActive(prog) ? "" : `lag ${fmtLagS(rep_.lagSeconds)}`;
-  return html`<div class="ha-dbrow">
-    <span class="dot ${sum.tone}"></span>
-    <span class="ha-dbrow-t"><b>Databases</b><span class="muted"> · primary ${sum.primary}${rep_ ? ` → replica ${rep_.name}` : ""}${repl.mode ? ` · ${repl.mode === "auto" ? "automatic" : "manual"} failover` : ""}</span>
-      ${sum.warns.length ? html`<div class="small ha-short">${sum.warns[0]}</div>` : ""}</span>
-    <span class="ha-node-meta muted small">${lag ? html`<span title="How far the replica's copy of the databases is behind (seconds behind the primary)">${lag}</span>` : html`<span>${sum.text}</span>`}${rep_?.sqlRunning != null ? html`<span>${rep_.ioRunning && rep_.sqlRunning ? "threads running" : "threads stopped"}</span>` : ""}</span>
-    <a class="btn btn-sm" href="#/settings/databases">Replication</a>
-    ${syncActive(prog) ? html`<span class="ha-db-bar">${syncBar(prog, { size: "sm" })}</span>` : ""}
-  </div>`;
-}
+/* Servers page header: a Panels section and a Databases section, each one tile per
+   server with its role, plus a collapsible Failover speed box. */
 
-function haStrip(ha, items, repl) {
-  // Panel failover off: the speed still sets how fast the database fails over (shown once there is a second server).
-  if (!ha?.enabled) return (ha?.failover && (items || []).length >= 2) || replSummary(repl) ? html`<div class="card ha-strip ha-strip-solo">${dbRow(repl)}${ha?.failover && (items || []).length >= 2 ? failoverBox(ha.failover) : ""}</div>` : html``;
-  const leader = nodeName(ha, items, ha.leaderId);
-  const standbys = (ha.nodes || []).filter((n) => n.serverId !== ha.leaderId);
+let foOpen = (() => { try { return localStorage.getItem("fcc.ha.foOpen") === "1"; } catch { return false; } })();
+
+const haTile = ({ dot, name, role, roleTone, meta = [], action = "", extra = "" }) => html`<div class="ha-tile">
+  <div class="ha-tile-head"><span class="dot ${dot}"></span><span class="ha-tile-name">${name}</span><span class="badge ${roleTone}">${role}</span></div>
+  ${meta.length ? html`<div class="ha-tile-meta muted small">${meta.map((m) => (typeof m === "string" ? html`<span>${m}</span>` : m))}</div>` : ""}
+  ${extra}${action ? html`<div class="ha-tile-foot">${action}</div>` : ""}
+</div>`;
+
+const secHead = (ico, tone, title, sub, right = "") => html`<div class="ha-sec-head"><span class="ha-ico ${tone}">${icon(ico, "sm")}</span>
+  <div class="ha-strip-t"><b>${title}</b>${sub ? html`<span class="muted"> · ${sub}</span>` : ""}</div>${right}</div>`;
+
+const warnList = (warns) => (warns.length ? html`<ul class="ha-warns ha-strip-warns">${warns.map((w) => html`<li>${icon("alert", "xs")}<span>${w}</span></li>`)}</ul>` : "");
+
+/** Panels: the active panel and every standby as tiles (null while panel failover is off). */
+function panelsSection(ha, items) {
+  if (!ha?.enabled) return "";
+  const nodes = ha.nodes || [];
+  const leader = nodes.find((n) => n.serverId === ha.leaderId) || { serverId: ha.leaderId, name: nodeName(ha, items, ha.leaderId), online: true };
+  const standbys = nodes.filter((n) => n.serverId !== ha.leaderId);
   const votes = (ha.votes || []).filter((v) => v.votedFor === ha.leaderId && v.reachable !== false && (v.leaseLeftMs == null || v.leaseLeftMs > 0)).length;
   const voters = ha.voters ?? (ha.votes || []).length;
   const short = ha.majority && votes < ha.majority;
   const warns = ha.warnings || [];
-  const tone = ha.armed === false || short ? "warn" : warns.length ? "warn" : "ok";
-  return html`<div class="card ha-strip ${tone === "warn" ? "is-warn" : ""}">
-    <div class="ha-strip-head">
-      <span class="ha-ico ${tone}">${icon("layers", "sm")}</span>
-      <div class="ha-strip-t"><b>Active panel: ${leader}</b><span class="muted"> · ${standbys.length ? `${standbys.length} ${standbys.length === 1 ? "standby" : "standbys"}` : "no standbys"} · </span><span class="${short ? "ha-short" : "muted"}" title="${ha.majority ? `A majority is ${ha.majority} of ${voters}.` : ""}">votes ${votes}/${voters}</span>
-        ${ha.armed === false ? html`<div class="muted small">Waiting for the servers to vote… Failover starts once a majority has voted.</div>` : ""}</div>
+  const tone = ha.armed === false || short || warns.length ? "warn" : "ok";
+  const sub = html`${standbys.length ? `${standbys.length} ${standbys.length === 1 ? "standby" : "standbys"}` : "no standbys"} · <span class="${short ? "ha-short" : ""}" title="${ha.majority ? `A majority is ${ha.majority} of ${voters}.` : ""}">votes ${votes}/${voters}</span>`;
+  return html`<section class="ha-sec">
+    ${secHead("layers", tone, "Panels", sub)}
+    ${ha.armed === false ? html`<div class="muted small">Waiting for the servers to vote… Failover starts once a majority has voted.</div>` : ""}
+    ${warnList(warns)}
+    <div class="ha-tiles">
+      ${haTile({ dot: "ok", name: leader.name || nodeName(ha, items, leader.serverId), role: "Active", roleTone: "ok",
+        meta: [leader.panelVersion ? `v${leader.panelVersion}` : null, "serving the panel", `${votes} of ${voters} votes`].filter(Boolean) })}
+      ${standbys.map((n) => {
+        const can = n.online && ha.armed !== false;
+        return haTile({
+          dot: !n.online ? "err" : n.role === "candidate" ? "warn" : "ok", name: n.name, role: !n.online ? "Offline" : n.role === "candidate" ? "Electing" : "Standby", roleTone: !n.online ? "err" : "",
+          meta: [n.panelVersion ? `v${n.panelVersion}` : null,
+            html`<span title="Panel data is copied to standbys as it changes; this is how far behind its copy is.">${!n.online ? "data lag —" : n.lagMs === 0 ? "data in sync" : `data lag ${fmtLag(n.lagMs)}`}</span>`,
+            html`<span class="${n.codeInSync === false ? "ha-short" : ""}">${n.codeInSync === false ? "code updating" : "code in sync"}</span>`].filter(Boolean),
+          action: html`<button class="btn btn-sm" type="button" data-ha-active="${n.serverId}" ${can ? "" : raw("disabled")} title="${!n.online ? `${n.name} is offline.` : ha.armed === false ? "Wait until the servers have voted." : "Hand the active panel over to this server."}">Make active panel</button>`,
+        });
+      })}
     </div>
-    ${warns.length ? html`<ul class="ha-warns ha-strip-warns">${warns.map((w) => html`<li>${icon("alert", "xs")}<span>${w}</span></li>`)}</ul>` : ""}
-    ${standbys.length ? html`<div class="edge-rows ha-nodes">${standbys.map((n) => {
-      const can = n.online && ha.armed !== false;
-      return html`<div class="edge-row ha-node">
-        <span class="dot ${!n.online ? "err" : n.role === "candidate" ? "warn" : "ok"}"></span>
-        <span class="edge-row-name">${n.name}<span class="muted small"> · ${!n.online ? "offline" : n.role === "candidate" ? "electing" : "standby"}${n.panelVersion ? ` · v${n.panelVersion}` : ""}</span></span>
-        <span class="ha-node-meta muted small"><span title="${n.version?.seq != null ? `Has panel data change #${n.version.seq}. ` : ""}Panel data is copied to standbys as it changes; this is how far behind its copy is.">${!n.online ? "lag —" : n.lagMs === 0 ? "data in sync" : `data lag ${fmtLag(n.lagMs)}`}</span><span class="${n.codeInSync === false ? "ha-short" : ""}">${n.codeInSync === false ? "code updating" : "code in sync"}</span></span>
-        <button class="btn btn-sm" type="button" data-ha-active="${n.serverId}" ${can ? "" : raw("disabled")} title="${!n.online ? `${n.name} is offline.` : ha.armed === false ? "Wait until the servers have voted." : "Hand the active panel over to this server."}">Make active panel</button>
-      </div>`;
-    })}</div>` : ""}
-    ${dbRow(repl)}
-    ${failoverBox(ha.failover)}
-  </div>`;
+  </section>`;
+}
+
+/** Databases: the primary and the replica as tiles (null when replication is off). */
+function databasesSection(repl) {
+  const sum = replSummary(repl);
+  if (!sum) return "";
+  const rep_ = repl?.replica, prog = repl?.progress, p = repl?.primary;
+  const broken = replicaBroken(repl);
+  const sub = repl.mode ? `${repl.mode === "auto" ? "automatic" : "manual"} failover` : sum.text;
+  return html`<section class="ha-sec">
+    ${secHead("database", sum.tone === "ok" ? "ok" : "warn", "Databases", sub, html`<a class="btn btn-sm" href="#/settings/databases">Replication</a>`)}
+    ${warnList(sum.warns)}
+    <div class="ha-tiles">
+      ${haTile({ dot: repl.detect?.primaryDownForMs ? "err" : "ok", name: p?.name || sum.primary, role: "Primary", roleTone: "ok",
+        meta: [p?.readOnly ? html`<span class="ha-short">read-only</span>` : "read & write", p?.address || null].filter(Boolean) })}
+      ${rep_ ? haTile({ dot: broken ? "err" : syncActive(prog) ? "run" : "ok", name: rep_.name, role: "Replica", roleTone: broken ? "err" : "",
+        meta: syncActive(prog) ? [sum.text] : [html`<span title="How far the replica's copy of the databases is behind (seconds behind the primary)">lag ${fmtLagS(rep_.lagSeconds)}</span>`,
+          rep_.sqlRunning != null ? (rep_.ioRunning && rep_.sqlRunning ? "threads running" : html`<span class="ha-short">threads stopped</span>`) : null].filter(Boolean),
+        extra: syncActive(prog) ? html`<div class="ha-db-bar">${syncBar(prog, { size: "sm" })}</div>` : "" })
+      : html`<div class="ha-tile ha-tile-empty muted small">No replica — the databases have no copy right now.</div>`}
+    </div>
+  </section>`;
+}
+
+/** Failover speed, folded away behind a button (the choice is remembered per browser). */
+function failoverSection(f) {
+  if (!f) return "";
+  return html`<section class="ha-sec ha-fo-sec">
+    <button type="button" class="ha-fo-toggle" data-fo-toggle aria-expanded="${foOpen ? "true" : "false"}">
+      <span class="ha-ico">${icon("zap", "sm")}</span>
+      <span class="ha-strip-t"><b>Failover speed</b><span class="muted"> · ${f.failoverSeconds} s</span></span>
+      <span class="ha-fo-chev">${icon(foOpen ? "chevronDown" : "chevronRight", "sm")}</span>
+    </button>
+    <div data-fo-body ${foOpen ? "" : raw("hidden")}>${failoverBox(f)}</div>
+  </section>`;
+}
+
+function haStrip(ha, items, repl) {
+  const panels = panelsSection(ha, items);
+  const dbs = databasesSection(repl);
+  // Panel failover off: the speed still sets how fast the database fails over (shown once there is a second server).
+  const fo = ha?.failover && (ha?.enabled || (items || []).length >= 2) ? failoverSection(ha.failover) : "";
+  if (!panels && !dbs && !fo) return html``;
+  const warn = ha?.enabled && (ha.armed === false || (ha.warnings || []).length);
+  return html`<div class="card ha-strip ${warn ? "is-warn" : ""}">${panels}${dbs}${fo}</div>`;
 }
 
 /* ───────── add/edit server dialog (docs/HA.md, Phase 3: three menus instead of switches) ───────── */
@@ -700,6 +747,13 @@ export default async function servers(ctx) {
   }, 200);
   const foValue = () => Math.round(Number($("[data-fo-input]", haBox)?.value));
   on(root, "input", "[data-fo-input]", () => { const v = foValue(); foState(v, null); foPreview(v); });
+  on(root, "click", "[data-fo-toggle]", (e, b) => {
+    foOpen = !foOpen;
+    try { localStorage.setItem("fcc.ha.foOpen", foOpen ? "1" : "0"); } catch { /* per-browser nicety */ }
+    b.setAttribute("aria-expanded", foOpen ? "true" : "false");
+    mount($(".ha-fo-chev", b), icon(foOpen ? "chevronDown" : "chevronRight", "sm"));
+    const body = $("[data-fo-body]", haBox); if (body) body.hidden = !foOpen;
+  });
   on(root, "click", "[data-fo-preset]", (e, b) => { const inp = $("[data-fo-input]", haBox); if (!inp) return; inp.value = b.dataset.foPreset; const v = foValue(); foState(v, null); foPreview(v); });
   on(root, "click", "[data-fo-save]", async (e, b) => {
     const v = foValue(); if (!foValid(v)) return;

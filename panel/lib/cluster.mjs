@@ -1890,6 +1890,9 @@ function createCluster(ctx) {
     db.save({ immediate: true });
     serversChanged("panel", serverId);
     const payload = { codeUrl: "/ha/code", directUrl, port, host: "0.0.0.0", allowFrom: await allServerIps() };
+    // A panel node may lead one day while the databases live elsewhere: give it the MySQL client.
+    const m = ctx.config?.mysqlHa;
+    if (m?.primary && (m.enabled || m.aliasKept)) payload.mysqlFlavor = m.flavor === "mariadb" ? "mariadb" : "mysql";
     log(`Installing the panel on ${s.name}: it will listen on port ${port} and be reached at ${directUrl}.`);
     log(`The panel port is opened to ${payload.allowFrom.length} server address(es) if ufw is active there.`);
     try {

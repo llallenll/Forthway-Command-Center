@@ -537,7 +537,7 @@ export function databasesTable(items, { projectsById = {}, showProject = true, m
     <thead><tr><th>Database</th>${showProject ? html`<th class="hide-sm">Project</th>` : ""}<th class="hide-sm">User</th><th>Size</th><th class="hide-sm">Last backup</th><th class="hide-sm">Used by</th><th></th></tr></thead>
     <tbody>${items.map((d) => {
       const p = projectsById[d.projectId];
-      return html`<tr>
+      return html`<tr class="${older ? "bk-older" : more ? "bk-top" : ""}" ${older ? raw(`data-bk-of="${k.replace(/"/g, "")}"`) : ""} ${older && !open ? raw("hidden") : ""}>
         <td><div class="row"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(51,212,193,.1);color:#5fe0cf">${icon("database", "sm")}</span>
           <div><div class="t-main mono">${d.name}</div><div class="t-sub">${d.charset || "utf8mb4"}${d.remoteAccess ? " · agent access" : ""}</div>
           ${d.remoteAccess && bindLocal ? html`<span class="badge warn mt-8" title="MySQL listens on ${mysql.bindAddress} only, so agent servers can't reach it.">${icon("alert")}Agents can't connect</span>` : ""}</div></div></td>
@@ -553,16 +553,37 @@ export function databasesTable(items, { projectsById = {}, showProject = true, m
 
 /* ───────── backups ───────── */
 
+/** Backup stacks the admin opened (kept while the list re-renders on live events). */
+const openStacks = new Set();
+const stackKey = (b) => (b.kind === "database" ? `db:${b.databaseId || b.databaseName || "?"}` : `srv:${b.serverId || "?"}`);
+
+/**
+ * Backups grouped per database (or per server): the newest one is a row, the older
+ * ones fold under it behind a "+N older" toggle — the list stays one line per thing.
+ */
 export function backupsTable(items, { serversById = {}, dbsById = {}, kind } = {}) {
-  return html`<div class="card"><div class="table-wrap"><table class="table">
+  const groups = new Map();
+  for (const b of [...items].sort((x, y) => String(y.createdAt).localeCompare(String(x.createdAt)))) {
+    const k = stackKey(b);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(b);
+  }
+  const rows = [];
+  for (const [k, list] of groups) list.forEach((b, i) => rows.push({ b, k, older: i > 0, list: i === 0 ? list : null }));
+  return html`<div class="card"><div class="table-wrap"><table class="table bk-table">
     <thead><tr><th>${kind === "server" ? "Server backup" : "Backup"}</th><th>Status</th><th>Size</th><th class="hide-sm">Trigger</th><th class="hide-sm">Created</th><th></th></tr></thead>
-    <tbody>${items.map((b) => {
+    <tbody>${rows.map(({ b, k, older, list }) => {
+      const open = openStacks.has(k);
+      const more = list && list.length > 1 ? list.length - 1 : 0;
+      const olderBytes = more ? list.slice(1).reduce((a, x) => a + (x.status === "ok" ? x.size || 0 : 0), 0) : 0;
+      const missing = more ? list.slice(1).filter((x) => x.status === "ok" && x.available === false).length : 0;
       const src = b.kind === "database" ? dbsById[b.databaseId]?.name || b.databaseName || "deleted database" : serversById[b.serverId]?.name || b.serverName || b.serverId;
       const inc = b.include ? Object.entries(b.include).filter(([, v]) => v).map(([k]) => k) : [];
-      return html`<tr>
+      return html`<tr class="${older ? "bk-older" : more ? "bk-top" : ""}" ${older ? raw(`data-bk-of="${k.replace(/"/g, "")}"`) : ""} ${older && !open ? raw("hidden") : ""}>
         <td><div class="row"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(74,114,255,.1);color:var(--blue-3)">${icon(b.kind === "server" ? "hardDrive" : "archive", "sm")}</span>
           <div style="min-width:0"><div class="t-main row" style="gap:8px">${src}${b.pinned ? html`<span class="badge violet" title="Pinned — never removed by retention">${icon("pin")}Pinned</span>` : ""}</div>
-          <div class="t-sub mono ellipsis" style="max-width:340px">${b.filename || String(b.file || "").split("/").pop()}${inc.length ? html` · <span style="font-family:var(--font)">${inc.join(", ")}</span>` : ""}</div>${b.note ? html`<div class="t-sub">“${b.note}”</div>` : ""}</div></div></td>
+          <div class="t-sub mono ellipsis" style="max-width:340px">${b.filename || String(b.file || "").split("/").pop()}${inc.length ? html` · <span style="font-family:var(--font)">${inc.join(", ")}</span>` : ""}</div>${b.note ? html`<div class="t-sub">“${b.note}”</div>` : ""}
+          ${more ? html`<button type="button" class="bk-stack" data-bk-stack="${k}" aria-expanded="${open ? "true" : "false"}">${icon(open ? "chevronDown" : "chevronRight", "xs")}<span>${open ? "Hide older" : `+${more} older · ${fmtBytes(olderBytes)}`}</span>${missing && !open ? html`<span class="bk-stack-warn" title="${missing} older archive(s) are no longer on this server">${icon("alert", "xs")}${missing} missing</span>` : ""}</button>` : ""}</div></div></td>
         <td>${b.status === "ok" && b.available === false ? html`<span class="badge warn" title="The archive is no longer on disk">${icon("alert")}File missing</span>` : b.status === "ok" ? html`<span class="badge ok">${icon("check")}OK</span>` : b.status === "running" ? html`<span class="badge blue"><span class="dot run" style="width:6px;height:6px"></span>Running</span>` : html`<span class="badge err" title="${b.error || ""}">${icon("alert")}Failed</span>`}</td>
         <td class="num">${b.status === "ok" ? fmtBytes(b.size) : html`<span class="dim">—</span>`}</td>
         <td class="hide-sm"><span class="muted small">${b.trigger === "schedule" ? "Scheduled" : b.trigger === "safety" ? "Safety copy" : "Manual"}</span>${b.remote?.type && !b.remote.error && b.remote.key ? html`<div class="t-sub row" style="gap:5px;white-space:nowrap" title="${b.remote.location || ""}${b.remote.uploadedAt ? ` · uploaded ${fmtDate(b.remote.uploadedAt)}` : ""}${b.remote.dryRun ? " (dry run)" : ""}">${icon(b.remote.type === "smb" ? "folder" : "cloud", "xs")}${b.remote.type === "smb" ? "SMB copy" : "Off-site"}</div>` : b.remote?.error ? html`<div class="t-sub" style="color:#ffc46b" title="${b.remote.error}">Upload failed</div>` : ""}</td>
@@ -595,6 +616,14 @@ export function bindBackupActions(root, getItems, { dbsById = () => ({}), server
       onMount(el, close) { $("[data-ok]", el).onclick = async () => { try { await patch(`/api/backups/${b.id}`, { note: $("[data-note]", el).value.trim() }); close(true); refresh?.(); } catch (e) { toastError(e); } }; } });
     await m.result;
   };
+  on(root, "click", "[data-bk-stack]", (e, el) => {
+    const k = el.dataset.bkStack, open = !openStacks.has(k);
+    if (open) openStacks.add(k); else openStacks.delete(k);
+    const rows = [...root.querySelectorAll("tr[data-bk-of]")].filter((tr) => tr.dataset.bkOf === k);
+    rows.forEach((tr) => (tr.hidden = !open));
+    el.setAttribute("aria-expanded", open ? "true" : "false");
+    mount(el, html`${icon(open ? "chevronDown" : "chevronRight", "xs")}<span>${open ? "Hide older" : `+${rows.length} older`}</span>`);
+  });
   on(root, "click", "[data-bk-dl]", (e, el) => download(dlUrl(byId(el.dataset.bkDl) || { id: el.dataset.bkDl })));
   on(root, "click", "[data-bk-menu]", (e, el) => {
     const b = byId(el.dataset.bkMenu); if (!b) return;
