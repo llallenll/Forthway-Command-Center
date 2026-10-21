@@ -1547,3 +1547,41 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
 .ms-step > .dot { margin-top: 5px; flex: none; }
 .ms-step-t { flex: 1; min-width: 0; display: grid; gap: 3px; line-height: 1.5; }
 .ms-step-t .small { overflow-wrap: anywhere; }
+
+/* Servers page: Panels / Databases tiles, collapsible failover speed (3.12.0) */
+.ha-strip { gap: 0; padding: 0; }
+.ha-sec { display: grid; gap: 10px; padding: 14px 16px; min-width: 0; }
+.ha-sec + .ha-sec { border-top: 1px solid var(--line); }
+.ha-sec-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.ha-sec-head .btn { flex: none; }
+.ha-sec .ha-ico:not(.ok):not(.warn) { width: 30px; height: 30px; border-radius: 9px; background: rgba(74, 114, 255, 0.1); color: var(--blue-3); }
+.ha-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.ha-tile { display: grid; gap: 8px; align-content: start; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: rgba(8, 13, 30, 0.3); min-width: 0; }
+.ha-tile-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.ha-tile-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: var(--text); font-size: 14px; }
+.ha-tile-head .badge { flex: none; }
+.ha-tile-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.ha-tile-foot { display: flex; justify-content: flex-end; }
+.ha-tile .ha-db-bar { display: flex; max-width: none; margin: 0; }
+.ha-tile-empty { display: flex; align-items: center; border-style: dashed; }
+.ha-fo-sec { padding-top: 10px; padding-bottom: 10px; }
+.ha-fo-toggle { display: flex; align-items: center; gap: 12px; width: 100%; padding: 4px 0; background: none; border: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; border-radius: 8px; }
+.ha-fo-toggle:focus-visible { outline: 2px solid var(--blue-3); outline-offset: 3px; }
+.ha-fo-chev { color: var(--muted); display: inline-flex; }
+.ha-fo-sec .ha-fo { margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--line); }
+@media (max-width: 640px) {
+  .ha-sec { padding: 12px; }
+  .ha-tiles { grid-template-columns: 1fr; }
+  .ha-tile-foot .btn { width: 100%; justify-content: center; }
+}
+
+/* Backups: stacked per database / server (3.12.0) */
+.bk-stack { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 9px 3px 7px; border-radius: 999px; border: 1px solid var(--line); background: rgba(74, 114, 255, 0.07); color: var(--blue-3); font: inherit; font-size: 12px; cursor: pointer; }
+.bk-stack:hover { background: rgba(74, 114, 255, 0.14); }
+.bk-stack:focus-visible { outline: 2px solid var(--blue-3); outline-offset: 2px; }
+.bk-stack-warn { display: inline-flex; align-items: center; gap: 4px; color: #ffc46b; margin-left: 2px; }
+.bk-table tr.bk-older > td { background: rgba(8, 13, 30, 0.35); }
+.bk-table tr.bk-older > td:first-child { padding-left: 34px; position: relative; }
+.bk-table tr.bk-older > td:first-child::before { content: ""; position: absolute; left: 20px; top: 0; bottom: 0; border-left: 2px solid rgba(74, 114, 255, 0.25); }
+.bk-table tr[hidden] { display: none; }
+.ha-fo-sec .ha-fo-head label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

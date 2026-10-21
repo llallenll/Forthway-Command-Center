@@ -2293,7 +2293,7 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       const s = db.get("servers", id);
       const base = { serverId: id, name: s?.name || (id === MAIN ? "Main" : id), directUrl: urlOf(id) };
       if (id === me) {
-        out.push({ ...base, online: true, role: role === "leader" && !fencing ? "leader" : role === "candidate" ? "candidate" : "follower", version: myVersion(), lagMs: role === "leader" ? 0 : null, codeInSync: true, local: true });
+        out.push({ ...base, online: true, role: role === "leader" && !fencing ? "leader" : role === "candidate" ? "candidate" : "follower", version: myVersion(), lagMs: role === "leader" ? 0 : null, codeInSync: true, local: true, panelVersion: ctx.version || null });
       } else if (role === "leader") {
         const n = nodes.get(id);
         out.push({ ...base, online: !!n && mono() - n.lastPollAt < ONLINE_MS, role: "follower", version: n?.acked || null, lagMs: lagMs(n), codeInSync: n?.codeDigest ? n.codeDigest === codeDigest() : null, panelVersion: n?.panelVersion || null });
