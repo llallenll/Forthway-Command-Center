@@ -2561,6 +2561,20 @@ export function createHa(ctx, { follower = false, port = 4000, tls = false, onPr
       local.token = token;
       saveLocal();
     },
+    /**
+     * main-switch.mjs: this agent panel node becomes the main server. Only the file
+     * changes — `localServerId` / `mainIsLocal` keep their boot values until the
+     * restart that follows at once. Clears this node's vote and term memory.
+     */
+    setLocalServerId(id) {
+      if (typeof id !== "string" || !ID_RE.test(id)) throw new Error("setLocalServerId: invalid server id");
+      local.serverId = id;
+      delete local.voter;
+      delete local.restart;
+      local.lastLeaderId = id;
+      lastLeader = id;
+      saveLocal();
+    },
     // server.mjs plumbing
     _handle: handle,
     _proxy: proxy,

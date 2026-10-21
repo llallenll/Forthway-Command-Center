@@ -47,15 +47,18 @@ import { edgeStatus, edgeLogSites } from "../shared/edge.mjs";
 import { createVoter, cleanPanels } from "../shared/ha-voter.mjs";
 import { mysqlStatusCached } from "../shared/mysql-ha.mjs";
 
-export const AGENT_VERSION = "3.4.0";
+export const AGENT_VERSION = "3.5.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
 // ------------------------------------------------------------------ config
 
+let CONFIG_FILE = null;
+
 function loadConfig() {
   const i = process.argv.indexOf("--config");
   const file = path.resolve(i !== -1 ? process.argv[i + 1] : process.env.FCC_NODE_CONFIG || "/etc/fcc-node/config.json");
+  CONFIG_FILE = file;
   let cfg;
   try {
     cfg = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -152,6 +155,27 @@ function setHa(on) {
     });
   }
   voter.start();
+}
+
+/**
+ * The panel moved to another machine (3.12.0 "Change the main server"): it sends
+ * the address agents should use from now on with every hello/poll reply. Saved
+ * in our config file so a restart keeps it. Main's embedded agent never moves.
+ */
+function adoptPanelUrl(url) {
+  if (cfg.isMain || typeof url !== "string") return;
+  const u = url.replace(/\/+$/, "");
+  if (u === cfg.panelUrl || !/^https?:\/\/[A-Za-z0-9.\-:[\]]+(\/[\w.\-/]*)?$/.test(u)) return;
+  const was = cfg.panelUrl;
+  cfg.panelUrl = u;
+  if (!haState.on) current = u;
+  try {
+    const disk = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+    writeJsonFile(CONFIG_FILE, { ...disk, panelUrl: u });
+  } catch (err) {
+    log(`could not save the new panel address in ${CONFIG_FILE}: ${err.message}`);
+  }
+  log(`the panel moved: talking to ${u} from now on (was ${was}).`);
 }
 
 // ------------------------------------------------------------- panel client
@@ -540,6 +564,7 @@ async function hello() {
       pollWaitMs = Number(r?.pollWaitMs) || pollWaitMs;
       metricsIntervalMs = Number(r?.metricsIntervalMs) || metricsIntervalMs;
       needHello = false;
+      if (r?.panelUrl) adoptPanelUrl(r.panelUrl);
       if (r?.ha === true) {
         if (Array.isArray(r.panels)) setPanels(r.panels, "hello");
         setHa(true);
@@ -600,6 +625,7 @@ async function pollLoop() {
         continue;
       }
       // The panel repeats the failover state in every poll reply (it may have been turned on after our hello).
+      if (r?.panelUrl) adoptPanelUrl(r.panelUrl);
       if (r?.ha === true && Array.isArray(r.panels)) setPanels(r.panels, "poll");
       if (typeof r?.ha === "boolean" && r.ha !== haState.on) setHa(r.ha);
       if (r?.ha === true && r.haTimings) voter?.adopt?.(r.haTimings);

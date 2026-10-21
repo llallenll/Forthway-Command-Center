@@ -1541,3 +1541,9 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
 .ha-dbrow-t { flex: 1; min-width: 0; }
 .ha-dbrow .ha-node-meta { display: inline-flex; gap: 14px; white-space: nowrap; }
 .ha-dbrow .ha-db-bar { flex: 1 1 100%; max-width: 320px; }
+
+/* Change the main server (3.12.0) */
+.ms-step { align-items: flex-start; }
+.ms-step > .dot { margin-top: 5px; flex: none; }
+.ms-step-t { flex: 1; min-width: 0; display: grid; gap: 3px; line-height: 1.5; }
+.ms-step-t .small { overflow-wrap: anywhere; }

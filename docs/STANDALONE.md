@@ -1189,3 +1189,24 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   `pushEdgesNow()` and `lastSeenMs(id)`; `ctx.mysqlHa` gains `dbCutover()` and `timings()`.
   New task `mysql.probe { host, port, timeoutMs }`; cluster.sync gains `dbCutover
   { blockIps, port }` (iptables/nft TCP-reset rule + `ss -K`). Details in docs/HA.md.
+- **3.12.0 — change the main server (agent 3.5.0, tasks 3.6.0).** New module
+  `panel/lib/main-switch.mjs` (listed last in MODULES): `GET /api/servers/:id/make-main` →
+  checklist `{ ok, steps: [{ id, state: ok|auto|todo|warn|blocked, title, detail }], transfer,
+  dbPlan, addresses }`; `POST /api/servers/:id/make-main { confirm: <old main's name> }` → job
+  `server.main.change`. It runs on the agent server X that is already the active panel (no
+  other standby panel nodes, no websites left on the old main, databases not only on the old
+  main): database switchover / replication off as needed (`ctx.mysqlHa.switchover(admin)` /
+  `.disable(admin)`), copies every local backup archive X lacks and `/etc/letsencrypt` from the
+  old main (task `main.handoff { kind: "backup", file } | { kind: "letsencrypt" }`, upload through
+  `/agent/upload/:taskId`), retires the old main (`main.retire { delaySeconds }`: stop + disable
+  fcc.service, data folder renamed `.retired-<stamp>`), sets `config.agentPanelUrl` (sent with
+  every hello/poll reply to non-main agents as `panelUrl`; agents ≥ 3.5.0 save it in their
+  config file), then rewrites the identity (pure `remapIdentity` / `remapKeys`, unit-tested in
+  scripts/main-switch.test.mjs): X's record becomes `main` across servers, `sites[].serverIds /
+  state / weights`, `releases[].built.builtOn`, `backups[].serverId`, `config.mysqlHa`,
+  `config.backups.server.serverIds`, metrics.json, usage.json; the old main's server backups move
+  to a retired id listed in `config.retiredServers`; `config.ha.enabled = false`. `ctx.ha` gains
+  `setLocalServerId(id)` (ha-local.json says "main"); fcc-node on X is disabled; the panel exits
+  75 and comes back as main. After that boot, `shared/edge.mjs retireEdge(agentDataDir)` takes
+  down the connector replicas, catch-all and shims fcc-node had set up (marker
+  `<dataDir>/main-switch.json`). UI: server menu → **Make main server**.

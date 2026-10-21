@@ -971,6 +971,22 @@ R("DELETE", "/api/servers/:id", (p) => {
   if (n.length) err(409, `${n.length} website(s) still run on ${s.name}: ${n.map((x) => x.name).join(", ")}. Move them first.`);
   db.servers = db.servers.filter((x) => x.id !== s.id); activity("server.remove", "server", s); emit("server", { id: s.id, deleted: true }); return { ok: true };
 });
+// Change the main server (3.12.0): the checklist only; the switch itself needs real servers.
+R("GET", "/api/servers/:id/make-main", (p) => {
+  const s = find("servers", p.id), old = find("servers", "main");
+  if (s.id === "main") err(400, "This server is already the main server.");
+  const onOld = db.sites.filter((x) => targets(x).includes("main"));
+  const steps = [
+    s.panel?.enabled ? { id: "active", state: "ok", title: `${s.name} runs the active panel` } : { id: "panel", state: "todo", title: `Make ${s.name} a panel node`, detail: `The new main server must already run the panel: use “Make panel node” on ${s.name}.` },
+    onOld.length ? { id: "sites", state: "blocked", title: `Move ${onOld.length} website(s) off ${old.name}`, detail: `${onOld.map((x) => x.name).join(", ")} — website → Settings → Hosting.` } : { id: "sites", state: "ok", title: `No websites run only on ${old.name}` },
+    { id: "databases", state: "auto", title: "Turn off database replication", detail: `${old.name} is the replica. Replication is turned off (the primary keeps every database). Turn it on again with another server afterwards.` },
+    { id: "transfer", state: "auto", title: `Copy 6 backup archives (412.3 MB) and the Let's Encrypt certificates from ${old.name}`, detail: "Panel data, settings, releases and secrets are already here (they are replicated to every panel node)." },
+    { id: "agents", state: "auto", title: `Point the agents at http://${s.host}:4000` },
+    { id: "retire", state: "auto", title: `Retire ${old.name}`, detail: "It stops and disables its panel and keeps its data folder (renamed — it holds secrets). Its websites' files, nginx and MySQL are left alone: shut the machine down when you are ready." },
+  ];
+  return { ok: !steps.some((x) => x.state === "blocked" || x.state === "todo"), target: { id: s.id, name: s.name, host: s.host }, oldMain: { id: "main", name: old.name, host: old.host, online: true }, steps, transfer: { backups: 6, bytes: 432340000, letsencrypt: true, oldOnline: true } };
+});
+R("POST", "/api/servers/:id/make-main", () => err(409, "Changing the main server needs real servers — it isn't simulated in the demo."));
 R("POST", "/api/servers/:id/token", (p) => { const s = find("servers", p.id); activity("server.token", "server", s); return { installCommand: installCmd(s) }; });
 R("GET", "/api/servers/:id/metrics", (p, b, q) => {
   const s = find("servers", p.id);

@@ -242,6 +242,8 @@ export function register(router, ctx) {
 
   function serverName(id) {
     try {
+      const retired = Array.isArray(ctx.config.retiredServers) ? ctx.config.retiredServers.find((r) => r?.id === id) : null; // main-switch.mjs
+      if (retired) return `${retired.name} (old main)`;
       return ctx.cluster?.getServer?.(id)?.name || (id === MAIN_ID ? "Main server" : id);
     } catch {
       return id;

@@ -419,6 +419,41 @@ export async function clusterSync(payload, o) {
   };
 }
 
+/**
+ * This agent server just became the main server (3.12.0 "Change the main
+ * server"): its panel now runs the front door and the tunnel connectors itself.
+ * Take down what fcc-node set up as an edge — connector replica units, the
+ * catch-all default, shims, the edge TLS pair — but keep the fcc-<siteId>.conf
+ * files: the panel (loadbalancer.mjs) has already rewritten them as main's own.
+ * `agentDataDir` is the old agent's data folder (edge-state.json lives there).
+ */
+export async function retireEdge(agentDataDir, { log = NOOP } = {}) {
+  const P = edgePaths(agentDataDir);
+  const prev = readEdgeState(agentDataDir);
+  const errors = [];
+  const r = await syncConnectors([], prev, P, { log, dataDir: agentDataDir }, log);
+  for (const c of r.results) if (c.error) errors.push(`connector ${c.id}: ${c.error}`);
+  const extras = new Set();
+  try {
+    for (const f of fs.readdirSync(P.conf)) if (f === DEFAULT_FILE || SHIM_RE.test(f)) extras.add(f);
+  } catch {
+    /* no conf dir */
+  }
+  try {
+    const res = await applyEdgeFiles(P.conf, new Map(), extras, log);
+    log(res.changed ? `Removed ${res.changed} edge-only nginx file(s).` : "No edge-only nginx files left.");
+  } catch (err) {
+    errors.push(`nginx: ${err.message}`);
+  }
+  if (!sys.DRY_RUN && exists(P.tls)) fs.rmSync(P.tls, { recursive: true, force: true });
+  try {
+    writeEdgeState(P.state, { ...prev, edge: false, frontDoor: false, files: [], shims: [], connectors: {}, nginx: false, nginxOkOnce: false, error: null, retiredAt: new Date().toISOString() });
+  } catch {
+    /* best effort */
+  }
+  return { connectorsStopped: Object.keys(prev.connectors || {}).length, error: errors.length ? errors.join("\n") : null };
+}
+
 // ------------------------------------------------------- database cut-over
 //
 // After a database failover the old primary may be half alive (a frozen VM, a

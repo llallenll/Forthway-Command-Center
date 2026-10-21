@@ -45,7 +45,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.5.0";
+export const TASKS_VERSION = "3.6.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -74,6 +74,9 @@ export const TASK_TYPES = [
   "mysql.users.sync",
   "mysql.rebuild",
   "mysql.probe", // 3.4.0: the replica's TCP view of the primary (fast failover)
+  // Changing the main server (3.6.0) — shared/main-handoff.mjs, main's embedded agent only
+  "main.handoff",
+  "main.retire",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -106,6 +109,8 @@ export const TASK_TIMEOUTS_MS = {
   "mysql.users.sync": 2 * 60_000,
   "mysql.rebuild": 6 * 60 * 60_000, // safety dump + full copy
   "mysql.probe": 10_000,
+  "main.handoff": 6 * 60 * 60_000, // one backup archive or /etc/letsencrypt
+  "main.retire": 60_000,
 };
 
 const NOOP = () => {};
@@ -182,6 +187,10 @@ export async function executeTask(type, payload = {}, opts = {}) {
       return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelInstall(payload, o));
     case "panel.remove":
       return withSiteLock("cluster:panel", async () => (await import("./edge.mjs")).panelRemove(payload, o));
+    case "main.handoff":
+      return (await import("./main-handoff.mjs")).mainHandoff(payload, o);
+    case "main.retire":
+      return (await import("./main-handoff.mjs")).mainRetire(payload, o);
     case "mysql.status":
     case "mysql.readonly":
     case "mysql.probe":

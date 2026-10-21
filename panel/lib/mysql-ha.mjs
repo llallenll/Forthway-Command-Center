@@ -1769,6 +1769,9 @@ function createMysqlHa(ctx) {
     primaryId: () => cfg().primary || MAIN_ID,
     replicaId: () => cfg().replica || null,
     isEnabled: () => cfg().enabled === true,
+    // Changing the main server (main-switch.mjs): the same jobs as the API routes.
+    switchover: (admin) => switchover(admin),
+    disable: (admin) => disable(admin),
     onFence,
     usersChanged,
     _routes: routes,
