@@ -1477,7 +1477,10 @@ export function register(router, ctx) {
   function localLogin(databaseId) {
     const rec = ctx.db.get("databases", databaseId);
     if (!rec) return null;
-    return { id: rec.id, projectId: rec.projectId, db: rec.name, user: rec.user, password: decrypt(rec.passwordEnc), host: "127.0.0.1", port: Number(mcfg().port) || 3306 };
+    // phpMyAdmin runs on the main server; when the databases live on another server it logs in there
+    // (the database's own user is granted from every server's addresses while the primary is elsewhere).
+    const host = primaryRemote() ? primaryAddress() : "127.0.0.1";
+    return { id: rec.id, projectId: rec.projectId, db: rec.name, user: rec.user, password: decrypt(rec.passwordEnc), host, port: Number(mcfg().port) || 3306 };
   }
 
   // ---------------------------------------------------------- API object

@@ -353,6 +353,9 @@ export function register(router, ctx) {
     else add("agents", offline.length ? "warn" : "auto", `Point the agents at ${addr.agentUrl}`, offline.length ? `${offline.map((s) => s.name).join(", ")} ${offline.length === 1 ? "is" : "are"} offline and will not hear the new address. If ${offline.length === 1 ? "it" : "they"} used ${old?.name || "the old main"}'s address, run ${offline.length === 1 ? "its" : "their"} install command again (Rotate token) afterwards.` : null);
     if (addr.panelUrl) add("panelUrl", "auto", `Change the panel URL to ${addr.panelUrl}`, `It pointed at ${old?.name || "the old main server"}.`);
 
+    // phpMyAdmin lives on the main server: the new main installs it after the restart.
+    if (ctx.config.phpmyadmin?.installed) add("phpmyadmin", "auto", `Install phpMyAdmin on ${x.name}`, "It runs on the main server. It is installed again right after the panel restarts as the main server (same settings and address).");
+
     // 7. Retire.
     add("retire", oldOnline ? "auto" : "warn", `Retire ${old?.name || "the old main server"}`, oldOnline
       ? "It stops and disables its panel and keeps its data folder (renamed — it holds secrets). Its websites' files, nginx and MySQL are left alone: shut the machine down when you are ready."
@@ -565,7 +568,7 @@ export function register(router, ctx) {
           const { retiredId } = rewriteIdentity(server(x.id), { log, admin, addr, transferResult });
           writeFileAtomic(
             path.join(ctx.dataDir, MARKER),
-            JSON.stringify({ from: x.id, retiredId, oldName, at: new Date().toISOString(), agentDataDir: agent.dataDir, edgeCleanup: "pending" }, null, 2) + "\n",
+            JSON.stringify({ from: x.id, retiredId, oldName, at: new Date().toISOString(), agentDataDir: agent.dataDir, edgeCleanup: "pending", phpmyadmin: ctx.config.phpmyadmin?.installed ? "pending" : null }, null, 2) + "\n",
             0o600,
           );
           ctx.ha?.setLocalServerId?.(MAIN_ID);
@@ -619,6 +622,32 @@ export async function start(ctx) {
     mark = JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
     return;
+  }
+  if (mark?.phpmyadmin === "pending") {
+    const p = setTimeout(() => {
+      const save = () => {
+        try {
+          writeFileAtomic(file, JSON.stringify(mark, null, 2) + "\n", 0o600);
+        } catch {
+          /* best effort */
+        }
+      };
+      try {
+        if (ctx.phpmyadmin?.isInstalled?.()) mark.phpmyadmin = "done";
+        else {
+          const job = ctx.phpmyadmin?.install?.(null);
+          mark.phpmyadmin = job?.id ? "started" : "skipped";
+          mark.phpmyadminJobId = job?.id || null;
+          console.log(`[main-switch] installing phpMyAdmin on the new main server (job ${job?.id || "?"})`);
+        }
+      } catch (err) {
+        mark.phpmyadmin = "failed";
+        mark.phpmyadminError = err.message;
+        console.error(`[main-switch] could not start the phpMyAdmin install: ${err.message} — install it under Settings → phpMyAdmin`);
+      }
+      save();
+    }, 5000);
+    p.unref?.();
   }
   if (mark?.edgeCleanup !== "pending") return;
   const t = setTimeout(async () => {
