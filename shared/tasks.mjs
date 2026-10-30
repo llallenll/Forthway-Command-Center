@@ -46,7 +46,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.7.0";
+export const TASKS_VERSION = "3.8.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -81,6 +81,8 @@ export const TASK_TYPES = [
   // Docker websites and commit testing (3.7.0) — docs/DOCKER-AND-TESTS.md
   "server.docker",
   "site.test",
+  // PHP / MySQL / cloudflared updates (3.8.0) — shared/software.mjs
+  "server.software",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -117,6 +119,7 @@ export const TASK_TIMEOUTS_MS = {
   "main.retire": 60_000,
   "server.docker": 40 * 60_000, // may apt-get install docker.io and pull an image
   "site.test": 3 * 60 * 60_000, // a whole commit test run (shared/testenv.mjs)
+  "server.software": 45 * 60_000, // apt-get update + upgrade, or a cloudflared download
 };
 
 const NOOP = () => {};
@@ -212,6 +215,17 @@ export async function executeTask(type, payload = {}, opts = {}) {
     case "server.docker":
       // One Docker install / image pull at a time per server.
       return payload?.check ? dockerCheck() : withSiteLock("cluster:docker", () => serverDocker(payload, o));
+    case "server.software": {
+      // Loaded on demand, so an agent without shared/software.mjs still runs every other task.
+      let mod;
+      try {
+        mod = await import("./software.mjs");
+      } catch (err) {
+        throw new Error(`Software updates are not available on this server (${err.message}). Update this server's agent from the Servers page.`);
+      }
+      // Checks are read-only; upgrades run one at a time per server.
+      return payload?.action === "upgrade" ? withSiteLock("cluster:software", () => mod.runSoftwareTask(payload, o)) : mod.runSoftwareTask(payload, o);
+    }
     case "site.test": {
       // Loaded on demand (and only here), so an agent without shared/testenv.mjs
       // still runs every other task.

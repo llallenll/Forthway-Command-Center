@@ -481,6 +481,53 @@ R("GET", "/api/jobs", (p, b, q) => {
   const limit = Math.max(1, Math.min(100, Number(q.limit) || 10)), offset = q.page != null ? (Math.max(1, Number(q.page) || 1) - 1) * limit : Math.max(0, Number(q.offset) || 0);
   return { items: clone(items.slice(offset, offset + limit)), total: items.length, offset, limit };
 });
+// Updates → Server software (panel/lib/software.mjs)
+const swPkg = (n, f, t) => ({ name: n, from: f, to: t });
+const sw = {
+  checking: null,
+  cloudflaredLatest: { version: "2026.10.0", url: "https://github.com/cloudflare/cloudflared/releases", checkedAt: iso(Date.now() - 40 * 60_000), error: null },
+  servers: {
+    main: { checkedAt: iso(Date.now() - 40 * 60_000), error: null, apt: true,
+      php: { installed: true, label: "PHP", version: "8.3.6", latest: "8.3.6", upgrades: [swPkg("php8.3-fpm", "8.3.6-0ubuntu0.24.04.2", "8.3.6-0ubuntu0.24.04.3"), swPkg("php8.3-cli", "8.3.6-0ubuntu0.24.04.2", "8.3.6-0ubuntu0.24.04.3"), swPkg("php8.3-mysql", "8.3.6-0ubuntu0.24.04.2", "8.3.6-0ubuntu0.24.04.3")] },
+      mysql: { installed: true, label: "MySQL", version: "8.0.39", latest: "8.0.40", upgrades: [swPkg("mysql-server-core-8.0", "8.0.39-0ubuntu0.24.04.2", "8.0.40-0ubuntu0.24.04.1"), swPkg("mysql-client-core-8.0", "8.0.39-0ubuntu0.24.04.2", "8.0.40-0ubuntu0.24.04.1")] },
+      cloudflared: { installed: true, version: "2025.8.0", managedBy: "panel", path: "/var/lib/fcc/bin/cloudflared" } },
+  },
+  jobs: {},
+};
+function swView() {
+  const L = sw.cloudflaredLatest.version;
+  const servers = db.servers.map((sv) => {
+    const r = sw.servers[sv.id] || { checkedAt: iso(Date.now() - 40 * 60_000), error: null, apt: true,
+      php: { installed: false, upgrades: [] }, mysql: { installed: true, label: "MySQL", version: "8.0.40", latest: "8.0.40", upgrades: [] }, cloudflared: { installed: true, version: L, managedBy: "panel" } };
+    const comp = (c) => {
+      const x = r[c]; const jobId = sw.jobs[`${sv.id}:${c}`] || null;
+      if (c === "cloudflared") { const available = !!(x.installed && x.version !== L); return { ...x, latest: L, available, canUpdate: available && x.managedBy !== "other", jobId }; }
+      const available = !!x.upgrades?.length; return { ...x, available, canUpdate: available, jobId };
+    };
+    return { id: sv.id, name: sv.name, role: sv.id === "main" ? "main" : "worker", online: sv.online !== false, checkedAt: r.checkedAt, error: r.error, apt: r.apt, php: comp("php"), mysql: comp("mysql"), cloudflared: comp("cloudflared") };
+  });
+  return { servers, cloudflaredLatest: sw.cloudflaredLatest, checking: sw.checking, updates: servers.reduce((n, s) => n + ["php", "mysql", "cloudflared"].filter((c) => s[c].available).length, 0) };
+}
+R("GET", "/api/software", () => swView());
+R("POST", "/api/software/check", () => {
+  const job = runJob({ type: "software.check", title: "Check PHP, MySQL and cloudflared for updates" }, { lines: ["Refreshing the package lists (apt-get update)…", "Newest cloudflared: 2026.10.0", "3 updates available."], onDone: () => { sw.checking = null; for (const r of Object.values(sw.servers)) r.checkedAt = iso(Date.now()); emit("software", swView()); } });
+  sw.checking = job.id; emit("software", swView()); return job;
+});
+R("POST", "/api/software/upgrade", (p, b) => {
+  const sv = find("servers", b.serverId); const c = b.component; const key = `${sv.id}:${c}`;
+  if (sw.jobs[key]) err(409, "Already updating.");
+  const names = { php: "PHP", mysql: "MySQL", cloudflared: "cloudflared" };
+  const job = runJob({ type: "software.upgrade", title: `Update ${names[c]} on ${sv.name}`, serverId: sv.id, heavy: true, servers: [sv.id] }, {
+    lines: c === "cloudflared" ? ["Downloading cloudflared-linux-amd64…", "Installed 2026.10.0 at /var/lib/fcc/bin/cloudflared.", "Restarted 1 tunnel connector on the new cloudflared."] : ["Refreshing the package lists (apt-get update)…", "Updating packages…", "Setting up packages…", "Done."],
+    onDone: () => {
+      delete sw.jobs[key];
+      const r = sw.servers[sv.id];
+      if (r) { if (c === "cloudflared") r.cloudflared.version = sw.cloudflaredLatest.version; else { r[c].version = r[c].latest; r[c].upgrades = []; } }
+      emit("software", swView());
+    },
+  });
+  sw.jobs[key] = job.id; emit("software", swView()); return job;
+});
 R("GET", "/api/jobs/queue", () => mqView()); // job queue (before /api/jobs/:id)
 R("GET", "/api/jobs/:id", (p) => clone(find("jobs", p.id)));
 R("POST", "/api/jobs/:id/cancel", (p) => { const j = find("jobs", p.id); if (j.status === "running" || j.status === "queued") { j.status = "cancelled"; j.finishedAt = iso(Date.now()); emit("job", j); if (j.heavy) mqPump(); } return clone(j); });

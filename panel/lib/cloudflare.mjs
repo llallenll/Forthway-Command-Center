@@ -772,6 +772,28 @@ function createCloudflare(ctx) {
     await running.get(id)?.stop();
   }
 
+  /** After cloudflared was replaced on disk: restart the connectors running here on the new binary. Returns how many. */
+  async function restartConnectors(log = () => {}) {
+    sys.forgetWhich?.("cloudflared");
+    await readVersion();
+    let n = 0;
+    for (const [id, c] of running) {
+      if (!c.status().running) continue;
+      const e = entry(id);
+      const token = e && reveal(e.tokenEnc);
+      if (!token) continue;
+      try {
+        await c.stop();
+        await c.start(token, () => resolveBinary());
+        n++;
+      } catch (err) {
+        log(`!! ${e.name || id} did not restart: ${err.message}`);
+      }
+    }
+    emitStatusSoon();
+    return n;
+  }
+
   function addConnector({ token, name, autoStart, cfId, accountId }) {
     const c = conf();
     const parsed = parseConnectorToken(token);
@@ -2479,6 +2501,7 @@ function createCloudflare(ctx) {
       syncPhpMyAdmin,
       edgeConnectors,
       edgeShims,
+      restartConnectors,
     },
   };
 }
