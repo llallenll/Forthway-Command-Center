@@ -372,3 +372,80 @@ test("tester settings: token shape, API keys refused, limits", () => {
 test("the runner refuses a bad run id before touching anything", async () => {
   await assert.rejects(() => runSiteTest({ runId: "../../x" }, {}), /not a valid test run id/);
 });
+
+// ---- regressions from the first real runs
+
+test("the tester's in-container mounts (/app, /out) are accepted; host paths still need two levels", async () => {
+  const docker = await import("../shared/docker.mjs");
+  const flags = docker.baseFlags({ uid: 20000, mounts: [{ src: "/var/lib/fcc/tests/x/app", dst: "/app", ro: true }], workdir: "/out" });
+  assert.ok(flags.includes("type=bind,src=/var/lib/fcc/tests/x/app,dst=/app,readonly"));
+  assert.throws(() => docker.baseFlags({ uid: 20000, mounts: [{ src: "/srv" }] }), /Refusing/);
+  assert.throws(() => docker.baseFlags({ uid: 20000, mounts: [{ src: "/srv/a,dst=/etc" }] }), /Refusing/);
+  assert.throws(() => docker.baseFlags({ uid: 20000, mounts: [{ src: "/srv/a", dst: "/" }] }), /container/);
+});
+
+test("schemaSteps: after-deploy scripts first, then Prisma migrations, then db push", async () => {
+  const { schemaSteps } = await import("../shared/testenv.mjs");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fcc-schema-"));
+  assert.deepEqual(schemaSteps([], dir, "node"), []);
+  fs.mkdirSync(path.join(dir, "prisma"));
+  fs.writeFileSync(path.join(dir, "prisma", "schema.prisma"), "");
+  assert.equal(schemaSteps([], dir, "node")[0][2], "npx prisma db push --skip-generate");
+  fs.mkdirSync(path.join(dir, "prisma", "migrations", "20260101_init"), { recursive: true });
+  assert.equal(schemaSteps(undefined, dir, "node")[0][2], "npx prisma migrate deploy");
+  assert.equal(schemaSteps(["db:migrate"], dir, "node")[0][2], "npm run db:migrate");
+  assert.deepEqual(schemaSteps([], dir, "php"), []);
+});
+
+// ---- the Testing page (GET /api/tests)
+
+import { filterRuns, testStats } from "../panel/lib/site-tests.mjs";
+
+test("filterRuns: newest first, by site / status / verdict, limit capped", () => {
+  const runs = [
+    { id: "a", siteId: "s1", status: "done", verdict: "ready", createdAt: "2026-10-01T10:00:00Z" },
+    { id: "b", siteId: "s2", status: "testing", verdict: null, createdAt: "2026-10-03T10:00:00Z" },
+    { id: "c", siteId: "s1", status: "done", verdict: "not_ready", createdAt: "2026-10-02T10:00:00Z" },
+    { id: "d", siteId: "s1", status: "error", verdict: null, createdAt: "2026-09-30T10:00:00Z" },
+  ];
+  assert.deepEqual(filterRuns(runs).map((r) => r.id), ["b", "c", "a", "d"]);
+  assert.deepEqual(filterRuns(runs, { siteId: "s1" }).map((r) => r.id), ["c", "a", "d"]);
+  assert.deepEqual(filterRuns(runs, { status: "active" }).map((r) => r.id), ["b"]);
+  assert.deepEqual(filterRuns(runs, { status: "finished" }).map((r) => r.id), ["c", "a", "d"]);
+  assert.deepEqual(filterRuns(runs, { status: "error" }).map((r) => r.id), ["d"]);
+  assert.deepEqual(filterRuns(runs, { verdict: "ready" }).map((r) => r.id), ["a"]);
+  assert.deepEqual(filterRuns(runs, { limit: "2" }).map((r) => r.id), ["b", "c"]);
+  assert.equal(filterRuns(runs, { limit: "nope" }).length, 4);
+  assert.equal(filterRuns(Array.from({ length: 600 }, (_, i) => ({ id: String(i), createdAt: "" })), { limit: 9999 }).length, 500);
+});
+
+test("testStats: last 7 days, ready rate and average over judged runs, active and never-tested sites", () => {
+  const at = Date.parse("2026-10-30T12:00:00Z");
+  const ago = (d) => new Date(at - d * 86400000).toISOString();
+  const runs = [
+    { siteId: "s1", status: "done", verdict: "ready", score: 94, createdAt: ago(0.1) },
+    { siteId: "s1", status: "done", verdict: "not_ready", score: 62, createdAt: ago(2) },
+    { siteId: "s2", status: "error", verdict: null, score: null, createdAt: ago(3) },
+    { siteId: "s2", status: "testing", verdict: null, score: null, createdAt: ago(0) },
+    { siteId: "s1", status: "done", verdict: "ready", score: 40, createdAt: ago(9) }, // older than a week
+  ];
+  const s = testStats(runs, ["s1", "s2", "s3"], at);
+  assert.equal(s.total, 5);
+  assert.equal(s.last7d, 4);
+  assert.equal(s.judged7d, 2);
+  assert.equal(s.ready7d, 1);
+  assert.equal(s.notReady7d, 1);
+  assert.equal(s.failed7d, 1);
+  assert.equal(s.readyRate, 50);
+  assert.equal(s.avgScore, 78);
+  assert.equal(s.active, 1);
+  assert.equal(s.sitesTested, 2);
+  assert.equal(s.sitesNeverTested, 1);
+  assert.deepEqual(s.neverTestedIds, ["s3"]);
+  const empty = testStats([], [], at);
+  assert.equal(empty.readyRate, null);
+  assert.equal(empty.avgScore, null);
+});

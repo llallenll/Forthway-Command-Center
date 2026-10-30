@@ -13,7 +13,17 @@
  *   exp  expiry (ms since epoch);
  *   sv   the admin's sessionVersion — bumped by "sign out everywhere",
  *        unlinking/relinking GitHub and password changes, which ends every
- *        older session for that admin.
+ *        older session for that admin;
+ *   sid  a random session id (challenges for the passkey step are bound to it);
+ *   pk   the id of the passkey that confirmed this session (lib/passkeys.mjs).
+ *
+ * Two steps: GitHub (or the dev / password / recovery sign-in) gives a
+ * PENDING session — no `pk`, 30 minutes — that may only finish the passkey
+ * step or sign out; a passkey assertion (or adding the first passkey) in that
+ * session turns it into a FULL one. Every cookie from before passkeys has no
+ * `pk`, so it is pending too. `authenticate()` / `sessionAdmin()` only ever
+ * return full sessions; `gate()` (the Router's check) answers a pending one
+ * with 401 { code: "passkey_required" | "passkey_setup_required" }.
  *
  * Cookies from before sessionVersion carry `pv` (a fingerprint of the
  * password hash) instead; they are still honoured until GitHub-only is on.
@@ -25,11 +35,16 @@
 
 import crypto from "node:crypto";
 import { promisify } from "node:util";
+import { httpError } from "./http.mjs";
 
 const scrypt = promisify(crypto.scrypt);
 
 export const SESSION_COOKIE = "fcc_session";
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+/** A session that has passed GitHub but not the passkey step yet. */
+export const PENDING_TTL_MS = 30 * 60 * 1000;
+/** db collection holding passkeys (one record per credential, see lib/passkeys.mjs). */
+export const PASSKEYS = "passkeys";
 export const MIN_PASSWORD = 8;
 
 // ------------------------------------------------------------- passwords
@@ -292,18 +307,27 @@ export function createAuth({ db, config }) {
     }
   }
 
-  function issue(admin) {
+  /** A session token: full when `passkey` (a passkey record id) is given, pending otherwise. */
+  function issue(admin, { passkey = null, sid = null } = {}) {
     const now = Date.now();
-    return sign({ a: admin.id, iat: now, exp: now + SESSION_TTL_MS, sv: admin.sessionVersion || 0 });
+    const payload = {
+      a: admin.id,
+      iat: now,
+      exp: now + (passkey ? SESSION_TTL_MS : PENDING_TTL_MS),
+      sv: admin.sessionVersion || 0,
+      sid: sid || crypto.randomBytes(12).toString("base64url"),
+    };
+    if (passkey) payload.pk = String(passkey);
+    return sign(payload);
   }
 
-  function cookieHeader(token, req) {
+  function cookieHeader(token, req, ttlMs = SESSION_TTL_MS) {
     const parts = [
       `${SESSION_COOKIE}=${token}`,
       "Path=/",
       "HttpOnly",
       "SameSite=Strict",
-      `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+      `Max-Age=${Math.floor(ttlMs / 1000)}`,
     ];
     if (isSecureRequest(req, config)) parts.push("Secure");
     return parts.join("; ");
@@ -315,9 +339,14 @@ export function createAuth({ db, config }) {
     return parts.join("; ");
   }
 
-  /** The full admin record behind a request's session, or null. */
-  function sessionAdmin(req) {
-    const payload = unsign(readCookies(req)[SESSION_COOKIE]);
+  /**
+   * Any valid session behind a request, pending or full:
+   * { admin (full record), full, pending, sid, passkeyId, exp } — or null.
+   * `sid` identifies the session (cookies from before `sid` use a hash of the token).
+   */
+  function sessionInfo(req) {
+    const token = readCookies(req)[SESSION_COOKIE];
+    const payload = unsign(token);
     if (!payload || typeof payload.exp !== "number" || payload.exp <= Date.now()) return null;
     const admin = db.get("admins", payload.a);
     if (!admin) return null;
@@ -328,17 +357,64 @@ export function createAuth({ db, config }) {
     } else {
       return null;
     }
-    return admin;
+    const full = typeof payload.pk === "string" && payload.pk.length > 0;
+    const sid = typeof payload.sid === "string" && payload.sid ? payload.sid : crypto.createHash("sha256").update(String(token)).digest("base64url").slice(0, 16);
+    return { admin, full, pending: !full, sid, passkeyId: full ? payload.pk : null, exp: payload.exp };
   }
 
-  /** Public view of the signed-in admin, or null. Used by the Router. */
+  /** The full admin record behind a request's FULL session (passkey step done), or null. */
+  function sessionAdmin(req) {
+    const info = sessionInfo(req);
+    return info?.full ? info.admin : null;
+  }
+
+  /** Public view of the signed-in admin (full sessions only), or null. */
   async function authenticate(req) {
     return publicAdmin(sessionAdmin(req));
   }
 
-  /** Set the session cookie on a response that is about to be sent. */
-  function setSession(res, req, admin) {
-    appendSetCookie(res, cookieHeader(issue(admin), req));
+  /** How many passkeys an admin has. */
+  const passkeyCount = (adminId) => db.list(PASSKEYS, (p) => p.adminId === adminId).length;
+
+  /**
+   * The Router's check for admin routes (and so for /api/events): the public
+   * admin for a full session, null for none (→ 401 "Sign in first."), and a
+   * 401 with a code the UI acts on for a pending one.
+   */
+  async function gate(req) {
+    const info = sessionInfo(req);
+    if (!info) return null;
+    if (info.full) return publicAdmin(info.admin);
+    if (passkeyCount(info.admin.id) === 0) {
+      throw httpError(401, "Add a passkey to finish signing in.", { code: "passkey_setup_required" });
+    }
+    throw httpError(401, "Confirm it's you with your passkey to finish signing in.", { code: "passkey_required" });
+  }
+
+  /** `pk` + `sid` of this request's own cookie when it is a full session of `adminId` (signature and expiry only). */
+  function currentPasskey(req, adminId) {
+    const payload = unsign(readCookies(req)[SESSION_COOKIE]);
+    if (!payload || typeof payload.exp !== "number" || payload.exp <= Date.now() || payload.a !== adminId) return null;
+    return typeof payload.pk === "string" && payload.pk ? { pk: payload.pk, sid: payload.sid || null } : null;
+  }
+
+  /**
+   * Set the session cookie on a response that is about to be sent.
+   *   { passkey }  a passkey just confirmed this session → full;
+   *   { fresh }    a new sign-in (GitHub, dev, password, recovery) → pending;
+   *   neither      re-issue (sessionVersion bumped, GitHub-only switch…): a
+   *                browser whose own cookie was already full for this admin
+   *                stays full — sessionVersion is not re-checked here, the
+   *                handler calling this has just authenticated the request.
+   */
+  function setSession(res, req, admin, { fresh = false, passkey = null } = {}) {
+    let opts = { passkey: null, sid: null };
+    if (passkey) opts = { passkey, sid: sessionInfo(req)?.sid || null };
+    else if (!fresh) {
+      const cur = currentPasskey(req, admin.id);
+      if (cur) opts = { passkey: cur.pk, sid: cur.sid };
+    }
+    appendSetCookie(res, cookieHeader(issue(admin, opts), req, opts.passkey ? SESSION_TTL_MS : PENDING_TTL_MS));
   }
 
   function clearSession(res, req) {
@@ -381,6 +457,9 @@ export function createAuth({ db, config }) {
     throttle: new LoginThrottle(),
     authenticate,
     sessionAdmin,
+    sessionInfo,
+    gate,
+    passkeyCount,
     setSession,
     clearSession,
     findByEmail,

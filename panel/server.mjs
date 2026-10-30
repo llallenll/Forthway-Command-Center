@@ -550,6 +550,8 @@ async function serveStaticOrPage(req, res, url) {
   }
   if (p === "/setup") return redirect(res, "/");
 
+  // Full sessions only: a pending one (passkey step not done) gets login.html,
+  // which shows the passkey screen.
   const admin = await auth.authenticate(req);
   if (p === "/login" || p === "/login.html") {
     return admin ? redirect(res, "/") : servePage(req, res, "login.html");
@@ -578,7 +580,10 @@ async function handler(req, res) {
   if (mode === "standby") return ha._proxy(req, res, url);
   if (mode !== "leader") return ha._switching(req, res, url);
   try {
-    const handled = await router.handle(req, res, url, { authenticate: auth.authenticate });
+    // auth.gate: a full session (GitHub + passkey) passes; a pending one gets
+    // 401 { code: "passkey_required" | "passkey_setup_required" } on every
+    // admin route, /api/events included. Public and agent routes never call it.
+    const handled = await router.handle(req, res, url, { authenticate: auth.gate });
     if (handled) return;
     const p = url.pathname;
     if (p === "/api" || p.startsWith("/api/") || p.startsWith("/agent/") || p.startsWith("/install/")) {

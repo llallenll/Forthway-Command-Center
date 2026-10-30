@@ -1223,3 +1223,44 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   gains `releasePayload`, `linkedEnvSources`, `deploy`, `panelBase`, `runtime`. `shared/fsx.mjs`
   copy/mirror now copy symlinks as links and refuse writes whose path resolves outside the
   destination (the root engine copies folders a container can write to).
+
+- **CORE — passkeys: the mandatory second sign-in step** (`panel/lib/webauthn.mjs` pure WebAuthn,
+  `panel/lib/passkeys.mjs` routes, registered from core-routes; tests `scripts/passkeys.test.mjs`).
+  - **Sessions.** GitHub / dev / password / recovery sign-in now issue a *pending* cookie (30 min, new
+    `sid`, no `pk`); a passkey assertion — or adding the first passkey — in that session re-issues it
+    *full* (`pk` = passkey record id, 12 h). Cookies from before this change have no `pk` → pending.
+    `ctx.auth` gains `sessionInfo(req)` (`{ admin, full, pending, sid, passkeyId, exp }`), `gate(req)`
+    (the Router's check: full → public admin; pending → 401 `{ code: "passkey_required" |
+    "passkey_setup_required" }`), `passkeyCount(id)`; `authenticate()` / `sessionAdmin()` return full
+    sessions only (pages: a pending session gets login.html, which shows the passkey screen);
+    `setSession(res, req, admin, { fresh?, passkey? })` — re-issues keep a full cookie full.
+    `/agent/*`, `/install/*`, `/ha/*`, `/internal/pma/redeem`, `/healthz`, `/privacy`, `/terms`,
+    `/sms-alerts`, `/auth/*` and `/api/setup*` are unchanged (they never used admin sessions).
+  - **Data.** Collection `passkeys`: `{ id: "pk_…", adminId, name, credentialId, alg (-7|-8|-257), jwk,
+    signCount, userHandle, rpId, aaguid, be, bs, transports, lastUsedAt, counterWarningAt? }` — in
+    db.json, so it replicates to standby panels. Deleting an admin deletes theirs.
+  - **Relying party.** rpId = the panel URL's hostname when the panel URL is https (or localhost);
+    a browser on another host is told to open the panel URL. Without a usable panel URL, the request's
+    own host if it is https / localhost. localhost always works (dev, SSH tunnel). An IP address or
+    plain http elsewhere: no passkeys; the screen says why. userVerification "required", residentKey
+    "preferred", attestation "none"; ES256 / RS256 / EdDSA.
+  - **Routes.** Public (session checked inside): `GET /api/auth/passkey` → `{ state, needs: "verify" |
+    "setup" | null, admin, passkeys, usableHere, otherHosts, rp, recoverCmd }`, `POST
+    /api/auth/passkey/register/options`, `POST /api/auth/passkey/register { credential, name }`, `POST
+    /api/auth/passkey/verify/options`, `POST /api/auth/passkey/verify { credential }`. Admin: `GET
+    /api/me/passkeys` → `{ items, rp, canRemove, recoverCmd }`, `PATCH /api/me/passkeys/:id { name }`,
+    `DELETE /api/me/passkeys/:id` (never the last; ends the admin's other sessions), `GET
+    /api/passkeys/admins` → `{ canReset, items: [publicAdmin + { passkeys, lastUsedAt, counterWarning }] }`,
+    `DELETE /api/admins/:id/passkeys` (owner, not self; ends their sessions). Errors carry `code`:
+    `signed_out`, `passkey_origin`, `passkey_failed` (+ `reason`), `passkey_other_host`, `throttled`.
+    Challenges: 32 random bytes, in memory, single use, bound to kind + admin + session `sid`, 5 min.
+    Throttle: 5 failures per session, 10 per admin, per 15 min.
+  - **Recovery.** `recover.mjs --reset-passkeys` marks the one-time link; redeeming it removes that
+    admin's passkeys (`ctx.passkeys.reset`) and the pending session goes to "Add a passkey". The
+    tunnel hint now says `http://localhost:<port>` (an IP can't be an rpId).
+  - **Audit.** `admin.passkey.add | rename | remove | reset | verify | fail | throttled | counter`
+    (counter = signature counter went backwards: recorded and flagged, not refused).
+  - **UI.** login.html gains the passkey step (`#pk`: confirm / add + suggested backup / HTTPS
+    notice), driven by assets/auth.js with `assets/passkey.js` (also used in Settings); Settings →
+    **Passkeys** (`views/settings-security.js`; your passkeys + everyone's, owner reset). Styles in
+    auth.css. Activity verbs for the new actions.

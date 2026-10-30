@@ -1210,7 +1210,13 @@ const PREP = [
 ];
 
 function testView(r) { return clone(r); }
-function testSummary(r) { const { activity: _a, ...rest } = r; return clone(rest); }
+function testSummary(r) {
+  const { activity: _a, ...rest } = r;
+  const sev = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of r.findings || []) if (f.severity in sev) sev[f.severity]++;
+  const cs = r.checks || [];
+  return clone({ ...rest, counts: { checks: cs.length, passed: cs.filter((c) => c.status === "pass").length, warned: cs.filter((c) => c.status === "warn").length, failed: cs.filter((c) => c.status === "fail").length, findings: (r.findings || []).length, bySeverity: sev } });
+}
 const emitRun = (r) => emit("testrun", testView(r));
 
 /** The steps of a simulated run; each is applied at one tick. */
@@ -1335,6 +1341,29 @@ R("POST", "/api/sites/:id/tests", (p, b) => {
   emitRun(r);
   return testView(r);
 });
+// The Testing page (GET /api/tests): every website's runs + the header stats (panel/lib/site-tests.mjs testStats).
+R("GET", "/api/tests", (p, b, q) => {
+  const ACTIVE = ["queued", "preparing", "testing", "reporting"];
+  const lim = Math.min(Number(q.limit) > 0 ? Number(q.limit) : 100, 500);
+  const items = db.testRuns
+    .filter((r) => (!q.siteId || r.siteId === q.siteId) && (!q.verdict || r.verdict === q.verdict))
+    .filter((r) => !q.status || (q.status === "active" ? ACTIVE.includes(r.status) : q.status === "finished" ? !ACTIVE.includes(r.status) : r.status === q.status))
+    .slice(0, lim)
+    .map((r) => { const s = db.sites.find((x) => x.id === r.siteId); return { ...testSummary(r), siteName: s?.name || null, siteType: s?.type || null, projectId: s?.projectId || null, projectName: s ? projectName(s.projectId) : null, serverName: db.servers.find((x) => x.id === r.serverId)?.name || r.serverId }; });
+  const week = db.testRuns.filter((r) => Date.now() - new Date(r.createdAt) < 7 * DAY);
+  const judged = week.filter((r) => r.status === "done" && r.verdict);
+  const ready = judged.filter((r) => r.verdict === "ready").length;
+  const tested = new Set(db.testRuns.map((r) => r.siteId));
+  const never = db.sites.filter((s) => !tested.has(s.id));
+  return { items, stats: {
+    total: db.testRuns.length, last7d: week.length, judged7d: judged.length, ready7d: ready, notReady7d: judged.length - ready, failed7d: week.filter((r) => r.status === "error").length,
+    readyRate: judged.length ? Math.round((ready / judged.length) * 100) : null,
+    avgScore: judged.length ? Math.round(judged.reduce((a, r) => a + (r.score || 0), 0) / judged.length) : null,
+    active: db.testRuns.filter((r) => ACTIVE.includes(r.status)).length,
+    sites: db.sites.length, sitesTested: db.sites.length - never.length, sitesNeverTested: never.length,
+    neverTested: never.slice(0, 20).map((s) => ({ id: s.id, name: s.name })),
+  } };
+});
 R("GET", "/api/tests/:id", (p) => testView(find("testRuns", p.id)));
 R("POST", "/api/tests/:id/cancel", (p) => {
   const r = find("testRuns", p.id);
@@ -1386,6 +1415,38 @@ R("PUT", "/api/tester", (p, b) => {
   if (b.maxMinutes !== undefined) { const n = Number(b.maxMinutes); if (!(n >= 5 && n <= 180)) err(400, "maxMinutes must be from 5 to 180."); tester.maxMinutes = n; }
   if (b.serverId) { find("servers", b.serverId); tester.serverId = b.serverId; }
   return clone(tester);
+});
+
+/* Passkeys (Settings → Passkeys). Adding one needs the real browser prompt, so mock mode can list, rename and remove only. */
+const myPasskeys = [
+  { id: "pk_mac", name: "MacBook · Safari", createdAt: iso(NOW - 30 * DAY), lastUsedAt: ago(5 * MIN), rpId: "panel.forthway.dev", synced: true, backedUp: true, transports: ["internal", "hybrid"], counterWarning: false, current: true },
+  { id: "pk_key", name: "YubiKey 5C", createdAt: iso(NOW - 28 * DAY), lastUsedAt: ago(9 * DAY), rpId: "panel.forthway.dev", synced: false, backedUp: false, transports: ["usb", "nfc"], counterWarning: false, current: false },
+];
+const passkeyCounts = { adm_1: 2, adm_2: 1 };
+const passkeysView = () => ({ items: clone(myPasskeys), rp: { ok: true, rpId: "panel.forthway.dev", origin: "https://panel.forthway.dev" }, canRemove: myPasskeys.length > 1, recoverCmd: "sudo node /opt/fcc/panel/recover.mjs --reset-passkeys" });
+R("GET", "/api/me/passkeys", () => passkeysView());
+R("PATCH", "/api/me/passkeys/:id", (p, b) => {
+  const k = myPasskeys.find((x) => x.id === p.id) || err(404, "Passkey not found.");
+  k.name = String(b.name || "").trim().slice(0, 60) || k.name;
+  return clone(k);
+});
+R("DELETE", "/api/me/passkeys/:id", (p) => {
+  const i = myPasskeys.findIndex((x) => x.id === p.id);
+  if (i === -1) err(404, "Passkey not found.");
+  if (myPasskeys.length === 1) err(409, "This is your last passkey — add another before removing it.");
+  myPasskeys.splice(i, 1);
+  passkeyCounts[me.id] = myPasskeys.length;
+  return { ok: true };
+});
+R("GET", "/api/passkeys/admins", () => ({
+  canReset: true,
+  items: db.admins.map((a) => ({ ...clone(a), passkeys: passkeyCounts[a.id] || 0, lastUsedAt: a.lastLoginAt, counterWarning: false })),
+}));
+R("DELETE", "/api/admins/:id/passkeys", (p) => {
+  const a = find("admins", p.id);
+  const removed = passkeyCounts[a.id] || 0;
+  passkeyCounts[a.id] = 0;
+  return { ok: true, removed };
 });
 
 function pick(o, keys) { const r = {}; for (const k of keys) if (o && k in o) r[k] = o[k]; return r; }

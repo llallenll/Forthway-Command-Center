@@ -224,7 +224,9 @@ export function registerLogin(router, ctx, { needsSetup, panelToken }) {
 
   /** Answer with a page that continues via a same-origin navigation (see the header). */
   function finish(res, req, to, admin) {
-    if (admin) auth.setSession(res, req, admin);
+    // A new sign-in is only ever a PENDING session: the passkey step follows
+    // (login.html shows it wherever `to` points; see lib/passkeys.mjs).
+    if (admin) auth.setSession(res, req, admin, { fresh: true });
     const js = JSON.stringify(to).replace(/</g, "\\u003c");
     const href = to.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
     send(res, 200, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="0;url=${href}"><title>Signing in…</title></head>
@@ -466,7 +468,10 @@ export function registerLogin(router, ctx, { needsSetup, panelToken }) {
     }
     const admin = db.get("admins", rec.adminId) || owner();
     if (!admin) return bad("recovery");
-    return finish(res, req, "/#/settings/security", signIn(res, req, admin, "recovery"));
+    // `recover.mjs --reset-passkeys`: a lost passkey too. Remove theirs (ending every
+    // session); the pending session below then goes straight to "Add a passkey".
+    if (rec.resetPasskeys) ctx.passkeys?.reset(admin.id, { via: "recovery" });
+    return finish(res, req, "/#/settings/security", signIn(res, req, db.get("admins", admin.id), "recovery", rec.resetPasskeys ? { resetPasskeys: true } : {}));
   });
 
   // ------------------------------------------------------------ setup
@@ -548,7 +553,7 @@ export function registerLogin(router, ctx, { needsSetup, panelToken }) {
     } else {
       admin = (body.adminId && db.get("admins", body.adminId)) || owner();
     }
-    auth.setSession(res, req, signIn(res, req, admin, "dev"));
+    auth.setSession(res, req, signIn(res, req, admin, "dev"), { fresh: true }); // pending: the passkey step follows
     return { ok: true, admin: publicAdmin(admin) };
   });
 

@@ -678,6 +678,28 @@ const active = new Set();
  * firewall rules labelled fcc.test, and their folders. Anything older than
  * `olderThanMs`, plus any run in `runIds` (runs the panel knows are dead).
  */
+/**
+ * How the test copy's empty database gets its tables: the site's own
+ * after-deploy scripts when it has any; otherwise, for a Prisma app, Prisma's
+ * migrations (or `db push` when the app keeps no migrations folder). Each entry
+ * is [id, title, command, "schema"].
+ */
+export function schemaSteps(afterDeployScripts, appDir, type) {
+  const scripts = (Array.isArray(afterDeployScripts) ? afterDeployScripts : []).filter((n) => /^[A-Za-z0-9_][A-Za-z0-9:._+-]{0,99}$/.test(n));
+  if (scripts.length) return scripts.map((name, i) => [`migrate${i ? i + 1 : ""}`, `After deploy: npm run ${name}`, `npm run ${name}`, "schema"]);
+  if (type !== "node" || !fs.existsSync(path.join(appDir, "prisma", "schema.prisma"))) return [];
+  const migrations = path.join(appDir, "prisma", "migrations");
+  let hasMigrations = false;
+  try {
+    hasMigrations = fs.readdirSync(migrations, { withFileTypes: true }).some((e) => e.isDirectory());
+  } catch {
+    /* no migrations folder */
+  }
+  return hasMigrations
+    ? [["migrate", "Database migrations", "npx prisma migrate deploy", "schema"]]
+    : [["migrate", "Database schema", "npx prisma db push --skip-generate", "schema"]];
+}
+
 export async function sweepTestLeftovers({ dataDir, olderThanMs = STALE_MS, runIds = [], log = NOOP } = {}) {
   if (sys.DRY_RUN) return { removed: 0 };
   const st = await docker.status();
@@ -900,17 +922,29 @@ async function realRun(payload, o) {
     if (!prepare && type === "node" && settings.autoPrepare !== false && fs.existsSync(path.join(appDir, "prisma", "schema.prisma"))) prepare = "npx prisma generate";
     if (prepare) steps.push(["prepare", "Prepare step", prepare]);
     if (build.build) steps.push(["build", "Build", build.build]);
+    // The database schema is created between prepare and build, not after the
+    // copy starts like a real deploy's after-deploy scripts: the test database
+    // is empty, and a Next.js build that pre-renders pages reading the database
+    // would otherwise bake "table does not exist" into them.
+    const schema = schemaSteps(payload.afterDeployScripts, appDir, type);
+    const buildAt = steps.findIndex(([id]) => id === "build");
+    if (schema.length) steps.splice(buildAt === -1 ? steps.length : buildAt, 0, ...schema);
     if (steps.length) {
       await docker.ensureImage(image, { log, signal });
-      for (const [id, title, cmd] of steps) {
+      for (const [id, title, cmd, kind] of steps) {
         phase("preparing", `${title}: ${clip(cmd, 80)}`);
         check(`setup.${id}`, "setup", title, "running");
         try {
-          await runStep(names.step(id), { image, runId, uid, appDir, env: { ...rw.env, HOME: "/tmp" }, command: cmd, networks: [names.internal, names.egress], log: (l) => log(redact(l)), signal, timeoutMs: 30 * 60_000 });
+          await runStep(names.step(id), { image, runId, uid, appDir, env: { ...rw.env, HOME: "/tmp" }, command: cmd, networks: kind === "schema" ? [names.internal] : [names.internal, names.egress], log: (l) => log(redact(l)), signal, timeoutMs: (kind === "schema" ? 15 : 30) * 60_000 });
           check(`setup.${id}`, "setup", title, "pass");
         } catch (err) {
           if (signal?.aborted) throw err;
           check(`setup.${id}`, "setup", title, "fail", err.message);
+          if (kind === "schema") {
+            // The copy may still run (and show what breaks without its tables).
+            finding({ id: `setup.${id}`, severity: "high", category: "setup", title: `${title} fails on an empty database`, detail: clip(redact(err.message), 1500), fix: "Make the migrations work from an empty database — a new server or a restore would hit the same error.", location: cmd });
+            continue;
+          }
           finding({ id: `setup.${id}`, severity: "critical", category: "setup", title: `${title} fails for this commit`, detail: clip(redact(err.message), 1500), fix: `Run \`${cmd}\` locally on a clean checkout of this commit and fix the error before deploying.`, location: "build" });
           return finish({ complete: true, reportedSummary: `${title} failed, so the commit could not be tested. It would also fail to deploy.` });
         }
@@ -943,23 +977,6 @@ async function realRun(payload, o) {
     });
     await sys.run("docker", testerArgs.args, { env: testerArgs.env, log: null, signal, timeoutMs: 120_000, redact: [tester.token] });
     await sys.run("docker", ["network", "connect", names.egress, names.tester], { log, timeoutMs: 60_000 });
-
-    // After-deploy scripts (migrations) run once the copy is up, like a real deploy.
-    const scripts = (payload.afterDeployScripts || []).filter((n) => /^[A-Za-z0-9_][A-Za-z0-9:._+-]{0,99}$/.test(n));
-    if (scripts.length) {
-      check("setup.migrate", "setup", "After-deploy scripts", "running");
-      try {
-        for (const name of scripts) {
-          phase("preparing", `After deploy: npm run ${name}`);
-          await runStep(names.step("script"), { image, runId, uid, appDir, env: { ...rw.env, HOME: "/tmp" }, command: `npm run ${name}`, networks: [names.internal], log: (l) => log(redact(l)), signal, timeoutMs: 15 * 60_000 });
-        }
-        check("setup.migrate", "setup", "After-deploy scripts", "pass", scripts.join(", "));
-      } catch (err) {
-        if (signal?.aborted) throw err;
-        check("setup.migrate", "setup", "After-deploy scripts", "fail", err.message);
-        finding({ id: "setup.migrate", severity: "high", category: "setup", title: "An after-deploy script fails on an empty database", detail: clip(redact(err.message), 1500), fix: "Make the migration/seed scripts work from an empty database (a new server or a restore would hit the same error).", location: "afterDeployScripts" });
-      }
-    }
 
     const healthPath = spec.healthPath || (type === "node" ? "" : "/");
     const up = await waitForSite(names.tester, `${testUrl}${healthPath && healthPath.startsWith("/") ? healthPath : "/"}`, { strict: !!healthPath, timeoutMs: Math.min(Number(settings.healthTimeoutMs) || 180_000, 5 * 60_000), signal });

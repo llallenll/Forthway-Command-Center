@@ -236,6 +236,57 @@ export function runSummary(run) {
   };
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const byNewest = (a, b) => String(b.createdAt).localeCompare(String(a.createdAt));
+
+/**
+ * GET /api/tests filtering. `runs` may be in any order; the result is newest first.
+ * status: a run status, or "active" (queued → reporting) / "finished" (done, error, cancelled).
+ * verdict: "ready" | "not_ready". limit: 1–500 (default 100).
+ */
+export function filterRuns(runs, { siteId = "", status = "", verdict = "", limit } = {}) {
+  const n = Number(limit);
+  const max = Number.isInteger(n) && n > 0 ? Math.min(n, 500) : 100;
+  const st = String(status || "");
+  return (runs || [])
+    .filter((r) => !siteId || r.siteId === siteId)
+    .filter((r) => !st || (st === "active" ? isActive(r) : st === "finished" ? !isActive(r) : r.status === st))
+    .filter((r) => !verdict || r.verdict === verdict)
+    .sort(byNewest)
+    .slice(0, max);
+}
+
+/**
+ * The header numbers of the Testing page. Rates and the average cover finished
+ * runs with a verdict from the last 7 days (null when there are none).
+ * `siteIds` = every website, for "never tested".
+ */
+export function testStats(runs, siteIds = [], at = Date.now()) {
+  const all = runs || [];
+  const since = at - 7 * DAY_MS;
+  const week = all.filter((r) => Date.parse(r.createdAt) >= since);
+  const judged = week.filter((r) => r.status === "done" && (r.verdict === "ready" || r.verdict === "not_ready"));
+  const ready = judged.filter((r) => r.verdict === "ready").length;
+  const scores = judged.map((r) => r.score).filter((s) => Number.isFinite(s));
+  const tested = new Set(all.map((r) => r.siteId));
+  const never = siteIds.filter((id) => !tested.has(id));
+  return {
+    total: all.length,
+    last7d: week.length,
+    judged7d: judged.length,
+    ready7d: ready,
+    notReady7d: judged.length - ready,
+    failed7d: week.filter((r) => r.status === "error").length,
+    readyRate: judged.length ? Math.round((ready / judged.length) * 100) : null,
+    avgScore: scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+    active: all.filter(isActive).length,
+    sites: siteIds.length,
+    sitesTested: siteIds.length - never.length,
+    sitesNeverTested: never.length,
+    neverTestedIds: never,
+  };
+}
+
 /** Validate a PUT /api/tester body against the current settings → the new settings (token handled by the caller). */
 export function cleanTesterInput(body = {}, current = {}, { serverExists = () => true } = {}) {
   const out = { ...current };
@@ -571,6 +622,29 @@ export function register(router, ctx) {
     const run = startRun(site, release, admin, req);
     audit(admin, "test.start", siteTarget(site), { runId: run.id, releaseId: release.id, version: release.version || null, serverId: run.serverId });
     return publicRun(run);
+  });
+
+  // Every website's runs (the Testing page): summaries newest first + header stats.
+  router.get("/api/tests", async (req, res, { query }) => {
+    const q = query || {};
+    const sites = db.list("sites", (s) => !s.deleting);
+    const siteById = new Map(sites.map((s) => [s.id, s]));
+    const runs = db.list(RUNS, (r) => siteById.has(r.siteId)).map((r) => live.get(r.id) || r);
+    const projectName = new Map();
+    const projectOf = (id) => {
+      if (!id) return null;
+      if (!projectName.has(id)) projectName.set(id, db.get("projects", id)?.name || null);
+      return projectName.get(id);
+    };
+    const items = filterRuns(runs, { siteId: q.siteId ? String(q.siteId) : "", status: q.status ? String(q.status) : "", verdict: q.verdict ? String(q.verdict) : "", limit: q.limit }).map((r) => {
+      const site = siteById.get(r.siteId);
+      const projectId = site?.projectId || r.projectId || null;
+      return { ...runSummary(r), siteName: site?.name || null, siteType: site?.type || null, projectId, projectName: projectOf(projectId), serverName: r.serverId ? serverName(r.serverId) : null };
+    });
+    const stats = testStats(runs, sites.map((s) => s.id));
+    stats.neverTested = stats.neverTestedIds.slice(0, 20).map((id) => ({ id, name: siteById.get(id)?.name || id }));
+    delete stats.neverTestedIds;
+    return { items, stats };
   });
 
   router.get("/api/tests/:id", async (req, res, { params }) => publicRun(mustRun(params.id)));

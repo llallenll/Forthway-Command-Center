@@ -21,6 +21,7 @@ import {
   requestIp,
 } from "./auth.mjs";
 import { registerLogin, ensureSetupCode, validGithubLogin } from "./login.mjs";
+import { registerPasskeys } from "./passkeys.mjs";
 
 const ACTIVITY_KEPT = 5000;
 const DASHBOARD_PROBE_MS = 3000;
@@ -220,14 +221,14 @@ export function register(router, ctx) {
     }
     auth.throttle.succeed(ip);
     db.update("admins", admin.id, { lastLoginAt: new Date().toISOString() });
-    auth.setSession(res, req, admin);
+    auth.setSession(res, req, admin, { fresh: true }); // pending until the passkey step (lib/passkeys.mjs)
     ctx.activity(admin, "admin.login", { type: "admin", id: admin.id, name: admin.name }, { ip, via: "password" });
     return { ok: true, admin: publicAdmin(admin) };
   });
 
   // Public so an expired session can still clear its cookie.
   router.post("/api/logout", { public: true }, async (req, res) => {
-    const admin = await auth.authenticate(req);
+    const admin = auth.sessionInfo(req)?.admin || null; // pending sessions sign out too
     auth.clearSession(res, req);
     if (admin) ctx.activity(admin, "admin.logout", { type: "admin", id: admin.id, name: admin.name });
     return { ok: true };
@@ -389,6 +390,7 @@ export function register(router, ctx) {
       if (ownerCount() <= 1) throw httpError(400, "The last owner cannot be removed. Make someone else an owner first.");
     }
     db.remove("admins", target.id);
+    db.removeWhere("passkeys", (p) => p.adminId === target.id);
     db.save({ immediate: true });
     ctx.activity(admin, "admin.delete", { type: "admin", id: target.id, name: target.name }, { email: target.email });
     return { ok: true };
@@ -653,6 +655,7 @@ export function register(router, ctx) {
     ctx.events.poll(res, Number(query.after) || 0, query.wait === undefined ? 25 : Number(query.wait)));
 
   registerLogin(router, ctx, { needsSetup, panelToken: () => githubTokenPlain() });
+  registerPasskeys(router, ctx); // the second sign-in step; ctx.passkeys
 }
 
 function readColor(value) {
