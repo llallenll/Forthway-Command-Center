@@ -207,6 +207,35 @@ async function aptUpgrade(component, o) {
   return { upgraded: names, before };
 }
 
+async function cloudflaredVersionAt(bin) {
+  sys.forgetWhich("cloudflared");
+  const r = await sys.run(bin || sys.which("cloudflared") || "cloudflared", ["--version"], { allowFail: true, timeoutMs: 15_000 }).catch(() => null);
+  return parseCloudflaredVersion(`${r?.stdout || ""} ${r?.stderr || ""}`);
+}
+
+/** Download the latest release's .deb and install it with dpkg (keeps it a package, like the one it replaces). */
+async function installCloudflaredDeb(o) {
+  const a = { x64: "amd64", arm64: "arm64", arm: "arm" }[os.arch()];
+  if (!a || os.platform() !== "linux") throw new Error(`There is no official cloudflared package for ${os.platform()}/${os.arch()}.`);
+  if (!sys.which("dpkg")) throw new Error("dpkg is not available on this server.");
+  const url = `${CLOUDFLARED_RELEASE}/cloudflared-linux-${a}.deb`;
+  o.log(`Downloading cloudflared-linux-${a}.deb…`);
+  const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(5 * 60_000) });
+  if (!res.ok) throw new Error(`Could not download the cloudflared package: HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length < 1_000_000 || buf.subarray(0, 8).toString("latin1") !== "!<arch>\n") throw new Error("The download is not a Debian package — nothing was installed.");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fcc-cloudflared-"));
+  const deb = path.join(dir, "cloudflared.deb");
+  try {
+    fs.writeFileSync(deb, buf, { mode: 0o644 });
+    const info = await sys.run("dpkg-deb", ["--field", deb, "Package"], { allowFail: true, timeoutMs: 30_000 });
+    if (info.stdout.trim() !== "cloudflared") throw new Error("The downloaded package is not cloudflared — nothing was installed.");
+    await sys.run("dpkg", ["-i", deb], { env: APT_ENV, log: o.log, timeoutMs: 10 * 60_000, signal: o.signal });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /** fcc-cloudflared-<id> units (edge replicas) on this server. */
 function cloudflaredUnits() {
   try {
@@ -220,9 +249,15 @@ async function cloudflaredUpgrade(payload, o) {
   const installed = sys.which("dpkg-query") ? parseDpkg((await sys.run("dpkg-query", ["-W", "-f", "${Package}\t${Version}\t${db:Status-Abbrev}\n"], { allowFail: true })).stdout) : new Map();
   const where = findCloudflared(o.dataDir, installed);
   if (where?.managedBy === "apt") {
-    o.log("cloudflared comes from an apt package here — updating it with apt.");
+    o.log("cloudflared comes from a package here — trying apt first.");
     await sys.run("apt-get", ["update", "-q", ...LOCK], { env: APT_ENV, log: o.log, timeoutMs: 10 * 60_000, allowFail: true, signal: o.signal });
     await sys.run("apt-get", ["install", "-y", "-q", "--only-upgrade", ...LOCK, "cloudflared"], { env: APT_ENV, log: o.log, timeoutMs: 15 * 60_000, signal: o.signal });
+    // Installed from a downloaded .deb (no Cloudflare apt repository): apt has nothing newer, so install the release's .deb.
+    const now = await cloudflaredVersionAt(where.path);
+    if (payload.latest && (!now || compareDotted(payload.latest, now) > 0)) {
+      o.log(`apt has nothing newer than ${now || "this version"} (no Cloudflare apt repository on this server) — installing the official ${payload.latest} package instead.`);
+      await installCloudflaredDeb(o);
+    }
   } else if (where?.managedBy === "other") {
     throw new Error(`cloudflared at ${where.path} was installed outside the panel — update it the way it was installed.`);
   } else {
@@ -249,7 +284,8 @@ async function cloudflaredUpgrade(payload, o) {
   }
   // Edge replicas run as systemd units; the panel restarts its own in-process connectors itself.
   const restarted = [];
-  for (const unit of cloudflaredUnits()) {
+  // `cloudflared service install` creates cloudflared.service; try-restart leaves it alone when it isn't running.
+  for (const unit of [...cloudflaredUnits(), ...(where?.managedBy === "apt" ? ["cloudflared.service"] : [])]) {
     o.log(`Restarting ${unit}…`);
     const r = await sys.run("systemctl", ["try-restart", unit], { allowFail: true, timeoutMs: 60_000 });
     if (r.code === 0) restarted.push(unit);
@@ -274,6 +310,10 @@ export async function runSoftwareTask(payload = {}, o) {
   }
   const r = component === "cloudflared" ? await cloudflaredUpgrade(payload, o) : await aptUpgrade(component, o);
   const after = await check({}, o);
+  const cv = after.cloudflared?.version;
+  if (component === "cloudflared" && payload.latest && cv && compareDotted(payload.latest, cv) > 0) {
+    throw new Error(`cloudflared is still ${cv} after the update (newest is ${payload.latest}). Nothing on this server could install the newer version.`);
+  }
   const left = component === "cloudflared" ? [] : after[component].upgrades;
   if (left.length) o.log(`!! ${left.length} package${left.length === 1 ? " was" : "s were"} held back: ${left.map((u) => u.name).join(", ")}`);
   else o.log("Done.");
