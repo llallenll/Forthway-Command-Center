@@ -4,6 +4,7 @@ import { get } from "../api.js";
 import { pageHead, lbBadge, healthChip, typeIco, TYPE_LABEL, updateBadge } from "../components.js";
 import { bindUptime } from "./monitor.js"; // MONITOR: fills the [data-uptime] slots below
 import { foldCard } from "../fold.js"; // one collapsible group per project
+import { stagingChip } from "./site-staging.js"; // STAGING: purple chip → the staging build
 
 /** Public URL of a site: https only once its certificate is active. */
 export function siteUrl(s, domain) {
@@ -21,7 +22,7 @@ export function siteRow(s, { serversById = {}, projectsById = {}, showProject = 
     <div class="site-id">${typeIco(s.type)}
       <div style="min-width:0"><div class="site-name">${s.name}</div>
         <div class="site-dom">${href.startsWith("https:") ? html`<span class="site-https" title="Served over HTTPS${s.ssl?.status === "active" ? " (Let's Encrypt)" : " (Cloudflare)"}">${icon("lock", "xs")}</span>` : ""}${(s.domains || [])[0] || html`<span class="dim">No domain</span>`}${(s.domains || []).length > 1 ? html` <span class="dim">+${s.domains.length - 1}</span>` : ""}</div></div></div>
-    <div class="site-meta"><span class="row" style="gap:6px;flex-wrap:wrap">${lbBadge(s, serversById)}${updateBadge(s)}</span>
+    <div class="site-meta"><span class="row" style="gap:6px;flex-wrap:wrap">${lbBadge(s, serversById)}${updateBadge(s)}${stagingChip(s)}</span>
       <span class="tiny muted row" style="gap:8px">${showProject && p ? html`<span class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(p.color)}"></span>${p.name}</span><span class="dim">·</span>` : ""}${TYPE_LABEL[s.type] || s.type}${ver ? html`<span class="dim">·</span><span class="mono">v${ver}</span>` : ""}<span class="site-health-inline row" style="gap:8px"><span class="dim">·</span>${healthChip(s)}<span data-uptime="${s.id}" data-compact></span></span></span></div>
     <div class="site-health">${healthChip(s)}<div data-uptime="${s.id}"></div></div>
     <div class="site-actions btn-row" style="flex-wrap:nowrap">

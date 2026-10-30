@@ -169,6 +169,8 @@ export function domainRows(D, { removable = true, routes = null, mainHost = "" }
     else if (o?.connected && !zone) sub = html`<span class="cf-err">${icon("alert", "xs")} Not in your Cloudflare account${o.zones.length ? html` (zones: ${o.zones.slice(0, 4).join(", ")}${o.zones.length > 4 ? "…" : ""})` : ""}</span>`;
     else if (o?.connected && tunnelAcct && o.zoneAccounts?.[zone] && o.zoneAccounts[zone] !== tunnelAcct) sub = html`<span class="cf-err">${icon("alert", "xs")} In ${accountName(o, o.zoneAccounts[zone])} — pick a tunnel in that account</span>`;
     else if (r?.status === "active") sub = html`<span class="cf-ok">${icon("check", "xs")} Live through the tunnel</span> · zone <span class="mono">${r.zoneName || zone || ""}</span> · HTTPS by Cloudflare`;
+    // Saved as Tunnel, but the panel has no route for it: nothing was written to Cloudflare (yet).
+    else if (routes && !r && o?.connected) sub = html`<span class="cf-warn">${icon("alert", "xs")} Not on the tunnel yet — no route has been written to Cloudflare for it. If this stays, use Re-sync Cloudflare routes.</span>`;
     else sub = html`${zone ? html`Zone <span class="mono">${zone}</span> · ` : ""}proxied CNAME → tunnel · HTTPS by Cloudflare`;
     return html`<div class="list-item cf-row">
       <span class="li-ico ${tun ? "cf-ico-tun" : ""}">${icon(tun ? "cloud" : "globe", "sm")}</span>

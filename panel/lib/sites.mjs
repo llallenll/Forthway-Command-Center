@@ -1935,6 +1935,12 @@ export function register(router, ctx) {
     audit(admin, "site.create", site, { type, domains, loadBalanced, serverIds, runtime, ...(extra.stagingOf ? { stagingOf: extra.stagingOf } : {}) });
     emit(site);
     cloudflareSync(site, admin); // CLOUDFLARE
+    // CLOUDFLARE: a tunnel route points at nginx on main (the front door). Give the hostnames
+    // their vhost now, not only after the first successful deploy — until then nginx would
+    // answer them with another website's vhost (e.g. a staging copy whose first deploy failed).
+    if (cloudflare.enabled && domains.length && ctx.lb?.syncSite) {
+      ctx.lb.syncSite(site).catch((err) => console.warn(`[fcc] front door for ${site.id} not written yet: ${err.message}`));
+    }
     return publicSite(site);
   }
 
@@ -2096,7 +2102,7 @@ export function register(router, ctx) {
     // STAGING: a website with a staging copy is not deleted behind its back — remove staging first
     // (its own button asks whether to drop the staging database too).
     const stg = site.stagingSiteId ? getSite(site.stagingSiteId) : null;
-    if (stg) throw httpError(409, `${site.name} has a staging copy (${stg.name}). Remove staging first (Environment → Staging → Remove staging), then delete the website.`, { stagingSiteId: stg.id });
+    if (stg) throw httpError(409, `${site.name} has a staging copy (${stg.name}). Remove staging first (open its staging build from the header's type icon → ⋯ → Remove staging), then delete the website.`, { stagingSiteId: stg.id });
     return removeSite(site, admin, { deleteFiles: query.deleteFiles === "1" || query.deleteFiles === "true" });
   });
 
