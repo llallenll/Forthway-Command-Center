@@ -585,7 +585,7 @@ export async function notificationsSettings(box, ctx) {
       ${link("Terms & Conditions", l.termsUrl)}
       ${link("Opt-in (sign-up) page", l.optInUrl)}
       <div class="span-2 hint">For Twilio's <b>opt-in method proof</b>, give the sign-up page link (or a screenshot of it). Sample confirmation text: <span class="mono">${l.brandShown}: You're signed up for website alerts. Msg frequency varies. Msg &amp; data rates may apply. Reply HELP for help, STOP to opt out.</span></div>
-      ${local ? html`<div class="note warn span-2">${icon("alert")}<div>These links use a local address, so Twilio can't open them. Give the panel a public hostname or set the Panel URL in Settings → General, then copy them again.</div></div>` : ""}
+      ${local ? html`<div class="note warn span-2">${icon("alert")}<div>These links use a local address, so Twilio can't open them. Publish the panel on a hostname (Settings → Cloudflare → Publish this panel) or set the Panel URL in Settings → General, then copy them again.</div></div>` : ""}
       <div class="error-box span-2" data-err hidden></div></div>`);
   };
   paintLegal();

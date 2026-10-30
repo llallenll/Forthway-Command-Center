@@ -1,12 +1,15 @@
 // Cloudflare Zero Trust (Cloudflare Tunnel).
-//  - Settings → Cloudflare (cloudflareSettings): the account — connect, switch, disconnect, forget.
-//    Connectors and domains have their own page: #/cloudflare (views/cloudflare-page.js).
+//  - Settings → Cloudflare (cloudflareSettings): the account (connect, switch, disconnect, forget),
+//    Publish this panel, Publish phpMyAdmin and Routes. Connectors and domains have their own
+//    page: #/cloudflare (views/cloudflare-page.js).
 //  - The per-domain delivery picker (Direct vs Cloudflare Tunnel) shared by the website wizard
 //    (Domains step) and a website's Domains & SSL tab.
 // Every user-supplied string goes through html``.
 import { html, raw, mount, $, on, plural, toast, toastError, confirmDialog, openModal, debounce } from "../util.js";
 import { icon } from "../icons.js";
-import { get, post } from "../api.js";
+import { get, post, put } from "../api.js";
+import { jobStarted } from "../components.js";
+import { foldCard } from "../fold.js";
 
 export const CF_SETTINGS = "#/settings/cloudflare"; // the Cloudflare account
 export const CF_PAGE = "#/cloudflare"; // connectors (tunnels) + domains
@@ -225,17 +228,20 @@ export function bindDelivery(root, D, { repaint, onChange } = {}) {
   });
 }
 
-/* ───────── Settings → Cloudflare: the account only ─────────
-   Connectors and domains live on their own page (#/cloudflare, views/cloudflare-page.js).
-   Routes, "Publish this panel" and "Publish phpMyAdmin" are no longer in the UI; their API
-   routes stay, so anything already published keeps working (shown read-only below). */
+/* ───────── Settings → Cloudflare ─────────
+   The account, Publish this panel, Publish phpMyAdmin and Routes. Connectors and domains
+   live on their own page (#/cloudflare, views/cloudflare-page.js). */
 
 export async function cloudflareSettings(box, ctx) {
-  let S = null, domainCount = null, loginTimer = null;
+  let S = null, routes = null, domainCount = null, loginTimer = null;
   const alive = () => ctx.alive();
   const load = async () => {
-    const [s, d] = await Promise.all([get("/api/cloudflare"), get("/api/cloudflare/domains").catch(() => null)]);
-    S = s; domainCount = d ? (d.items || []).length : null;
+    const [s, r, d] = await Promise.all([
+      get("/api/cloudflare"),
+      get("/api/cloudflare/routes").catch((e) => ({ error: e.message, items: [], tunnels: [] })),
+      get("/api/cloudflare/domains").catch(() => null),
+    ]);
+    S = s; routes = r; domainCount = d ? (d.items || []).length : null;
     if (alive()) paint();
   };
 
@@ -243,7 +249,6 @@ export async function cloudflareSettings(box, ctx) {
     const via = S.connected ? (S.viaLogin ? "Signed in with Cloudflare" : "API token") : S.connectors.length ? "Connector token only" : "Not connected";
     const tone = S.connected ? "ok" : S.connectors.length ? "warn" : "off";
     const running = S.connectors.filter((c) => c.connected).length;
-    const published = [S.panel && { what: "The panel", ...S.panel }, S.phpmyadmin && { what: "phpMyAdmin", ...S.phpmyadmin }].filter(Boolean);
     mount(box, html`
       ${S.dryRun ? html`<div class="note warn">${icon("alert")}<div><b>Dry run.</b> cloudflared is never started or downloaded — connectors are simulated.${S.simulatedApi ? html` The Cloudflare API is simulated too (zones <span class="mono">example.com</span>, <span class="mono">example.org</span>; “Add domain” adds <span class="mono">example.net</span>, then <span class="mono">example.ca</span> from a second, shared account); nothing leaves this machine.` : ""}</div></div>` : ""}
 
@@ -282,16 +287,83 @@ export async function cloudflareSettings(box, ctx) {
         <span class="btn btn-sm">Open${icon("arrowRight", "sm")}</span>
       </a>
 
-      ${published.length ? html`<div class="note cf-published">${icon("info")}<div>${published.map((p) => html`<div><b>${p.what}</b> is published through Cloudflare on <a class="mono" href="https://${p.hostname}" target="_blank" rel="noopener noreferrer">${p.hostname}</a>${p.route?.status && p.route.status !== "active" ? html` <span class="muted">(${p.route.status === "error" ? "route error" : p.route.status === "manual" ? "add it in the Cloudflare dashboard" : "pending"})</span>` : ""}.</div>`)}
-        <div class="muted small mt-8">Set up earlier; it keeps working. To take it down, remove that public hostname from the tunnel in the Cloudflare dashboard, or use <b>Forget Cloudflare</b> below.</div></div></div>` : ""}
+      <form class="card" data-panelform novalidate>
+        <div class="card-head"><div><h3>Publish this panel</h3><div class="sub">Reach the panel itself on a hostname through the tunnel (→ <span class="mono">${S.panelService}</span>).</div></div>
+          ${S.panel ? html`<div class="right"><span class="badge ${S.panel.route?.status === "active" ? "ok" : S.panel.route?.status === "error" ? "err" : "warn"}">${S.panel.route?.status === "active" ? "Live" : S.panel.route?.status === "error" ? "Error" : S.panel.route?.status === "manual" ? "Add in dashboard" : "Pending"}</span></div>` : ""}</div>
+        <div class="card-body">
+          ${S.connectors.some((c) => c.cfId) || (S.tunnels || []).length ? html`<div class="form-grid">
+            <div class="field"><label>Hostname</label><input class="input mono" name="hostname" value="${S.panel?.hostname || ""}" placeholder="panel.example.com" autocomplete="off" spellcheck="false"/></div>
+            <div class="field"><label>Tunnel</label><select class="select" name="tunnelId">${panelTunnels().map((t) => html`<option value="${t.id}" ${t.id === S.panel?.tunnelId ? raw("selected") : ""}>${t.name}</option>`)}</select></div>
+          </div>
+          ${S.panel?.route?.error ? html`<div class="${S.panel.route.status === "manual" ? "note warn" : "error-box"} mt-16">${icon("alert")}<div>${S.panel.route.error}</div></div>` : ""}
+          <p class="hint mt-12">Protect it with a Cloudflare Access policy for extra safety. Leave the hostname empty and save to unpublish.</p>`
+          : html`<p class="muted small">Add a connector first.</p>`}
+        </div>
+        ${S.connectors.some((c) => c.cfId) || (S.tunnels || []).length ? html`<div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-savepanel>${icon("check")}${S.panel ? "Save" : "Publish panel"}</button></div>` : ""}
+      </form>
+
+      <form class="card" data-pmaform novalidate>
+        <div class="card-head"><div><h3>Publish phpMyAdmin</h3><div class="sub">A tunnel carries hostnames, not ports — so phpMyAdmin needs a hostname of its own (→ <span class="mono">${S.phpmyadminService}</span>).</div></div>
+          ${S.phpmyadmin ? html`<div class="right"><span class="badge ${S.phpmyadmin.route?.status === "active" ? "ok" : S.phpmyadmin.route?.status === "error" ? "err" : "warn"}">${S.phpmyadmin.route?.status === "active" ? "Live" : S.phpmyadmin.route?.status === "error" ? "Error" : S.phpmyadmin.route?.status === "manual" ? "Add in dashboard" : "Pending"}</span></div>` : ""}</div>
+        <div class="card-body">
+          ${S.connectors.some((c) => c.cfId) || (S.tunnels || []).length ? html`<div class="form-grid">
+            <div class="field"><label>Hostname</label><input class="input mono" name="hostname" value="${S.phpmyadmin?.hostname || ""}" placeholder="${S.panel?.hostname ? `pma.${S.panel.hostname.split(".").slice(1).join(".")}` : "pma.example.com"}" autocomplete="off" spellcheck="false"/></div>
+            <div class="field"><label>Tunnel</label><select class="select" name="tunnelId">${panelTunnels().map((t) => html`<option value="${t.id}" ${t.id === (S.phpmyadmin?.tunnelId || S.panel?.tunnelId) ? raw("selected") : ""}>${t.name}</option>`)}</select></div>
+          </div>
+          ${S.phpmyadmin?.route?.error ? html`<div class="${S.phpmyadmin.route.status === "manual" ? "note warn" : "error-box"} mt-16">${icon("alert")}<div>${S.phpmyadmin.route.error}</div></div>` : ""}
+          <p class="hint mt-12">“Open in phpMyAdmin” then links to <span class="mono">https://${S.phpmyadmin?.hostname || "this hostname"}</span>. Sign-in still only works through the panel's one-time links. Leave the hostname empty and save to unpublish.</p>`
+          : html`<p class="muted small">Add a connector first.</p>`}
+        </div>
+        ${S.connectors.some((c) => c.cfId) || (S.tunnels || []).length ? html`<div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-savepma>${icon("check")}${S.phpmyadmin ? "Save" : "Publish phpMyAdmin"}</button></div>` : ""}
+      </form>
+
+      ${foldCard({ id: "settings.cf.routes", title: "Routes", open: false,
+        sub: "Public hostnames on your tunnels. The panel only changes the ones it created; dashboard-made routes and the catch-all are kept.",
+        count: routes && !routes.error ? (routes.tunnels || []).reduce((n, t) => n + (t.rules || []).filter((r) => !r.catchAll).length, 0) : null,
+        forceOpen: !!(routes?.error || (routes?.items || []).some((r) => r.status !== "active")),
+        actions: html`<button class="btn btn-sm" data-reloadroutes>${icon("refresh")}Refresh</button>`, body: routesView() })}
 
       ${S.configured || S.connectors.length || S.routes ? html`<div class="card cf-danger">
         <div class="card-head"><div><h3>Forget everything</h3><div class="sub">Stops every connector and deletes the panel's Cloudflare credentials, connector tokens, login certificate and route records. Tunnels, routes and DNS records stay in your Cloudflare account.</div></div>
           <div class="right"><button class="btn btn-danger" data-reset>${icon("trash")}Forget Cloudflare</button></div></div></div>` : ""}`);
   };
 
+  function panelTunnels() {
+    const m = new Map();
+    const pre = (id) => (others().length && id ? `${acctName(id)} · ` : "");
+    for (const c of S.connectors) if (c.cfId) m.set(c.cfId, { id: c.cfId, name: `${pre(c.accountId)}${c.name}` });
+    for (const t of S.tunnels || []) if (t.remotelyManaged && !m.has(t.id)) m.set(t.id, { id: t.id, name: `${pre(t.accountId)}${t.name} (not run here)` });
+    return [...m.values()];
+  }
   /** Accounts other than the main one that the panel reaches (through domain credentials). */
   function others() { return (S.managedAccounts || []).filter((a) => !a.main); }
+  function acctName(id) { return (S.managedAccounts || []).find((a) => a.id === id)?.name || id.slice(0, 8); }
+
+  // A website's tunnel rule points at nginx on this server; nginx then forwards
+  // to the site's port (or every server in its pool). Show both hops so ":80"
+  // isn't mistaken for the app's port.
+  function routeText(r) {
+    if (!r.siteId || !r.targets?.length) return html`→ ${r.service}`;
+    const shown = r.targets.slice(0, 3).map((t) => `${t.address}${t.server ? ` (${t.server})` : ""}`).join(", ");
+    const more = r.targets.length > 3 ? ` +${r.targets.length - 3} more` : "";
+    return html`→ nginx ${r.service.replace(/^https?:\/\//, "")} → ${shown}${more}${r.loadBalanced ? html` <span class="muted">· load balanced</span>` : ""}`;
+  }
+
+  function routesView() {
+    if (!routes) return html`<div class="card-body"><span class="muted small">Loading…</span></div>`;
+    if (routes.error) return html`<div class="card-body"><div class="error-box">${icon("alert")}<div>${routes.error}</div></div></div>`;
+    const errs = (routes.items || []).filter((r) => r.status !== "active");
+    const tunnels = routes.tunnels || [];
+    if (!tunnels.length && !errs.length) return html`<div class="card-body"><p class="muted small">No routes yet. Choose <b>Cloudflare Tunnel</b> for a domain in a website's Domains step (or its Domains & SSL tab).</p></div>`;
+    return html`${errs.length ? html`<div class="card-body" style="padding-bottom:0">${errs.map((r) => html`<div class="${r.status === "manual" ? "note warn" : "error-box"} mt-8">${icon("alert")}<div><b class="mono">${r.hostname}</b>${r.siteName ? html` · <a href="#/sites/${r.siteId}/domains">${r.siteName}</a>` : r.owner === "panel" ? " · panel" : r.owner === "phpmyadmin" ? " · phpMyAdmin" : ""} — ${r.error || r.status}</div></div>`)}</div>` : ""}
+      ${tunnels.map((t) => html`<div class="cf-routes-head"><span class="strong">${t.name}</span> <span class="muted small mono">${t.tunnelId.slice(0, 8)}</span>${others().length && t.accountName ? html` <span class="muted small">· ${t.accountName}</span>` : ""}</div>
+        ${t.error ? html`<div class="card-body" style="padding-top:0"><span class="muted small">${t.error}</span></div>`
+        : html`<div class="list">${t.rules.map((r) => html`<div class="list-item">
+            <span class="li-ico">${icon(r.catchAll ? "x" : r.panel ? "dashboard" : r.phpmyadmin ? "database" : r.siteId ? "globe" : "link", "sm")}</span>
+            <div class="li-main"><div class="li-title ${r.catchAll ? "muted" : "mono"}">${r.catchAll ? "Everything else (catch-all)" : html`${r.hostname}${r.path ? html`<span class="muted">${r.path}</span>` : ""}`}</div><div class="li-sub mono">${routeText(r)}</div></div>
+            <div class="li-right">${r.catchAll ? html`<span class="badge">Always last</span>` : r.panel ? html`<span class="badge blue">Panel</span>` : r.phpmyadmin ? html`<span class="badge blue">phpMyAdmin</span>` : r.siteId ? html`<a class="badge blue" href="#/sites/${r.siteId}/domains">${r.siteName || "Website"}</a>${r.adopted ? html`<span class="badge" title="Existed before the panel managed it; it won't be deleted">Adopted</span>` : ""}` : html`<span class="badge" title="Made in the Cloudflare dashboard — the panel leaves it alone">Dashboard</span>`}</div></div>`)}</div>`}`)}`;
+  }
+
 
   const errBox = () => $("[data-cferr]", box);
   const showErr = (msg) => { const el = errBox(); if (!el) return toast(msg, "err"); el.hidden = !msg; mount(el, msg ? html`${icon("alert")}<div>${msg}</div>` : html``); };
@@ -342,6 +414,28 @@ export async function cloudflareSettings(box, ctx) {
     const ok = await confirmDialog({ title: "Disconnect the Cloudflare account?", message: "The panel stops managing routes and DNS. Connectors keep running; existing routes keep working.", confirmText: "Disconnect" });
     if (!ok) return;
     try { await post("/api/cloudflare/token", { token: "" }); toast("Disconnected", "ok"); load(); } catch (ex) { toastError(ex); }
+  });
+
+  on(box, "click", "[data-reloadroutes]", async (e, b) => { busy(b, true); try { routes = await get("/api/cloudflare/routes"); paint(); } catch (ex) { toastError(ex); busy(b, false); } });
+  on(box, "submit", "[data-panelform]", async (e, form) => {
+    e.preventDefault();
+    const b = $("[data-savepanel]", form); busy(b, true);
+    try {
+      const r = await put("/api/cloudflare/panel", { hostname: form.elements.hostname.value.trim(), tunnelId: form.elements.tunnelId?.value });
+      if (r.job) jobStarted(r.job, r.panel ? `Publishing the panel on ${r.panel.hostname}` : "Unpublishing the panel");
+      if (r.panelUrlSet) toast("Panel URL updated", "info", { msg: `Set to ${r.panelUrlSet} — use it for Sign in with GitHub (callback ${r.panelUrlSet}/auth/github/callback).` });
+      setTimeout(load, 1200);
+    } catch (ex) { toastError(ex, "Couldn't save"); busy(b, false); }
+  });
+
+  on(box, "submit", "[data-pmaform]", async (e, form) => {
+    e.preventDefault();
+    const b = $("[data-savepma]", form); busy(b, true);
+    try {
+      const r = await put("/api/cloudflare/phpmyadmin", { hostname: form.elements.hostname.value.trim(), tunnelId: form.elements.tunnelId?.value });
+      if (r.job) jobStarted(r.job, r.phpmyadmin ? `Publishing phpMyAdmin on ${r.phpmyadmin.hostname}` : "Unpublishing phpMyAdmin");
+      setTimeout(load, 1200);
+    } catch (ex) { toastError(ex, "Couldn't save"); busy(b, false); }
   });
 
   on(box, "click", "[data-reset]", async () => {

@@ -93,3 +93,18 @@ test("URLs on the website's domains point at the staging address", () => {
   assert.equal(r.env.CDN, "https://cdn.example.com");
   assert.deepEqual(r.repointed.sort(), ["CALLBACK", "NEXT_PUBLIC_SITE_URL"]);
 });
+
+test("schemaCommands: a staging copy's empty database gets its tables before the build", async () => {
+  const { schemaCommands } = await import("../shared/deployer.mjs");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fcc-schema-sync-"));
+  assert.deepEqual(schemaCommands(dir, []), []);
+  assert.deepEqual(schemaCommands(dir, ["db:migrate", "bad name; rm -rf /"]), ["npm run db:migrate"]);
+  fs.mkdirSync(path.join(dir, "prisma"));
+  fs.writeFileSync(path.join(dir, "prisma", "schema.prisma"), "");
+  assert.deepEqual(schemaCommands(dir), ["npx prisma db push --skip-generate"]);
+  fs.mkdirSync(path.join(dir, "prisma", "migrations", "20260101_init"), { recursive: true });
+  assert.deepEqual(schemaCommands(dir), ["npx prisma migrate deploy"]);
+});
