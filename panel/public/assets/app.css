@@ -2354,3 +2354,9 @@ a.badge.stg-badge:hover { border-color: rgba(192, 132, 252, 0.6); }
   .menu.build-menu { min-width: 0; width: calc(100vw - 16px); }
 }
 }
+
+/* Settings → Updates → Server software */
+.sw-server { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 12px 18px 6px; border-top: 1px solid var(--line); }
+.sw-server:first-of-type { border-top: 0; }
+.sw-off .li-title { color: var(--muted); }
+.sw-pkgs { margin: 10px 0 4px; padding: 0 0 0 18px; display: grid; gap: 3px; font-size: 12.5px; max-height: 220px; overflow: auto; }

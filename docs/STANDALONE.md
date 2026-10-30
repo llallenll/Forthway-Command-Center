@@ -1360,3 +1360,17 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   - `site-tests.mjs`: `POST /api/sites/:id/tests` on a staging copy tests its parent's releases (with the copy's own
     variables), so the staging build's Tests tab works. `util.js openMenu` gains `{ cls, focus, onClose }`, arrow-key
     navigation and Escape (which also fixes a stale outside-click listener closing a keyboard-opened menu).
+- **Server software updates** (tasks 3.8.0). Settings → Updates gets a **Server software** card under the panel's own
+  update: for every server, the installed PHP, MySQL/MariaDB and cloudflared versions and whether an update is out.
+  - Task `server.software` (`shared/software.mjs`): `{ action: "check", refresh? }` reads `dpkg-query` and
+    `apt list --upgradable` (after `apt-get update` when `refresh`) and runs `cloudflared --version`;
+    `{ action: "upgrade", component }` runs `apt-get install --only-upgrade` on that component's upgradable packages
+    (PHP 8.3 stays 8.3, MySQL 8.0 stays 8.0 — never a new major), or replaces `<dataDir>/bin/cloudflared` with the
+    latest release after checking it runs (an apt-installed cloudflared is upgraded with apt; one installed some
+    other way is left alone) and `systemctl try-restart`s the `fcc-cloudflared-*` edge units. Agents older than 3.8.0
+    report "too old" until they update themselves.
+  - `panel/lib/software.mjs`: `GET /api/software`, `POST /api/software/check` (job, every online server in
+    parallel; also every 12 hours), `POST /api/software/upgrade { serverId, component }` (a heavy job, so it waits in
+    the job queue behind builds on that server). The newest cloudflared comes from GitHub's releases API (the GitHub
+    token is used when set). State is kept in `<dataDir>/software-state.json`; SSE event `software`. Updating
+    cloudflared on main restarts the connectors the panel runs (`ctx.cloudflare.restartConnectors`).

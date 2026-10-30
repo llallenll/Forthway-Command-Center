@@ -14,6 +14,7 @@ import { testerSettings } from "./settings-tester.js"; // Website testing (commi
 import { passkeySettings } from "./settings-security.js"; // Passkeys (the second sign-in step)
 import { queueSettings } from "./settings-queue.js"; // Job queue (heavy jobs per server)
 import { foldCard, moreList } from "../fold.js"; // collapsible lists (Load balancer, Updates)
+import { softwareSettings } from "./settings-software.js"; // Updates → Server software (PHP, MySQL, cloudflared)
 
 const SECTIONS = [
   { id: "general", label: "General", icon: "settings", render: general },
@@ -226,10 +227,23 @@ async function github(box, ctx) {
   });
 }
 
-/* ───────── Updates (panel self-update) ───────── */
+/* ───────── Updates (panel self-update + server software) ───────── */
 
-async function updates(box, ctx) {
-  let u = await get("/api/updates");
+async function updates(outer, ctx) {
+  // The panel's own update above, server software (PHP, MySQL, cloudflared) below.
+  mount(outer, html`<div class="stack" data-panel-upd>${skeletonRows(2, 120)}</div><div data-software>${skeletonRows(3, 52)}</div>`);
+  const box = $("[data-panel-upd]", outer);
+  const swBox = $("[data-software]", outer);
+  softwareSettings(swBox, ctx).catch((e) => { if (ctx.alive()) mount(swBox, errorState(e, false)); });
+  let u;
+  try { u = await get("/api/updates"); }
+  catch (e) {
+    // The panel's own update failing to load must not hide server software below it.
+    if (!ctx.alive()) return;
+    mount(box, errorState(e));
+    $("[data-retry]", box)?.addEventListener("click", () => ctx.reload());
+    return;
+  }
   let backupsList = [];
   const loadBackups = async () => { try { backupsList = (await get("/api/updates/backups")).items || []; } catch { backupsList = []; } };
   await loadBackups();
