@@ -224,7 +224,7 @@ export async function security(box, ctx) {
             <div class="li-sub">${a.github ? html`<span class="gh-login">@${a.github.login}</span> · GitHub id ${a.github.id}` : s.githubOnly ? "No GitHub account — can't sign in" : "Not linked — signs in with a password"}</div></div>
           <div class="li-right">${a.github ? html`<span class="badge ok">${icon("github")}Linked</span>` : html`<span class="badge warn">${icon("alert")}Not linked</span>`}</div></div>`)}</div>
       </div>
-      <div class="note">${icon("info")}<div>Break-glass: if GitHub sign-in ever stops working, run <span class="mono">${RECOVER_CMD}</span> on the server for a one-time owner sign-in link (15 minutes, single use).</div></div>`);
+      <div class="note">${icon("info")}<div>Break-glass: if GitHub sign-in ever stops working, run <span class="mono">${RECOVER_CMD}</span> on the server for a one-time owner sign-in link (15 minutes, single use). The passkey step still follows; if the passkey is lost too, add <span class="mono">--reset-passkeys</span> (see <a href="#/settings/passkeys" style="color:var(--text);font-weight:600">Passkeys</a>).</div></div>`);
   };
   paint();
 

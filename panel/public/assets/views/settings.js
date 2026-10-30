@@ -11,11 +11,13 @@ import { notificationsSettings } from "./monitor.js"; // Notifications section (
 import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliased: avoids clashing with the shared import line)
 import { admins, security, account } from "./settings-auth.js"; // Admins + Security + Account (Sign in with GitHub)
 import { testerSettings } from "./settings-tester.js"; // Website testing (commit tests with Claude Code)
+import { passkeySettings } from "./settings-security.js"; // Passkeys (the second sign-in step)
 
 const SECTIONS = [
   { id: "general", label: "General", icon: "settings", render: general },
   { id: "admins", label: "Admins", icon: "users", render: admins },
   { id: "security", label: "Security", icon: "shield", render: security },
+  { id: "passkeys", label: "Passkeys", icon: "key", render: passkeySettings },
   { id: "servers", label: "Servers & load balancing", icon: "balance", render: serversLb },
   { id: "backups", label: "Backups", icon: "archive", render: backups },
   { id: "databases", label: "Databases", icon: "database", render: mysqlSettings },
@@ -27,7 +29,7 @@ const SECTIONS = [
   { id: "updates", label: "Updates", icon: "refresh", render: updates },
   { id: "account", label: "Account", icon: "user", render: account },
 ];
-const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", auth: "security", login: "security", signin: "security", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications", tester: "testing", tests: "testing" };
+const ALIASES = { passkey: "passkeys", "2fa": "passkeys", webauthn: "passkeys", loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", auth: "security", login: "security", signin: "security", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications", tester: "testing", tests: "testing" };
 
 export default async function settings(ctx) {
   const { root, params } = ctx;

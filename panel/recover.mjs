@@ -13,9 +13,16 @@
  * <data dir>/recovery.json, mode 600, and the running panel redeems it at
  * GET /auth/recover once. Making a new link replaces any earlier one.
  *
+ * The link signs in like GitHub does: the passkey step still follows. When
+ * the passkey is lost too, add --reset-passkeys — redeeming the link then
+ * removes that admin's passkeys (and ends their sessions), and the sign-in
+ * goes straight to "Add a passkey". So the owner can always get back in.
+ *
  * The data dir is FCC_DATA_DIR, else the one fcc.service runs with, else
  * /var/lib/fcc. Options: --admin <id|github login|email> to sign in as
- * someone other than the owner; --url <base> to print a different address.
+ * someone other than the owner; --url <base> to print a different address;
+ * --reset-passkeys as above. With panel failover, run it on the server that
+ * is the active panel right now.
  */
 
 import fs from "node:fs";
@@ -49,7 +56,7 @@ function serviceEnv() {
 }
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  console.log("Usage: sudo node /opt/fcc/panel/recover.mjs [--admin <id|github login|email>] [--url https://panel.example.com]");
+  console.log("Usage: sudo node /opt/fcc/panel/recover.mjs [--admin <id|github login|email>] [--url https://panel.example.com] [--reset-passkeys]");
   process.exit(0);
 }
 
@@ -87,6 +94,9 @@ const record = {
   exp: Date.now() + TTL_MS,
   createdBy: os.userInfo().username,
 };
+const resetPasskeys = process.argv.includes("--reset-passkeys");
+if (resetPasskeys) record.resetPasskeys = true;
+const passkeyCount = (Array.isArray(db.passkeys) ? db.passkeys : []).filter((p) => p.adminId === admin.id).length;
 const file = path.join(dataDir, "recovery.json");
 const tmp = `${file}.${process.pid}.tmp`;
 fs.writeFileSync(tmp, JSON.stringify(record, null, 2), { mode: 0o600 });
@@ -111,7 +121,14 @@ console.log(`
 
   Can't reach that address? Tunnel to the panel first:
     ssh -L ${port}:127.0.0.1:${port} root@<this server>
-  and open http://127.0.0.1:${port}/auth/recover?token=${token}
+  and open http://localhost:${port}/auth/recover?token=${token}
+  (use "localhost", not 127.0.0.1: passkeys don't work on an IP address)
 
-  Once in, fix sign-in under Settings → Security.
+${resetPasskeys
+    ? `  Opening it removes ${admin.name || who}'s ${passkeyCount === 1 ? "passkey" : `${passkeyCount} passkeys`} and signs out
+  their sessions; you'll be asked to add a new passkey right away.`
+    : `  You'll still confirm with your passkey after opening it. Lost that too?
+  Run this again with --reset-passkeys.`}
+
+  Once in, fix sign-in under Settings → Security (passkeys: Settings → Passkeys).
 `);

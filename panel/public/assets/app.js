@@ -12,6 +12,7 @@ const NAV = [
   { id: "dashboard", label: "Dashboard", icon: "dashboard", href: "#/" },
   { id: "projects", label: "Projects", icon: "folder", href: "#/projects" },
   { id: "sites", label: "Websites", icon: "globe", href: "#/sites" },
+  { id: "tests", label: "Testing", icon: "flask", href: "#/tests", live: "tests" }, // commit testing hub (views/tests.js)
   { id: "databases", label: "Databases", icon: "database", href: "#/databases" },
   { id: "backups", label: "Backups", icon: "archive", href: "#/backups" },
   { id: "servers", label: "Servers", icon: "server", href: "#/servers" },
@@ -30,7 +31,8 @@ const ROUTES = [
   ["/sites/new", "wizard", "sites"],
   ["/sites/:id", "site", "sites"],
   ["/sites/:id/:tab", "site", "sites"],
-  ["/tests/:id", "test-run", "sites"], // commit test page (views/test-run.js)
+  ["/tests", "tests", "tests"], // testing hub: every website's runs (views/tests.js)
+  ["/tests/:id", "test-run", "tests"], // commit test page (views/test-run.js)
   ["/databases", "databases", "databases"],
   ["/backups", "backups", "backups"],
   ["/backups/:tab", "backups", "backups"],
@@ -44,10 +46,35 @@ const ROUTES = [
   return { re, keys, view, nav };
 });
 
+/* Live counters on nav items (n.live): how many commit tests are running right now. */
+const navLive = { tests: 0 };
+const navLiveBadge = (key) => {
+  const n = navLive[key] || 0;
+  return n ? html`<span class="nav-live" title="${n === 1 ? "1 test running" : `${n} tests running`}"><span class="dot run"></span><span class="num">${n}</span></span>` : "";
+};
 function paintNav(active) {
-  const item = (n) => html`<a class="nav-item ${n.id === active ? "active" : ""}" href="${n.href}">${icon(n.icon)}<span>${n.label}</span></a>`;
+  const item = (n) => html`<a class="nav-item ${n.id === active ? "active" : ""}" href="${n.href}" ${n.live ? raw(`data-navlive="${n.live}"`) : ""}>${icon(n.icon)}<span>${n.label}</span>${n.live ? navLiveBadge(n.live) : ""}</a>`;
   mount($("#sbNav"), html`<div class="sb-label">Workspace</div>${NAV.map(item)}`);
   mount($("#sbNavBottom"), html`${NAV_BOTTOM.map(item)}`);
+}
+function paintNavLive(key) {
+  const a = document.querySelector(`[data-navlive="${key}"]`);
+  if (!a) return;
+  a.querySelector(".nav-live")?.remove();
+  const b = navLiveBadge(key);
+  if (b) a.insertAdjacentHTML("beforeend", b.toString());
+}
+/** Active test runs: counted once from GET /api/tests, then kept up to date from SSE `testrun`. */
+function initTestBadge() {
+  const RUNNING = new Set(["queued", "preparing", "testing", "reporting"]);
+  const active = new Set();
+  const set = () => { navLive.tests = active.size; paintNavLive("tests"); };
+  get("/api/tests?status=active&limit=100").then((r) => { for (const x of r?.items || []) if (RUNNING.has(x.status)) active.add(x.id); set(); }).catch(() => {});
+  onEvent("testrun", (d) => {
+    if (!d?.id) return;
+    if (!d.deleted && RUNNING.has(d.status)) active.add(d.id); else active.delete(d.id);
+    set();
+  });
 }
 
 function paintTop() {
@@ -381,6 +408,7 @@ async function boot() {
   startEvents();
   initUpdates();
   initHa();
+  initTestBadge();
   onStatus(paintLive);
   onEvent("lb", debounce(paintSidebarStatus, 500));
   onEvent("job", (j) => {

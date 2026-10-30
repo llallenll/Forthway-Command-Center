@@ -50,9 +50,20 @@ function checkUid(n, what) {
   return v;
 }
 
+/**
+ * A host folder to mount: absolute, at least two levels deep (never / or
+ * /srv), and free of the characters that would split a --mount spec.
+ */
 function checkPath(p) {
   const s = String(p || "");
-  if (!s.startsWith("/") || /[\0\n:]/.test(s) || s.split("/").filter(Boolean).length < 2) throw new Error(`Refusing to mount ${s || "(nothing)"} into a container.`);
+  if (!s.startsWith("/") || /[\0\n:,]/.test(s) || s.split("/").filter(Boolean).length < 2) throw new Error(`Refusing to mount ${s || "(nothing)"} into a container.`);
+  return s;
+}
+
+/** A path inside the container (/app, /out): absolute and not the root. */
+function checkContainerPath(p) {
+  const s = String(p || "");
+  if (!s.startsWith("/") || /[\0\n:,]/.test(s) || !s.split("/").filter(Boolean).length) throw new Error(`"${s || "(nothing)"}" can't be used as a path inside a container.`);
   return s;
 }
 
@@ -96,10 +107,10 @@ export function baseFlags(o) {
   a.push("--tmpfs", `/tmp:rw,nosuid,nodev,size=${Math.max(16, Number(o.tmpfsMb) || 256)}m`);
   for (const m of o.mounts || []) {
     const src = checkPath(m.src);
-    const dst = checkPath(m.dst || m.src);
+    const dst = m.dst ? checkContainerPath(m.dst) : src;
     a.push("--mount", `type=bind,src=${src},dst=${dst}${m.ro ? ",readonly" : ""}`);
   }
-  if (o.workdir) a.push("-w", checkPath(o.workdir));
+  if (o.workdir) a.push("-w", checkContainerPath(o.workdir));
   for (const [k, v] of Object.entries(o.labels || {})) a.push("--label", `${k}=${v}`);
   return a;
 }

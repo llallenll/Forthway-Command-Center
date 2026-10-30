@@ -39,6 +39,14 @@ const VERB = {
   "admin.transfer-owner": "made the owner:",
   "admin.promote": "made an owner:",
   "admin.demote": "made a regular admin:",
+  "admin.passkey.verify": "confirmed sign-in with a passkey",
+  "admin.passkey.fail": "failed a passkey check",
+  "admin.passkey.throttled": "was stopped after too many passkey attempts",
+  "admin.passkey.add": "added a passkey for",
+  "admin.passkey.rename": "renamed a passkey of",
+  "admin.passkey.remove": "removed a passkey of",
+  "admin.passkey.reset": "removed every passkey of",
+  "admin.passkey.counter": "saw a passkey counter go backwards for",
   "settings.update": "updated",
   "project.create": "created project",
   "project.update": "updated project",
@@ -80,7 +88,7 @@ const VERB = {
   "job.cancel": "cancelled",
 };
 // Actions whose target name adds nothing after the verb.
-const NO_TARGET = new Set(["admin.login", "admin.logout", "admin.password", "setup.complete", "backup.settings", "lb.apply", "mysql.root.update"]);
+const NO_TARGET = new Set(["admin.login", "admin.passkey.verify", "admin.passkey.fail", "admin.passkey.throttled", "admin.logout", "admin.password", "setup.complete", "backup.settings", "lb.apply", "mysql.root.update"]);
 const GONE = new Set(["site.delete", "project.delete", "database.delete", "server.delete", "admin.delete", "backup.delete"]);
 
 const isSelf = (a) => a.target?.type === "admin" && a.adminId && a.target?.id === a.adminId;

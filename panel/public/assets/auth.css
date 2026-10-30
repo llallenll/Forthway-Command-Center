@@ -18,6 +18,7 @@
 .auth-pw[open] summary { margin-bottom: 4px; }
 .auth-pw form { margin-top: 10px !important; }
 .auth-recover { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--line-2); font-size: 11.5px; color: var(--dim); line-height: 1.55; }
+.auth-recover:empty { display: none; }
 .auth-recover code, .auth-help code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; color: var(--text-2); background: rgba(148, 166, 255, 0.07); border: 1px solid var(--line-2); padding: 1px 6px; border-radius: 6px; white-space: nowrap; }
 .auth-dev { border-style: dashed; color: var(--muted); }
 
@@ -67,3 +68,31 @@
 .sec-step .d { color: var(--muted); font-size: 12.5px; margin-top: 2px; line-height: 1.5; }
 .page.auth-banner-wrap { padding-bottom: 0; }
 .auth-banner-wrap .auth-banner { margin: 0; }
+
+/* Passkey step of signing in (login.html #pk) and Settings → Passkeys */
+.pk-who { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line-2); background: rgba(148, 166, 255, 0.04); }
+.pk-who img, .pk-who .pk-av { width: 38px; height: 38px; border-radius: 11px; flex: none; object-fit: cover; background: var(--panel-3); display: grid; place-items: center; font-weight: 700; color: var(--text-2); }
+.pk-who > div { display: flex; flex-direction: column; min-width: 0; }
+.pk-who b { font-size: 14px; font-weight: 650; color: var(--text); }
+.pk-who span { font-size: 12px; color: var(--muted); }
+.pk-pane { display: flex; flex-direction: column; gap: 14px; margin: 0 !important; }
+.pk-pane[hidden] { display: none; }
+.pk-ico { display: inline-grid; place-items: center; }
+.pk-ico .ico, .pk-ico svg { width: 18px; height: 18px; }
+.pk .btn-lg .pk-ico { margin-right: 2px; }
+.pk-hint { font-size: 12px; color: var(--dim); text-align: center; line-height: 1.5; margin: -4px 0 0; }
+.pk-hint.left { text-align: left; color: var(--muted); font-size: 12.5px; margin: 0; }
+.pk-points { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.pk-points li { position: relative; padding-left: 20px; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+.pk-points li::before { content: ""; position: absolute; left: 4px; top: 7px; width: 6px; height: 6px; border-radius: 50%; background: linear-gradient(135deg, #5a80ff, #8a5cff); }
+.pk-done { display: flex; gap: 12px; align-items: center; padding: 12px 14px; border-radius: 14px; background: rgba(61, 220, 151, 0.08); border: 1px solid rgba(61, 220, 151, 0.25); }
+.pk-done .pk-ico { width: 30px; height: 30px; border-radius: 9px; background: rgba(61, 220, 151, 0.15); color: var(--ok); flex: none; }
+.pk-done > div { display: flex; flex-direction: column; }
+.pk-done b { font-size: 13.5px; font-weight: 650; }
+.pk-done span { font-size: 12px; color: var(--muted); }
+.pk-out { color: var(--muted); font-size: 12.5px; height: auto; padding: 6px; }
+.pk .note.warn { flex-wrap: wrap; }
+.pk .note.warn > div { flex: 1; min-width: 0; line-height: 1.55; }
+.pk .note code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; color: var(--text-2); background: rgba(148, 166, 255, 0.07); border: 1px solid var(--line-2); padding: 1px 6px; border-radius: 6px; word-break: break-all; }
+.pk-go { margin-top: 10px; }
+.pk-list .li-sub .badge { margin-left: 2px; }

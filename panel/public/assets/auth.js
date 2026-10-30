@@ -1,7 +1,9 @@
-// Sign-in + first-run setup pages (Sign in with GitHub; see panel/lib/login.mjs).
+// Sign-in + first-run setup pages (Sign in with GitHub; see panel/lib/login.mjs),
+// and the passkey step that follows every sign-in (panel/lib/passkeys.mjs).
 import { get, post, pageUrl, MOCK } from "./api.js";
 import { iconHTML } from "./icons.js";
 import { loginError } from "./login-errors.js";
+import { addPasskey, confirmPasskey, browserSupport, defaultPasskeyName } from "./passkey.js";
 
 const page = document.body.dataset.page;
 const $ = (s) => document.querySelector(s);
@@ -15,7 +17,8 @@ const nextHash = () => {
   if (n.startsWith("/") && !n.startsWith("//")) return "#" + n; // server-side next=/projects/x → client route
   return "";
 };
-const toApp = () => { location.href = (MOCK ? "./?mock=1" : "./") + nextHash(); };
+// GitHub / recovery land on "/#/route" with login.html shown for the passkey step: keep that route.
+const toApp = () => { location.href = (MOCK ? "./?mock=1" : "./") + (nextHash() || (location.hash.startsWith("#/") ? location.hash : "")); };
 const busy = (b, on) => { if (!b) return; b.classList.toggle("loading", on); b.disabled = on; };
 
 document.querySelectorAll("[data-toggle-pw]").forEach((b) => {
@@ -48,8 +51,10 @@ else initSetup(setup);
 async function initLogin(s) {
   if (s?.needsSetup) { location.replace(pageUrl("setup.html")); return; }
   if (!MOCK) {
-    const me = await get("/api/me", { quiet401: true }).catch(() => null);
+    const me = await get("/api/me", { quiet401: true }).catch((e) => ({ code: e?.body?.code }));
     if (me?.id) { toApp(); return; }
+    // Signed in with GitHub, passkey step still to do.
+    if (me?.code === "passkey_required" || me?.code === "passkey_setup_required") { await initPasskey(); return; }
   }
   const a = s?.auth || (MOCK ? { github: true, passwordLogin: true } : {});
   const gh = $("#gh"), pwBox = $("#pwBox");
@@ -88,6 +93,103 @@ async function initLogin(s) {
       f.password.select?.();
     } finally { busy(go, false); }
   });
+}
+
+/* ───────── step 2: passkey ───────── */
+
+async function initPasskey() {
+  const st = await get("/api/auth/passkey", { quiet401: true }).catch(() => null);
+  if (!st || st.state === "full") { if (st) toApp(); else location.reload(); return; }
+  document.querySelectorAll("[data-ico]").forEach((x) => (x.innerHTML = iconHTML(x.dataset.ico)));
+  $("#signin").hidden = true;
+  $("#pk").hidden = false;
+  document.title = "Confirm it's you · Forthway Command Center";
+  const pkErr = $("#pkErr");
+  const showPkErr = (m) => { pkErr.hidden = !m; pkErr.textContent = m || ""; };
+  const panes = { verify: $("#pkVerify"), setup: $("#pkSetup"), added: $("#pkAdded") };
+  const show = (k) => Object.entries(panes).forEach(([n, el]) => (el.hidden = n !== k));
+  const a = st.admin || {};
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  $("#pkWho").innerHTML = `${a.avatarUrl ? `<img src="${esc(a.avatarUrl)}" alt="" referrerpolicy="no-referrer"/>` : `<span class="pk-av">${esc((a.name || a.login || "?").slice(0, 1).toUpperCase())}</span>`}
+    <div><b>${esc(a.name || (a.login ? "@" + a.login : "Admin"))}</b><span>${a.login ? `@${esc(a.login)} · signed in with GitHub` : "signed in"}</span></div>`;
+  $("#foot").textContent = st.needs === "setup"
+    ? "Passkeys are required on this panel for every admin. Questions? Ask the panel owner."
+    : "Lost your passkey? An owner can remove it under Settings → Passkeys so you can add a new one at your next sign-in.";
+
+  $("#pkOut").addEventListener("click", async (e) => {
+    busy(e.currentTarget, true);
+    try { await post("/api/logout", {}); } catch { /* signed out anyway */ }
+    location.replace(pageUrl("login.html"));
+  });
+
+  // Passkeys need HTTPS (or localhost) and a domain name — say so instead of failing cryptically.
+  const support = browserSupport();
+  if (!st.rp?.ok || !support.ok) {
+    const box = $("#pkInsecure");
+    const link = st.rp?.panelUrl && st.rp.panelUrl !== location.origin ? st.rp.panelUrl : "";
+    const msg = !st.rp?.ok ? st.rp?.message : support.message;
+    const port = Number(location.port) || (location.protocol === "https:" ? 443 : 4000);
+    box.innerHTML = `${iconHTML("lock")}<div><b>${esc(msg || "Passkeys can't be used on this address.")}</b><br/>${link
+      ? `<a class="btn btn-primary btn-sm pk-go" href="${esc(link)}/login">Open ${esc(link)}</a>`
+      : "Set the panel up with a domain name and HTTPS (install.sh with a panel domain, or Settings → Cloudflare → Publish this panel). Until then, an SSH tunnel works: <code>ssh -L ${port}:127.0.0.1:${port} root@&lt;server&gt;</code>, then open <code>http://localhost:${port}</code>."}</div>`;
+    box.hidden = false;
+    $("#title").textContent = st.needs === "setup" ? "Add a passkey" : "Confirm it's you";
+    $("#sub").textContent = "This panel asks for a passkey after GitHub sign-in.";
+    show(null);
+    return;
+  }
+
+  if (st.needs === "verify") {
+    $("#title").textContent = "Confirm it's you";
+    $("#sub").textContent = "One more step: use your passkey to finish signing in.";
+    show("verify");
+    if (st.otherHosts?.length) showPkErr(`Your passkeys were made for ${st.otherHosts.join(", ")}. Open the panel at that address to sign in.`);
+    const use = $("#pkUse");
+    use.addEventListener("click", async () => {
+      showPkErr(""); busy(use, true);
+      try { await confirmPasskey(); toApp(); }
+      catch (ex) { showPkErr(ex.message); busy(use, false); }
+    });
+    use.focus();
+    return;
+  }
+
+  // No passkey yet: every admin adds one at their next sign-in.
+  $("#title").textContent = "Add a passkey";
+  $("#sub").textContent = "This panel now asks for a passkey after GitHub sign-in. Create one now — it takes a few seconds.";
+  $("#pkName").value = defaultPasskeyName();
+  show("setup");
+  let count = 0;
+  $("#pkSetup").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("#pkCreate");
+    showPkErr(""); busy(btn, true);
+    try {
+      const r = await addPasskey($("#pkName").value.trim() || defaultPasskeyName());
+      count = r.passkeys || 1;
+      $("#title").textContent = "You're in";
+      $("#sub").textContent = "Your passkey is set up. You'll use it after GitHub each time you sign in.";
+      show("added");
+      $("#pkOut").hidden = true; // signed in now: "Not you?" no longer fits
+      $("#pkContinue").focus();
+    } catch (ex) { showPkErr(ex.message); busy(btn, false); }
+  });
+  $("#pkAdded").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("#pkBackup"), name = $("#pkName2").value.trim();
+    if (!name) { showPkErr("Give the backup passkey a name, like “iPhone” or “YubiKey”."); $("#pkName2").focus(); return; }
+    showPkErr(""); busy(btn, true);
+    try {
+      const r = await addPasskey(name);
+      count = r.passkeys || count + 1;
+      $("#pkDoneTitle").textContent = `${count} passkeys added`;
+      $("#pkDoneSub").textContent = "Either one signs you in.";
+      $("#pkBackupLead").textContent = "Add another if you like, or carry on. You can manage them later in Settings → Passkeys.";
+      $("#pkName2").value = "";
+    } catch (ex) { showPkErr(ex.message); }
+    finally { busy(btn, false); }
+  });
+  $("#pkContinue").addEventListener("click", toApp);
 }
 
 /* ───────── first-run setup ───────── */
