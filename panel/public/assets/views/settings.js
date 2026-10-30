@@ -10,6 +10,7 @@ import { mysqlSettings, phpMyAdminSettings } from "./settings-databases.js"; // 
 import { notificationsSettings } from "./monitor.js"; // Notifications section (uptime SMS alerts via Twilio)
 import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliased: avoids clashing with the shared import line)
 import { admins, security, account } from "./settings-auth.js"; // Admins + Security + Account (Sign in with GitHub)
+import { testerSettings } from "./settings-tester.js"; // Website testing (commit tests with Claude Code)
 
 const SECTIONS = [
   { id: "general", label: "General", icon: "settings", render: general },
@@ -20,12 +21,13 @@ const SECTIONS = [
   { id: "databases", label: "Databases", icon: "database", render: mysqlSettings },
   { id: "phpmyadmin", label: "phpMyAdmin", icon: "layers", render: phpMyAdminSettings },
   { id: "github", label: "GitHub", icon: "github", render: github },
+  { id: "testing", label: "Website testing", icon: "flask", render: testerSettings },
   { id: "cloudflare", label: "Cloudflare", icon: "cloud", render: cloudflareSettings },
   { id: "notifications", label: "Notifications", icon: "bell", render: notificationsSettings },
   { id: "updates", label: "Updates", icon: "refresh", render: updates },
   { id: "account", label: "Account", icon: "user", render: account },
 ];
-const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", auth: "security", login: "security", signin: "security", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications" };
+const ALIASES = { loadbalancer: "servers", lb: "servers", hosting: "servers", me: "account", profile: "account", auth: "security", login: "security", signin: "security", tunnel: "cloudflare", zerotrust: "cloudflare", sms: "notifications", alerts: "notifications", tester: "testing", tests: "testing" };
 
 export default async function settings(ctx) {
   const { root, params } = ctx;

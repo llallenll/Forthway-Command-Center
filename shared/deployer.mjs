@@ -26,11 +26,21 @@ import { extractZip, inspectZip } from "./zip.mjs";
 import { ensureDir, rmrf, exists, readJson, writeJson, mirror, copyDir, hardlinkDir, makeMatcher, sha1File, humanBytes, walk } from "./fsx.mjs";
 import { makeZip } from "./zipwrite.mjs";
 import { mergeEnvFile, shadowedKeys, lintEnv } from "./env.mjs";
+import * as docker from "./docker.mjs";
+import * as sys from "../panel/lib/sys.mjs";
 
-export const ENGINE_VERSION = "2.0.0";
+export const ENGINE_VERSION = "2.1.0";
 // "none": there is no app process to manage (static / php sites served by
 // nginx + php-fpm). Stop/start/restart are no-ops; deploy is unpack + swap.
-export const RESTART_MODES = ["pm2", "systemd", "command", "child", "none"];
+// "docker" (docs/DOCKER-AND-TESTS.md): the app runs in its own container as
+// its own non-root user, and so does every command that runs the app's code
+// (install, prepare, build, migrations, commands). Only the engine's own
+// housekeeping — unpacking, swapping, chown, pm2/systemctl clean-up — stays
+// on the host.
+export const RESTART_MODES = ["pm2", "systemd", "command", "child", "none", "docker"];
+
+/** Marker inside node_modules: which runtime those packages were installed for. */
+export const RUNTIME_MARKER = ".fcc-runtime";
 
 export function defaultSettings() {
   return {
@@ -73,6 +83,20 @@ export function defaultSettings() {
     writeEnvFile: true,
     // Create appDir when it does not exist yet (a brand new site on a server).
     createAppDir: false,
+
+    // restart.mode "docker" only. restart.service is the container name.
+    docker: {
+      image: docker.DEFAULT_NODE_IMAGE,
+      uid: null, // the site's own uid (= gid), never root
+      gid: null,
+      memoryMb: docker.DEFAULT_LIMITS.memoryMb, // 0 = no limit
+      cpus: docker.DEFAULT_LIMITS.cpus, // 0 = no limit
+      pids: docker.DEFAULT_LIMITS.pids,
+      legacyPm2: "", // pm2 process this site ran as before it moved to docker — deleted on stop
+    },
+    // Any other mode: a container this site ran as before it moved back from
+    // docker — removed before the app starts, so the two never fight for the port.
+    leftoverContainer: "",
   };
 }
 
@@ -85,6 +109,7 @@ export function withDefaults(input) {
     ...s,
     restart: { ...d.restart, ...(s.restart || {}) },
     build: { ...d.build, ...(s.build || {}) },
+    docker: { ...d.docker, ...(s.docker || {}) },
     swapDirs: s.swapDirs?.length ? s.swapDirs : d.swapDirs,
     preserve: s.preserve?.length ? s.preserve : d.preserve,
   };
@@ -156,19 +181,28 @@ export class Deployer {
    * deploy right there.
    */
   run(cmd, { cwd, log = this.log, env = {}, unsetEnv = [], timeoutMs = 30 * 60_000, allowFail = false } = {}) {
-    // Asked to stop between two commands: do not start another one.
-    if (this.aborted) return Promise.reject(abortError(this.aborted));
     // `unsetEnv` is applied last, so a key the site's own variables set (e.g.
     // NODE_ENV=production) cannot sneak back in after the caller removed it.
     const childEnv = { ...process.env, ...this._appEnv(), ...env };
     for (const key of unsetEnv) delete childEnv[key];
+    return this._spawn({ shown: cmd, file: cmd, args: [], shell: true, env: childEnv }, { cwd, log, timeoutMs, allowFail });
+  }
+
+  /**
+   * The one place a job's command is spawned — a shell string (run) or an
+   * argument list (docker). Streams output into the job log; rejects on a
+   * non-zero exit unless `allowFail`.
+   */
+  _spawn({ shown, file, args, shell, env }, { cwd, log = this.log, timeoutMs = 30 * 60_000, allowFail = false } = {}) {
+    // Asked to stop between two commands: do not start another one.
+    if (this.aborted) return Promise.reject(abortError(this.aborted));
     return new Promise((resolve, reject) => {
-      log?.line(`$ ${cmd}`);
-      const child = spawn(cmd, {
+      log?.line(`$ ${shown}`);
+      const child = spawn(file, args, {
         cwd: cwd || this.S.appDir || process.cwd(),
-        shell: true,
+        shell,
         detached: true, // own process group, so a timeout can kill the whole tree
-        env: childEnv,
+        env,
         stdio: ["ignore", "pipe", "pipe"],
       });
       this.jobChild = child;
@@ -193,7 +227,7 @@ export class Deployer {
         settled = true;
         clearTimeout(timer);
         if (this.jobChild === child) this.jobChild = null;
-        reject(this.aborted ? abortError(this.aborted) : err);
+        reject(this.aborted ? abortError(this.aborted) : err.code === "ENOENT" && !shell ? new Error(`${file} is not installed on ${os.hostname()}.`) : err);
       });
       const done = (code) => {
         if (settled) return;
@@ -204,12 +238,170 @@ export class Deployer {
         // would bury the reason under an exit code nobody can interpret.
         if (this.aborted) return reject(abortError(this.aborted));
         if (code === 0 || allowFail) resolve({ code, output: out });
-        else reject(new Error(`Command failed (exit ${code}): ${cmd}`));
+        else reject(new Error(`Command failed (exit ${code}): ${shown}`));
       };
       child.on("close", done);
       // Fall back to 'exit' in case a background grandchild holds the pipes open.
       child.on("exit", (code) => setTimeout(() => done(code), 300));
     });
+  }
+
+  // -------------------------------------------------------------- docker
+
+  _docker() {
+    return this.S.restart.mode === "docker";
+  }
+
+  /** The container user, checked: a docker site never runs anything as root. */
+  _dockerUser() {
+    const d = this.S.docker || {};
+    const uid = Number(d.uid);
+    if (!Number.isInteger(uid) || uid < 1000) {
+      throw new Error("This website runs in Docker but has no container user yet. Open its settings and move it to Docker again, or ask the panel to redeploy it.");
+    }
+    const gid = Number.isInteger(Number(d.gid)) && Number(d.gid) >= 1000 ? Number(d.gid) : uid;
+    return { uid, gid };
+  }
+
+  _containerName() {
+    const name = this.S.restart.service;
+    if (!docker.validName(name)) throw new Error('Restart mode is "docker" but no valid container name is set for this site.');
+    return name;
+  }
+
+  /** Which runtime the app's node_modules must be installed for (see RUNTIME_MARKER). */
+  runtimeTag() {
+    if (this._docker()) return `docker ${this.S.docker.image || docker.DEFAULT_NODE_IMAGE} ${os.arch()}`;
+    return `host node ${process.version.split(".")[0]} ${os.arch()}`;
+  }
+
+  /**
+   * Hand the folder to the site's own user (docker mode). The engine runs as
+   * root and unpacks/swaps as root; the container must be able to write its
+   * own build output, uploads and caches, and nothing else on the host.
+   */
+  async _own(dir, log = this.log) {
+    if (!this._docker() || !dir || !exists(dir)) return;
+    const { uid, gid } = this._dockerUser();
+    await docker.own(dir, uid, gid, { log: null });
+    try {
+      if (dir === this.S.appDir) fs.chmodSync(dir, 0o750);
+    } catch {
+      /* not fatal: ownership is what matters */
+    }
+    log?.line?.(`${dir} now belongs to the website's own user (uid ${uid}).`);
+  }
+
+  /**
+   * Run one of the APP's commands (install, prepare, build, a migration, an
+   * admin's command). docker mode: in a throw-away container as the site's
+   * uid, with the app folder mounted at the same path and only the site's own
+   * variables — never the panel's environment. Other modes: on the host, as
+   * before.
+   */
+  runApp(cmd, opts = {}) {
+    if (!this._docker()) return this.run(cmd, opts);
+    return this._runInContainer(cmd, opts);
+  }
+
+  async _runInContainer(cmd, { cwd, log = this.log, env = {}, unsetEnv = [], timeoutMs = 30 * 60_000, allowFail = false } = {}) {
+    const { uid, gid } = this._dockerUser();
+    const containerEnv = { ...this._appEnv(), ...env };
+    for (const key of unsetEnv) delete containerEnv[key];
+    // npm's cache: kept in the work folder (owned by the site, outside the
+    // read-only image, left out of server backups) so installs stay fast.
+    if (this.paths && !Object.keys(containerEnv).some((k) => k.toLowerCase() === "npm_config_cache")) {
+      const cache = path.join(this.paths.workDir, "cache", "npm");
+      try {
+        ensureDir(cache);
+        for (const d of [path.dirname(cache), cache]) fs.chownSync(d, uid, gid);
+        containerEnv.NPM_CONFIG_CACHE = cache;
+      } catch {
+        /* no cache: npm falls back to $HOME (/tmp) */
+      }
+    }
+    const work = cwd || this.S.appDir;
+    // A name, so a cancelled or timed-out command can be removed for certain:
+    // killing the docker CLI alone does not stop the container behind it.
+    const name = `${this._containerName()}-job-${crypto.randomBytes(3).toString("hex")}`;
+    const b = docker.buildArgs({
+      image: this.S.docker.image || docker.DEFAULT_NODE_IMAGE,
+      command: cmd,
+      env: containerEnv,
+      name,
+      uid,
+      gid,
+      mounts: [{ src: this.S.appDir }],
+      workdir: work,
+      network: "host", // same view as the running app: MySQL on 127.0.0.1, the registry for npm
+      pids: this.S.docker.pids,
+      tmpfsMb: 1024, // prisma/npm scratch space; the npm cache itself lives in the work folder
+      labels: { "fcc.site": this._containerName(), "fcc.job": "1" },
+    });
+    if (b.dropped.length) log?.line(`(not passed into the container: ${b.dropped.join(", ")} — not usable as variable names there)`);
+    const bin = sys.which("docker") || "docker";
+    try {
+      return await this._spawn(
+        { shown: `${cmd}   # in a container (${this.S.docker.image}, uid ${uid})`, file: bin, args: b.args, shell: false, env: docker.cliEnv(b.env) },
+        { cwd: work, log, timeoutMs, allowFail },
+      );
+    } catch (err) {
+      await sys.run(bin, ["rm", "-f", name], { allowFail: true, timeoutMs: 60_000 }).catch(() => {});
+      throw err;
+    }
+  }
+
+  /** Start the app's long-running container (any old one is removed first). */
+  async _startContainer(log = this.log) {
+    const { uid, gid } = this._dockerUser();
+    const name = this._containerName();
+    const D = this.S.docker;
+    await docker.remove(name, { log: null, graceSec: Math.max(1, Math.round((this.S.stopGraceMs ?? 10_000) / 1000)) });
+    const cmd = this.S.restart.start || this.S.restart.pm2Start || "npm start";
+    const b = docker.appArgs({
+      image: D.image || docker.DEFAULT_NODE_IMAGE,
+      name,
+      command: cmd,
+      env: this._appEnv(), // + NODE_ENV=production unless the site sets its own (appArgs)
+      uid,
+      gid,
+      mounts: [{ src: this.S.appDir }],
+      workdir: this.S.appDir,
+      network: "host", // the server firewall still applies; -p publishing would bypass ufw
+      memoryMb: D.memoryMb,
+      cpus: D.cpus,
+      pids: D.pids,
+      readOnly: true,
+      labels: { "fcc.site": name },
+    });
+    if (b.dropped.length) log?.line(`(not passed into the container: ${b.dropped.join(", ")} — not usable as variable names there)`);
+    log?.line(`Starting container ${name} (${D.image}, uid ${uid}${Number(D.memoryMb) > 0 ? `, ${D.memoryMb} MB` : ""}${Number(D.cpus) > 0 ? `, ${D.cpus} CPU` : ""}): ${cmd}`);
+    const r = await sys.run(sys.which("docker") || "docker", b.args, { env: b.env, allowFail: true, timeoutMs: 120_000 });
+    if (r.code !== 0) {
+      const why = String(r.stderr || r.stdout || "").trim().split("\n").slice(-4).join("\n");
+      throw new Error(`Docker could not start the website's container${why ? `: ${why}` : "."}`);
+    }
+  }
+
+  /** Delete the pm2 process this site ran as before (docker mode), so it cannot come back. */
+  async _dropLegacyPm2(log = this.log) {
+    const name = this.S.docker?.legacyPm2;
+    if (!name || !sys.which("pm2")) return;
+    const known = await sys.run("pm2", ["describe", name], { allowFail: true, timeoutMs: 20_000 }).catch(() => null);
+    if (!known || known.code !== 0) return;
+    log?.line(`Removing the old pm2 process ${name} — this website now runs in Docker.`);
+    await sys.run("pm2", ["delete", name], { allowFail: true, timeoutMs: 60_000 }).catch(() => {});
+    await sys.run("pm2", ["save"], { allowFail: true, timeoutMs: 30_000 }).catch(() => {});
+  }
+
+  /** Remove the container this site ran as before (non-docker modes). */
+  async _dropLeftoverContainer(log = this.log) {
+    const name = this.S.leftoverContainer;
+    if (!name || !docker.validName(name) || !sys.which("docker")) return;
+    const st = await docker.inspect(name);
+    if (!st.exists) return;
+    log?.line(`Removing the old container ${name} — this website no longer runs in Docker.`);
+    await docker.remove(name, { log: null });
   }
 
   _appEnv() {
@@ -256,6 +448,16 @@ export class Deployer {
     const next = mergeEnvFile(current, env);
     if (next === null) return file; // already correct — leave the mtime alone
     fs.writeFileSync(file, next, { mode: 0o600 });
+    // docker mode: the root engine just wrote it 0600 — hand it to the
+    // website's own user, or the app (and prisma, next) could not read it.
+    if (this._docker()) {
+      try {
+        const { uid, gid } = this._dockerUser();
+        fs.chownSync(file, uid, gid);
+      } catch (err) {
+        log?.line(`.env: could not hand ${file} to the website's user: ${err.message}`);
+      }
+    }
     const n = Object.keys(env).length;
     log?.line(`Wrote ${n} variable${n === 1 ? "" : "s"} into ${file}.`);
     return file;
@@ -358,6 +560,13 @@ export class Deployer {
     switch (this.S.restart.mode) {
       case "none":
         return;
+      case "docker":
+        // Also the pm2 process from before the move to docker: deleting it
+        // here — the moment the engine stops the old app, after the new build
+        // is ready — keeps a migration's downtime to the swap and the start.
+        await this._dropLegacyPm2(log);
+        await docker.remove(this._containerName(), { log: null, graceSec: Math.max(1, Math.round((this.S.stopGraceMs ?? 10_000) / 1000)) });
+        return;
       case "child":
         return this.stopChild(log);
       case "pm2":
@@ -370,9 +579,14 @@ export class Deployer {
   }
 
   async startApp(log = this.log) {
+    // Back from docker: the old container would hold the port.
+    if (this.S.restart.mode !== "docker") await this._dropLeftoverContainer(log);
     switch (this.S.restart.mode) {
       case "none":
         return;
+      case "docker":
+        await this._dropLegacyPm2(log);
+        return this._startContainer(log);
       case "child":
         this.startChild(log);
         return;
@@ -407,9 +621,13 @@ export class Deployer {
   async restartApp(log = this.log) {
     if (this.S.restart.mode === "none") return;
     if (this.S.restart.mode === "pm2" && (await this._pm2Known(log))) {
+      await this._dropLeftoverContainer(log);
       return this.run(`pm2 restart ${this._pm2Name()} --update-env`, { log, timeoutMs: 120_000 });
     }
-    if (this.S.restart.mode === "systemd") return this.run(this._systemdUnit("restart"), { log, timeoutMs: 120_000 });
+    if (this.S.restart.mode === "systemd") {
+      await this._dropLeftoverContainer(log);
+      return this.run(this._systemdUnit("restart"), { log, timeoutMs: 120_000 });
+    }
     await this.stopApp(log);
     await sleep(800);
     await this.startApp(log);
@@ -419,6 +637,10 @@ export class Deployer {
   async appRunning() {
     try {
       if (this.S.restart.mode === "child") return !!this.child;
+      if (this.S.restart.mode === "docker") {
+        const st = await docker.inspect(this._containerName());
+        return st.dryRun ? null : !!st.running;
+      }
       if (this.S.restart.mode === "pm2" && this.S.restart.service) {
         const r = await this.run(
           `pm2 jlist`,
@@ -511,7 +733,12 @@ export class Deployer {
       log.setStep?.("App log");
       log.line("The app did not answer. This is its own output:");
       const mode = this.S.restart.mode;
-      if (mode === "pm2" && this.S.restart.service) {
+      if (mode === "docker") {
+        const text = await docker.logs(this._containerName(), lines);
+        log.line(text.trim() || "(the container printed nothing)");
+        const st = await docker.inspect(this._containerName());
+        if (st.exists && !st.running) log.line(`(the container is ${st.status || "not running"}${st.exitCode != null ? `, exit code ${st.exitCode}` : ""}${st.restarts ? `, restarted ${st.restarts}×` : ""})`);
+      } else if (mode === "pm2" && this.S.restart.service) {
         await this.run(`pm2 logs ${this._pm2Name()} --lines ${lines} --nostream`, {
           log,
           timeoutMs: 45_000,
@@ -739,12 +966,28 @@ export class Deployer {
 
     let depsUnchanged = false;
 
+    // docker mode: the build container runs as the site's own user, so the
+    // tree it builds in must be that user's.
+    await this._own(p.staging, log);
+
+    // node_modules holds native modules compiled for one node version on one
+    // system. Moving a site into a container (or to another image, or back)
+    // means installing fresh — never reusing packages built for the other side.
+    const wantRuntime = this.runtimeTag();
+
     // --- dependencies ---------------------------------------------------
     if (this.S.build.install) {
       log.setStep("Dependencies");
       const liveModules = path.join(p.appDir, "node_modules");
+      const liveRuntime = readText(path.join(liveModules, RUNTIME_MARKER));
+      const otherRuntime = exists(liveModules) && (liveRuntime ? liveRuntime !== wantRuntime : this._docker());
       let seeded = false;
-      if (exists(liveModules)) {
+      if (otherRuntime) {
+        log.line(
+          `The app's node_modules was installed for ${liveRuntime || "this server's own Node.js"}; it now runs on ${wantRuntime} — ` +
+            `installing every package fresh, so native modules are rebuilt for it.`,
+        );
+      } else if (exists(liveModules)) {
         const t0 = Date.now();
         const r = hardlinkDir(liveModules, path.join(p.staging, "node_modules"));
         seeded = true;
@@ -778,7 +1021,7 @@ export class Deployer {
         // (typescript, prisma, tailwindcss, bundlers) and the build fails. The
         // site's own variables usually set it, so it is removed after they are
         // merged, and npm is told outright to include dev dependencies.
-        await this.run(this.S.build.install, {
+        await this.runApp(this.S.build.install, {
           cwd: p.staging,
           log,
           // (Not NPM_CONFIG_PRODUCTION=false: npm 8+ ignores it apart from
@@ -788,6 +1031,7 @@ export class Deployer {
           timeoutMs: 20 * 60_000,
         });
       }
+      markRuntime(path.join(p.staging, "node_modules"), wantRuntime);
     } else {
       log.line("No install command configured — skipping dependencies.");
     }
@@ -801,7 +1045,7 @@ export class Deployer {
     if (prepareCmd) {
       if (liveSchema !== newSchema || !depsUnchanged || this.S.build.prepare) {
         log.setStep("Prepare");
-        await this.run(prepareCmd, { cwd: p.staging, log, timeoutMs: 10 * 60_000 });
+        await this.runApp(prepareCmd, { cwd: p.staging, log, timeoutMs: 10 * 60_000 });
       } else {
         log.line("Nothing the prepare step depends on has changed — skipping it.");
       }
@@ -828,7 +1072,7 @@ export class Deployer {
       log.line("No build command configured — nothing to build.");
       return "none";
     }
-    await this.run(this.S.build.build, { cwd: p.staging, log, timeoutMs: 30 * 60_000 });
+    await this.runApp(this.S.build.build, { cwd: p.staging, log, timeoutMs: 30 * 60_000 });
     if (this.S.build.artifact && !exists(path.join(p.staging, this.S.build.artifact))) {
       throw new Error(
         `The build finished but ${this.S.build.artifact} is missing — refusing to deploy a broken build.`,
@@ -922,7 +1166,7 @@ export class Deployer {
         continue;
       }
       log.line(`Running migration ${name}…`);
-      await this.run(`node ${JSON.stringify(name)}`, { cwd: p.appDir, log, timeoutMs: 15 * 60_000 });
+      await this.runApp(`node ${JSON.stringify(name)}`, { cwd: p.appDir, log, timeoutMs: 15 * 60_000 });
       ran.push(name);
     }
     return ran;
@@ -996,6 +1240,7 @@ export class Deployer {
     await this.stopApp(log);
     this._snapshotPrevious(p, log);
     const swap = this._swapIntoPlace(p, log);
+    await this._own(p.appDir, log); // the swap copied files in as root
 
     // The swap protects .env from being overwritten by the archive, which is
     // right — but it also means the staging copy never lands. Write it here.
@@ -1021,6 +1266,7 @@ export class Deployer {
       log.line("!! The new build did not come up. Rolling back to the previous one.");
       await this.stopApp(log);
       const meta = this._restorePrevious(p, log);
+      await this._own(p.appDir, log);
       await this.startApp(log);
       const recovered = await this.waitForHealthy(log, Math.min(this.S.healthTimeoutMs, 120_000));
       const why =
@@ -1075,6 +1321,7 @@ export class Deployer {
     log.setStep("Restart");
     const onDisk = this.readDeployedInfo();
     this.writeEnvFile(this.S.appDir, log);
+    await this._own(this.S.appDir, null); // e.g. back from legacy: root-owned files the container must write
     await this.restartApp(log);
     const health = await this.waitForHealthy(log);
     if (health.ok === false) {
@@ -1112,6 +1359,7 @@ export class Deployer {
     this._require(log);
     log.setStep("Start");
     this.writeEnvFile(this.S.appDir, log);
+    await this._own(this.S.appDir, null);
     await this.startApp(log);
     const health = await this.waitForHealthy(log);
     if (health.ok === false) await this.dumpAppLog(log);
@@ -1129,6 +1377,7 @@ export class Deployer {
     log.setStep("Rollback");
     await this.stopApp(log);
     this._restorePrevious(p, log);
+    await this._own(p.appDir, log);
     await this.startApp(log);
     const health = await this.waitForHealthy(log);
     const deployed = this.readDeployedInfo();
@@ -1147,7 +1396,7 @@ export class Deployer {
   async doCommand(job, log) {
     this._require(log);
     log.setStep("Command");
-    const r = await this.run(job.command, { cwd: this.S.appDir, log, timeoutMs: 15 * 60_000, allowFail: true });
+    const r = await this.runApp(job.command, { cwd: this.S.appDir, log, timeoutMs: 15 * 60_000, allowFail: true });
     log.line(`\nExit code ${r.code}.`);
     if (r.code !== 0) throw new Error(`Command exited with code ${r.code}.`);
     return { summary: { exitCode: r.code } };
@@ -1219,6 +1468,26 @@ export class Deployer {
 }
 
 // ------------------------------------------------------------------ utils
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record which runtime a node_modules was installed for. Unlinks first: the file may be hardlinked to the live copy. */
+function markRuntime(modulesDir, tag) {
+  if (!exists(modulesDir)) return;
+  const file = path.join(modulesDir, RUNTIME_MARKER);
+  try {
+    fs.rmSync(file, { force: true });
+    fs.writeFileSync(file, `${tag}\n`);
+  } catch {
+    /* best effort: a missing marker only means a fresh install next time (docker) */
+  }
+}
 
 /** Tagged so a caller can tell "you stopped this" from "this broke". */
 export function abortError(reason) {

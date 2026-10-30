@@ -41,11 +41,12 @@ import zlib from "node:zlib";
 import { execFile, spawn } from "node:child_process";
 
 import { Deployer } from "./deployer.mjs";
+import * as docker from "./docker.mjs";
 import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.6.0";
+export const TASKS_VERSION = "3.7.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -77,6 +78,9 @@ export const TASK_TYPES = [
   // Changing the main server (3.6.0) — shared/main-handoff.mjs, main's embedded agent only
   "main.handoff",
   "main.retire",
+  // Docker websites and commit testing (3.7.0) — docs/DOCKER-AND-TESTS.md
+  "server.docker",
+  "site.test",
 ];
 
 /** A package.json script (site.script) is stopped after this long. */
@@ -111,6 +115,8 @@ export const TASK_TIMEOUTS_MS = {
   "mysql.probe": 10_000,
   "main.handoff": 6 * 60 * 60_000, // one backup archive or /etc/letsencrypt
   "main.retire": 60_000,
+  "server.docker": 40 * 60_000, // may apt-get install docker.io and pull an image
+  "site.test": 3 * 60 * 60_000, // a whole commit test run (shared/testenv.mjs)
 };
 
 const NOOP = () => {};
@@ -203,6 +209,20 @@ export async function executeTask(type, payload = {}, opts = {}) {
     case "mysql.rebuild":
       // Database replication (docs/HA.md Phase 3); one change to the local MySQL at a time.
       return withSiteLock("cluster:mysql", async () => (await import("./mysql-ha.mjs")).runMysqlTask(type, payload, o));
+    case "server.docker":
+      // One Docker install / image pull at a time per server.
+      return payload?.check ? dockerCheck() : withSiteLock("cluster:docker", () => serverDocker(payload, o));
+    case "site.test": {
+      // Loaded on demand (and only here), so an agent without shared/testenv.mjs
+      // still runs every other task.
+      let mod;
+      try {
+        mod = await import("./testenv.mjs");
+      } catch (err) {
+        throw new Error(`Commit testing is not available on this server (${err.message}). Update this server's agent from the Servers page.`);
+      }
+      return mod.runSiteTest(payload, o);
+    }
     case "site.status":
       return siteStatus(payload, o);
     case "site.logs":
@@ -283,12 +303,50 @@ function healthUrlOf(spec) {
   return `http://127.0.0.1:${spec.port}${p.startsWith("/") ? p : `/${p}`}`;
 }
 
+/** "docker" | "legacy" | "none" — how this spec's app runs (docs/DOCKER-AND-TESTS.md). */
+export function runtimeOf(spec) {
+  if ((spec?.type || "node") === "static") return "none";
+  return spec?.runtime === "docker" && (spec.type || "node") === "node" ? "docker" : "legacy";
+}
+
+/** The website's container name, or "" when its id cannot make one. */
+function containerOf(spec) {
+  try {
+    return docker.containerName(spec.siteId);
+  } catch {
+    return "";
+  }
+}
+
 /** Deployer settings for this spec. */
-function engineSettings(spec) {
+export function engineSettings(spec) {
   const s = spec.settings || {};
   const restart = s.restart || {};
   const build = s.build || {};
   const env = { ...(restart.env || {}), ...(spec.env || {}) };
+  if (spec.type === "node" && runtimeOf(spec) === "docker") {
+    // Its own container, as its own user. The app's environment is exactly
+    // the site's variables (+ PORT, NODE_ENV) — nothing of this process's.
+    const c = docker.containerSettings(spec.container);
+    const name = containerOf(spec);
+    if (!name) throw new Error(`"${spec.siteId}" can't be used as a container name.`);
+    return {
+      ...s,
+      appDir: spec.appDir,
+      port: spec.port,
+      healthUrl: healthUrlOf(spec),
+      restart: {
+        ...restart,
+        mode: "docker",
+        service: name,
+        start: restart.start || restart.pm2Start || "npm start",
+        pm2Start: "",
+        env,
+      },
+      docker: { image: c.image, uid: c.uid, gid: c.gid, memoryMb: c.memoryMb, cpus: c.cpus, legacyPm2: pm2NameOf(spec) },
+      leftoverContainer: "",
+    };
+  }
   if (spec.type === "node") {
     return {
       ...s,
@@ -297,11 +355,13 @@ function engineSettings(spec) {
       healthUrl: healthUrlOf(spec),
       restart: {
         ...restart,
-        mode: restart.mode && restart.mode !== "child" ? restart.mode : "pm2",
+        mode: restart.mode && restart.mode !== "child" && restart.mode !== "docker" ? restart.mode : "pm2",
         service: restart.mode === "systemd" || restart.mode === "command" ? restart.service : pm2NameOf(spec),
         pm2Start: restart.pm2Start || restart.start || "npm start",
         env,
       },
+      // Back from docker: the engine removes this container before starting the app.
+      leftoverContainer: containerOf(spec),
     };
   }
   // static / php: nginx on this server serves the files; nothing to supervise.
@@ -493,9 +553,16 @@ async function siteAction(type, payload, o) {
         return { written: !!file, file: file || null, keys: Object.keys(env).length };
       }
       case "site.remove": {
+        // Both ways a node site may have run here — its container and its
+        // pm2 process — whatever its runtime is today (a half-done move).
+        if (spec.type === "node" && sys.which("docker") && containerOf(spec)) {
+          await docker.remove(containerOf(spec), { log });
+        }
         if (spec.type === "node" && spec.settings?.restart?.mode !== "systemd") {
-          await sys.run("pm2", ["delete", pm2NameOf(spec)], { log, allowFail: true, timeoutMs: 60_000 });
-          await pm2Save(log);
+          if (sys.which("pm2")) {
+            await sys.run("pm2", ["delete", pm2NameOf(spec)], { log, allowFail: true, timeoutMs: 60_000 });
+            await pm2Save(log);
+          }
         } else if (spec.type === "node") {
           await d.stopApp(L).catch(() => {});
         }
@@ -566,6 +633,24 @@ async function siteStatus(payload, o) {
   }
   const d = deployerFor(spec, o);
   if (spec.type !== "node") return staticStatus(spec, d, o);
+  if (runtimeOf(spec) === "docker") {
+    const [health, ct, serving] = await Promise.all([
+      d.checkHealth().catch(() => null),
+      docker.inspect(containerOf(spec)),
+      d.readServingInfo().catch(() => null),
+    ]);
+    const deployed = d.readDeployedInfo();
+    return {
+      running: ct.running ?? health?.ok ?? false,
+      healthy: health?.ok ?? null,
+      version: serving?.version || deployed?.version || null,
+      pid: ct.pid || undefined,
+      restarts: ct.restarts,
+      container: { name: containerOf(spec), exists: ct.exists, status: ct.status || null, startedAt: ct.startedAt || null },
+      deployed,
+      checkedAt: new Date().toISOString(),
+    };
+  }
   const health = await d.checkHealth().catch(() => null);
   const pm = await pm2Info(pm2NameOf(spec));
   let running = pm ? pm.status === "online" : await d.appRunning().catch(() => null);
@@ -644,6 +729,13 @@ async function siteLogs(payload, o) {
     return { text: `[dry-run] would show the last ${lines} lines of ${spec.name || spec.siteId}'s logs on ${os.hostname()}\n` };
   }
   const files = [];
+  if (spec.type === "node" && runtimeOf(spec) === "docker") {
+    const name = containerOf(spec);
+    const st = await docker.inspect(name);
+    if (!st.exists) return { text: `==> container ${name} <==\n(there is no container yet — deploy or start the website)\n` };
+    const body = await docker.logs(name, lines);
+    return { text: `==> container ${name} (docker logs: stdout and stderr) <==\n${body || "(nothing printed yet)\n"}` };
+  }
   if (spec.type === "node") {
     const pm = await pm2Info(pm2NameOf(spec));
     const pm2Home = process.env.PM2_HOME || path.join(os.homedir(), ".pm2");
@@ -754,17 +846,50 @@ async function siteScript(payload, o) {
   const result = (extra) => ({ ...(command != null ? { command } : { script: name }), ...extra });
   log(`in ${spec.appDir} on ${os.hostname()}`);
   if (sys.DRY_RUN) {
-    log(`[dry-run] would run ${label} with the website's environment (${Object.keys(spec.env || {}).length} variable(s) + PORT)`);
+    log(
+      `[dry-run] would run ${label}${runtimeOf(spec) === "docker" ? ` in a one-off container (${docker.containerSettings(spec.container).image}, uid ${spec.container?.uid ?? "?"})` : ""} ` +
+        `with the website's environment (${Object.keys(spec.env || {}).length} variable(s) + PORT)`,
+    );
     return result({ code: 0, durationMs: Date.now() - started, dryRun: true });
   }
-  env = scriptEnv(spec);
-  if (command != null) {
-    bin = exists("/bin/bash") ? "/bin/bash" : "/bin/sh";
-    args = ["-c", command];
-    env.PATH = [path.join(spec.appDir, "node_modules", ".bin"), env.PATH].filter(Boolean).join(path.delimiter);
+  let jobContainer = null;
+  if (spec.type === "node" && runtimeOf(spec) === "docker") {
+    // A one-off container, exactly like the running app's: the site's own
+    // user, its folder and its variables only. The admin's command travels
+    // as a variable (FCC_COMMAND), so it is never re-quoted into a shell string.
+    const c = docker.containerSettings(spec.container);
+    if (!c.uid) throw new Error("This website runs in Docker but has no container user yet — redeploy it from the panel.");
+    const cenv = { ...(spec.settings?.restart?.env || {}), ...(spec.env || {}), PORT: String(spec.port) };
+    if (!cenv.NODE_ENV) cenv.NODE_ENV = "production";
+    if (command != null) cenv.FCC_COMMAND = command;
+    jobContainer = `${containerOf(spec)}-job-${crypto.randomBytes(3).toString("hex")}`;
+    const b = docker.buildArgs({
+      image: c.image,
+      command: command != null ? 'export PATH="$PWD/node_modules/.bin:$PATH"; exec bash -c "$FCC_COMMAND"' : `exec npm run ${name}`,
+      env: cenv,
+      name: jobContainer,
+      uid: c.uid,
+      gid: c.gid,
+      mounts: [{ src: spec.appDir }],
+      workdir: spec.appDir,
+      network: "host",
+      tmpfsMb: 1024,
+      labels: { "fcc.site": containerOf(spec), "fcc.job": "1" },
+    });
+    bin = sys.which("docker") || "docker";
+    args = b.args;
+    env = docker.cliEnv(b.env);
+    log(`(in a one-off container: ${c.image}, uid ${c.uid})`);
   } else {
-    bin = sys.which("npm") || "npm";
-    args = ["run", name];
+    env = scriptEnv(spec);
+    if (command != null) {
+      bin = exists("/bin/bash") ? "/bin/bash" : "/bin/sh";
+      args = ["-c", command];
+      env.PATH = [path.join(spec.appDir, "node_modules", ".bin"), env.PATH].filter(Boolean).join(path.delimiter);
+    } else {
+      bin = sys.which("npm") || "npm";
+      args = ["run", name];
+    }
   }
 
   // Scripts like `prisma db push` read .env for themselves: make sure the
@@ -809,6 +934,8 @@ async function siteScript(payload, o) {
       stopReason = reason;
       log(`!! ${reason} — stopping ${label}`);
       killGroup(child, "SIGTERM");
+      // Killing the docker CLI does not stop the container behind it.
+      if (jobContainer) sys.run(bin, ["rm", "-f", jobContainer], { allowFail: true, timeoutMs: 60_000 }).catch(() => {});
       killTimer = setTimeout(() => killGroup(child, "SIGKILL"), 5000);
     };
     const onAbort = () => stop("Cancelled from the panel");
@@ -825,7 +952,7 @@ async function siteScript(payload, o) {
       for (const key of ["out", "err"]) if (partial[key]) (log(partial[key]), tail.push(partial[key]));
       partial = { out: "", err: "" };
       const durationMs = Date.now() - started;
-      if (err) return reject(err.code === "ENOENT" ? new Error(`${command != null ? bin : "npm"} is not installed on ${os.hostname()}.`) : err);
+      if (err) return reject(err.code === "ENOENT" ? new Error(`${jobContainer ? "docker" : command != null ? bin : "npm"} is not installed on ${os.hostname()}.`) : err);
       if (stopReason) {
         const e = new Error(`${stopReason}.`);
         if (signal?.aborted) e.aborted = true;
@@ -1143,6 +1270,10 @@ async function dryRunSite(type, spec, payload, o) {
   const { log } = o;
   const st = dryState(spec.siteId);
   const where = `${spec.appDir} (port ${spec.port}) on ${os.hostname()}`;
+  const inDocker = spec.type === "node" && runtimeOf(spec) === "docker";
+  const ct = inDocker ? docker.containerSettings(spec.container) : null;
+  // What runs the app, in words, for the simulated log.
+  const proc = inDocker ? `container ${containerOf(spec)} (${ct.image}, uid ${ct.uid ?? "?"})` : `pm2 process ${pm2NameOf(spec)}`;
   const step = async (text) => {
     if (o.signal?.aborted) throw abortError();
     log(text);
@@ -1157,7 +1288,7 @@ async function dryRunSite(type, spec, payload, o) {
       await step(
         rel.prebuilt
           ? `[dry-run] would unpack into ${where} and install dependencies — the archive is the build made on ${rel.builtOn || "the first server"}, so the build step is skipped`
-          : `[dry-run] would unpack into ${where}, install and build (${spec.type})`,
+          : `[dry-run] would unpack into ${where}, install and build (${spec.type})${inDocker ? ` in a throw-away container as uid ${ct.uid ?? "?"}` : ""}`,
       );
       let packaged;
       const pkg = packageTarget(payload, spec, o);
@@ -1174,7 +1305,9 @@ async function dryRunSite(type, spec, payload, o) {
       }
       if (spec.type !== "node") await writeSiteVhost(spec, o);
       await step(`── Swap & restart ──`);
-      await step(spec.type === "node" ? `[dry-run] pm2 start/restart ${pm2NameOf(spec)}` : `[dry-run] nginx serves ${siteRoot(spec)}`);
+      if (inDocker) await step(`[dry-run] would delete the old pm2 process ${pm2NameOf(spec)} if there is one, then start ${proc} (read-only, --network host)`);
+      else if (spec.type === "node") await step(`[dry-run] would remove the container ${containerOf(spec)} if there is one, then pm2 start/restart ${pm2NameOf(spec)}`);
+      else await step(`[dry-run] nginx serves ${siteRoot(spec)}`);
       await step(`── Health check ──`);
       await step(`[dry-run] ${healthUrlOf(spec)} → ok`);
       st.running = true;
@@ -1188,12 +1321,12 @@ async function dryRunSite(type, spec, payload, o) {
     case "site.start":
     case "site.restart":
       if (spec.type !== "node") await writeSiteVhost(spec, o);
-      await step(`[dry-run] would ${type.split(".")[1]} ${spec.type === "node" ? `pm2 process ${pm2NameOf(spec)}` : "the nginx vhost"} for ${where}`);
+      await step(`[dry-run] would ${type.split(".")[1]} ${spec.type === "node" ? proc : "the nginx vhost"} for ${where}`);
       st.running = true;
       return { running: true, healthy: true, version: st.version, dryRun: true };
     case "site.stop":
       if (spec.type !== "node") await removeSiteVhost(spec, o);
-      await step(`[dry-run] would stop ${spec.type === "node" ? `pm2 process ${pm2NameOf(spec)}` : "serving"} ${where}`);
+      await step(`[dry-run] would stop ${spec.type === "node" ? proc : "serving"} ${where}`);
       st.running = false;
       return { running: false, healthy: null, version: st.version, dryRun: true };
     case "site.env": {
@@ -1203,6 +1336,7 @@ async function dryRunSite(type, spec, payload, o) {
     }
     case "site.remove":
       if (spec.type !== "node") await removeSiteVhost(spec, o);
+      if (spec.type === "node") await sys.run("docker", ["rm", "-f", containerOf(spec)], { log, allowFail: true });
       await sys.run("pm2", ["delete", pm2NameOf(spec)], { log, allowFail: true });
       await step(payload.deleteFiles ? `[dry-run] would delete ${spec.appDir}` : `Files left in place at ${spec.appDir}`);
       dryStates.delete(spec.siteId);
@@ -1211,16 +1345,38 @@ async function dryRunSite(type, spec, payload, o) {
   throw new Error(`Unknown task type "${type}"`);
 }
 
+// ------------------------------------------------------------ server.docker
+
+/** { installed, running, version, error? } — read-only, never installs anything. */
+async function dockerCheck() {
+  const st = await docker.status();
+  return { installed: st.installed, running: st.running, version: st.version || null, ...(st.error ? { error: st.error } : {}), ...(st.dryRun ? { dryRun: true } : {}) };
+}
+
+/**
+ * server.docker { image? } — make this server ready for docker websites:
+ * install docker.io when missing, run the daemon at boot, pull the image.
+ */
+async function serverDocker(payload, o) {
+  const image = payload?.image == null || payload.image === "" ? docker.DEFAULT_NODE_IMAGE : String(payload.image);
+  if (!docker.validImage(image)) throw new Error(`"${image.slice(0, 80)}" is not a valid Docker image name.`);
+  const st = await docker.ensureInstalled({ log: o.log });
+  const { pulled } = await docker.ensureImage(image, { log: o.log, signal: o.signal });
+  o.log(pulled ? `${image} is ready.` : `${image} is already on this server.`);
+  return { installed: true, running: true, version: st.version || null, image, pulled, ...(st.dryRun ? { dryRun: true } : {}) };
+}
+
 // -------------------------------------------------------------- site usage
 
 /*
- * sites.usage { specs: [{ siteId, type, appDir, port, pm2Name, restart: { mode, service } }] }
+ * sites.usage { specs: [{ siteId, type, appDir, port, pm2Name, runtime?, container?, restart: { mode, service } }] }
  *   → { at, cores, memTotal, simulated?, sites: { [siteId]: { cpu, mem, procs, source, disk, diskAt } } }
  *
  * cpu    % of one core (top/pm2 style), averaged since the previous call for the same
  *        processes — null the first time a process is seen.
  * mem    resident memory (RSS, bytes) of the app's processes and their children.
- * source how the processes were found: "pm2" (by process name), "systemd" (the unit's
+ * source how the processes were found: "docker" (the container's main pid from
+ *        docker inspect, runtime "docker"), "pm2" (by process name), "systemd" (the unit's
  *        cgroup), "port" (whoever listens on the site's port), "nginx" (static/php:
  *        nginx and php-fpm are shared, so there is nothing of its own to measure),
  *        or null (not running). procs = 0 then.
@@ -1427,7 +1583,7 @@ function simulatedUsage(spec) {
     cpu: round1(2 + (h % 12) + wave * 18 + Math.random() * 4),
     mem: Math.round((90 + (h % 160) + wave * 40 + Math.random() * 6) * 1024 * 1024),
     procs: 1 + (h % 3),
-    source: "pm2",
+    source: spec.runtime === "docker" || spec.restart?.mode === "docker" ? "docker" : "pm2",
     disk,
     diskAt: new Date().toISOString(),
   };
@@ -1443,11 +1599,18 @@ async function sitesUsage(payload) {
   const procs = readProcTable();
   const now = Date.now();
   const nodeSpecs = specs.filter((s) => (s.type || "node") === "node");
-  const pm2 = procs && nodeSpecs.some((s) => !["systemd", "command"].includes(s.restart?.mode)) ? await pm2Pids() : new Map();
+  const inDocker = (s) => s.runtime === "docker" || s.restart?.mode === "docker";
+  const pm2 = procs && nodeSpecs.some((s) => !inDocker(s) && !["systemd", "command"].includes(s.restart?.mode)) ? await pm2Pids() : new Map();
   const roots = new Map(); // siteId -> { pids, source }
   for (const s of nodeSpecs) {
     if (!procs) break;
-    if (s.restart?.mode === "systemd" && s.restart.service) {
+    if (inDocker(s)) {
+      // The container's main process (docker-init) is the root of its tree;
+      // its processes are ordinary host processes in /proc.
+      const name = docker.validName(String(s.container || "")) ? String(s.container) : containerOf(s);
+      const ct = name ? await docker.inspect(name) : null;
+      if (ct?.running && ct.pid > 0) roots.set(s.siteId, { pids: [ct.pid], source: "docker" });
+    } else if (s.restart?.mode === "systemd" && s.restart.service) {
       const pids = await systemdPids(String(s.restart.service));
       if (pids.length) roots.set(s.siteId, { pids, source: "systemd" });
     } else if (s.restart?.mode !== "command") {
@@ -1660,6 +1823,7 @@ async function serverBackup(payload, o) {
     "*/.forthway/staging",
     "*/.forthway/previous",
     "*/.forthway/downloads",
+    "*/.forthway/cache", // npm cache of docker websites
   ].map((e) => `--exclude=${e.replace(/^\//, "")}`);
   const rel = present.map((p) => p.replace(/^\//, ""));
 

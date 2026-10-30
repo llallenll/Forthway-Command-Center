@@ -101,14 +101,26 @@ mkSite({ id: "site_blog", projectId: "prj_mkt", name: "blog", type: "php", domai
 mkSite({ id: "site_status", projectId: "prj_int", name: "status-page", type: "static", domains: ["status.forthway.dev"], port: 3008, serverIds: ["srv_nyc1"], healthPath: "/",
   github: { repo: "forthway/status", branch: "main" }, ssl: { enabled: false, status: "failed", error: "DNS for status.forthway.dev does not point at this server." } });
 
+// Docker runtime (docs/DOCKER-AND-TESTS.md §1): two sites already in containers, the rest still legacy pm2.
+const CONTAINERS = { site_acmeweb: { uid: 20001, gid: 20001, image: "node:20-bookworm-slim", memoryMb: 1024, cpus: 1.5 }, site_nwapi: { uid: 20002, gid: 20002, image: "node:20-bookworm-slim", memoryMb: 768, cpus: 1 } };
+for (const s of db.sites) {
+  s.runtime = s.type === "static" ? "none" : CONTAINERS[s.id] ? "docker" : "legacy";
+  s.container = CONTAINERS[s.id] || null;
+}
+const COMMIT_MSGS = ["Checkout: show the order summary on mobile", "Fix cart total rounding for 3-decimal currencies", "Add password reset by email", "Bump next to 14.2.15", "Stripe: handle payment_intent.payment_failed",
+  "Search: debounce queries and cache results", "Admin: export orders as CSV", "Move session store to MySQL", "Tighten CSP headers", "Products: lazy-load images below the fold"];
+const AUTHORS = ["Jordan Reyes", "Sam Patel", "Alex Kim"];
+
 // Releases
 const SRC_VERS = { site_acmeweb: ["2.14.0", "2.13.2", "2.13.1", "2.13.0", "2.12.4"], site_acmeadmin: ["1.6.3", "1.6.2", "1.6.0"], site_acmestg: ["2.15.0-rc.2", "2.15.0-rc.1"], site_nwapi: ["4.2.1", "4.2.0", "4.1.9", "4.1.8"],
   site_nwhooks: ["1.3.0", "1.2.7"], site_landing: ["2026.10.02", "2026.09.27", "2026.09.14"], site_blog: ["6.6.2"], site_status: ["1.0.4", "1.0.3"] };
 for (const s of db.sites) {
   const vers = SRC_VERS[s.id] || ["1.0.0"];
   vers.forEach((v, i) => {
-    const r = { id: nid("rel"), siteId: s.id, filename: `${s.name}-${v}.zip`, size: Math.round((s.type === "node" ? 18 : 4) * MB * (0.8 + Math.random() * 0.5)), sha256: hex(64), version: v, commit: s.github ? hex(7) : null,
+    const sha = s.github ? hex(40) : null;
+    const r = { id: nid("rel"), siteId: s.id, filename: `${s.name}-${v}.zip`, size: Math.round((s.type === "node" ? 18 : 4) * MB * (0.8 + Math.random() * 0.5)), sha256: hex(64), version: v, commit: sha ? sha.slice(0, 7) : null,
       source: s.github && i !== 1 ? "github" : "upload", pinned: i === vers.length - 1 && vers.length > 2, createdAt: ago((i * 2.3 + 0.2) * DAY + Math.random() * 4 * HOUR) };
+    if (r.source === "github") r.github = { repo: s.github.repo, ref: s.github.branch, sha, message: COMMIT_MSGS[(i * 3 + s.name.length) % COMMIT_MSGS.length], author: AUTHORS[i % AUTHORS.length] };
     db.releases.push(r);
     if (i === 0) s.currentReleaseId = r.id;
     if (i === 1) s.previousReleaseId = r.id;
@@ -277,7 +289,7 @@ function upstreams(s) {
     return { serverId: sid, name: srv?.name || sid, address: sid === "main" ? "127.0.0.1" : srv?.privateHost || srv?.host, port: s.port, weight: srv?.weight || 1, online: !!srv?.online, healthy: !!s.state?.[sid]?.healthy };
   });
 }
-function siteView(s) { const bj = db.jobs.find((x) => x.siteId === s.id && (x.status === "running" || x.status === "queued")); return { ...clone(s), busyJobId: bj?.id || null, envCount: Object.keys(s.env || {}).length, currentVersion: db.releases.find((r) => r.id === s.currentReleaseId)?.version || null, lb: lbSummary(s), currentRelease: clone(db.releases.find((r) => r.id === s.currentReleaseId) || null) }; }
+function siteView(s) { const bj = db.jobs.find((x) => x.siteId === s.id && (x.status === "running" || x.status === "queued")); return { ...clone(s), canMigrate: s.runtime === "legacy" && s.type !== "static", busyJobId: bj?.id || null, envCount: Object.keys(s.env || {}).length, currentVersion: db.releases.find((r) => r.id === s.currentReleaseId)?.version || null, lb: lbSummary(s), currentRelease: clone(db.releases.find((r) => r.id === s.currentReleaseId) || null) }; }
 function projectCounts(p) {
   const sites = db.sites.filter((s) => s.projectId === p.id);
   return { sites: sites.length, sitesLoadBalanced: sites.filter((s) => s.loadBalanced).length, databases: db.databases.filter((d) => d.projectId === p.id).length,
@@ -456,6 +468,7 @@ R("PATCH", "/api/sites/:id", (p, b) => {
   const prevGithub = s.github || {};
   Object.assign(s, pick(b, ["name", "type", "domains", "loadBalanced", "serverIds", "lbMethod", "healthPath", "port", "github", "linkedDatabaseIds"]));
   if (b.github) s.github = { ...prevGithub, ...b.github }; // merged like the real server's sanitizeGithub
+  if (b.container && s.runtime === "docker") s.container = { ...s.container, ...pick(b.container, ["image", "memoryMb", "cpus"]) };
   if (b.settings) s.settings = { ...s.settings, ...b.settings, build: { ...(s.settings.build || {}), ...(b.settings.build || {}) }, restart: { ...(s.settings.restart || {}), ...(b.settings.restart || {}) } };
   for (const sid of targets(s)) if (!s.state[sid]) { const srv = db.servers.find((x) => x.id === sid); s.state[sid] = { running: !!srv?.online, healthy: !!srv?.online, version: db.releases.find((r) => r.id === s.currentReleaseId)?.version, checkedAt: iso(Date.now()) }; }
   activity("site.update", "site", s); emit("site", siteView(s));
@@ -547,10 +560,15 @@ R("POST", "/api/sites/:id/releases/github", (p, b) => {
   const s = find("sites", p.id);
   if (!s.github?.repo) err(400, "Set a GitHub repository in Settings first.");
   const ref = b.ref || s.github.branch || "main";
-  return runJob({ type: "release.github", title: `Pull ${s.github.repo}@${ref}`, siteId: s.id, projectId: s.projectId }, {
-    lines: [`▸ Resolving ${ref}`, `  ${ref} → ${hex(7)}`, "▸ Downloading archive from GitHub", "  14.8 MB", "▸ Verifying archive", "✓ Release created"],
-    onDone() { const r = { id: nid("rel"), siteId: s.id, filename: `${s.name}-${ref}.zip`, size: 14.8 * MB, sha256: hex(64), version: ref.startsWith("v") ? ref.slice(1) : `${ref}-${hex(7)}`, commit: hex(7), source: "github", pinned: false, createdAt: iso(Date.now()) };
-      db.releases.unshift(r); emit("site", siteView(s)); return { releaseId: r.id }; } });
+  const sha = /^[0-9a-f]{40}$/.test(ref) ? ref : hex(40), message = COMMIT_MSGS[Math.floor(Math.random() * COMMIT_MSGS.length)];
+  if (b.deploy) busy(s);
+  return runJob({ type: "release.github", title: `Pull ${s.github.repo}@${ref.slice(0, 12)}${b.deploy ? " and deploy" : ""}`, siteId: s.id, projectId: s.projectId }, {
+    lines: [`▸ Resolving ${ref}`, `  ${ref.slice(0, 12)} → ${sha.slice(0, 7)}: ${message}`, "▸ Downloading archive from GitHub", "  14.8 MB", "▸ Verifying archive", "✓ Release created", ...(b.deploy ? linesFor("site.deploy", "").map((l) => l.replace(/^\[[^\]]+\] /, "")) : [])],
+    onDone() { const r = { id: nid("rel"), siteId: s.id, filename: `${s.name}-${sha.slice(0, 7)}.zip`, size: 14.8 * MB, sha256: hex(64), version: /^v\d/.test(ref) ? ref.slice(1) : `${(db.releases.find((x) => x.siteId === s.id)?.version || "1.0.0").replace(/-.*$/, "")}-${sha.slice(0, 7)}`, commit: sha.slice(0, 7), source: "github", pinned: false, createdAt: iso(Date.now()),
+        github: { repo: s.github.repo, ref, sha, message, author: me.name } };
+      db.releases.unshift(r);
+      if (b.deploy) { s.previousReleaseId = s.currentReleaseId; s.currentReleaseId = r.id; for (const sid of targets(s)) s.state[sid] = { ...s.state[sid], running: true, healthy: true, version: r.version, checkedAt: iso(Date.now()) }; }
+      emit("site", siteView(s)); return { releaseId: r.id, version: r.version }; } });
 });
 R("PATCH", "/api/releases/:id", (p, b) => Object.assign(find("releases", p.id), pick(b, ["pinned"])));
 R("DELETE", "/api/releases/:id", (p) => {
@@ -1112,6 +1130,263 @@ R("POST", "/api/backups/:id/restore", (p) => {
 });
 R("PATCH", "/api/backups/:id", (p, b) => { const bk = Object.assign(find("backups", p.id), pick(b, ["pinned", "note"])); emit("backup", bk); return clone(bk); });
 R("DELETE", "/api/backups/:id", (p) => { const bk = find("backups", p.id); db.backups = db.backups.filter((x) => x.id !== p.id); emit("backup", { id: bk.id, deleted: true }); return { ok: true }; });
+
+/* ───────── Docker runtime: move a website in / out of its container ───────── */
+R("POST", "/api/sites/:id/migrate", (p, b) => {
+  const s = find("sites", p.id);
+  const to = b.to === "legacy" ? "legacy" : "docker";
+  if (s.type === "static") err(400, "Static websites have no runtime to move.");
+  if (s.runtime === to) err(409, `${s.name} already runs ${to === "docker" ? "in Docker" : "the legacy way"}.`);
+  busy(s);
+  const names = targets(s).map((sid) => db.servers.find((x) => x.id === sid)?.name || sid);
+  const lines = to === "docker"
+    ? [...names.flatMap((n) => [`━━ ${n} ━━`, "▸ Checking Docker", "  docker 27.3.1 running", "▸ Pulling node:20-bookworm-slim", "  up to date"]), "▸ Allocating container user", `  uid ${20000 + db.sites.indexOf(s) + 3}`,
+      "▸ Installing and building inside the container", "  added 612 packages in 24s", "  ✓ Compiled successfully", "▸ Stopping the pm2 process", "▸ Starting container fcc-" + s.id, "▸ Waiting for health check", "  200 OK in 1.4s", `✓ ${s.name} now runs in Docker`]
+    : ["▸ Stopping container fcc-" + s.id, "▸ Removing the container", "▸ Starting under pm2", "▸ Waiting for health check", "  200 OK in 2.1s", `✓ ${s.name} runs the legacy way again`];
+  activity("site.migrate", "site", s, to === "docker" ? "Moved to Docker" : "Moved back to legacy");
+  return runJob({ type: "site.migrate", title: to === "docker" ? `Move ${s.name} to Docker` : `Move ${s.name} back to legacy`, siteId: s.id, projectId: s.projectId }, { lines, speed: 220, onDone() {
+    s.runtime = to;
+    if (to === "docker" && !s.container) s.container = { uid: 20000 + db.sites.indexOf(s) + 3, gid: 20000 + db.sites.indexOf(s) + 3, image: "node:20-bookworm-slim", memoryMb: 512, cpus: 1 };
+    emit("site", siteView(s));
+  } });
+});
+
+/* ───────── Commit testing (docs/DOCKER-AND-TESTS.md §2) ─────────
+   Runs are simulated: a run steps through ~32 ticks (~1.15 s each) and emits `testrun`
+   with the full run on every change, like the real panel. A release's first live run is
+   "not ready"; running it again after that passes, so both verdict reveals can be seen. */
+const tester = { tokenSet: true, model: "sonnet", maxMinutes: 30, image: "fcc-tester:1", serverId: "srv_fra1" };
+const testEnv = { site_acmeweb: { STRIPE_SECRET_KEY: "sk_test_51Hx…", STRIPE_PUBLISHABLE_KEY: "pk_test_51Hx…", STRIPE_WEBHOOK_SECRET: "whsec_test…" } };
+db.testRuns = [];
+const testTimers = new Map();
+
+const TEST_PLAN = [
+  { cat: "setup", title: "App installs and builds", ok: "npm ci + next build finished in 41 s", tool: "npm run build" },
+  { cat: "setup", title: "Health check answers", ok: "GET /api/health → 200 in 38 ms", tool: "curl -s http://site:3000/api/health" },
+  { cat: "config", title: "Required variables are set", ok: "Every key in .env.example has a value", tool: "read .env.example", think: "The app expects 14 variables; checking each is present in the copy." },
+  { cat: "database", title: "Migrations run on an empty database", ok: "14 migrations applied, 22 tables", tool: "npx prisma migrate deploy" },
+  { cat: "database", title: "Data survives a restart", ok: "Order created before restart is still there", tool: "docker restart fcc-t-site" },
+  { cat: "auth", title: "Sign up with email", ok: "Account created; welcome email captured", tool: "browser: open /signup", think: "Using a throw-away address — the mail catcher will receive the welcome email." },
+  { cat: "auth", title: "Sign in and sign out", ok: "Session cookie set and cleared", tool: "browser: fill #email, #password → Sign in" },
+  { cat: "auth", title: "Password reset link works", ok: "Reset email arrives and the link signs in", tool: "mail: GET /api/messages?to=test-7f3@example.test", bad: { status: "warn", detail: "Works, but the reset link never expires" } },
+  { cat: "features", title: "Browse products and search", ok: "Search for “chair” returns 6 results in 120 ms", tool: "browser: open /search?q=chair" },
+  { cat: "features", title: "Cart keeps items and updates totals", ok: "3 items, quantities and total update without reload", tool: "browser: click “Add to cart” ×3", think: "The cart total updates live. Next: change a quantity and remove an item." },
+  { cat: "features", title: "Checkout page works on a phone", ok: "No horizontal scroll at 375 px; all buttons reachable", tool: "browser: set viewport 375×812" },
+  { cat: "payments", title: "Card payment in Stripe test mode", ok: "Paid with 4242 4242 4242 4242 — order #1001 created", tool: "browser: Stripe Checkout → pay with test card", think: "Stripe is in test mode with the test keys from the panel. Paying with the standard test card." },
+  { cat: "payments", title: "Webhook marks the order paid", ok: "checkout.session.completed → order #1001 is “paid”", tool: "stripe trigger checkout.session.completed", bad: { status: "fail", detail: "Webhook answered 400: signature verification failed" } },
+  { cat: "payments", title: "Declined card shows an error", ok: "4000 0000 0000 0002 → “Your card was declined.”", tool: "browser: pay with 4000 0000 0000 0002" },
+  { cat: "security", title: "Session cookie is HttpOnly and Secure", ok: "sid: HttpOnly; Secure; SameSite=Lax", tool: "inspect Set-Cookie on POST /api/login" },
+  { cat: "security", title: "Admin pages need sign-in", ok: "/admin redirects to /login when signed out", tool: "curl -I http://site:3000/admin" },
+  { cat: "security", title: "Sign-in is rate limited", ok: "429 after 10 attempts in a minute", tool: "20 × POST /api/login with a wrong password", bad: { status: "warn", detail: "No limit: 50 wrong passwords in 8 s were all answered" } },
+  { cat: "config", title: "No secrets in the browser bundle", ok: "No sk_ / whsec_ / DATABASE_URL in .next/static", tool: "grep -r \"sk_\\|whsec_\" .next/static" },
+];
+const FINDINGS = {
+  bad: [
+    { severity: "high", category: "payments", title: "Stripe webhook rejects every event", location: "app/api/stripe/webhook/route.ts:18",
+      detail: "The webhook reads the raw body after it has been parsed as JSON, so the signature check always fails. Orders stay “pending” after a successful payment.",
+      fix: "Read the body with `await req.text()` before `stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET)`, and don't JSON-parse it first." },
+    { severity: "medium", category: "security", title: "No rate limit on sign-in", location: "app/api/login/route.ts",
+      detail: "50 wrong passwords in 8 seconds were all answered, so passwords can be guessed quickly.",
+      fix: "Limit attempts per IP and per email (e.g. 10 per minute) and answer 429 above that. A small in-memory or MySQL counter is enough for one server." },
+    { severity: "low", category: "auth", title: "Password reset links never expire", location: "lib/auth/reset.ts:41",
+      detail: "A reset link from the test still worked after the password had been changed.",
+      fix: "Store an expiry (e.g. 1 hour) with the token and delete it once used." },
+    { severity: "info", category: "features", title: "Product images load at full size on phones", location: "components/ProductCard.tsx",
+      detail: "Each card downloads a 1600 px image even at 375 px wide.", fix: "Use next/image with `sizes=\"(max-width: 640px) 50vw, 25vw\"`." },
+  ],
+  good: [
+    { severity: "low", category: "security", title: "Sign-in limit is generous", location: "middleware.ts", detail: "Sign-in allows 30 attempts a minute per IP.", fix: "10 a minute is plenty for people and slows down guessing." },
+    { severity: "info", category: "features", title: "Product images load at full size on phones", location: "components/ProductCard.tsx",
+      detail: "Each card downloads a 1600 px image even at 375 px wide.", fix: "Use next/image with `sizes=\"(max-width: 640px) 50vw, 25vw\"`." },
+  ],
+};
+const PREP = [
+  ["Creating an isolated test network", "Network fcc-t-%id created (internal)"],
+  ["Starting a throw-away MySQL database", "mysql:8.0 started with random credentials; DATABASE_URL re-pointed"],
+  ["Starting the mail catcher", "SMTP_HOST / MAIL_* re-pointed at the catcher: no real email can leave"],
+  ["Installing and building the release", "npm ci (612 packages) and next build in a --rm container"],
+  ["Running migrations", "npm run db:migrate on the empty database"],
+  ["Starting the copy of the site", "Site answering on http://site:3000 — live payment keys removed, 3 test variables applied"],
+];
+
+function testView(r) { return clone(r); }
+function testSummary(r) { const { activity: _a, ...rest } = r; return clone(rest); }
+const emitRun = (r) => emit("testrun", testView(r));
+
+/** The steps of a simulated run; each is applied at one tick. */
+function testScript(r, variant) {
+  const plan = TEST_PLAN.map((x, i) => ({ ...x, id: `chk_${i + 1}` }));
+  const say = (at, kind, text) => { r.activity.push({ at: iso(at), kind, text }); if (r.activity.length > 300) r.activity.shift(); };
+  const steps = [];
+  steps.push((at) => { r.status = "preparing"; r.startedAt = iso(at); r.phase = PREP[0][0] + "…"; say(at, "info", `Test run started on ${db.servers.find((x) => x.id === r.serverId)?.name || r.serverId}`); });
+  PREP.forEach(([phase, done], i) => steps.push((at) => {
+    say(at, "info", done.replace("%id", r.id.slice(-6)));
+    r.phase = (PREP[i + 1]?.[0] || "Handing over to Claude Code") + "…";
+    if (i === 3) r.env = { url: `http://${r.id.slice(-6)}.test.internal:3000`, database: true, mail: true };
+  }));
+  steps.push((at) => {
+    r.status = "testing"; r.phase = "Claude is reading the app to plan its checks";
+    say(at, "tool", "claude -p --output-format stream-json (max 30 min)");
+    say(at, "think", "It's a Next.js shop with Stripe checkout, email sign-in and a MySQL database. I'll cover setup, sign-in, the cart, payments and the obvious security basics.");
+  });
+  steps.push((at) => {
+    r.checks = plan.map((x) => ({ id: x.id, category: x.cat, title: x.title, status: "pending", detail: "", startedAt: null, finishedAt: null }));
+    say(at, "info", `Checklist written: ${plan.length} checks in ${new Set(plan.map((x) => x.cat)).size} categories`);
+  });
+  plan.forEach((x, i) => steps.push((at) => {
+    const prev = r.checks[i - 1], cur = r.checks[i], p = plan[i - 1];
+    if (prev) {
+      const res = variant === "bad" && p.bad ? p.bad : variant === "good" && p.bad?.status === "warn" && p.cat === "security" ? { status: "warn", detail: "Limited, but only after 30 attempts a minute" } : { status: "pass", detail: p.ok };
+      Object.assign(prev, { status: res.status, detail: res.detail, finishedAt: iso(at) });
+      say(at, res.status === "fail" ? "error" : "info", `${res.status === "pass" ? "✓" : res.status === "warn" ? "!" : "✗"} ${p.title}${res.status === "pass" ? "" : ` — ${res.detail}`}`);
+      if (res.status !== "pass") {
+        const f = FINDINGS[variant].find((y) => y.category === p.cat && !r.findings.some((z) => z.title === y.title));
+        if (f) r.findings.push({ id: `fnd_${r.findings.length + 1}`, ...f });
+      }
+    }
+    Object.assign(cur, { status: "running", startedAt: iso(at) });
+    r.phase = `${catLabel(x.cat)}: ${x.title.toLowerCase()}`;
+    if (x.think) say(at, "think", x.think);
+    say(at, "tool", x.tool);
+  }));
+  steps.push((at) => {
+    const last = r.checks[r.checks.length - 1], p = plan[plan.length - 1];
+    Object.assign(last, { status: "pass", detail: p.ok, finishedAt: iso(at) });
+    say(at, "info", `✓ ${p.title}`);
+    r.status = "reporting"; r.phase = "Writing the report";
+    say(at, "think", variant === "bad" ? "Payments don't complete: the webhook never confirms an order. That alone means this commit isn't ready." : "Everything that matters works end to end. A couple of small things are worth fixing later.");
+  });
+  steps.push((at) => {
+    for (const f of FINDINGS[variant]) if (!r.findings.some((z) => z.title === f.title)) r.findings.push({ id: `fnd_${r.findings.length + 1}`, ...f });
+    say(at, "tool", "fcc-report --final /out/report.json");
+  });
+  steps.push((at) => {
+    r.status = "done"; r.phase = "Finished"; r.finishedAt = iso(at);
+    r.verdict = variant === "bad" ? "not_ready" : "ready";
+    r.score = variant === "bad" ? 62 : 94;
+    r.summary = variant === "bad"
+      ? "The site builds, signs people in and takes card payments, but the Stripe webhook rejects every event, so paid orders stay pending. Sign-in also has no rate limit."
+      : "Sign-up, sign-in, the cart, checkout and Stripe test payments all work end to end on a fresh database. Two small improvements below; nothing blocks production.";
+    r.usage = { turns: variant === "bad" ? 58 : 47, durationMs: new Date(at) - new Date(r.startedAt) };
+    say(at, "info", `Verdict: ${r.verdict === "ready" ? "ready for production" : "not ready"} (${r.score}/100). Test copy removed.`);
+  });
+  return steps;
+}
+const catLabel = (c) => ({ setup: "Setup", payments: "Payments", database: "Database", auth: "Sign-in", features: "Features", security: "Security", config: "Config" })[c] || c;
+
+function newRun(s, rel) {
+  return {
+    id: nid("tst"), siteId: s.id, releaseId: rel.id, serverId: tester.serverId, jobId: null, adminId: me.id,
+    commit: rel.github?.sha ? { sha: rel.github.sha, shortSha: rel.github.sha.slice(0, 7), message: rel.github.message || "", author: rel.github.author || null } : rel.commit ? { sha: rel.commit, shortSha: rel.commit, message: "", author: null } : null,
+    version: rel.version, status: "queued", phase: "Waiting for a free tester…", verdict: null, score: null, summary: "", checks: [], findings: [], activity: [],
+    env: null, usage: null, error: null, createdAt: iso(Date.now()), startedAt: null, finishedAt: null,
+  };
+}
+function startLiveRun(s, rel) {
+  const r = newRun(s, rel);
+  // Run again after a "not ready" verdict and the fix "worked": the same release now passes.
+  const prev = db.testRuns.find((x) => x.releaseId === rel.id && x.status === "done");
+  const variant = prev?.verdict === "not_ready" ? "good" : "bad";
+  r.jobId = runJob({ type: "site.test", title: `Test ${s.name} ${rel.version}`, siteId: null, projectId: s.projectId }, { lines: ["▸ site.test dispatched to " + (db.servers.find((x) => x.id === r.serverId)?.name || r.serverId)], speed: 400 }).id;
+  db.testRuns.unshift(r);
+  const steps = testScript(r, variant);
+  let i = 0;
+  const t = setInterval(() => {
+    if (r.status === "cancelled") { clearInterval(t); testTimers.delete(r.id); return; }
+    steps[i++](Date.now());
+    emitRun(r);
+    if (i >= steps.length) { clearInterval(t); testTimers.delete(r.id); }
+  }, 1150);
+  testTimers.set(r.id, t);
+  activity("site.test", "site", s, `Test of ${rel.version}`);
+  return r;
+}
+// Seeded history: runs replayed instantly with past timestamps.
+function seedRun(siteId, relIndex, variant, ageMs, { cancelAt, error } = {}) {
+  const s = db.sites.find((x) => x.id === siteId);
+  const rel = db.releases.filter((x) => x.siteId === siteId)[relIndex];
+  if (!s || !rel) return;
+  const r = newRun(s, rel);
+  r.createdAt = iso(Date.now() - ageMs);
+  const steps = testScript(r, variant);
+  const n = cancelAt ?? (error ? 4 : steps.length);
+  for (let i = 0; i < n; i++) steps[i](Date.now() - ageMs + 2000 + i * 1150 * 9);
+  if (cancelAt != null) { r.status = "cancelled"; r.phase = "Cancelled"; r.finishedAt = iso(Date.now() - ageMs + 2000 + n * 1150 * 9); r.checks.forEach((c) => { if (c.status === "running" || c.status === "pending") c.status = "skip"; }); r.activity.push({ at: r.finishedAt, kind: "info", text: `Cancelled by ${me.name}` }); }
+  if (error) { r.status = "error"; r.error = error; r.phase = "Failed"; r.finishedAt = iso(Date.now() - ageMs + 2000 + n * 1150 * 9); r.activity.push({ at: r.finishedAt, kind: "error", text: error }); }
+  db.testRuns.push(r);
+}
+seedRun("site_acmeweb", 0, "good", 2 * HOUR);
+seedRun("site_acmeweb", 1, "bad", 2.4 * DAY);
+seedRun("site_acmeweb", 2, "good", 4.7 * DAY, { cancelAt: 14 });
+seedRun("site_acmestg", 0, "bad", 2.6 * DAY, { error: "The copy didn't start: next build exited with code 1 (Type error in app/checkout/page.tsx:88)." });
+seedRun("site_nwapi", 0, "good", 5 * HOUR);
+db.testRuns.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+
+const activeRun = (siteId) => db.testRuns.find((x) => x.siteId === siteId && ["queued", "preparing", "testing", "reporting"].includes(x.status));
+R("GET", "/api/sites/:id/tests", (p) => { find("sites", p.id); return { items: db.testRuns.filter((x) => x.siteId === p.id).map(testSummary) }; });
+R("POST", "/api/sites/:id/tests", (p, b) => {
+  const s = find("sites", p.id);
+  const rel = b.releaseId ? find("releases", b.releaseId) : db.releases.find((x) => x.siteId === s.id);
+  if (!rel || rel.siteId !== s.id) err(400, "Pick a release of this website to test.");
+  const a = activeRun(s.id);
+  if (a) err(409, `A test of ${s.name} is already running.`, { runId: a.id });
+  if (!tester.tokenSet) err(400, "Add a Claude Code token in Settings → Website testing first.");
+  const r = startLiveRun(s, rel);
+  emitRun(r);
+  return testView(r);
+});
+R("GET", "/api/tests/:id", (p) => testView(find("testRuns", p.id)));
+R("POST", "/api/tests/:id/cancel", (p) => {
+  const r = find("testRuns", p.id);
+  if (["queued", "preparing", "testing", "reporting"].includes(r.status)) {
+    clearInterval(testTimers.get(r.id)); testTimers.delete(r.id);
+    r.status = "cancelled"; r.phase = "Cancelled"; r.finishedAt = iso(Date.now());
+    r.checks.forEach((c) => { if (c.status === "running" || c.status === "pending") c.status = "skip"; });
+    r.activity.push({ at: r.finishedAt, kind: "info", text: `Cancelled by ${me.name}. Test containers removed.` });
+    emitRun(r);
+  }
+  return testView(r);
+});
+R("POST", "/api/tests/:id/deploy", (p) => {
+  const r = find("testRuns", p.id);
+  if (r.status !== "done") err(409, "Only a finished test can be deployed.");
+  const s = find("sites", r.siteId), rel = find("releases", r.releaseId);
+  busy(s);
+  activity("site.deploy", "site", s, `Tested release ${rel.version}`);
+  const tg = targets(s);
+  return runJob({ type: "site.deploy", title: `Deploy ${s.name} ${rel.version} (tested)`, siteId: s.id, projectId: s.projectId }, { lines: linesFor("site.deploy", ""), speed: 160, onDone() {
+    if (s.currentReleaseId !== rel.id) { s.previousReleaseId = s.currentReleaseId; s.currentReleaseId = rel.id; }
+    for (const sid of tg) s.state[sid] = { running: true, healthy: db.servers.find((x) => x.id === sid)?.online, version: rel.version, checkedAt: iso(Date.now()) };
+    emit("site", siteView(s));
+  } });
+});
+R("DELETE", "/api/tests/:id", (p) => {
+  const r = find("testRuns", p.id);
+  if (testTimers.has(r.id)) err(409, "Cancel the test before deleting it.");
+  db.testRuns = db.testRuns.filter((x) => x.id !== r.id);
+  emit("testrun", { id: r.id, siteId: r.siteId, deleted: true });
+  return { ok: true };
+});
+R("GET", "/api/sites/:id/test-env", (p) => { find("sites", p.id); return { items: Object.keys(testEnv[p.id] || {}).sort().map((key) => ({ key, set: true })) }; });
+R("PUT", "/api/sites/:id/test-env", (p, b) => {
+  const s = find("sites", p.id);
+  const env = (testEnv[s.id] ||= {});
+  for (const [k, v] of Object.entries(b.env || {})) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) err(400, `“${k}” isn't a valid variable name.`);
+    if (v === null) delete env[k]; else env[k] = String(v);
+  }
+  activity("site.test-env", "site", s, `${Object.keys(env).length} test variables`);
+  return { items: Object.keys(env).sort().map((key) => ({ key, set: true })) };
+});
+R("GET", "/api/tester", () => clone(tester));
+R("PUT", "/api/tester", (p, b) => {
+  if (b.token) tester.tokenSet = true;
+  if (b.clearToken) tester.tokenSet = false;
+  if (b.model !== undefined) tester.model = String(b.model || "");
+  if (b.maxMinutes !== undefined) { const n = Number(b.maxMinutes); if (!(n >= 5 && n <= 180)) err(400, "maxMinutes must be from 5 to 180."); tester.maxMinutes = n; }
+  if (b.serverId) { find("servers", b.serverId); tester.serverId = b.serverId; }
+  return clone(tester);
+});
 
 function pick(o, keys) { const r = {}; for (const k of keys) if (o && k in o) r[k] = o[k]; return r; }
 

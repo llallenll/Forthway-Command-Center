@@ -808,6 +808,16 @@ async function main() {
   // is the one that died, the others need this vote to take over.
   if (haState.on) setHa(true);
   await hello();
+  // Commit tests (docs/DOCKER-AND-TESTS.md) run inside this process, so after
+  // a restart none of them is still running here: remove whatever containers,
+  // networks and firewall rules they left. Not on main's embedded agent — the
+  // panel runs main's tests in its own process and sweeps for itself.
+  if (!cfg.isMain) {
+    import("../shared/testenv.mjs")
+      .then((t) => t.sweepTestLeftovers({ dataDir: cfg.dataDir, olderThanMs: 0, log }))
+      .then((r) => r?.removed && log(`Removed ${r.removed} leftover test container(s).`))
+      .catch((err) => log(`test cleanup skipped: ${err.message}`));
+  }
   metricsLoop();
   edgeLogsLoop().catch((err) => log(`edge log shipping stopped: ${err.message}`));
   await pollLoop();

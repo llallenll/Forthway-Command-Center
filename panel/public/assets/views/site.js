@@ -7,6 +7,7 @@ import { siteUrl } from "./sites.js";
 import { scriptsTab } from "./site-scripts.js";
 import { uptimeTab } from "./monitor.js"; // Uptime tab (monitoring + SMS alerts)
 import { trafficTab } from "./site-traffic.js"; // Traffic tab (visitors, page views — panel/lib/analytics.mjs)
+import { askTestOrDeploy, pullAndTest, startTest, testsTab, testEnvCard, verdictBadge, latestByRelease, runtimeBadge, migrateSite, runtimeCard, bindRuntimeCard } from "./site-tests.js"; // commit testing + Docker runtime
 import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts, savedDelivery } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
@@ -15,6 +16,7 @@ const TABS = [
   { id: "traffic", label: "Traffic", icon: "users" },
   { id: "uptime", label: "Uptime", icon: "activity" },
   { id: "deployments", label: "Deployments", icon: "rocket" },
+  { id: "tests", label: "Tests", icon: "flask" },
   { id: "environment", label: "Environment", icon: "key" },
   { id: "scripts", label: "Scripts", icon: "zap" },
   { id: "domains", label: "Domains & SSL", icon: "lock" },
@@ -57,7 +59,7 @@ export default async function site(ctx) {
   const paintHead = () => mount(head, html`<div class="site-head">
       ${typeIco(S.type)}
       <div style="min-width:0;flex:1">
-        <h1>${S.name} ${lbBadge(S, serversById())} ${updateBadge(S)}</h1>
+        <h1>${S.name} ${lbBadge(S, serversById())} ${runtimeBadge(S)} ${updateBadge(S)}</h1>
         <div class="sh-meta">${healthChip(S)}<span class="dim">·</span>
           ${project ? html`<a href="#/projects/${project.id}" class="row" style="gap:6px"><span class="dot" style="width:7px;height:7px;background:${colorOf(project.color)}"></span>${project.name}</a><span class="dim">·</span>` : ""}
           ${(S.domains || []).slice(0, 2).map((d, i) => html`${i ? html`<span class="dim">·</span>` : ""}<a href="${siteUrl(S, d) || "#"}" target="_blank" rel="noopener noreferrer" class="row" style="gap:5px">${d}${icon("external", "xs")}</a>`)}
@@ -68,6 +70,7 @@ export default async function site(ctx) {
       <div class="right btn-row">
         ${S.update ? html`<button class="btn btn-primary" data-update title="${updateTitle()}">${icon("arrowUp")}Update</button>`
           : !deployed() ? html`<button class="btn btn-primary" ${S.github?.repo && !(S.releases || []).length ? raw("data-update") : raw('data-act="deploy"')}>${icon("rocket")}Deploy</button>` : ""}
+        ${S.canMigrate && S.runtime !== "docker" ? html`<button class="btn" data-migrate="docker" title="Run it in its own container, as its own user">${icon("container")}Move to Docker</button>` : ""}
         <button class="btn" data-act="restart">${icon("restart")}Restart</button>
         <button class="icon-btn" data-more aria-label="More actions">${icon("more")}</button>
       </div></div>`);
@@ -95,16 +98,27 @@ export default async function site(ctx) {
     } catch (e) { toastError(e, `Couldn't ${verbs[act].toLowerCase()}`); }
   };
   on(head, "click", "[data-act]", (e, b) => runAction(b.dataset.act));
+  on(head, "click", "[data-migrate]", (e, b) => migrateSite(S, b.dataset.migrate));
 
   /* ── updates: the tracked branch (or a newer release) is ahead of what's live ── */
   /** Pull the tracked branch and deploy it (or deploy the newer release that's already here). */
   const pullDeploy = async (b) => {
     const u = S.update;
-    if (u?.kind === "release" && u.releaseId) return runAction("deploy", { releaseId: u.releaseId });
+    const commit = u ? { message: u.message, shortSha: u.shortSha || (u.version ? `v${u.version}` : ""), author: u.author, date: u.date } : null;
+    const title = u ? `Update ${S.name}${u.version && u.version !== u.currentVersion ? ` to v${u.version}` : ""}?` : `Pull & deploy ${S.name}?`;
+    if (u?.kind === "release" && u.releaseId) {
+      const pick = await askTestOrDeploy({ title, commit, loadBalanced: S.loadBalanced });
+      if (pick === "test") return startTest(S.id, u.releaseId, { btn: b });
+      if (pick === "deploy") return runAction("deploy", { releaseId: u.releaseId });
+      return;
+    }
     if (!S.github?.repo) { location.hash = `${base}/deployments`; return; }
+    const pick = await askTestOrDeploy({ title, commit, what: `${S.github.repo}@${S.github.branch || "default branch"}`, loadBalanced: S.loadBalanced });
+    if (pick === "test") return pullAndTest(S, u?.sha);
+    if (pick !== "deploy") return;
     b?.classList.add("loading");
     try {
-      const job = await post(`/api/sites/${S.id}/releases/github`, { deploy: true });
+      const job = await post(`/api/sites/${S.id}/releases/github`, { ref: u?.sha || undefined, deploy: true });
       jobStarted(job, `Pulling ${S.github.branch || "the default branch"} & deploying${S.loadBalanced ? " — rolling, one server at a time" : ""}`);
     } catch (e) { toastError(e, "Couldn't pull & deploy"); }
     finally { b?.classList.remove("loading"); }
@@ -126,7 +140,10 @@ export default async function site(ctx) {
     { label: "Stop", icon: "stop", onClick: () => runAction("stop") },
     { label: "Roll back", icon: "rollback", disabled: !S.previousReleaseId, onClick: () => runAction("rollback") },
     ...(S.github?.repo ? [{ label: "Check for updates", icon: "refresh", onClick: () => checkUpdates() }] : []),
+    ...(S.canMigrate && S.runtime !== "docker" ? [{ label: "Move to Docker…", icon: "container", onClick: () => migrateSite(S, "docker") }] : []),
+    ...(S.runtime === "docker" ? [{ label: "Move back to legacy…", icon: "rollback", onClick: () => migrateSite(S, "legacy") }] : []),
     { sep: true },
+    { label: "Test a release…", icon: "flask", onClick: () => (location.hash = `${base}/tests`) },
     { label: "Run a script…", icon: "zap", onClick: () => (location.hash = `${base}/scripts`) },
     { label: "Open nginx config", icon: "code", onClick: () => (location.hash = `${base}/domains`) },
     { label: "Website settings", icon: "settings", onClick: () => (location.hash = `${base}/settings`) },
@@ -141,7 +158,7 @@ export default async function site(ctx) {
   };
 
   const refresh = debounce(async () => {
-    try { await loadSite(); if (!ctx.alive()) return; paintHead(); if (tab === "overview") paintOverview(); if (tab === "deployments") paintReleases?.(); } catch {}
+    try { const rt = S.runtime; await loadSite(); if (!ctx.alive()) return; if (tab === "settings" && S.runtime !== rt) return ctx.reload(); paintHead(); if (tab === "overview") paintOverview(); if (tab === "deployments") paintReleases?.(); } catch {}
   }, 300);
   ctx.on("site", (d) => { if (d?.id === S.id) { if (d.deleted) { toast(`${S.name} was deleted`, "warn"); location.hash = "#/sites"; } else refresh(); } });
   ctx.on("server", debounce(async () => { servers = (await get("/api/servers").catch(() => ({ items: servers }))).items || servers; }, 2000));
@@ -231,7 +248,7 @@ export default async function site(ctx) {
         <div class="card"><div class="card-head"><h3>Pull from GitHub</h3>${S.github?.repo ? html`<span class="sub mono">${S.github.repo}</span>` : ""}</div><div class="card-body">
           ${S.github?.repo ? html`<div class="form-stack"><div class="field"><label>Branch, tag or commit</label><div class="input-group"><input class="input mono" data-ref value="${S.github.branch || "main"}" list="refs_dl" spellcheck="false"/><button class="btn btn-primary" data-pull>${icon("github")}Pull</button></div><datalist id="refs_dl"></datalist>
             <div class="row" style="gap:8px;flex-wrap:wrap;justify-content:space-between;margin-top:6px"><span class="hint" style="margin:0">Downloads the archive and creates a release.</span><button class="btn btn-sm btn-ghost" type="button" data-saveref hidden>${icon("check")}Save as default branch</button></div></div>
-            <label class="check"><input type="checkbox" data-pulldeploy/>Deploy it right away</label></div>`
+            <p class="hint row" style="margin:0;gap:7px;align-items:flex-start">${icon("flask", "xs")}<span>After the download you choose: test the commit on a throw-away copy first, or deploy it right away.</span></p></div>`
           : emptyState({ ico: "github", title: "No repository set", text: "Connect a GitHub repository in Settings to pull releases.", sm: true, action: html`<a class="btn btn-sm" href="${base}/settings">${icon("settings")}Open settings</a>` })}
         </div></div>
       </div>
@@ -274,24 +291,37 @@ export default async function site(ctx) {
         } catch (ex) { toastError(ex, "Couldn't save the branch"); } finally { b.classList.remove("loading"); }
       });
       on(box, "click", "[data-pull]", async (e, b) => {
+        const ref = $("[data-ref]", box).value.trim() || undefined;
+        const pick = await askTestOrDeploy({ title: "Pull from GitHub", what: `${S.github.repo}@${ref || S.github.branch || "default branch"}`, allowPullOnly: true, loadBalanced: S.loadBalanced });
+        if (!pick) return;
+        if (pick === "test") return pullAndTest(S, ref);
+        const dep = pick === "deploy";
         b.classList.add("loading");
-        try { const dep = $("[data-pulldeploy]", box).checked;
-          const job = await post(`/api/sites/${S.id}/releases/github`, { ref: $("[data-ref]", box).value.trim() || undefined, deploy: dep || undefined }); jobStarted(job, dep ? "Pulling & deploying from GitHub" : "Pulling from GitHub"); }
+        try { const job = await post(`/api/sites/${S.id}/releases/github`, { ref, deploy: dep || undefined }); jobStarted(job, dep ? "Pulling & deploying from GitHub" : "Pulling from GitHub"); }
         catch (ex) { toastError(ex, "Couldn't pull"); } finally { b.classList.remove("loading"); }
       });
     }
 
+    let runsByRel = new Map();
+    let runs = [];
+    get(`/api/sites/${S.id}/tests`).then((r) => { runs = r.items || []; runsByRel = latestByRelease(runs); paintReleases(); }).catch(() => {});
+    ctx.on("testrun", (d) => {
+      if (!d || d.siteId !== S.id) return;
+      runs = d.deleted ? runs.filter((x) => x.id !== d.id) : [d, ...runs.filter((x) => x.id !== d.id)].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      runsByRel = latestByRelease(runs); paintReleases();
+    });
     paintReleases = () => {
       const rels = S.releases || [];
       mount($("[data-rel]", box), rels.length ? html`<div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Release</th><th>Source</th><th class="hide-sm">Size</th><th class="hide-sm">Created</th><th></th></tr></thead><tbody>
         ${rels.map((r) => {
           const live = r.id === S.currentReleaseId, prev = r.id === S.previousReleaseId;
-          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}</div>
+          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}${runsByRel.get(r.id) ? html`<a href="#/tests/${runsByRel.get(r.id).id}" class="rel-verdict" title="Latest test of this release — open it">${verdictBadge(runsByRel.get(r.id))}</a>` : ""}</div>
             <div class="t-sub mono ellipsis" style="max-width:300px">${r.filename}</div></td>
             <td>${r.source === "github" ? html`<span class="row small" style="gap:7px">${icon("github", "sm")}<span class="mono">${r.commit || "—"}</span></span>` : html`<span class="row small" style="gap:7px">${icon("upload", "sm")}Upload</span>`}</td>
             <td class="hide-sm num">${fmtBytes(r.size)}</td>
             <td class="hide-sm"><div class="small">${fmtDate(r.createdAt)}</div><div class="t-sub">${ago(r.createdAt)}</div></td>
             <td class="actions"><div class="btn-row">
+              ${r.available === false ? "" : html`<button class="btn btn-sm" data-rtest="${r.id}" title="Test this release on a throw-away copy" ${runsByRel.get(r.id) && ["queued", "preparing", "testing", "reporting"].includes(runsByRel.get(r.id).status) ? raw("disabled") : ""}>${icon("flask")}<span class="hide-sm">Test</span></button>`}
               ${r.available === false ? "" : live ? html`<button class="btn btn-sm" data-rdeploy="${r.id}">${icon("restart")}Redeploy</button>` : html`<button class="btn btn-sm btn-primary" data-rdeploy="${r.id}">${icon("rocket")}Deploy</button>`}
               <button class="icon-btn sm" data-rpin="${r.id}" title="${r.pinned ? "Unpin" : "Pin"}" style="${r.pinned ? "color:var(--violet)" : ""}">${icon("pin")}</button>
               <button class="icon-btn sm" data-rdel="${r.id}" title="Delete" ${live ? raw("disabled style='opacity:.35;pointer-events:none'") : ""}>${icon("trash")}</button></div></td></tr>`;
@@ -300,6 +330,7 @@ export default async function site(ctx) {
     };
     paintReleases();
     on(box, "click", "[data-rdeploy]", (e, b) => runAction("deploy", { releaseId: b.dataset.rdeploy }));
+    on(box, "click", "[data-rtest]", (e, b) => startTest(S.id, b.dataset.rtest, { btn: b }));
     on(box, "click", "[data-rpin]", async (e, b) => {
       const r = S.releases.find((x) => x.id === b.dataset.rpin);
       try { await patch(`/api/releases/${r.id}`, { pinned: !r.pinned }); r.pinned = !r.pinned; paintReleases(); toast(r.pinned ? "Release pinned" : "Release unpinned", "ok"); } catch (ex) { toastError(ex); }
@@ -336,7 +367,9 @@ export default async function site(ctx) {
             <button class="btn btn-sm mt-16" data-savelinks>${icon("link")}Update links</button>`
           : html`<p class="muted small">This project has no databases. <a href="#/projects/${S.projectId}/databases" style="color:var(--blue-3)">Create one →</a></p>`}
         </div></div>
-      </div></div>`);
+      </div></div>
+      <div class="mt-20" data-testenv></div>`);
+    testEnvCard(ctx, $("[data-testenv]", box), S);
     const dirty = $("[data-dirty]", box);
     const ed = envEditor($("[data-env]", box), envData.env || {}, { onDirty: () => (dirty.textContent = "Unsaved changes") });
     const ex = (S.releases || []).find((r) => r.id === S.currentReleaseId)?.envExample || (S.releases || []).find((r) => r.envExample)?.envExample;
@@ -513,6 +546,8 @@ export default async function site(ctx) {
           <label class="switch"><input type="checkbox" data-sw="smartInstall" ${st.smartInstall !== false ? raw("checked") : ""}/><span class="track"></span>Skip install when the lockfile is unchanged</label></div></div>
       </div></div><div class="card-foot"><span class="muted small">Applies from the next deploy.</span><span class="spacer"></span><button class="btn btn-primary btn-sm" data-save-build>${icon("check")}Save</button></div></div>
 
+      ${runtimeCard(S)}
+
       <div class="card danger-zone"><div class="card-head"><h3>Delete website</h3></div><div class="card-body row wrap" style="justify-content:space-between;gap:16px">
         <p class="muted small" style="max-width:560px">Removes the nginx config, stops the app on ${plural((S.serverIds || []).length || 1, "server")} and deletes its releases. Linked databases are kept.</p>
         <button class="btn btn-danger" data-delete>${icon("trash")}Delete website</button></div></div>
@@ -538,6 +573,7 @@ export default async function site(ctx) {
         return true;
       } catch (ex) { toastError(ex, "Couldn't save"); return false; } finally { btn.classList.remove("loading"); }
     };
+    bindRuntimeCard(box, () => S, { save });
     on(box, "click", "[data-save-general]", (e, btn) => {
       const v = (k) => $(`[data-g=${k}]`, box).value.trim();
       const github = { repo: v("repo"), branch: v("repo") ? v("branch") || "main" : "", ...(v("token") ? { token: v("token") } : {}) };
@@ -580,6 +616,7 @@ export default async function site(ctx) {
 
   /* ── scripts (views/site-scripts.js) ── */
   if (tab === "scripts") await scriptsTab(ctx, box, S);
+  if (tab === "tests") await testsTab(ctx, box, S);
   if (tab === "uptime") await uptimeTab(box, ctx, S);
   if (tab === "traffic") await trafficTab(ctx, box, S);
 

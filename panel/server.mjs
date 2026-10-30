@@ -54,7 +54,7 @@ const PUBLIC_DIR = path.join(HERE, "public");
 const VERSION = "3.12.0";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
-const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "mysql", "mysql-ha", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "cluster-alerts", "analytics", "usage", "main-switch"];
+const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "site-tests", "mysql", "mysql-ha", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "cluster-alerts", "analytics", "usage", "main-switch"];
 const START_TIMEOUT_MS = 15_000;
 const SSE_PING_MS = 15_000;
 const SSE_PAD = `:${" ".repeat(2048)}\n\n`; // pushes the first bytes past proxy buffer thresholds
