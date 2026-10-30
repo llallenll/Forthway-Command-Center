@@ -2353,10 +2353,19 @@ a.badge.stg-badge:hover { border-color: rgba(192, 132, 252, 0.6); }
   .env-switch { gap: 8px; }
   .menu.build-menu { min-width: 0; width: calc(100vw - 16px); }
 }
-}
 
 /* Settings → Updates → Server software */
-.sw-server { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 12px 18px 6px; border-top: 1px solid var(--line); }
+.sw-server { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 14px 20px 8px; border-top: 1px solid var(--line); background: rgba(255, 255, 255, 0.015); }
 .sw-server:first-of-type { border-top: 0; }
+.sw-server .ico { color: var(--muted); }
+.sw-server b { font-weight: 650; }
+.sw-server + .list, .sw-server + .card-body + .list { border-top: 1px solid var(--line); }
 .sw-off .li-title { color: var(--muted); }
+/* Component tiles in each product's own colour */
+.li-ico.sw-ico { border: 1px solid transparent; }
+.li-ico.sw-php { background: rgba(119, 123, 179, 0.16); border-color: rgba(119, 123, 179, 0.35); color: #b3b7ec; }
+.li-ico.sw-mysql { background: rgba(0, 117, 143, 0.18); border-color: rgba(0, 150, 180, 0.35); color: #5ec8e0; }
+.li-ico.sw-cloudflared { background: rgba(243, 128, 32, 0.14); border-color: rgba(243, 128, 32, 0.35); color: #f8a35b; }
+.sw-off .li-ico.sw-ico { filter: grayscale(1); opacity: 0.55; }
+.sw-glyph { width: 24px; height: 24px; display: block; }
 .sw-pkgs { margin: 10px 0 4px; padding: 0 0 0 18px; display: grid; gap: 3px; font-size: 12.5px; max-height: 220px; overflow: auto; }
