@@ -6,6 +6,9 @@ import { get, post } from "../api.js";
 import { openJobLog } from "../components.js";
 
 const ICON = { php: "php", mysql: "database", cloudflared: "cloud" };
+// PHP gets its oval wordmark; MySQL and the tunnel keep the line icons, in each product's colour (app.css .sw-*).
+const PHP_GLYPH = raw('<svg class="sw-glyph" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="12" rx="11" ry="6.6" fill="currentColor" opacity=".9"/><text x="12" y="14.6" text-anchor="middle" font-family="Georgia,serif" font-style="italic" font-weight="700" font-size="7.6" fill="#1b1d33">php</text></svg>');
+const tile = (c) => html`<span class="li-ico sw-ico sw-${c}">${c === "php" ? PHP_GLYPH : icon(ICON[c], "sm")}</span>`;
 const ORDER = ["php", "mysql", "cloudflared"];
 const short = (v) => String(v || "").replace(/^\d+:/, "");
 const series = (v) => String(v || "").split(".").slice(0, 2).join(".");
@@ -18,9 +21,9 @@ function nameOf(c, x) {
 
 function row(sv, c, x) {
   const name = nameOf(c, x);
-  if (!x) return html`<div class="list-item"><span class="li-ico">${icon(ICON[c], "sm")}</span>
+  if (!x) return html`<div class="list-item">${tile(c)}
     <div class="li-main"><div class="li-title">${name}</div><div class="li-sub">Not checked yet</div></div></div>`;
-  if (!x.installed) return html`<div class="list-item sw-off"><span class="li-ico">${icon(ICON[c], "sm")}</span>
+  if (!x.installed) return html`<div class="list-item sw-off">${tile(c)}
     <div class="li-main"><div class="li-title">${name}</div><div class="li-sub">Not installed on this server</div></div>
     <div class="li-right"><span class="badge">Not installed</span></div></div>`;
   const n = x.upgrades?.length || 0;
@@ -34,7 +37,7 @@ function row(sv, c, x) {
     : x.available
       ? x.canUpdate ? html`<button class="btn btn-sm btn-primary" type="button" data-sw-up="${c}" data-sv="${sv.id}" ${sv.online ? "" : raw("disabled")}>${icon("arrowUp")}Update</button>` : html`<span class="badge warn">${icon("arrowUp")}Update available</span>`
       : html`<span class="badge ok">${icon("check")}Up to date</span>`;
-  return html`<div class="list-item"><span class="li-ico">${icon(ICON[c], "sm")}</span>
+  return html`<div class="list-item">${tile(c)}
     <div class="li-main"><div class="li-title">${name} <span class="muted" style="font-weight:500">${x.version || "version unknown"}</span></div><div class="li-sub">${sub}</div></div>
     <div class="li-right">${right}</div></div>`;
 }
