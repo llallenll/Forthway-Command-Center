@@ -1335,3 +1335,28 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   after-deploy scripts, or `prisma migrate deploy` (`db push --skip-generate` without a migrations folder),
   in the build container (`shared/deployer.mjs schemaCommands`). Those scripts no longer also run after a
   staging deploy. Fixes staging failing its health check on an empty database. Agents need the update.
+
+- **SITES/UI — staging is a build you switch to, not a panel inside Environment.**
+  - **Header switch** (`views/site-staging.js`): the website header's type icon is a button (chevron, `aria-haspopup`,
+    keyboard: Enter/Space opens and focuses the first item, ↑/↓/Home/End, Escape returns focus) that opens **Live
+    build** / **Staging build** with each one's address and status; the current one is ticked and switching keeps the
+    tab. Without staging: **Staging build — Create…** opens the create dialog (address, default `staging.<first
+    domain>`; release to deploy, default the live one, or "Don't deploy yet"; server when the site is load balanced;
+    what happens to the database and variables in plain words) → `POST /api/sites/:id/staging` → opens the staging
+    build's page.
+  - **The staging build's page is the ordinary website page** (`#/sites/<copy>`), every tab working against the copy.
+    Cues: purple type icon (`.type-ico.staging`), a **Staging** badge, "Staging of <live site>" in the header,
+    breadcrumb Projects › project › live site › Staging. Deployments lists the live site's releases ("On staging" /
+    "Live" badges; Deploy / Redeploy / Roll back act on the copy; upload / GitHub pull replaced by a pointer to the
+    live site; pin / delete hidden — they change the live site's release records). Settings hides the GitHub fields
+    and its danger zone is **Remove staging** (also in the header ⋯ menu): typed confirm, "delete files", "also drop
+    the staging database" → `DELETE /api/sites/:id/staging`, then back to the live site.
+  - **Environment**: on a live site Live / Test / Staging, where Staging is only the copy's variables editor (`PUT
+    /api/sites/<copy>/env`) or one line + **Create staging build**; on the staging build the switch is Staging / Test
+    (its own variables and test-only variables — no Live segment, so the staging page can't edit live variables).
+    The staging strip on the Overview and the staging controls in Environment are gone. The live site's release rows
+    keep **To staging** and get an **On staging** badge; website rows get a purple **Staging** chip (with status dot)
+    that opens the staging build.
+  - `site-tests.mjs`: `POST /api/sites/:id/tests` on a staging copy tests its parent's releases (with the copy's own
+    variables), so the staging build's Tests tab works. `util.js openMenu` gains `{ cls, focus, onClose }`, arrow-key
+    navigation and Escape (which also fixes a stale outside-click listener closing a keyboard-opened menu).

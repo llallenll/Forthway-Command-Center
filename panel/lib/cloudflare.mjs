@@ -63,6 +63,7 @@ const RELEASE = "https://github.com/cloudflare/cloudflared/releases/latest/downl
 const COLL = "cloudflareRoutes";
 const MAX_LOG_LINES = 300;
 const CACHE_MS = 60_000;
+const INGRESS_ATTEMPTS = 3; // read-modify-write-read-back rounds per tunnel before a lost route is an error
 const HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const now = () => new Date().toISOString();
@@ -128,16 +129,20 @@ async function realCf(token, p, { method = "GET", body, timeoutMs = 20_000 } = {
       signal: ctrl.signal,
     });
   } catch (err) {
-    throw new Error(err.name === "AbortError" ? "Cloudflare did not answer in time." : `Could not reach Cloudflare: ${err.message}`);
-  } finally {
     clearTimeout(t);
+    throw new Error(err.name === "AbortError" ? "Cloudflare did not answer in time." : `Could not reach Cloudflare: ${err.message}`);
   }
+  // The timeout covers the body too: a call that never finishes would hold every
+  // later tunnel change behind it (they run one at a time, see serial()).
   let json = null;
   try {
     json = await res.json();
   } catch {
     /* handled below */
+  } finally {
+    clearTimeout(t);
   }
+  if (!json && ctrl.signal.aborted) throw new Error("Cloudflare did not answer in time.");
   if (!json) throw new Error(`Cloudflare returned ${res.status} with nothing readable in it.`);
   if (!json.success) {
     const first = (json.errors || [])[0];
@@ -274,6 +279,44 @@ export function zoneForHostname(zones, hostname) {
     if (host === name || host.endsWith(`.${name}`)) if (!best || name.length > best.name.length) best = z;
   }
   return best;
+}
+
+/** Does this ingress list route `hostname` (a whole-hostname rule, no path)? */
+export function ingressHas(ingress, hostname) {
+  const h = String(hostname || "").trim().toLowerCase();
+  return !!h && (ingress || []).some((r) => String(r?.hostname || "").toLowerCase() === h && !r.path);
+}
+
+/** Codes the drift check puts on a ledger row; a later check clears them once Cloudflare matches again. */
+export const DRIFT_CODES = Object.freeze(["route_missing", "dns_missing"]);
+
+/**
+ * Which recorded routes Cloudflare doesn't really have. The ledger only says what
+ * the last sync did; a route can be missing anyway (removed in the dashboard or by
+ * another writer, a write that didn't stick). Pure — scripts/cloudflare-drift.test.mjs.
+ *
+ *   rows     ledger rows ({ id, hostname, tunnelId, status, code })
+ *   ingress  Map tunnelId → that tunnel's ingress rules (a tunnel not in the map couldn't be read: not judged)
+ *   dns      Map hostname → the DNS records of that name (same)
+ *
+ * Only rows that are active, or were marked by an earlier check, are looked at.
+ * → [{ id, hostname, route: true|false|null, dns: true|false|null, drift: "route_missing"|"dns_missing"|null }]
+ */
+export function routeDrift(rows, ingress = new Map(), dns = new Map()) {
+  const out = [];
+  for (const r of rows || []) {
+    if (!(r.status === "active" || (r.status === "error" && DRIFT_CODES.includes(r.code)))) continue;
+    const route = ingress.has(r.tunnelId) ? ingressHas(ingress.get(r.tunnelId), r.hostname) : null;
+    const target = `${String(r.tunnelId || "").toLowerCase()}.cfargotunnel.com`;
+    const cname = dns.has(r.hostname) ? (dns.get(r.hostname) || []).some((x) => x?.type === "CNAME" && String(x.content || "").toLowerCase().replace(/\.$/, "") === target) : null;
+    out.push({ id: r.id, hostname: r.hostname, route, dns: cname, drift: route === false ? "route_missing" : cname === false ? "dns_missing" : null });
+  }
+  return out;
+}
+
+/** What a tunnel's routes look like after the panel's change: the hostnames it added that aren't there. */
+export function lostRoutes(ingress, hostnames) {
+  return (hostnames || []).filter((h) => !ingressHas(ingress, h));
 }
 
 /** What `cloudflared tunnel login` leaves behind (see hub/lib/cloudflare.mjs). */
@@ -1200,37 +1243,68 @@ function createCloudflare(ctx) {
       return { manual: desired.length };
     }
 
-    // 1. ingress, one GET + at most one PUT per tunnel, with the credentials of its account
+    // 1. ingress, per tunnel with the credentials of its account: one GET + at
+    // most one PUT, then a read-back. A route that isn't there when read back
+    // (another writer's PUT crossed ours — the dashboard, another panel — or a
+    // write that didn't stick) is written again, so "active" in the ledger
+    // means Cloudflare really had the route.
     const tunnels = [...new Set([...removing.map((e) => e.tunnelId), ...desired.map((d) => d.tunnelId)])];
     const tunnelAccount = new Map(); // tunnelId -> accountId
     for (const tid of tunnels) {
       const rm = removing.filter((e) => e.tunnelId === tid);
       const add = desired.filter((d) => d.tunnelId === tid);
-      let config;
       let tc;
       try {
         const acct = await accountOfTunnel(tid);
         tunnelAccount.set(tid, acct);
         tc = credsForAccount(acct);
         if (!tc) throw new Error(`the panel has no credentials for ${accountLabel(acct)}, the Cloudflare account this tunnel is in. Add one of that account's domains in Settings → Cloudflare → Domains`);
-        config = await getConfig(tc, tid);
       } catch (err) {
         if (rm.length) log(`!! tunnel ${tid}: could not read its routes (${err.message}) — leaving them as they are.`);
         for (const d of add) errors.set(d.hostname, `Could not read the tunnel's routes: ${err.message}`);
         continue;
       }
+      for (let attempt = 1; attempt <= INGRESS_ATTEMPTS; attempt++) {
+        const lost = await writeIngress(tc, tid, rm, add, attempt);
+        if (!lost.length) break;
+        if (attempt < INGRESS_ATTEMPTS) {
+          log(`!! ${lost.join(", ")}: not on the tunnel when read back — writing the routes again.`);
+          continue;
+        }
+        log(`!! ${lost.join(", ")}: still not on the tunnel after ${INGRESS_ATTEMPTS} tries.`);
+        for (const h of lost) {
+          errors.set(h, `Cloudflare accepted the route for ${h}, but it was not on the tunnel when the panel read the routes back (something else may be changing this tunnel's routes at the same time). Use Re-sync to write it again.`);
+          const d = add.find((x) => x.hostname === h);
+          if (d) outcome.delete(key(d));
+        }
+      }
+      // A removal whose ingress could be dealt with: forget the ledger row
+      // once DNS is handled below.
+    }
+
+    /** One read-modify-write(-read-back) of a tunnel's ingress. → hostnames we wrote that aren't there. */
+    async function writeIngress(tc, tid, rm, add, attempt) {
+      let config;
+      try {
+        config = await getConfig(tc, tid);
+      } catch (err) {
+        if (rm.length) log(`!! tunnel ${tid}: could not read its routes (${err.message}) — leaving them as they are.`);
+        for (const d of add) errors.set(d.hostname, `Could not read the tunnel's routes: ${err.message}`);
+        return [];
+      }
       let { rules, catchAll } = splitCatchAll(config.ingress);
       let changed = false;
+      const quiet = attempt > 1; // don't repeat the per-hostname lines on a retry
       for (const e of rm) {
         if (e.ingress !== "created") {
-          if (e.ingress === "adopted") log(`${e.hostname}: route was there before the panel — left in place.`);
+          if (e.ingress === "adopted" && !quiet) log(`${e.hostname}: route was there before the panel — left in place.`);
           continue;
         }
         const before = rules.length;
         rules = rules.filter((r) => !(r.hostname === e.hostname && !r.path));
         if (rules.length !== before) {
           changed = true;
-          log(`${e.hostname}: removed its route from the tunnel.`);
+          if (!quiet) log(`${e.hostname}: removed its route from the tunnel.`);
         }
       }
       for (const d of add) {
@@ -1250,7 +1324,7 @@ function createCloudflare(ctx) {
           outcome.set(key(d), { ingress: prev.ingress });
         } else if (sameTarget(rules[idx], d.rule)) {
           outcome.set(key(d), { ingress: "adopted" });
-          log(`${d.hostname}: already routed the same way — adopted.`);
+          if (!quiet) log(`${d.hostname}: already routed the same way — adopted.`);
         } else if (replaceExisting) {
           log(`${d.hostname}: replacing the existing route → ${rules[idx].service} (replace requested)`);
           rules[idx] = d.rule;
@@ -1260,18 +1334,23 @@ function createCloudflare(ctx) {
           errors.set(d.hostname, `${d.hostname} is already routed in this tunnel to ${rules[idx].service} (set up outside the panel). Remove that public hostname in the Cloudflare dashboard, or use “Replace existing records”.`);
         }
       }
-      if (changed) {
-        try {
-          await putConfig(tc, tid, config, rules, catchAll);
-        } catch (err) {
-          for (const d of add) if (!errors.has(d.hostname)) errors.set(d.hostname, `Saving the tunnel's routes failed: ${err.message}`);
-          for (const d of add) outcome.delete(key(d));
-          log(`!! saving the tunnel's routes failed: ${err.message}`);
-          continue;
-        }
+      if (!changed) return [];
+      try {
+        await putConfig(tc, tid, config, rules, catchAll);
+      } catch (err) {
+        for (const d of add) if (!errors.has(d.hostname)) errors.set(d.hostname, `Saving the tunnel's routes failed: ${err.message}`);
+        for (const d of add) outcome.delete(key(d));
+        log(`!! saving the tunnel's routes failed: ${err.message}`);
+        return [];
       }
-      // A removal whose ingress could be dealt with: forget the ledger row
-      // once DNS is handled below.
+      let after;
+      try {
+        after = (await getConfig(tc, tid)).ingress;
+      } catch (err) {
+        log(`(could not read the tunnel's routes back to check them: ${err.message})`);
+        return [];
+      }
+      return lostRoutes(after, add.filter((d) => outcome.has(key(d))).map((d) => d.hostname));
     }
 
     // 2. DNS: removals (only records we created), then additions
@@ -1378,7 +1457,19 @@ function createCloudflare(ctx) {
     if (!force && !replaceExisting && inSync(desired, current)) return null;
     return ctx.jobs.start(
       { type: "cloudflare.sync", title: `Cloudflare routes for ${site.name}`, siteId: site.id, projectId: site.projectId, adminId: admin?.id || null, lock: false },
-      ({ log }) => serial(() => reconcile(siteOwner(site.id), desiredForSite(siteRecord(site.id) || site), { log, replaceExisting, siteId: site.id })),
+      async ({ log }) => {
+        // A manual sync also makes sure the front door (nginx on main, where the tunnel's
+        // route points) has this website's vhost — a site that was never deployed
+        // successfully (e.g. a fresh staging copy) may not have one yet.
+        if (force && desiredForSite(siteRecord(site.id) || site).length && ctx.lb?.syncSite) {
+          try {
+            await ctx.lb.syncSite(siteRecord(site.id) || site, { log });
+          } catch (err) {
+            log(`!! the front door (nginx) could not be updated: ${err.message}`);
+          }
+        }
+        return serial(() => reconcile(siteOwner(site.id), desiredForSite(siteRecord(site.id) || site), { log, replaceExisting, siteId: site.id }));
+      },
     );
   }
 
@@ -1440,6 +1531,106 @@ function createCloudflare(ctx) {
   }
   function publicRoute(r) {
     return { id: r.id, owner: r.owner, siteId: r.siteId, hostname: r.hostname, tunnelId: r.tunnelId, zoneName: r.zoneName, service: r.service, status: r.status, error: r.error, code: r.code || null, ingress: r.ingress, dnsCreated: !!r.dnsCreated, syncedAt: r.syncedAt };
+  }
+
+  function driftMessage(hostname, drift) {
+    return drift === "route_missing"
+      ? `${hostname} is not on the tunnel: Cloudflare has no public hostname (route) for it, although the panel recorded one. Use Re-sync to add it again.`
+      : `${hostname} has no proxied CNAME to the tunnel in Cloudflare DNS, although the panel recorded one. Use Re-sync to create it again.`;
+  }
+
+  /**
+   * Compare ledger rows with what Cloudflare really has — each tunnel's ingress and
+   * each hostname's DNS — and record the difference. The ledger only says what the
+   * last sync did, so without this a route that is gone (or never stuck) would show
+   * as live forever. A missing route / CNAME turns the row into an error (code
+   * route_missing / dns_missing): the Domains & SSL tab says so and offers Re-sync,
+   * and the next sync rewrites it (inSync() needs "active"). A row marked earlier
+   * turns active again once Cloudflare has it. Read-only towards Cloudflare; runs
+   * in serial() so a half-done sync is never judged. Never call it from inside serial().
+   * → { checked, drifted: [hostnames], error }
+   */
+  // Page views ask for this check (Domains & SSL, Routes) and live updates reload them often:
+  // each route is checked against Cloudflare at most once a minute, so browsing never eats
+  // into Cloudflare's API rate limit. `force` (boot check) ignores that.
+  const ROUTE_CHECK_TTL_MS = 60_000;
+  const routeCheckedAt = new Map(); // route id -> ms
+  function checkRoutes(rows, { force = false } = {}) {
+    return serial(async () => {
+      const c = creds();
+      const live = (rows || []).map((r) => db.get(COLL, r.id)).filter(Boolean);
+      const now = Date.now();
+      const candidates = live.filter((r) => (r.status === "active" || (r.status === "error" && DRIFT_CODES.includes(r.code))) && (force || now - (routeCheckedAt.get(r.id) || 0) >= ROUTE_CHECK_TTL_MS));
+      if (!c || !candidates.length) return { checked: 0, drifted: [], error: null };
+      for (const r of candidates) routeCheckedAt.set(r.id, now);
+      const ingress = new Map();
+      const dns = new Map();
+      let error = null;
+      for (const tid of new Set(candidates.map((r) => r.tunnelId))) {
+        try {
+          const tc = credsForAccount(await accountOfTunnel(tid));
+          if (tc) ingress.set(tid, (await getConfig(tc, tid)).ingress);
+        } catch (err) {
+          error ||= `Couldn't read the routes of tunnel ${tid.slice(0, 8)}: ${err.message}`;
+        }
+      }
+      for (const r of candidates) {
+        if (!r.zoneId) continue;
+        try {
+          dns.set(r.hostname, await cfCall(tokenForZone(c, r.zoneId), `/zones/${r.zoneId}/dns_records?name=${encodeURIComponent(r.hostname)}&per_page=50`));
+        } catch (err) {
+          error ||= `Couldn't read the DNS records of ${r.hostname}: ${err.message}`;
+        }
+      }
+      const drifted = [];
+      const touched = new Map(); // owner -> siteId
+      for (const x of routeDrift(candidates, ingress, dns)) {
+        const r = candidates.find((y) => y.id === x.id);
+        if (x.drift) {
+          drifted.push(x.hostname);
+          const msg = driftMessage(x.hostname, x.drift);
+          if (r.status !== "error" || r.code !== x.drift || r.error !== msg) {
+            db.update(COLL, r.id, { status: "error", code: x.drift, error: msg });
+            touched.set(r.owner, r.siteId);
+          }
+        } else if (r.status === "error" && x.route === true && x.dns !== false && r.ruleKey) {
+          db.update(COLL, r.id, { status: "active", code: null, error: null });
+          touched.set(r.owner, r.siteId);
+        }
+      }
+      for (const [owner, siteId] of touched) emit("routes", { owner, siteId });
+      return { checked: candidates.length, drifted, error };
+    });
+  }
+
+  /**
+   * After a restart: websites whose tunnel hostnames have no ledger row at all (the
+   * sync job was lost — the panel restarted, or it never started) get synced, and
+   * every recorded route is checked against Cloudflare (marked only, nothing written).
+   */
+  async function resumeAfterBoot() {
+    if (!creds()) return;
+    for (const site of db.list("sites", (s) => s.cloudflare?.enabled && !s.deleting)) {
+      const have = new Set(ledger(siteOwner(site.id)).map((e) => `${e.hostname}|${e.tunnelId}`));
+      if (!desiredForSite(site).some((d) => !have.has(`${d.hostname}|${d.tunnelId}`))) continue;
+      try {
+        syncSite(site);
+      } catch (err) {
+        console.warn(`[cloudflare] ${site.name}: could not start its route sync: ${err.message}`);
+      }
+    }
+    const r = await checkRoutes(db.list(COLL), { force: true });
+    if (r.drifted.length) console.warn(`[cloudflare] Not in Cloudflare although recorded: ${r.drifted.join(", ")} — Re-sync them from the website's Domains & SSL tab.`);
+  }
+
+  /**
+   * checkRoutes for a page request: it queues behind any route sync (which can take minutes),
+   * so wait at most a few seconds. A check still running finishes on its own and its "routes"
+   * event updates the page.
+   */
+  function quickCheck(rows) {
+    const check = checkRoutes(rows).catch((err) => ({ checked: 0, drifted: [], error: err.message }));
+    return Promise.race([check, new Promise((r) => setTimeout(() => r({ checked: 0, drifted: [], error: null, pending: true }), 4000).unref?.())]);
   }
 
   function isTunnelHostname(hostname) {
@@ -2010,6 +2201,7 @@ function createCloudflare(ctx) {
     }
 
     router.get("/api/cloudflare/routes", async () => {
+      await quickCheck(db.list(COLL)); // mark recorded routes Cloudflare doesn't have
       const all = db.list(COLL);
       const sitesById = Object.fromEntries(db.list("sites").map((s) => [s.id, s]));
       const ledgerItems = all.map((r) => ({ ...publicRoute(r), siteName: sitesById[r.siteId]?.name || null }));
@@ -2060,11 +2252,21 @@ function createCloudflare(ctx) {
       const site = db.get("sites", params.id);
       if (!site) throw httpError(404, "Website not found.");
       const cfg = site.cloudflare || { enabled: false, tunnelId: "", hostnames: [] };
+      // Check the recorded routes against Cloudflare first, so "active" means the
+      // tunnel and DNS really have them (a missing one comes back as an error).
+      let check = null;
+      try {
+        check = await quickCheck(ledger(siteOwner(site.id)));
+      } catch (err) {
+        check = { error: err.message };
+      }
       const recs = siteRoutes(site.id);
       const tunnelHosts = new Set(cfg.enabled ? cfg.hostnames || [] : []);
       return {
         cloudflare: cfg,
         connected: !!creds(),
+        checkedAt: now(),
+        checkError: check?.error || null,
         domains: (site.domains || []).map((d) => {
           const r = recs.find((x) => x.hostname === d) || null;
           return { hostname: d, mode: tunnelHosts.has(d) ? "tunnel" : "direct", route: r };
@@ -2216,9 +2418,17 @@ function createCloudflare(ctx) {
   // ------------------------------------------------------------ lifecycle
 
   let onLb = null;
+  let bootTimer = null;
   async function startModule() {
     conf();
     readVersion().catch(() => {});
+    // Once things have settled: resume route syncs a restart lost, and check the
+    // recorded routes against Cloudflare (see resumeAfterBoot).
+    bootTimer = setTimeout(() => {
+      bootTimer = null;
+      resumeAfterBoot().catch((err) => console.warn(`[cloudflare] checking the tunnel routes after start failed: ${err.message}`));
+    }, Number(process.env.FCC_CLOUDFLARE_BOOT_CHECK_MS) || 30_000);
+    bootTimer.unref?.();
     if (!mainLocal()) {
       if (conf().connectors.length) console.log("[cloudflare] Not on the main server — tunnel connectors are not started in the panel process; they run as replicas on the edge nodes.");
     }
@@ -2246,6 +2456,7 @@ function createCloudflare(ctx) {
   }
 
   async function stopModule() {
+    if (bootTimer) clearTimeout(bootTimer);
     if (onLb) ctx.events?.off?.("lb", onLb);
     login.cancel();
     await Promise.allSettled([...running.keys()].map((id) => stopConnector(id)));

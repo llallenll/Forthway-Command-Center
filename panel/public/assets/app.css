@@ -2306,24 +2306,51 @@ a.mini-stat.lt-stat:focus-visible { outline: 2px solid var(--blue-3); outline-of
 .env-seg button { display: inline-flex; align-items: center; gap: 7px; }
 .env-switch-sub { margin: 0; }
 .env-row .input.env-random { font-style: italic; font-family: inherit; color: var(--muted); }
-.stg-strip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; margin-bottom: 16px; border-radius: 14px;
-  background: rgba(157, 125, 255, 0.07); border: 1px solid rgba(157, 125, 255, 0.2); font-size: 13px; }
-.stg-strip > .ico { color: #c0aaff; }
-.stg-strip .spacer { flex: 1; }
-.stg-strip-t { flex: 1; min-width: 200px; }
-.stg-strip-t a, .stg-strip-url { color: var(--blue-3); }
-.stg-strip-url { display: inline-flex; align-items: center; gap: 5px; max-width: 280px; }
-.stg-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-.stg-facts .ms-l { font-size: 12px; color: var(--muted); font-weight: 550; margin-bottom: 6px; }
-.stg-card .card-head h3 .ico { color: #c0aaff; }
-.stg-cta .stg-cta-head { display: flex; gap: 14px; align-items: flex-start; }
-.stg-cta .stg-cta-head h3 { margin: 0 0 4px; font-size: 16px; }
-.stg-cta-ico { flex: none; width: 44px; height: 44px; border-radius: 13px; display: grid; place-items: center; background: rgba(157, 125, 255, 0.12); color: #c0aaff; }
-.stg-list { list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 10px; }
-.stg-list li { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; line-height: 1.5; }
-.stg-list li > .ico { flex: none; margin-top: 2px; color: var(--blue-3); }
+/* ───────── Live build / Staging build (views/site-staging.js) ───────── */
+/* A staging build: the type icon turns purple (a pinker purple than PHP's lavender, with a brighter rim). */
+.type-ico.staging { background: rgba(192, 132, 252, 0.16); color: #d8b4fe; border-color: rgba(192, 132, 252, 0.42); }
+.site-head .type-ico.staging { box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.1), 0 10px 26px -14px rgba(192, 132, 252, 0.7); }
+/* The header's type icon is the switch between the live and staging build. */
+.build-switch { position: relative; padding: 0; cursor: pointer; font: inherit; transition: border-color 0.15s, transform 0.15s, background 0.15s; }
+.build-switch:hover { border-color: var(--line-3); transform: translateY(-1px); }
+.build-switch.staging:hover { border-color: rgba(192, 132, 252, 0.7); }
+.build-switch:focus-visible { outline: 2px solid var(--blue-3); outline-offset: 3px; border-radius: 15px; }
+.build-switch .bs-chev { position: absolute; right: -6px; bottom: -6px; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--panel-3, #1a2347); border: 1px solid var(--line-2); color: var(--text-2); transition: transform 0.15s; }
+.build-switch .bs-chev .ico { width: 12px; height: 12px; }
+.build-switch[aria-expanded="true"] .bs-chev { transform: rotate(180deg); }
+.menu.build-menu { min-width: 280px; max-width: min(360px, calc(100vw - 16px)); }
+.build-menu .menu-head .tiny { margin-top: 3px; line-height: 1.4; }
+.menu.build-menu button { padding: 8px; }
+.build-menu button > span { flex: 1; min-width: 0; }
+.bs-item { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.bs-item .bs-ico { width: 32px; height: 32px; border-radius: 9px; }
+.bs-item .bs-ico .ico { width: 16px; height: 16px; }
+.bs-txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.bs-t { color: var(--text); font-weight: 650; }
+.bs-sub { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); font-weight: 500; min-width: 0; }
+.bs-sub .dot { width: 7px; height: 7px; flex: none; }
+.bs-cur { flex: none; color: var(--blue-3); display: grid; place-items: center; }
+/* "Staging" badge next to the name, release rows, the purple chip on website rows. */
+.badge.stg-badge { background: rgba(192, 132, 252, 0.13); color: #d8b4fe; border-color: rgba(192, 132, 252, 0.3); }
+a.badge.stg-badge:hover { border-color: rgba(192, 132, 252, 0.6); }
+.site-head h1 .badge.stg-badge { height: 24px; font-size: 12px; }
+.stg-of { color: #d8b4fe; }
+.stg-of .ico { color: #d8b4fe; }
+.stg-chip { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; border-radius: 7px; font-size: 11.5px; font-weight: 650; white-space: nowrap;
+  background: rgba(192, 132, 252, 0.12); color: #d8b4fe; border: 1px solid rgba(192, 132, 252, 0.28); }
+.stg-chip:hover { border-color: rgba(192, 132, 252, 0.6); color: #ecd9ff; }
+.stg-chip .dot { width: 6px; height: 6px; }
+.btn.btn-stg .ico { color: #d8b4fe; }
+.env-seg button.stg.active .ico { color: #d8b4fe; }
+.stg-none { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.stg-none .type-ico { width: 40px; height: 40px; }
+.stg-src { margin-bottom: 0; }
+.stg-list { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 10px; }
+.stg-list li { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; line-height: 1.5; color: var(--text-2); }
+.stg-list li > .ico { flex: none; margin-top: 2px; color: #d8b4fe; }
 @media (max-width: 640px) {
-  .stg-facts { grid-template-columns: 1fr; gap: 12px; }
   .env-switch { gap: 8px; }
-  .stg-card .card-head .right { width: 100%; justify-content: flex-start; }
+  .menu.build-menu { min-width: 0; width: calc(100vw - 16px); }
+}
 }

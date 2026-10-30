@@ -1,6 +1,6 @@
 /**
  * STAGING — one click from a website's page, a second, persistent copy of the
- * website that runs next to production (Environment → Staging).
+ * website that runs next to production (the website header's type icon → Staging build).
  *
  * A staging copy is an ordinary website record with `stagingOf: <parentId>`
  * (the parent gets `stagingSiteId`), so everything a website has — deploys,

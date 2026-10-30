@@ -629,10 +629,12 @@ export function register(router, ctx) {
   router.post("/api/sites/:id/tests", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
     const releaseId = body?.releaseId ? String(body.releaseId) : null;
+    // STAGING (panel/lib/staging.mjs): a staging copy tests its parent's releases (with its own variables).
+    const owner = site.stagingOf || site.id;
     const release = releaseId
       ? db.get("releases", releaseId)
-      : db.list("releases", { siteId: site.id }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
-    if (!release || release.siteId !== site.id) throw httpError(releaseId ? 404 : 409, releaseId ? "Release not found." : "This website has no releases yet. Pull a commit from GitHub or upload a zip first.");
+      : db.list("releases", { siteId: owner }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
+    if (!release || release.siteId !== owner) throw httpError(releaseId ? 404 : 409, releaseId ? "Release not found." : "This website has no releases yet. Pull a commit from GitHub or upload a zip first.");
     const file = ctx.sites?.releaseFile?.(release.id) || path.join(ctx.dataDir, "releases", `${release.id}.zip`);
     if (!fs.existsSync(file)) throw httpError(409, "That release's archive is missing.");
     const running = activeRun(site.id);

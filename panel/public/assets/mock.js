@@ -570,7 +570,7 @@ R("PATCH", "/api/sites/:id", (p, b) => {
   activity("site.update", "site", s); emit("site", siteView(s));
   return { ...siteView(s), upstreams: upstreams(s) };
 });
-R("DELETE", "/api/sites/:id", (p) => { const s = find("sites", p.id); if (s.stagingSiteId) err(409, `${s.name} has a staging copy. Remove staging first (Environment → Staging → Remove staging), then delete the website.`); db.sites = db.sites.filter((x) => x.id !== p.id); activity("site.delete", "site", s); emit("site", { id: s.id, deleted: true }); return { ok: true }; });
+R("DELETE", "/api/sites/:id", (p) => { const s = find("sites", p.id); if (s.stagingSiteId) err(409, `${s.name} has a staging copy. Remove staging first (open its staging build from the header's type icon → ⋯ → Remove staging), then delete the website.`); db.sites = db.sites.filter((x) => x.id !== p.id); activity("site.delete", "site", s); emit("site", { id: s.id, deleted: true }); return { ok: true }; });
 R("POST", "/api/sites/:id/deploy", (p, b) => {
   const s = find("sites", p.id);
   busy(s);
@@ -649,11 +649,13 @@ R("PUT", "/api/sites/:id/env", (p, b) => { const s = find("sites", p.id); s.env 
 R("GET", "/api/sites/:id/releases", (p) => ({ items: clone(db.releases.filter((r) => r.siteId === p.id)) }));
 R("POST", "/api/sites/:id/releases/upload", (p, b, q) => {
   const s = find("sites", p.id);
+  if (s.stagingOf) err(409, "A staging copy deploys its website's releases — upload the release to the website itself.");
   const r = { id: nid("rel"), siteId: s.id, filename: q.filename || b?.name || "upload.zip", size: b?.size || 12 * MB, sha256: hex(64), version: (q.filename || "upload").replace(/\.zip$/, "").split("-").pop() || "upload", commit: null, source: "upload", pinned: false, createdAt: iso(Date.now()) };
   db.releases.unshift(r); activity("release.upload", "site", s, r.filename); emit("site", siteView(s)); return r;
 });
 R("POST", "/api/sites/:id/releases/github", (p, b) => {
   const s = find("sites", p.id);
+  if (s.stagingOf) err(409, "A staging copy deploys its website's releases — pull from GitHub on the website itself.");
   if (!s.github?.repo) err(400, "Set a GitHub repository in Settings first.");
   const ref = b.ref || s.github.branch || "main";
   const sha = /^[0-9a-f]{40}$/.test(ref) ? ref : hex(40), message = COMMIT_MSGS[Math.floor(Math.random() * COMMIT_MSGS.length)];
@@ -1527,8 +1529,9 @@ const activeRun = (siteId) => db.testRuns.find((x) => x.siteId === siteId && ["q
 R("GET", "/api/sites/:id/tests", (p) => { find("sites", p.id); return { items: db.testRuns.filter((x) => x.siteId === p.id).map(testSummary) }; });
 R("POST", "/api/sites/:id/tests", (p, b) => {
   const s = find("sites", p.id);
-  const rel = b.releaseId ? find("releases", b.releaseId) : db.releases.find((x) => x.siteId === s.id);
-  if (!rel || rel.siteId !== s.id) err(400, "Pick a release of this website to test.");
+  const owner = s.stagingOf || s.id; // STAGING: a staging copy tests its parent's releases
+  const rel = b.releaseId ? find("releases", b.releaseId) : db.releases.find((x) => x.siteId === owner);
+  if (!rel || rel.siteId !== owner) err(400, "Pick a release of this website to test.");
   const a = activeRun(s.id);
   if (a) err(409, `A test of ${s.name} is already running.`, { runId: a.id });
   if (!tester.tokenSet) err(400, "Add a Claude Code token in Settings → Website testing first.");
@@ -1834,7 +1837,7 @@ function stagingSummary(s) {
   const bj = db.jobs.find((x) => x.siteId === c.id && (x.status === "running" || x.status === "queued"));
   return { role: "parent", id: c.id, name: c.name, url: c.domains[0] ? `${c.ssl?.enabled || s.ssl?.enabled ? "https" : "http"}://${c.domains[0]}` : null, domains: c.domains, port: c.port, serverId: sid,
     serverName: db.servers.find((x) => x.id === sid)?.name || sid, currentReleaseId: c.currentReleaseId || null, currentVersion: db.releases.find((r) => r.id === c.currentReleaseId)?.version || null,
-    running: st.running ?? null, healthy: st.healthy ?? null, deploying: bj?.type === "site.deploy", error: st.error || null, busyJobId: bj?.id || null, deleting: false, databaseIds: c.linkedDatabaseIds, ssl: c.ssl, createdAt: c.createdAt };
+    running: st.running ?? null, healthy: st.healthy ?? null, deploying: bj?.type === "site.deploy", error: st.error || null, busyJobId: bj?.id || null, deleting: !!c.deleting, databaseIds: c.linkedDatabaseIds, ssl: c.ssl, createdAt: c.createdAt };
 }
 const sqlName = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "site";
 function testDbPreview(s) {
@@ -1908,6 +1911,7 @@ R("DELETE", "/api/sites/:id/staging", (p, b, q) => {
   const s = s0.stagingOf ? find("sites", s0.stagingOf) : s0;
   const c = stagingChild(s) || err(404, `${s.name} has no staging copy.`);
   busy(c);
+  c.deleting = true; emit("site", siteView(s));
   const drop = q.dropDatabase === "1" ? db.databases.filter((d) => d.stagingOf === s.id && c.linkedDatabaseIds.includes(d.id)) : [];
   activity("site.staging.remove", "site", s, drop.length ? `and dropped ${drop.map((d) => d.name).join(", ")}` : "database kept");
   const lines = [`Removing ${c.name}…`, `── ${db.servers.find((x) => x.id === targets(c)[0])?.name || "main"}: removing the website${q.deleteFiles !== "0" ? " and its files" : ""}`, "✓ front door (nginx) entry removed.", `✓ ${c.name} removed.`,

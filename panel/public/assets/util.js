@@ -297,11 +297,25 @@ export function formDialog({ title, sub, ico = "edit", fields, submitText = "Sav
 }
 
 /* ── dropdown menu ── */
-let openMenuEl = null;
-export function closeMenu() { openMenuEl?.remove(); openMenuEl = null; }
-export function openMenu(anchor, items, { align = "right", head } = {}) {
+let openMenuEl = null, menuAnchor = null, menuOnClose = null;
+export function closeMenu() {
+  openMenuEl?.remove(); openMenuEl = null; menuAnchor = null;
+  const f = menuOnClose; menuOnClose = null; f?.();
+}
+// Escape closes an open menu and gives focus back to what opened it (mouse- or keyboard-opened).
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !openMenuEl) return;
+  e.preventDefault(); e.stopPropagation();
+  const a = menuAnchor; closeMenu(); a?.focus?.();
+}, true);
+/**
+ * Dropdown menu next to `anchor`. Items: { label (text or html``), icon, danger, disabled, onClick } | { sep: true }.
+ * ↑/↓/Home/End move between items, Escape closes. `focus: true` focuses the first item (opened from the keyboard);
+ * `cls` adds a class to the menu; `onClose` runs when it closes for any reason.
+ */
+export function openMenu(anchor, items, { align = "right", head, cls = "", focus = false, onClose } = {}) {
   closeMenu();
-  const el = frag(html`<div class="menu" role="menu">${head || ""}${items.filter(Boolean).map((it, i) =>
+  const el = frag(html`<div class="menu ${cls}" role="menu">${head || ""}${items.filter(Boolean).map((it, i) =>
     it.sep ? html`<hr/>` : html`<button role="menuitem" data-i="${i}" class="${it.danger ? "danger" : ""}" ${it.disabled ? raw("disabled") : ""}>${it.icon ? icon(it.icon, "sm") : ""}<span>${it.label}</span></button>`)}</div>`);
   const list = items.filter(Boolean);
   el.addEventListener("click", (e) => {
@@ -318,9 +332,23 @@ export function openMenu(anchor, items, { align = "right", head } = {}) {
   let top = r.bottom + 6;
   if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
   el.style.left = left + "px"; el.style.top = top + "px";
-  openMenuEl = el;
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Tab") { closeMenu(); return; }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    const btns = Array.from(el.querySelectorAll("button[data-i]:not([disabled])"));
+    if (!btns.length) return;
+    e.preventDefault();
+    const i = btns.indexOf(document.activeElement), n = btns.length;
+    const next = e.key === "Home" ? 0 : e.key === "End" ? n - 1 : e.key === "ArrowDown" ? (i < 0 ? 0 : (i + 1) % n) : i < 0 ? n - 1 : (i - 1 + n) % n;
+    btns[next].focus();
+  });
+  openMenuEl = el; menuAnchor = anchor; menuOnClose = onClose || null;
+  if (focus) el.querySelector("button[data-i]:not([disabled])")?.focus();
   setTimeout(() => {
-    const off = (e) => { if (!el.contains(e.target)) { closeMenu(); document.removeEventListener("mousedown", off); } };
+    const off = (e) => {
+      if (openMenuEl !== el) { document.removeEventListener("mousedown", off); return; } // closed meanwhile (item picked, Escape)
+      if (!el.contains(e.target)) { closeMenu(); document.removeEventListener("mousedown", off); }
+    };
     document.addEventListener("mousedown", off);
   }, 0);
   return el;
