@@ -62,7 +62,7 @@ note), not as a defect of the site.
 3. **Report as you go** — the owner is watching live:
    - before a check: `fcc-report check --id <category.short-name> --category <category> --status running --title "<what is verified>"`
    - after it: the same id with `--status pass|warn|fail|skip` and a one-line `--detail` of the evidence;
-   - for every problem: `fcc-report finding --severity <critical|high|medium|low|info> --category <category> --title "…" --detail "<what you observed, how to reproduce>" --fix "<the concrete change>" --location "<file:line or URL>"`;
+   - for every problem: `fcc-report finding --severity <critical|high|medium|low|info> --category <category> --title "<plain words>" --plain "<what this means, for the owner>" --detail "<what you observed, how to reproduce>" --fix "<the concrete change>" --location "<file:line or URL>"`;
    - occasional `fcc-report note "<what you are doing next>"`.
 4. Use real browser flows for anything a customer does (Playwright is
    installed: write a short Node script under /tmp and run it with `node`;
@@ -164,9 +164,23 @@ record any problem as a finding with a fix.
 - **low** — hardening and best practice.
 - **info** — observations, environment limitations, suggestions.
 
-Every finding needs a **location** (file:line or URL) and a **concrete fix**:
-the specific change to make (which file, what to change, an example snippet
-or setting), not general advice.
+Every finding is read by two different people, so it has two halves:
+
+- **For the owner** — a business owner, not a developer. `title` names the
+  problem in everyday words ("Password-reset emails can be hijacked", not
+  "Host header injection in reset links"). `plain` is 2–4 short sentences:
+  what is wrong, what could actually happen and to whom (customers, orders,
+  money, the business's reputation), and how likely it is. No jargon, no
+  code, no acronyms without a short explanation in brackets. Example: "When a
+  customer asks to reset their password, the link in the email can be
+  pointed at someone else's website. A scammer could use that to take over
+  customer accounts. It needs the scammer to trick the customer into
+  clicking, but it is a well-known attack."
+- **For the developer or AI agent who will fix it** — `detail` (what you
+  observed, with exact requests, responses or steps to reproduce),
+  `location` (file:line or URL) and `fix`: the specific change to make
+  (which file, what to change, an example snippet or setting), not general
+  advice. Write `fix` so it can be handed to a coding agent as-is.
 
 ## The report
 
@@ -176,12 +190,13 @@ Write `/out/report.json` as the last thing you do:
 {
   "verdict": "ready" | "not_ready",
   "score": 0-100,
-  "summary": "Two or three plain-English sentences for the owner: is it safe to deploy, and what matters most.",
+  "plainSummary": "Three to five short sentences for the owner, no jargon: is it safe to put live, what works well, and the few things that most need fixing first and why they matter to the business.",
+  "summary": "The same verdict for the developer: the main technical reasons, in two or three sentences.",
   "checks": [
     { "id": "payments.checkout", "category": "payments", "title": "Checkout in test mode", "status": "pass", "detail": "…" }
   ],
   "findings": [
-    { "id": "auth.reset-reuse", "severity": "high", "category": "auth", "title": "…", "detail": "…", "fix": "…", "location": "src/…:42" }
+    { "id": "auth.reset-reuse", "severity": "high", "category": "auth", "title": "…", "plain": "…", "detail": "…", "fix": "…", "location": "src/…:42" }
   ]
 }
 ```

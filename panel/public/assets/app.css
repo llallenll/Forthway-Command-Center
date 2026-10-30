@@ -1666,7 +1666,8 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
 .tr-eyebrow { display: inline-flex; align-items: center; gap: 10px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
 .tr-eyebrow > span { display: inline-flex; align-items: center; gap: 6px; }
 .tr-eyebrow:hover { color: var(--text); }
-.tr-eyebrow .tr-type { width: 26px; height: 26px; border-radius: 8px; }
+/* The type badge is a <span> too: undo the `> span` text layout above, or its icon sits off-centre. */
+.tr-eyebrow .tr-type { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; gap: 0; }
 .tr-eyebrow .tr-type .ico { width: 14px; height: 14px; }
 .tr-hero h1 { font-size: 28px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.15; margin-top: 10px; }
 .tr-page.v-ready .tr-hero h1 { color: #b5f5d8; }
@@ -1844,6 +1845,22 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
 .tr-loc { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 3px 8px; border-radius: 7px; background: rgba(148, 166, 255, 0.07); font-size: 12px; color: var(--text-2); max-width: 100%; overflow-wrap: anywhere; }
 .tr-fix { margin-top: 12px; padding: 11px 13px; border-radius: 10px; background: rgba(61, 220, 151, 0.06); border: 1px solid rgba(61, 220, 151, 0.18); }
 .tr-fix-h { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700; color: #63e6ad; margin-bottom: 4px; }
+/* Findings in two halves: what it means (for the owner), then the developer's part. */
+.tr-find-tt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.tr-find-peek { font-size: 12.5px; font-weight: 400; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tr-find[open] .tr-find-peek { display: none; }
+.tr-plain { padding: 2px 0 0; }
+.tr-plain-h { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700; color: var(--blue-3); margin-bottom: 4px; }
+.tr-plain p { font-size: 14px; line-height: 1.6; color: var(--text); }
+.tr-dev { margin-top: 14px; padding: 12px 13px 13px; border-radius: 10px; border: 1px dashed var(--line-2); background: rgba(8, 13, 30, 0.35); }
+.tr-dev-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.tr-dev-h > span { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700; color: var(--muted); }
+.tr-dev-what { font-size: 12.5px; color: var(--text-2); overflow-wrap: anywhere; }
+.tr-v-tech { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.tr-v-tech summary { cursor: pointer; width: max-content; }
+.tr-v-tech summary:hover { color: var(--text-2); }
+.tr-v-tech p { margin-top: 6px; color: var(--text-2); }
+.tr-sevcounts .btn { margin-left: 4px; }
 .tr-nofind { display: flex; align-items: center; gap: 10px; color: #63e6ad; font-weight: 600; }
 
 /* verdict reveal */
@@ -1878,6 +1895,7 @@ details.inc[open] > summary { background: rgba(148, 166, 255, 0.04); }
 .tr-verdict.in .tr-v-text > :nth-child(2) { transition-delay: calc(var(--rd) + 0.12s); }
 .tr-verdict.in .tr-v-text > :nth-child(3) { transition-delay: calc(var(--rd) + 0.24s); }
 .tr-verdict.in .tr-v-text > :nth-child(4) { transition-delay: calc(var(--rd) + 0.36s); }
+.tr-verdict.in .tr-v-text > :nth-child(5) { transition-delay: calc(var(--rd) + 0.48s); }
 .tr-v-eyebrow { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; color: var(--vc); }
 .tr-verdict h2 { font-size: 32px; font-weight: 800; letter-spacing: -0.035em; line-height: 1.1; margin-top: 6px; color: #fff; }
 .tr-verdict.ok h2 { background: linear-gradient(90deg, #fff, #9ff0cb); -webkit-background-clip: text; background-clip: text; color: transparent; }

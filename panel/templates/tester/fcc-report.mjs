@@ -9,7 +9,7 @@
  *
  *   fcc-report check   --id auth.login --category auth --status running --title "Login"
  *   fcc-report check   --id auth.login --category auth --status pass --title "Login" --detail "Works; wrong passwords are refused."
- *   fcc-report finding --severity high --category auth --title "…" --detail "…" --fix "…" --location "src/x.ts:12"
+ *   fcc-report finding --severity high --category auth --title "…" --plain "…" --detail "…" --fix "…" --location "src/x.ts:12"
  *   fcc-report note    "Mapped 14 pages; starting with the checkout."
  *
  * Categories: setup payments database auth features security config
@@ -28,7 +28,7 @@ function usage(msg) {
   if (msg) console.error(`fcc-report: ${msg}`);
   console.error(`usage:
   fcc-report check   --id <id> --category <${CATEGORIES.join("|")}> --status <${STATUSES.join("|")}> --title <text> [--detail <text>]
-  fcc-report finding --severity <${SEVERITIES.join("|")}> --category <category> --title <text> --detail <text> --fix <text> [--location <file:line or URL>] [--id <id>]
+  fcc-report finding --severity <${SEVERITIES.join("|")}> --category <category> --title <text> --plain <text for the owner> --detail <text> --fix <text> [--location <file:line or URL>] [--id <id>]
   fcc-report note    <text>`);
   process.exit(2);
 }
@@ -60,10 +60,10 @@ if (kind === "check") {
   ev = { t: "check", id: clip(f.id, 64), category: f.category || "features", title: clip(f.title || f.id, 160), status: f.status || "running", detail: clip(f.detail, 2000) };
 } else if (kind === "finding") {
   const f = flags(rest);
-  for (const k of ["severity", "category", "title", "fix"]) if (!f[k]) usage(`a finding needs --${k}`);
+  for (const k of ["severity", "category", "title", "plain", "fix"]) if (!f[k]) usage(`a finding needs --${k}`);
   if (!SEVERITIES.includes(f.severity)) usage(`unknown severity "${f.severity}"`);
   if (!CATEGORIES.includes(f.category)) usage(`unknown category "${f.category}"`);
-  ev = { t: "finding", id: clip(f.id, 64), severity: f.severity, category: f.category, title: clip(f.title, 200), detail: clip(f.detail, 4000), fix: clip(f.fix, 4000), location: clip(f.location, 300) };
+  ev = { t: "finding", id: clip(f.id, 64), severity: f.severity, category: f.category, title: clip(f.title, 200), plain: clip(f.plain, 1500), detail: clip(f.detail, 4000), fix: clip(f.fix, 4000), location: clip(f.location, 300) };
 } else if (kind === "note") {
   const text = rest.join(" ").trim();
   if (!text) usage("a note needs some text");
