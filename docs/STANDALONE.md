@@ -1324,3 +1324,14 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     Deploy a release, Stop/Start, domain + HTTPS, staging variables, staging database vars, jobs, Remove staging with
     typed confirm + "also drop the database"). Activity verbs `site.staging.start|remove`. Tests:
     `scripts/staging.test.mjs`, new cases in `scripts/site-tests.test.mjs`.
+
+- **Cloudflare page** (UI only). Sidebar **Cloudflare** (`#/cloudflare`, views/cloudflare-page.js): connectors
+  and domains, with their add flows. **Settings → Cloudflare** (views/cloudflare.js `cloudflareSettings`): the
+  account(s), **Publish this panel**, **Publish phpMyAdmin**, **Routes** (a fold-away card, closed by default,
+  forced open on a route error) and Forget everything. No API changes.
+
+- **Staging copies get their database schema before the build** (engine `settings.schemaSync`, set by
+  sites.mjs for node staging copies only). Between Prepare and Build the engine runs the site's
+  after-deploy scripts, or `prisma migrate deploy` (`db push --skip-generate` without a migrations folder),
+  in the build container (`shared/deployer.mjs schemaCommands`). Those scripts no longer also run after a
+  staging deploy. Fixes staging failing its health check on an empty database. Agents need the update.

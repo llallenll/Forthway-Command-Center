@@ -841,6 +841,9 @@ export function register(router, ctx) {
       createAppDir: true,
     };
     if (st.publicDir) out.root = st.publicDir; // document root inside appDir (static/php), read by shared/tasks.mjs
+    // Staging copies start on an empty database: the engine brings its schema up to date before
+    // the build (shared/deployer.mjs schemaCommands), running the after-deploy scripts there.
+    if (site.stagingOf && node) out.schemaSync = { scripts: (st.afterDeployScripts || []).filter(validScriptName) };
     if (st.swapDirs?.length) out.swapDirs = st.swapDirs;
     if (st.preserve?.length) out.preserve = st.preserve;
     return out;
@@ -1338,7 +1341,8 @@ export function register(router, ctx) {
         ship = { packageFirst: true, fingerprint: buildFingerprint(site) };
       }
     }
-    const scripts = afterDeploy ? (site.settings?.afterDeployScripts || []).filter(validScriptName) : [];
+    // A node staging copy already ran its after-deploy scripts before the build (schemaSync above).
+    const scripts = afterDeploy && !(site.stagingOf && site.type === "node") ? (site.settings?.afterDeployScripts || []).filter(validScriptName) : [];
     const afterFirst = scripts.length ? (sid) => runAfterDeployScripts(siteId, sid, scripts, { log, signal, multi: ids.length > 1 }) : null;
     await deployTo(siteId, release, ids, { log, signal, base, multi: ids.length > 1, afterFirst, ship });
     markCurrent(siteId, release.id);

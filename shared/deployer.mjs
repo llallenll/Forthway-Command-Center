@@ -100,6 +100,25 @@ export function defaultSettings() {
   };
 }
 
+/**
+ * The commands that bring a staging copy's database schema up to date
+ * (settings.schemaSync): the site's after-deploy scripts if it has any,
+ * otherwise Prisma's migrations, or `db push` when there is no migrations
+ * folder. [] when there is nothing to run.
+ */
+export function schemaCommands(dir, scripts = []) {
+  const names = (Array.isArray(scripts) ? scripts : []).filter((n) => /^[A-Za-z0-9_][A-Za-z0-9:._+-]{0,99}$/.test(n));
+  if (names.length) return names.map((n) => `npm run ${n}`);
+  if (!exists(path.join(dir, "prisma", "schema.prisma"))) return [];
+  let migrations = false;
+  try {
+    migrations = fs.readdirSync(path.join(dir, "prisma", "migrations"), { withFileTypes: true }).some((e) => e.isDirectory());
+  } catch {
+    /* no migrations folder */
+  }
+  return [migrations ? "npx prisma migrate deploy" : "npx prisma db push --skip-generate"];
+}
+
 /** Fill in anything missing, so a partial settings object is always safe. */
 export function withDefaults(input) {
   const d = defaultSettings();
@@ -1048,6 +1067,24 @@ export class Deployer {
         await this.runApp(prepareCmd, { cwd: p.staging, log, timeoutMs: 10 * 60_000 });
       } else {
         log.line("Nothing the prepare step depends on has changed — skipping it.");
+      }
+    }
+
+    // --- database schema (staging copies) ---------------------------------
+    // settings.schemaSync (the panel sets it for staging copies only): their
+    // database starts empty, and a build that pre-renders pages, or an app
+    // whose home page reads the database, fails the health check on missing
+    // tables. So the schema is brought up to date here, before the build and
+    // long before the app starts: the site's after-deploy scripts when it has
+    // any, otherwise Prisma's migrations (or `db push` without a migrations
+    // folder). Never on production sites — their schema is the owner's call.
+    if (this.S.schemaSync) {
+      const cmds = schemaCommands(p.staging, this.S.schemaSync.scripts);
+      if (cmds.length) {
+        log.setStep("Database");
+        for (const cmd of cmds) await this.runApp(cmd, { cwd: p.staging, log, timeoutMs: 15 * 60_000 });
+      } else {
+        log.line("No after-deploy scripts and no prisma/schema.prisma — leaving the staging database as it is.");
       }
     }
 

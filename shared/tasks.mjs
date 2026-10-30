@@ -1290,6 +1290,10 @@ async function dryRunSite(type, spec, payload, o) {
           ? `[dry-run] would unpack into ${where} and install dependencies — the archive is the build made on ${rel.builtOn || "the first server"}, so the build step is skipped`
           : `[dry-run] would unpack into ${where}, install and build (${spec.type})${inDocker ? ` in a throw-away container as uid ${ct.uid ?? "?"}` : ""}`,
       );
+      if (spec.settings?.schemaSync) {
+        const scripts = spec.settings.schemaSync.scripts || [];
+        await step(`[dry-run] staging copy: before the build, would bring its database schema up to date (${scripts.length ? scripts.map((n) => `npm run ${n}`).join(", ") : "prisma migrate deploy / db push when the release has prisma/schema.prisma"})`);
+      }
       let packaged;
       const pkg = packageTarget(payload, spec, o);
       if (pkg) {
