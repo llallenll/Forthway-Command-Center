@@ -1010,6 +1010,10 @@ export class Deployer {
         const t0 = Date.now();
         const r = hardlinkDir(liveModules, path.join(p.staging, "node_modules"));
         seeded = true;
+        // The engine (root) just made every folder of that copy, so they are root's: npm in the
+        // build container (the site's own user) could then not replace or remove anything in them
+        // (EACCES on node_modules/.bin). The linked files are the live app's, already the site's.
+        await this._own(path.join(p.staging, "node_modules"), null);
         log.line(
           `Seeded node_modules from the running app: ${r.total} files ` +
             `(${r.linked} linked, ${r.copied} copied) in ${Date.now() - t0}ms.`,
