@@ -11,6 +11,7 @@
 
 import os from "node:os";
 import { httpError } from "./http.mjs";
+import { QUEUE_MAX_PER_SERVER } from "./jobs.mjs";
 import {
   hashPassword,
   verifyPassword,
@@ -145,7 +146,8 @@ export function register(router, ctx) {
   const needsSetup = () => db.list("admins").length === 0;
 
   const projectCounts = (projectId) => {
-    const sites = db.list("sites", { projectId });
+    // Staging copies (site.stagingOf) live inside their website, not as websites of their own.
+    const sites = db.list("sites", (x) => x.projectId === projectId && !x.stagingOf);
     return {
       sites: sites.length,
       sitesLoadBalanced: sites.filter((s) => s.loadBalanced).length,
@@ -474,7 +476,7 @@ export function register(router, ctx) {
   router.get("/api/dashboard", async (req, res, { admin, query }) => {
     const range = query.range === "1h" ? "1h" : "24h";
     const mainId = ctx.cluster?.MAIN_ID || "main";
-    const sites = db.list("sites");
+    const sites = db.list("sites", (x) => !x.stagingOf); // staging copies aren't websites of their own
     const backups = db.list("backups");
 
     const [metrics, servers, nginx, mysql] = await Promise.all([
@@ -586,23 +588,83 @@ export function register(router, ctx) {
 
   // -------------------------------------------------------------- jobs
 
-  router.get("/api/jobs", (req, res, { query }) => ({
-    items: ctx.jobs.list({
+  // ?offset=N (or ?page=N, 1-based) pages through the kept jobs: { items, total, offset, limit }.
+  // Without either, the answer is the newest `limit` jobs as before ({ items }).
+  router.get("/api/jobs", (req, res, { query }) => {
+    const filter = {
       siteId: query.siteId,
       projectId: query.projectId,
       serverId: query.serverId,
       databaseId: query.databaseId,
       type: query.type,
       status: query.status,
-      limit: query.limit || 50,
-    }),
-  }));
+    };
+    const paged = (query.offset != null && query.offset !== "") || (query.page != null && query.page !== "");
+    if (!paged) return { items: ctx.jobs.list({ ...filter, limit: query.limit || 50 }) };
+    const limit = Math.max(1, Math.min(100, Math.floor(Number(query.limit)) || 10));
+    const offset = query.page != null && query.page !== "" ? (Math.max(1, Math.floor(Number(query.page)) || 1) - 1) * limit : Math.max(0, Math.floor(Number(query.offset)) || 0);
+    const all = ctx.jobs.list({ ...filter, limit: Infinity }); // clamped to every kept job
+    return { items: all.slice(offset, offset + limit), total: all.length, offset, limit };
+  });
 
   const getJob = (id) => {
     const job = ctx.jobs.get(id);
     if (!job) throw httpError(404, "Job not found.");
     return job;
   };
+
+  // ---- the job queue (heavy jobs: builds, installs, server backups — jobs.mjs)
+
+  /** ctx.jobs.queue() plus names for the browser: who started it, which servers, which website. */
+  const queueView = () => {
+    const q = ctx.jobs.queue();
+    const adminName = (id) => (id ? db.get("admins", id)?.name || null : null);
+    const serverName = (id) => db.get("servers", id)?.name || (id === "main" ? "Main server" : id);
+    const siteName = (id) => (id ? db.get("sites", id)?.name || null : null);
+    const named = (j) => ({ ...j, adminName: adminName(j.adminId), siteName: siteName(j.siteId), serverNames: j.servers.map(serverName) });
+    return { ...q, running: q.running.map(named), waiting: q.waiting.map(named) };
+  };
+  const queueError = (err) => {
+    if (err?.code === "locked") return httpError(409, err.message, { jobId: err.jobId });
+    if (err?.code === "bad_move") return httpError(400, err.message);
+    if (err?.code) return httpError(409, err.message);
+    return err;
+  };
+
+  router.get("/api/jobs/queue", () => queueView());
+
+  router.patch("/api/jobs/queue", (req, res, { admin, body }) => {
+    if (body?.perServer === undefined) throw httpError(400, "Nothing to change.");
+    const n = Number(body.perServer);
+    if (!Number.isInteger(n) || n < 1 || n > QUEUE_MAX_PER_SERVER) throw httpError(400, `Heavy jobs per server must be a whole number from 1 to ${QUEUE_MAX_PER_SERVER}.`);
+    const before = ctx.jobs.perServer();
+    ctx.jobs.setPerServer(n);
+    ctx.saveConfig();
+    if (before !== n) ctx.activity(admin, "settings.update", { type: "settings", id: "queue", name: "Job queue" }, { fields: ["perServer"], perServer: n });
+    return queueView();
+  });
+
+  router.post("/api/jobs/:id/move", (req, res, { params, body }) => {
+    getJob(params.id);
+    try {
+      ctx.jobs.move(params.id, { to: body?.to ?? null, index: body?.index ?? null });
+    } catch (err) {
+      throw queueError(err);
+    }
+    return queueView();
+  });
+
+  router.post("/api/jobs/:id/force", (req, res, { admin, params }) => {
+    const job = getJob(params.id);
+    let started;
+    try {
+      started = ctx.jobs.forceStart(job.id, { by: admin.name || admin.email });
+    } catch (err) {
+      throw queueError(err);
+    }
+    ctx.activity(admin, "job.force", { type: "job", id: job.id, name: job.title, projectId: job.projectId });
+    return started;
+  });
 
   router.get("/api/jobs/:id", (req, res, { params }) => getJob(params.id));
 

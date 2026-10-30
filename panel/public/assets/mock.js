@@ -100,6 +100,15 @@ mkSite({ id: "site_blog", projectId: "prj_mkt", name: "blog", type: "php", domai
   ssl: { enabled: true, status: "active", issuedAt: ago(70 * DAY), expiresAt: iso(NOW + 20 * DAY) } });
 mkSite({ id: "site_status", projectId: "prj_int", name: "status-page", type: "static", domains: ["status.forthway.dev"], port: 3008, serverIds: ["srv_nyc1"], healthPath: "/",
   github: { repo: "forthway/status", branch: "main" }, ssl: { enabled: false, status: "failed", error: "DNS for status.forthway.dev does not point at this server." } });
+// More load-balanced sites, so the collapsible lists (fold.js) have something to fold in ?mock=1.
+for (const [id, projectId, name, domain, port, serverIds] of [
+  ["site_acmecheckout", "prj_acme", "acme-checkout", "checkout.acme.com", 3009, ["main", "srv_fra1", "srv_fra2"]],
+  ["site_acmesearch", "prj_acme", "acme-search", "search.acme.com", 3010, ["srv_fra1", "srv_fra2"]],
+  ["site_acmeimg", "prj_acme", "acme-images", "img.acme.com", 3011, ["main", "srv_fra2"]],
+  ["site_nwdocs", "prj_north", "northwind-docs", "docs.northwind.io", 3012, ["main", "srv_fra1"]],
+  ["site_nwgql", "prj_north", "northwind-graphql", "graphql.northwind.io", 3013, ["main", "srv_fra1", "srv_fra2"]],
+]) mkSite({ id, projectId, name, domains: [domain], port, loadBalanced: true, serverIds, lbMethod: "least_conn", github: { repo: `${name.split("-")[0]}/${name}`, branch: "main" },
+  env: { NODE_ENV: "production" }, ssl: { enabled: true, status: "active", issuedAt: ago(20 * DAY), expiresAt: iso(NOW + 70 * DAY) } });
 
 // Docker runtime (docs/DOCKER-AND-TESTS.md §1): two sites already in containers, the rest still legacy pm2.
 const CONTAINERS = { site_acmeweb: { uid: 20001, gid: 20001, image: "node:20-bookworm-slim", memoryMb: 1024, cpus: 1.5 }, site_nwapi: { uid: 20002, gid: 20002, image: "node:20-bookworm-slim", memoryMb: 768, cpus: 1 } };
@@ -112,7 +121,7 @@ const COMMIT_MSGS = ["Checkout: show the order summary on mobile", "Fix cart tot
 const AUTHORS = ["Jordan Reyes", "Sam Patel", "Alex Kim"];
 
 // Releases
-const SRC_VERS = { site_acmeweb: ["2.14.0", "2.13.2", "2.13.1", "2.13.0", "2.12.4"], site_acmeadmin: ["1.6.3", "1.6.2", "1.6.0"], site_acmestg: ["2.15.0-rc.2", "2.15.0-rc.1"], site_nwapi: ["4.2.1", "4.2.0", "4.1.9", "4.1.8"],
+const SRC_VERS = { site_acmeweb: ["2.14.0", "2.13.2", "2.13.1", "2.13.0", "2.12.4", "2.12.3", "2.12.2", "2.12.0", "2.11.5", "2.11.4", "2.11.0", "2.10.2"], site_acmeadmin: ["1.6.3", "1.6.2", "1.6.0"], site_acmestg: ["2.15.0-rc.2", "2.15.0-rc.1"], site_nwapi: ["4.2.1", "4.2.0", "4.1.9", "4.1.8"],
   site_nwhooks: ["1.3.0", "1.2.7"], site_landing: ["2026.10.02", "2026.09.27", "2026.09.14"], site_blog: ["6.6.2"], site_status: ["1.0.4", "1.0.3"] };
 for (const s of db.sites) {
   const vers = SRC_VERS[s.id] || ["1.0.0"];
@@ -171,6 +180,18 @@ for (const [type, title, siteId, projectId, status, at, dur, extra] of jobSeed) 
     startedAt: ago(at), finishedAt: ago(at - dur), error: extra?.error || null, result: null });
   db.logs[id] = linesFor(type, title, status === "failed" ? extra?.error : null);
 }
+// A longer history for acme-web, so its Deploy history has several pages (5 per page) in ?mock=1.
+for (let i = 0; i < 21; i++) {
+  const ver = SRC_VERS.site_acmeweb[1 + (i % (SRC_VERS.site_acmeweb.length - 1))];
+  const [type, title, status, error] = [
+    ["site.deploy", `Deploy acme-web ${ver}`, "succeeded"], ["site.restart", "Restart acme-web", "succeeded"], ["site.deploy", `Deploy acme-web ${ver}`, "succeeded"],
+    ["site.env", "Apply environment to acme-web", "succeeded"], ["site.deploy", `Deploy acme-web ${ver}`, i === 4 ? "failed" : "succeeded", i === 4 ? "Health check failed: GET /api/health returned 500 after 180s — rolled back" : null],
+    ["site.ssl", "Renew certificate for acme.com", "succeeded"], ["site.deploy", `Pull & deploy acme-web ${ver}`, "succeeded"],
+  ][i % 7];
+  const at = DAY * (1.2 + i * 2.7), id = nid("job");
+  db.jobs.push({ id, type, title, status, siteId: "site_acmeweb", projectId: "prj_acme", serverId: null, databaseId: null, adminId: "adm_1", startedAt: ago(at), finishedAt: ago(at - 40e3 - i * 3e3), error: error || null, result: null });
+  db.logs[id] = linesFor(type, title, error || null);
+}
 const actSeed = [
   [12 * MIN, "adm_1", "site.deploy", "site", "site_acmeweb", "acme-web", "Release 2.14.0 to 3 servers"],
   [40 * MIN, "adm_1", "site.update", "site", "site_acmeweb", "acme-web", "Load balancing method → least_conn"],
@@ -226,7 +247,7 @@ const ha = { enabled: true, armed: true, leaderId: "main", term: 7, switchingUnt
 /* ───────── event bus ───────── */
 const listeners = new Set();
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
-function emit(type, data) { setTimeout(() => listeners.forEach((f) => f(type, clone(data))), 0); }
+function emit(type, data) { setTimeout(() => listeners.forEach((f) => f(type, clone(data))), 0); if (type === "site" && data?.stagingOf && !data.deleted) { const par = db.sites.find((x) => x.id === data.stagingOf); if (par) setTimeout(() => listeners.forEach((f) => f("site", clone(siteView(par)))), 0); } } // STAGING: the parent shows its copy
 
 // metrics heartbeat
 setInterval(() => {
@@ -244,14 +265,14 @@ setInterval(() => {
 
 /* ───────── jobs ───────── */
 function runJob(meta, { lines, fail, onDone, speed = 260 } = {}) {
-  const job = { id: nid("job"), status: "queued", siteId: null, projectId: null, serverId: null, databaseId: null, adminId: me.id, startedAt: iso(Date.now()), finishedAt: null, error: null, result: null, ...meta };
+  const job = { id: nid("job"), status: "queued", siteId: null, projectId: null, serverId: null, databaseId: null, adminId: me.id, createdAt: iso(Date.now()), startedAt: iso(Date.now()), finishedAt: null, error: null, result: null, ...meta };
   db.jobs.unshift(job);
   db.logs[job.id] = [];
   emit("job", job);
   const L = lines || linesFor(job.type, job.title, fail);
   let i = 0;
-  setTimeout(() => {
-    job.status = "running"; emit("job", job);
+  const begin = () => {
+    job.status = "running"; job.startedAt = iso(Date.now()); emit("job", job);
     const tick = setInterval(() => {
       if (job.status === "cancelled") { clearInterval(tick); return; }
       const batch = L.slice(i, i + 1 + Math.floor(Math.random() * 2)).map((l) => l.startsWith("[") ? l : `[${new Date().toISOString().slice(11, 19)}] ${l}`);
@@ -265,10 +286,59 @@ function runJob(meta, { lines, fail, onDone, speed = 260 } = {}) {
         job.finishedAt = iso(Date.now());
         if (!fail) { try { job.result = onDone?.(job) ?? null; } catch (e) { console.error(e); } }
         emit("job", job);
+        if (job.heavy) mqPump();
       }
     }, speed);
-  }, 500);
+  };
+  if (job.heavy) mqAdd(job, begin); else setTimeout(begin, 500);
   return job;
+}
+
+/* ───────── job queue (panel/lib/jobs.mjs): heavy jobs wait for a free slot per server ───────── */
+const mq = { perServer: 1, waiting: [], begin: new Map(), slots: new Map() }; // slots: jobId -> { servers, forced }
+function mqAdd(job, begin) {
+  job.servers = job.servers?.length ? job.servers : [job.serverId || "main"];
+  job.position = null; job.forced = false;
+  mq.begin.set(job.id, begin);
+  mq.waiting.push(job);
+  mqPump();
+}
+function mqUsed(sid) { let n = 0; for (const s of mq.slots.values()) if (s.servers.includes(sid)) n++; return n; }
+function mqPump() {
+  for (const [id] of mq.slots) { const j = db.jobs.find((x) => x.id === id); if (!j || !["queued", "running"].includes(j.status)) mq.slots.delete(id); }
+  mq.waiting = mq.waiting.filter((j) => j.status === "queued");
+  const blocked = new Set();
+  for (const j of [...mq.waiting]) {
+    if (j.servers.every((sid) => !blocked.has(sid) && mqUsed(sid) < mq.perServer)) mqBegin(j, false);
+    else j.servers.forEach((sid) => blocked.add(sid));
+  }
+  mq.waiting.forEach((j, i) => (j.position = i + 1));
+  emit("queue", mqView());
+}
+function mqBegin(j, forced) {
+  mq.waiting = mq.waiting.filter((x) => x !== j);
+  mq.slots.set(j.id, { servers: j.servers, forced });
+  j.position = null; j.forced = forced;
+  const begin = mq.begin.get(j.id); mq.begin.delete(j.id);
+  begin?.();
+}
+function mqView() {
+  const named = (j) => ({ id: j.id, type: j.type, title: j.title, status: j.status, siteId: j.siteId, projectId: j.projectId, adminId: j.adminId, servers: j.servers, forced: !!j.forced, position: j.position ?? null,
+    createdAt: j.createdAt, startedAt: j.status === "running" ? j.startedAt : null, lastLine: j.status === "running" ? (db.logs[j.id] || []).at(-1)?.replace(/^\[[^\]]+\] /, "") || "" : "",
+    adminName: db.admins.find((a) => a.id === j.adminId)?.name || null, siteName: db.sites.find((x) => x.id === j.siteId)?.name || null,
+    serverNames: j.servers.map((sid) => db.servers.find((x) => x.id === sid)?.name || sid),
+    waitingFor: j.status === "queued" ? [...mq.slots.keys()].map((id) => db.jobs.find((x) => x.id === id)).filter((r) => r && r.servers.some((sid) => j.servers.includes(sid))).map((r) => r.title) : [] });
+  const running = [...mq.slots.keys()].map((id) => db.jobs.find((x) => x.id === id)).filter((j) => j?.status === "running");
+  return { perServer: mq.perServer, maxPerServer: 8, running: running.map(named), waiting: mq.waiting.map(named) };
+}
+// A busy moment to look at: two heavy jobs running (main, fra-agent-1) and three waiting behind them.
+{
+  const slow = (type, n) => Array.from({ length: n }, (_, k) => linesFor(type, "")[k % 15]).map((l) => l.replace(/^\[[^\]]+\] /, ""));
+  runJob({ type: "site.deploy", title: "Deploy acme-web 2.15.0", siteId: "site_acmeweb", projectId: "prj_acme", heavy: true, servers: ["main"] }, { lines: slow("site.deploy", 60), speed: 2500 });
+  runJob({ type: "backup.server", title: "Back up server fra-agent-1", serverId: "srv_fra1", heavy: true, servers: ["srv_fra1"], adminId: "adm_2" }, { lines: slow("backup.server", 7).concat(Array(40).fill("  …compressing")), speed: 3000 });
+  runJob({ type: "site.deploy", title: "Deploy northwind-api 4.3.0", siteId: "site_nwapi", projectId: "prj_north", heavy: true, servers: ["srv_fra1"], adminId: "adm_2" }, { lines: slow("site.deploy", 30), speed: 900 });
+  runJob({ type: "site.test", title: "Test landing 2026.10.30", siteId: "site_landing", projectId: "prj_mkt", heavy: true, servers: ["main"] }, { lines: slow("site.deploy", 30), speed: 900 });
+  runJob({ type: "release.github", title: "Deploy acme-staging 2.15.0-rc.3", siteId: "site_acmestg", projectId: "prj_acme", heavy: true, servers: ["srv_fra1"] }, { lines: slow("site.deploy", 30), speed: 900 });
 }
 
 function activity(action, type, target, details) {
@@ -289,7 +359,7 @@ function upstreams(s) {
     return { serverId: sid, name: srv?.name || sid, address: sid === "main" ? "127.0.0.1" : srv?.privateHost || srv?.host, port: s.port, weight: srv?.weight || 1, online: !!srv?.online, healthy: !!s.state?.[sid]?.healthy };
   });
 }
-function siteView(s) { const bj = db.jobs.find((x) => x.siteId === s.id && (x.status === "running" || x.status === "queued")); return { ...clone(s), canMigrate: s.runtime === "legacy" && s.type !== "static", busyJobId: bj?.id || null, envCount: Object.keys(s.env || {}).length, currentVersion: db.releases.find((r) => r.id === s.currentReleaseId)?.version || null, lb: lbSummary(s), currentRelease: clone(db.releases.find((r) => r.id === s.currentReleaseId) || null) }; }
+function siteView(s) { const bj = db.jobs.find((x) => x.siteId === s.id && (x.status === "running" || x.status === "queued")); return { ...clone(s), canMigrate: s.runtime === "legacy" && s.type !== "static", busyJobId: bj?.id || null, envCount: Object.keys(s.env || {}).length, currentVersion: db.releases.find((r) => r.id === s.currentReleaseId)?.version || null, lb: lbSummary(s), currentRelease: clone(db.releases.find((r) => r.id === s.currentReleaseId) || null), stagingOf: s.stagingOf || null, stagingSiteId: s.stagingSiteId || null, staging: stagingSummary(s) }; }
 function projectCounts(p) {
   const sites = db.sites.filter((s) => s.projectId === p.id);
   return { sites: sites.length, sitesLoadBalanced: sites.filter((s) => s.loadBalanced).length, databases: db.databases.filter((d) => d.projectId === p.id).length,
@@ -406,10 +476,36 @@ R("PATCH", "/api/settings", (p, b) => {
 R("GET", "/api/jobs", (p, b, q) => {
   let items = db.jobs;
   for (const k of ["siteId", "projectId", "serverId", "databaseId"]) if (q[k]) items = items.filter((j) => j[k] === q[k]);
-  return { items: clone(items.slice(0, Number(q.limit) || 50)) };
+  if (q.offset == null && q.page == null) return { items: clone(items.slice(0, Number(q.limit) || 50)) };
+  // paged (Deploy history): { items, total, offset, limit }, like panel/lib/core-routes.mjs
+  const limit = Math.max(1, Math.min(100, Number(q.limit) || 10)), offset = q.page != null ? (Math.max(1, Number(q.page) || 1) - 1) * limit : Math.max(0, Number(q.offset) || 0);
+  return { items: clone(items.slice(offset, offset + limit)), total: items.length, offset, limit };
 });
+R("GET", "/api/jobs/queue", () => mqView()); // job queue (before /api/jobs/:id)
 R("GET", "/api/jobs/:id", (p) => clone(find("jobs", p.id)));
-R("POST", "/api/jobs/:id/cancel", (p) => { const j = find("jobs", p.id); if (j.status === "running" || j.status === "queued") { j.status = "cancelled"; j.finishedAt = iso(Date.now()); emit("job", j); } return clone(j); });
+R("POST", "/api/jobs/:id/cancel", (p) => { const j = find("jobs", p.id); if (j.status === "running" || j.status === "queued") { j.status = "cancelled"; j.finishedAt = iso(Date.now()); emit("job", j); if (j.heavy) mqPump(); } return clone(j); });
+// job queue
+R("PATCH", "/api/jobs/queue", (p, b) => {
+  const n = Number(b.perServer);
+  if (!Number.isInteger(n) || n < 1 || n > 8) err(400, "Heavy jobs per server must be a whole number from 1 to 8.");
+  mq.perServer = n; mqPump(); return mqView();
+});
+R("POST", "/api/jobs/:id/move", (p, b) => {
+  const j = find("jobs", p.id);
+  const from = mq.waiting.indexOf(j);
+  if (from === -1) err(409, "That job isn't waiting in the queue any more.");
+  const last = mq.waiting.length - 1;
+  const to = b.to === "top" ? 0 : b.to === "bottom" ? last : b.to === "up" ? from - 1 : b.to === "down" ? from + 1 : Number(b.index);
+  if (!Number.isFinite(to)) err(400, 'Say where to move it: to "top", "bottom", "up", "down" or an index.');
+  mq.waiting.splice(from, 1); mq.waiting.splice(Math.max(0, Math.min(last, to)), 0, j);
+  mqPump(); return mqView();
+});
+R("POST", "/api/jobs/:id/force", (p) => {
+  const j = find("jobs", p.id);
+  if (!mq.waiting.includes(j)) err(409, "That job isn't waiting in the queue any more.");
+  activity("job.force", "job", { id: j.id, name: j.title, projectId: j.projectId });
+  mqBegin(j, true); mqPump(); return clone(j);
+});
 R("GET", "/api/activity", (p, b, q) => {
   let items = db.activity;
   if (q.projectId) items = items.filter((a) => a.projectId === q.projectId);
@@ -417,7 +513,7 @@ R("GET", "/api/activity", (p, b, q) => {
 });
 
 // sites
-R("GET", "/api/sites", (p, b, q) => ({ items: db.sites.filter((s) => !q.projectId || s.projectId === q.projectId).map(siteView) }));
+R("GET", "/api/sites", (p, b, q) => ({ items: db.sites.filter((s) => (!q.projectId || s.projectId === q.projectId) && !s.stagingOf).map(siteView) })); // STAGING: copies show inside their parent
 R("POST", "/api/projects/:projectId/sites", (p, b) => {
   find("projects", p.projectId);
   if (!b.name) err(400, "Name is required.");
@@ -460,7 +556,7 @@ R("GET", "/api/sites/:id/usage", (p, b, q) => { // USAGE (panel/lib/usage.mjs)
 });
 R("GET", "/api/sites/:id", (p) => {
   const s = find("sites", p.id);
-  return { ...siteView(s), upstreams: upstreams(s), releases: clone(db.releases.filter((r) => r.siteId === s.id).slice(0, 20)) };
+  return { ...siteView(s), upstreams: upstreams(s), releases: clone(db.releases.filter((r) => r.siteId === (s.stagingOf || s.id)).slice(0, 20)) }; // STAGING: a copy deploys its parent's releases
 });
 R("PATCH", "/api/sites/:id", (p, b) => {
   const s = find("sites", p.id);
@@ -474,7 +570,7 @@ R("PATCH", "/api/sites/:id", (p, b) => {
   activity("site.update", "site", s); emit("site", siteView(s));
   return { ...siteView(s), upstreams: upstreams(s) };
 });
-R("DELETE", "/api/sites/:id", (p) => { const s = find("sites", p.id); db.sites = db.sites.filter((x) => x.id !== p.id); activity("site.delete", "site", s); emit("site", { id: s.id, deleted: true }); return { ok: true }; });
+R("DELETE", "/api/sites/:id", (p) => { const s = find("sites", p.id); if (s.stagingSiteId) err(409, `${s.name} has a staging copy. Remove staging first (Environment → Staging → Remove staging), then delete the website.`); db.sites = db.sites.filter((x) => x.id !== p.id); activity("site.delete", "site", s); emit("site", { id: s.id, deleted: true }); return { ok: true }; });
 R("POST", "/api/sites/:id/deploy", (p, b) => {
   const s = find("sites", p.id);
   busy(s);
@@ -483,7 +579,7 @@ R("POST", "/api/sites/:id/deploy", (p, b) => {
   const tg = targets(s);
   const lines = tg.flatMap((sid, i) => [`━━ ${db.servers.find((x) => x.id === sid)?.name || sid} (${i + 1}/${tg.length}) ━━`, ...linesFor("site.deploy", "").map((l) => l.replace(/^\[[^\]]+\] /, ""))]);
   activity("site.deploy", "site", s, `Release ${rel.version} to ${tg.length} server${tg.length > 1 ? "s" : ""}`);
-  return runJob({ type: "site.deploy", title: `Deploy ${s.name} ${rel.version}`, siteId: s.id, projectId: s.projectId }, { lines, speed: 160, onDone() {
+  return runJob({ type: "site.deploy", title: `Deploy ${s.name} ${rel.version}`, siteId: s.id, projectId: s.projectId, heavy: true, servers: [tg[0]] }, { lines, speed: 160, onDone() {
     if (s.currentReleaseId !== rel.id) { s.previousReleaseId = s.currentReleaseId; s.currentReleaseId = rel.id; }
     for (const sid of tg) s.state[sid] = { running: true, healthy: db.servers.find((x) => x.id === sid)?.online, version: rel.version, checkedAt: iso(Date.now()) };
     emit("site", siteView(s));
@@ -562,7 +658,7 @@ R("POST", "/api/sites/:id/releases/github", (p, b) => {
   const ref = b.ref || s.github.branch || "main";
   const sha = /^[0-9a-f]{40}$/.test(ref) ? ref : hex(40), message = COMMIT_MSGS[Math.floor(Math.random() * COMMIT_MSGS.length)];
   if (b.deploy) busy(s);
-  return runJob({ type: "release.github", title: `Pull ${s.github.repo}@${ref.slice(0, 12)}${b.deploy ? " and deploy" : ""}`, siteId: s.id, projectId: s.projectId }, {
+  return runJob({ type: "release.github", title: `Pull ${s.github.repo}@${ref.slice(0, 12)}${b.deploy ? " and deploy" : ""}`, siteId: s.id, projectId: s.projectId, ...(b.deploy ? { heavy: true, servers: [targets(s)[0]] } : {}) }, {
     lines: [`▸ Resolving ${ref}`, `  ${ref.slice(0, 12)} → ${sha.slice(0, 7)}: ${message}`, "▸ Downloading archive from GitHub", "  14.8 MB", "▸ Verifying archive", "✓ Release created", ...(b.deploy ? linesFor("site.deploy", "").map((l) => l.replace(/^\[[^\]]+\] /, "")) : [])],
     onDone() { const r = { id: nid("rel"), siteId: s.id, filename: `${s.name}-${sha.slice(0, 7)}.zip`, size: 14.8 * MB, sha256: hex(64), version: /^v\d/.test(ref) ? ref.slice(1) : `${(db.releases.find((x) => x.siteId === s.id)?.version || "1.0.0").replace(/-.*$/, "")}-${sha.slice(0, 7)}`, commit: sha.slice(0, 7), source: "github", pinned: false, createdAt: iso(Date.now()),
         github: { repo: s.github.repo, ref, sha, message, author: me.name } };
@@ -618,20 +714,116 @@ function cfConnectorView(c) {
     const e = (s.edgeStatus?.connectors || []).find((x) => x.id === c.id);
     if (e) replicas.push({ serverId: s.id, serverName: s.name, running: !!(s.online && e.active), connections: s.online ? e.readyConnections : 0 });
   }
-  return { id: c.id, name: c.name, cfId: c.cfId, accountId: "", autoStart: c.autoStart, hasToken: true, tokenHint: "eyJh••••" + c.id.slice(-3), running: c.running, connections: c.running ? c.connections : 0,
+  return { id: c.id, name: c.name, cfId: c.cfId, accountId: cf.account.connected ? cf.account.id : "", autoStart: c.autoStart, hasToken: true, tokenHint: "eyJh••••" + c.id.slice(-3), running: c.running, connections: c.running ? c.connections : 0,
     connected: c.running && c.connections > 0, startedAt: c.running ? c.startedAt : null, lastError: null, lastExit: null, fatal: false, simulated: false, replicas };
+}
+// The Cloudflare account (Settings → Cloudflare) and the Cloudflare page (#/cloudflare): connectors, tunnels, domains.
+cf.account = { connected: true, viaLogin: true, id: "acc_fw", name: "Forthway" };
+cf.zones = [
+  { id: "zone_acme", name: "acme.com", status: "active", source: "main" },
+  { id: "zone_nw", name: "northwind.io", status: "active", source: "main" },
+  { id: "zone_fw", name: "forthway.dev", status: "active", source: "dc_fw" },
+];
+cf.sources = [{ id: "dc_fw", viaLogin: true, addedAt: ago(20 * DAY) }];
+cf.spare = [{ id: "7c3f8a21-5d4e-4b9a-8f60-1e2d3c4b5a69", name: "staging-tunnel", status: "inactive" }]; // in the account, no connector here
+cf.toAdd = ["shop-demo.net", "example.org"]; // what "Add domain" adds next (the first one waits for its nameservers)
+cf.login = { until: 0 };
+cf.panel = { hostname: "panel.forthway.dev", tunnelId: "6f1c2b9e-7a1d-4c3e-9b55-2d8e0f3a4c11", route: { hostname: "panel.forthway.dev", status: "active", error: null } };
+const cfSourceLabel = (src) => (src === "main" ? "Account login" : cf.sources.find((x) => x.id === src)?.viaLogin === false ? "API token ••••" + src.slice(-3) : "Domain login");
+const cfTunnels = () => !cf.account.connected ? [] : [
+  ...cf.connectors.filter((c) => c.cfId).map((c) => ({ id: c.cfId, name: c.name, status: c.running ? "healthy" : "down", createdAt: c.startedAt, connections: c.running ? c.connections : 0, remotelyManaged: true, accountId: cf.account.id, accountName: cf.account.name, connectorId: c.id })),
+  ...cf.spare.map((t) => ({ ...t, createdAt: ago(60 * DAY), connections: 0, remotelyManaged: true, accountId: cf.account.id, accountName: cf.account.name, connectorId: null })),
+];
+function cfAddDomain(viaLogin) {
+  const name = cf.toAdd.shift() || `site-${hex(3)}.com`;
+  const src = { id: `dc_${hex(4)}`, viaLogin, addedAt: iso(Date.now()) };
+  cf.sources.push(src);
+  cf.zones.push({ id: `zone_${hex(4)}`, name, status: name === "shop-demo.net" ? "pending" : "active", source: src.id });
+  emit("cloudflare", { kind: "status" });
+  return { ok: true, done: true, added: [name], accounts: [], refused: [] };
 }
 function cfStatus() {
   const connectors = cf.connectors.map(cfConnectorView);
-  return { connected: false, mode: "connector", configured: true, hasToken: false, tokenHint: "", viaLogin: false, accountId: "", accountName: "", managedAccounts: [], connectors,
-    running: connectors.filter((x) => x.running).length, connectedConnectors: connectors.filter((x) => x.connected).length, panel: null, panelService: "http://127.0.0.1:4000",
-    phpmyadmin: null, phpmyadminService: "http://127.0.0.1:8081", routes: 0, routeErrors: 0,
-    binary: { installed: true, simulated: false, supported: true, version: "2026.9.1", path: "/var/lib/fcc/bin/cloudflared" }, login: { running: false, url: "" }, dryRun: false, simulatedApi: false };
+  const a = cf.account;
+  return { connected: a.connected, mode: a.connected ? (a.viaLogin ? "login" : "token") : "connector", configured: true, hasToken: a.connected, tokenHint: a.connected ? "••••7f3a" : "", viaLogin: a.connected && a.viaLogin,
+    accountId: a.connected ? a.id : "", accountName: a.connected ? a.name : "", managedAccounts: a.connected ? [{ id: a.id, name: a.name, main: true }] : [], connectors,
+    running: connectors.filter((x) => x.running).length, connectedConnectors: connectors.filter((x) => x.connected).length, panel: cf.panel ? clone(cf.panel) : null, panelService: "http://127.0.0.1:4000",
+    phpmyadmin: null, phpmyadminService: "http://127.0.0.1:8081", routes: 4, routeErrors: 0,
+    binary: { installed: true, simulated: false, supported: true, version: "2026.9.1", path: "/var/lib/fcc/bin/cloudflared" }, login: { running: cf.login.until > 0, url: "" }, dryRun: false, simulatedApi: false };
 }
-R("GET", "/api/cloudflare", () => ({ ...cfStatus(), accounts: [], zones: [], tunnels: [], error: null }));
+R("GET", "/api/cloudflare", () => ({ ...cfStatus(), accounts: cf.account.connected ? [{ id: cf.account.id, name: cf.account.name }] : [], zones: cf.account.connected ? cf.zones.map((z) => ({ ...z, accountId: cf.account.id })) : [], tunnels: cfTunnels(), error: null }));
 R("GET", "/api/cloudflare/status", () => cfStatus());
+R("GET", "/api/cloudflare/options", () => {
+  const s = cfStatus();
+  const local = new Map(s.connectors.map((c) => [c.cfId, c]));
+  return { connected: s.connected, mode: s.mode, accountName: s.accountName, accounts: s.managedAccounts, simulatedApi: false, error: null, panelHostname: cf.panel?.hostname || null,
+    tunnels: cfTunnels().map((t) => ({ id: t.id, name: t.name, status: t.status, accountId: t.accountId, accountName: t.accountName, local: local.has(t.id), running: !!local.get(t.id)?.running, connectedHere: !!local.get(t.id)?.connected })),
+    zones: s.connected ? cf.zones.map((z) => z.name) : [], zoneAccounts: s.connected ? Object.fromEntries(cf.zones.map((z) => [z.name, cf.account.id])) : {} };
+});
 R("GET", "/api/cloudflare/routes", () => ({ items: [], tunnels: [] }));
-R("GET", "/api/cloudflare/domains", () => ({ items: [], sources: [] }));
+R("GET", "/api/cloudflare/domains", () => {
+  if (!cf.account.connected) return { connected: false, items: [], sources: [] };
+  return { connected: true, error: null, accounts: cfStatus().managedAccounts, addSiteUrl: `https://dash.cloudflare.com/${cf.account.id}/add-site`,
+    items: cf.zones.map((z) => ({ id: z.id, name: z.name, status: z.status, accountId: cf.account.id, accountName: cf.account.name, source: z.source, sourceLabel: cfSourceLabel(z.source), removable: z.source !== "main", error: null,
+      routes: db.sites.filter((s) => s.domains.some((d) => d === z.name || d.endsWith("." + z.name))).length })),
+    sources: cf.sources.map((x) => ({ id: x.id, label: cfSourceLabel(x.id), viaLogin: x.viaLogin, accountId: cf.account.id, accountName: cf.account.name, zones: cf.zones.filter((z) => z.source === x.id).map((z) => z.name), addedAt: x.addedAt, error: null })) };
+});
+R("POST", "/api/cloudflare/domains", (p, b) => { if (!String(b.token || "").trim()) err(400, "Paste an API token first."); return cfAddDomain(false); });
+R("POST", "/api/cloudflare/domains/login", () => { if (!cf.account.connected) err(400, "Connect Cloudflare first."); cf.login = { until: Date.now() + 4000, purpose: "domain" }; return { ok: true, url: "https://dash.cloudflare.com/argotunnel?mock=1" }; });
+R("POST", "/api/cloudflare/login", () => { cf.login = { until: Date.now() + 3000, purpose: "connect" }; return { ok: true, url: "https://dash.cloudflare.com/argotunnel?mock=1" }; });
+R("GET", "/api/cloudflare/login", () => {
+  if (!cf.login.until) return { running: false, done: false, error: "" };
+  if (Date.now() < cf.login.until) return { running: true, done: false, error: "", url: "https://dash.cloudflare.com/argotunnel?mock=1" };
+  const purpose = cf.login.purpose; cf.login = { until: 0 };
+  if (purpose === "domain") return cfAddDomain(true);
+  cf.account.connected = true; cf.account.viaLogin = true; emit("cloudflare", { kind: "status" });
+  return { running: false, done: true, error: "", accountName: cf.account.name };
+});
+R("POST", "/api/cloudflare/login/cancel", () => { cf.login = { until: 0 }; return { ok: true }; });
+R("DELETE", "/api/cloudflare/domains/:id", (p) => {
+  const src = cf.sources.find((x) => x.id === p.id) || err(404, "Not found.");
+  const removed = cf.zones.filter((z) => z.source === src.id).map((z) => z.name);
+  cf.sources = cf.sources.filter((x) => x !== src); cf.zones = cf.zones.filter((z) => z.source !== src.id);
+  emit("cloudflare", { kind: "status" }); return { ok: true, removed };
+});
+R("POST", "/api/cloudflare/token", (p, b) => {
+  if (!String(b.token || "").trim()) { cf.account.connected = false; cf.sources = []; cf.zones = cf.zones.filter((z) => z.source === "main"); emit("cloudflare", { kind: "status" }); return { ok: true, cleared: true, status: cfStatus() }; }
+  cf.account.connected = true; cf.account.viaLogin = false; emit("cloudflare", { kind: "status" });
+  return { ok: true, accounts: [{ id: cf.account.id, name: cf.account.name }], status: cfStatus() };
+});
+R("POST", "/api/cloudflare/tunnels", (p, b) => {
+  if (!cf.account.connected) err(400, "Connect Cloudflare first.");
+  let tun;
+  if (b.tunnelId) { tun = cf.spare.find((t) => t.id === b.tunnelId) || err(400, "That tunnel isn't in your Cloudflare account."); cf.spare = cf.spare.filter((t) => t !== tun); }
+  else {
+    const name = String(b.name || "").trim().slice(0, 60) || "fcc-main";
+    if (cf.connectors.some((c) => c.name === name)) err(400, `A tunnel named “${name}” already exists. Pick another name.`);
+    tun = { id: [hex(4), hex(2), hex(2), hex(2), hex(6)].join("-"), name };
+  }
+  const c = { id: `cfc_${hex(3)}`, name: tun.name, cfId: tun.id, autoStart: b.autoStart !== false, running: b.autoStart !== false, connections: 4, startedAt: iso(Date.now()) };
+  cf.connectors.push(c); emit("cloudflare", { kind: "status" });
+  if (c.autoStart) for (const s of edgeServers()) if (s.online) setTimeout(() => edgeSync(s), 300); // edge nodes run a copy
+  return { ok: true, tunnel: { id: tun.id, name: tun.name }, connector: cfConnectorView(c), started: c.running, startError: null };
+});
+R("POST", "/api/cloudflare/connectors", (p, b) => {
+  const token = String(b.token || "").trim().replace(/^.*\s/, "");
+  if (token.length < 40) err(400, "Paste the connector token from the Cloudflare dashboard (Zero Trust → Networks → Tunnels → Configure).");
+  const c = { id: `cfc_${hex(3)}`, name: String(b.name || "").trim().slice(0, 60) || "Cloudflare Tunnel", cfId: [hex(4), hex(2), hex(2), hex(2), hex(6)].join("-"), autoStart: b.autoStart !== false, running: b.autoStart !== false, connections: 4, startedAt: iso(Date.now()) };
+  cf.connectors.push(c); emit("cloudflare", { kind: "status" });
+  if (c.autoStart) for (const s of edgeServers()) if (s.online) setTimeout(() => edgeSync(s), 300); // edge nodes run a copy
+  return { ok: true, connector: cfConnectorView(c), startError: null };
+});
+R("DELETE", "/api/cloudflare/connectors/:id", (p) => {
+  const c = cf.connectors.find((x) => x.id === p.id) || err(404, "No such connector.");
+  cf.connectors = cf.connectors.filter((x) => x !== c);
+  if (c.cfId && cf.account.connected) cf.spare.push({ id: c.cfId, name: c.name, status: "inactive" }); // the tunnel stays in the account
+  emit("cloudflare", { kind: "status" }); return { ok: true, note: "The tunnel itself stays in your Cloudflare account." };
+});
+R("POST", "/api/cloudflare/reset", () => {
+  const removed = ["Cloudflare login", ...cf.connectors.map((c) => `Connector token: ${c.name}`)];
+  cf.connectors.length = 0; cf.account.connected = false; cf.sources = []; cf.panel = null; emit("cloudflare", { kind: "status" });
+  return { ok: true, removed, remaining: [] };
+});
 R("GET", "/api/cloudflare/connectors/:id/logs", (p) => { const c = cf.connectors.find((x) => x.id === p.id) || err(404, "No such connector.");
   return { lines: c.running ? [`${iso(Date.now() - 60e3)} INF Starting tunnel tunnelID=${c.cfId}`, ...[0, 1, 2, 3].slice(0, c.connections).map((i) => `${iso(Date.now() - 50e3 + i * 1e3)} INF Registered tunnel connection connIndex=${i} location=fra0${i + 1} protocol=quic`)] : [] }; });
 R("POST", "/api/cloudflare/connectors/:id/:act", (p) => {
@@ -1399,7 +1591,7 @@ R("DELETE", "/api/tests/:id", (p) => {
   emit("testrun", { id: r.id, siteId: r.siteId, deleted: true });
   return { ok: true };
 });
-R("GET", "/api/sites/:id/test-env", (p) => { find("sites", p.id); return { items: Object.keys(testEnv[p.id] || {}).sort().map((key) => ({ key, set: true })) }; });
+R("GET", "/api/sites/:id/test-env", (p) => { const s = find("sites", p.id); return { items: Object.keys(testEnv[p.id] || {}).sort().map((key) => ({ key, set: true })), database: testDbPreview(s) }; });
 R("PUT", "/api/sites/:id/test-env", (p, b) => {
   const s = find("sites", p.id);
   const env = (testEnv[s.id] ||= {});
@@ -1450,6 +1642,282 @@ R("DELETE", "/api/admins/:id/passkeys", (p) => {
   const removed = passkeyCounts[a.id] || 0;
   passkeyCounts[a.id] = 0;
   return { ok: true, removed };
+});
+
+/* ───────── Uptime monitoring (panel/lib/monitor.mjs) — website Statistics tab, website rows, dashboard ─────────
+   Deterministic per site: acme-web has a history of short outages (with text + Discord alerts),
+   status-page is down right now, everything else is up. Checks / pause / resume / settings work. */
+const MON_DEFAULTS = { intervalSec: 60, timeoutSec: 10, failThreshold: 3, recoverThreshold: 2, expectMin: 200, expectMax: 399, path: "", url: "", smsEnabled: false, recipients: [], includeDefaults: true, repeatMinutes: null, discordEnabled: true, discordSkip: [], paused: false };
+const monCfg = {}, monRt = {}, monInc = {};
+const monHash = (id) => [...id].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+const monRand = (seed) => () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+function monSettings(id) {
+  return (monCfg[id] ||= { ...clone(MON_DEFAULTS), pausedAt: null, pausedBy: null, pauseUntil: null, pauseReason: null,
+    ...(id === "site_acmeweb" ? { smsEnabled: true, recipients: [{ name: "On-call phone", phone: "+15550104477" }], path: "/api/health" } : {}),
+    ...(id === "site_status" ? { smsEnabled: true, discordSkip: [] } : {}) });
+}
+const monDeployed = (s) => !!s.currentReleaseId || Object.values(s.state || {}).some((x) => x?.releaseId || x?.version);
+const monBase = (s) => 38 + (monHash(s.id) % 140);
+function monTarget(s) {
+  const c = monSettings(s.id);
+  if (c.url) return { url: c.url, how: "custom" };
+  const p = c.path || s.healthPath || "/";
+  const d = (s.domains || [])[0];
+  return d ? { url: `${s.ssl?.status === "active" ? "https" : "http"}://${d}${p}`, how: "domain" } : { url: "", how: "none" };
+}
+function monIncidents(s) {
+  if (monInc[s.id]) return monInc[s.id];
+  const out = [];
+  const alertsFor = (startedAt, endedAt, open) => {
+    const c = monSettings(s.id);
+    const nums = c.smsEnabled ? [...c.recipients, ...(c.includeDefaults ? notif.defaults : [])] : [];
+    const at = (t) => iso(Date.parse(startedAt) + t);
+    const list = [];
+    for (const n of nums) list.push({ at: at(3 * MIN), channel: "sms", kind: "down", to: n.phone, name: n.name, ok: true });
+    list.push({ at: at(3 * MIN + 2000), channel: "discord", kind: "down", to: "#ops", ok: true, attempts: 1 });
+    if (open) for (const n of nums) list.push({ at: at(63 * MIN), channel: "sms", kind: "reminder", to: n.phone, name: n.name, ok: n.phone !== "+15559876543", error: n.phone === "+15559876543" ? "Twilio error 21610: the number has opted out (STOP)" : null });
+    if (endedAt) { for (const n of nums) list.push({ at: endedAt, channel: "sms", kind: "up", to: n.phone, name: n.name, ok: true }); list.push({ at: endedAt, channel: "discord", kind: "up", to: "#ops", ok: true, attempts: 1 }); }
+    return list;
+  };
+  const add = (agoMs, durMs, cause, extra = {}) => {
+    const startedAt = iso(NOW - agoMs), open = durMs == null, endedAt = open ? null : iso(NOW - agoMs + durMs);
+    out.push({ id: nid("inc"), siteId: s.id, startedAt, endedAt, cause, lastCause: extra.lastCause || cause, servers: extra.servers || [], gaps: [], endedBy: endedAt ? "check" : null, alerts: alertsFor(startedAt, endedAt, open) });
+  };
+  if (s.id === "site_acmeweb") {
+    add(26 * HOUR, 7 * MIN, "HTTP 502", { servers: ["fra-agent-2"] });
+    add(3.2 * DAY, 4 * MIN, "Timed out after 10 s");
+    add(9 * DAY, 18 * MIN, "HTTP 503", { lastCause: "Connection refused" });
+    add(17 * DAY, 3 * MIN, "HTTP 500");
+    add(29 * DAY, 41 * MIN, "Connection refused", { servers: ["fcc-main", "fra-agent-1"] });
+    add(44 * DAY, 6 * MIN, "TLS handshake failed");
+    add(61 * DAY, 12 * MIN, "HTTP 502");
+    add(83 * DAY, 2 * MIN, "Timed out after 10 s");
+  }
+  if (s.id === "site_status") add(2.6 * HOUR, null, "DNS lookup failed", { lastCause: "Connection refused" });
+  return (monInc[s.id] = out);
+}
+function monRuntime(s) {
+  if (monRt[s.id]) return monRt[s.id];
+  const down = s.id === "site_status";
+  const r = { state: down ? "down" : "up", since: iso(NOW - (down ? 2.6 * HOUR : 26 * HOUR - 7 * MIN)), lastCheck: null };
+  r.lastCheck = down ? { at: ago(25e3), ok: false, status: null, ms: null, error: "Connection refused" } : { at: ago(18e3), ok: true, status: 200, ms: monBase(s) + 9, error: null };
+  return (monRt[s.id] = r);
+}
+function monState(s) {
+  const c = monSettings(s.id);
+  return c.paused ? "paused" : !c.url && !monDeployed(s) ? "pending" : monRuntime(s).state;
+}
+function monDays(s) {
+  const inc = monIncidents(s), rnd = monRand(monHash(s.id));
+  const today = Math.floor(NOW / DAY) * DAY, first = Date.parse(s.createdAt) || NOW - 40 * DAY;
+  return Array.from({ length: 90 }, (_, k) => {
+    const d = today - (89 - k) * DAY;
+    if (d + DAY < first) return { day: iso(d).slice(0, 10), uptime: null, downMinutes: 0, pausedMinutes: 0, avgMs: null };
+    const down = inc.reduce((a, i) => { const st = Date.parse(i.startedAt), en = i.endedAt ? Date.parse(i.endedAt) : NOW; return a + Math.max(0, Math.min(en, d + DAY) - Math.max(st, d)) / MIN; }, 0);
+    const mins = Math.round(down);
+    return { day: iso(d).slice(0, 10), uptime: +(100 - (mins / 1440) * 100).toFixed(3), downMinutes: mins, pausedMinutes: 0, avgMs: Math.round(monBase(s) + rnd() * 30) };
+  });
+}
+function monUptime(s, spanMs) {
+  if (monState(s) === "pending") return null;
+  const from = NOW - spanMs, first = Date.parse(s.createdAt) || from, start = Math.max(from, first);
+  const down = monIncidents(s).reduce((a, i) => { const st = Date.parse(i.startedAt), en = i.endedAt ? Date.parse(i.endedAt) : Date.now(); return a + Math.max(0, Math.min(en, Date.now()) - Math.max(st, start)); }, 0);
+  return +(100 - (down / Math.max(1, Date.now() - start)) * 100).toFixed(3);
+}
+function monSummary(s) {
+  const c = monSettings(s.id), r = monRuntime(s), state = monState(s);
+  const hourStart = Math.floor(Date.now() / HOUR) * HOUR - 23 * HOUR;
+  const inc = monIncidents(s);
+  const bars24h = Array.from({ length: 24 }, (_, i) => {
+    if (state === "pending") return null;
+    const a = hourStart + i * HOUR, b = a + HOUR;
+    const down = inc.reduce((n, x) => { const st = Date.parse(x.startedAt), en = x.endedAt ? Date.parse(x.endedAt) : Date.now(); return n + Math.max(0, Math.min(en, b) - Math.max(st, a)); }, 0);
+    return c.paused && i === 23 ? -1 : +(1 - down / HOUR).toFixed(4);
+  });
+  const ups = targets(s).map((id) => { const srv = db.servers.find((x) => x.id === id); return { serverId: id, name: srvName(id), online: !!srv?.online, healthy: state === "down" ? false : srv?.online ? true : null, down: false, error: state === "down" ? r.lastCheck.error : null, latencyMs: srv?.online ? monBase(s) - 10 : null }; });
+  const tgt = monTarget(s);
+  const recips = monRecipients(s.id);
+  return {
+    siteId: s.id, name: s.name, projectId: s.projectId, domain: (s.domains || [])[0] || null, state, since: state === "paused" ? c.pausedAt : r.since,
+    degraded: false, unhealthyServers: [], servers: ups, lastCheck: state === "pending" ? null : r.lastCheck, failing: 0, incidentId: inc.find((i) => !i.endedAt)?.id || null,
+    paused: !!c.paused, pauseUntil: c.pauseUntil || null, intervalSec: c.intervalSec,
+    sms: { enabled: !!c.smsEnabled, recipients: recips.length }, discord: { enabled: c.discordEnabled !== false, webhooks: monDiscordTargets(s.id).length }, target: tgt.url || null,
+    uptime: { h24: monUptime(s, DAY), d7: monUptime(s, 7 * DAY), d30: monUptime(s, 30 * DAY), d90: monUptime(s, 90 * DAY) },
+    avgMs24h: state === "pending" ? null : monBase(s) + 6, bars24h, bars24hStart: iso(hourStart),
+  };
+}
+function monRecipients(id) {
+  const c = monSettings(id), out = new Map();
+  for (const r of [...(c.recipients || []), ...(c.includeDefaults !== false ? notif.defaults : [])]) if (r.phone && !out.has(r.phone)) out.set(r.phone, { phone: r.phone, name: r.name || "" });
+  return [...out.values()];
+}
+function monDiscordTargets(id) {
+  const c = monSettings(id);
+  if (c.discordEnabled === false) return [];
+  return notif.discord.webhooks.filter((w) => w.enabled && w.urlHint && !(c.discordSkip || []).includes(w.id));
+}
+const MON_RANGES = { "1h": [HOUR, MIN], "24h": [DAY, 5 * MIN], "7d": [7 * DAY, HOUR], "30d": [30 * DAY, 6 * HOUR], "90d": [90 * DAY, DAY] };
+function monSeries(s, range) {
+  const key = MON_RANGES[range] ? range : "24h", [span, step] = MON_RANGES[key];
+  const to = Math.floor(Date.now() / step) * step + step, rnd = monRand(monHash(s.id) + span), inc = monIncidents(s), first = Date.parse(s.createdAt) || 0;
+  const points = [];
+  for (let t = to - span; t < to; t += step) {
+    const down = inc.some((i) => Date.parse(i.startedAt) < t + step && (i.endedAt ? Date.parse(i.endedAt) : Date.now()) > t);
+    const none = monState(s) === "pending" || t + step < first;
+    const wave = Math.sin((t / DAY) * Math.PI * 2) * 0.18 + 1; // busier afternoons → a bit slower
+    points.push({ t: iso(t), ms: none || (down && s.id === "site_status") ? null : Math.round(monBase(s) * wave + rnd() * 9 + (down ? 140 : 0)), uptime: none ? null : down ? 92.5 : 100, up: none ? 0 : step / MIN, down: down ? 1 : 0, paused: 0 });
+  }
+  return { range: key, step, points };
+}
+const monSettingsView = (id) => ({ ...clone(monSettings(id)), repeatMinutesDefault: notif.repeatMinutes, minIntervalSec: 10 });
+function monNotif() {
+  return { enabled: notif.enabled, configured: notif.configured, dryRun: notif.dryRun, defaults: clone(notif.defaults), repeatMinutes: notif.repeatMinutes, notifyRecovery: notif.notifyRecovery, minGapMinutes: notif.minGapMinutes,
+    discord: { webhooks: notif.discord.webhooks.map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, ready: !!w.urlHint, mention: !!w.mention })), active: notif.discord.webhooks.filter((w) => w.enabled && w.urlHint).length, testEndpoint: null } };
+}
+R("GET", "/api/monitor", () => {
+  const items = db.sites.map(monSummary);
+  const counts = { total: items.length, up: 0, down: 0, paused: 0, pending: 0, unknown: 0, degraded: 0 };
+  for (const i of items) counts[i.state] = (counts[i.state] || 0) + 1;
+  return { items, counts, notifications: { enabled: notif.enabled, configured: notif.configured || notif.dryRun, dryRun: notif.dryRun, discord: notif.discord.webhooks.filter((w) => w.enabled).length } };
+});
+R("GET", "/api/sites/:id/monitor", (p, b, q) => {
+  const s = find("sites", p.id);
+  return { summary: monSummary(s), settings: monSettingsView(s.id), effective: { ...monTarget(s), path: monSettings(s.id).path || s.healthPath || "/", healthPath: s.healthPath || "" },
+    recipients: monRecipients(s.id), notifications: monNotif(), discordTargets: monDiscordTargets(s.id).map((w) => w.id),
+    series: monSeries(s, q.range), days: monDays(s), incidents: monIncidents(s).map((i) => { const end = i.endedAt ? Date.parse(i.endedAt) : Date.now(); return { ...clone(i), open: !i.endedAt, durationMs: end - Date.parse(i.startedAt), alerts: [...i.alerts].reverse() }; }), gaps: [] };
+});
+R("PUT", "/api/sites/:id/monitor", (p, b) => {
+  const s = find("sites", p.id), c = monSettings(s.id), out = {};
+  const int = (v, lo, hi, d) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
+  if ("intervalSec" in b) out.intervalSec = int(b.intervalSec, 10, 3600, c.intervalSec);
+  if ("timeoutSec" in b) out.timeoutSec = int(b.timeoutSec, 1, 60, c.timeoutSec);
+  if ("failThreshold" in b) out.failThreshold = int(b.failThreshold, 1, 20, c.failThreshold);
+  if ("recoverThreshold" in b) out.recoverThreshold = int(b.recoverThreshold, 1, 20, c.recoverThreshold);
+  if ("path" in b) { const v = String(b.path || "").trim(); if (v && !/^\/[^\s#]*$/.test(v)) err(400, "The check path must start with / (for example /api/health)."); out.path = v; }
+  if ("url" in b) { const v = String(b.url || "").trim(); if (v && !/^https?:\/\/[^\s/]+/.test(v)) err(400, "The custom URL must be a full address, like https://example.com/health."); out.url = v; }
+  if ("expect" in b) { const m = /^\s*(\d{3})\s*(?:-\s*(\d{3}))?\s*$/.exec(String(b.expect)); if (!m) err(400, "Expected status must look like 200-399 or 200."); out.expectMin = +m[1]; out.expectMax = +(m[2] || m[1]); if (out.expectMax < out.expectMin) err(400, "The expected status range is upside down."); }
+  for (const k of ["smsEnabled", "includeDefaults", "discordEnabled"]) if (k in b) out[k] = !!b[k];
+  if ("recipients" in b) out.recipients = (b.recipients || []).map((r) => { const ph = String(r.phone || "").trim(); if (!/^\+[1-9]\d{6,14}$/.test(ph)) err(400, `"${r.phone}" is not a valid phone number.`); return { name: String(r.name || "").trim().slice(0, 60), phone: ph }; });
+  if ("discordSkip" in b) out.discordSkip = (b.discordSkip || []).filter((x) => notif.discord.webhooks.some((w) => w.id === x));
+  if ("repeatMinutes" in b) out.repeatMinutes = b.repeatMinutes == null || b.repeatMinutes === "" ? null : int(b.repeatMinutes, 1, 1440, null);
+  Object.assign(c, out);
+  activity("monitor.settings.update", "site", s, Object.keys(out).join(", "));
+  emit("monitor", { kind: "settings", siteId: s.id });
+  return { settings: monSettingsView(s.id), summary: monSummary(s), recipients: monRecipients(s.id) };
+});
+R("POST", "/api/sites/:id/monitor/check", (p) => {
+  const s = find("sites", p.id), c = monSettings(s.id), r = monRuntime(s);
+  if (c.paused) err(409, "Monitoring is paused for this website.");
+  r.lastCheck = r.state === "down" ? { at: iso(Date.now()), ok: false, status: null, ms: null, error: "Connection refused" } : { at: iso(Date.now()), ok: true, status: 200, ms: Math.round(monBase(s) + Math.random() * 30), error: null };
+  return { summary: monSummary(s) };
+});
+R("POST", "/api/sites/:id/monitor/pause", (p, b) => {
+  const s = find("sites", p.id);
+  Object.assign(monSettings(s.id), { paused: true, pausedAt: iso(Date.now()), pausedBy: me.name, pauseUntil: b?.minutes ? iso(Date.now() + b.minutes * MIN) : null });
+  emit("monitor", { kind: "settings", siteId: s.id });
+  return { settings: monSettingsView(s.id), summary: monSummary(s) };
+});
+R("POST", "/api/sites/:id/monitor/resume", (p) => {
+  const s = find("sites", p.id);
+  Object.assign(monSettings(s.id), { paused: false, pausedAt: null, pausedBy: null, pauseUntil: null });
+  emit("monitor", { kind: "settings", siteId: s.id });
+  return { settings: monSettingsView(s.id), summary: monSummary(s) };
+});
+
+/* ───────── STAGING (panel/lib/staging.mjs): a staging copy = a child site record; test_<slug> test databases ───────── */
+const stagingChild = (s) => (s?.stagingSiteId ? db.sites.find((x) => x.id === s.stagingSiteId) || null : null);
+function stagingSummary(s) {
+  if (s.stagingOf) return { role: "staging", parentId: s.stagingOf, parentName: db.sites.find((x) => x.id === s.stagingOf)?.name || null };
+  const c = stagingChild(s);
+  if (!c) return null;
+  const sid = targets(c)[0], st = c.state[sid] || {};
+  const bj = db.jobs.find((x) => x.siteId === c.id && (x.status === "running" || x.status === "queued"));
+  return { role: "parent", id: c.id, name: c.name, url: c.domains[0] ? `${c.ssl?.enabled || s.ssl?.enabled ? "https" : "http"}://${c.domains[0]}` : null, domains: c.domains, port: c.port, serverId: sid,
+    serverName: db.servers.find((x) => x.id === sid)?.name || sid, currentReleaseId: c.currentReleaseId || null, currentVersion: db.releases.find((r) => r.id === c.currentReleaseId)?.version || null,
+    running: st.running ?? null, healthy: st.healthy ?? null, deploying: bj?.type === "site.deploy", error: st.error || null, busyJobId: bj?.id || null, deleting: false, databaseIds: c.linkedDatabaseIds, ssl: c.ssl, createdAt: c.createdAt };
+}
+const sqlName = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "site";
+function testDbPreview(s) {
+  if (s.type === "static" && !(s.linkedDatabaseIds || []).length) return null;
+  const ids = s.linkedDatabaseIds || [];
+  const dbs = (ids.length ? ids : [null]).map((id, i) => ({ name: `test_${sqlName(s.name)}${i ? `_${i + 1}` : ""}`, host: `db${i + 1}`, port: "3306", source: id ? db.databases.find((d) => d.id === id)?.name || id : "the test run (this website has no database of its own)", added: !id }));
+  const d = dbs[0];
+  return { databases: dbs, vars: [["DATABASE_URL", `mysql://‹random›:‹random›@${d.host}:3306/${d.name}`, true], ["DB_HOST", d.host, false], ["DB_NAME", d.name, false], ["DB_PASSWORD", "‹random›", true], ["DB_PORT", "3306", false], ["DB_USER", "‹random›", true]].map(([key, value, random]) => ({ key, value, random })) };
+}
+function stagingDb(parent, i) {
+  const name = `${sqlName(projectName(parent.projectId)).slice(0, 16).replace(/_+$/, "")}_staging_${sqlName(parent.name)}${i ? `_${i + 1}` : ""}`;
+  let d = db.databases.find((x) => x.name === name), created = false;
+  if (!d) { d = { id: nid("db"), projectId: parent.projectId, name, user: name.slice(0, 32), charset: "utf8mb4", collation: "utf8mb4_unicode_ci", remoteAccess: true, sizeBytes: 0, createdAt: iso(Date.now()), stagingOf: parent.id }; db.databases.push(d); created = true; }
+  return { d, created };
+}
+function stagingVars(parent, url) {
+  const out = {}, removed = [];
+  const doms = (parent.domains || []).map((x) => x.replace(/^www\./, ""));
+  for (const [k, v] of Object.entries(parent.env || {})) {
+    if (/^(sk|pk|rk)_live_/.test(v) || /^whsec_/.test(v)) { removed.push(`${k} was not copied: live payment key.`); continue; }
+    out[k] = url ? doms.reduce((acc, dm) => acc.replace(new RegExp(`https?://(?:www\\.)?${dm.replace(/\./g, "\\.")}(?=[/?#]|$)`, "g"), url), v) : v;
+  }
+  return { env: out, removed };
+}
+function makeStaging(parent, { domain, serverId, releaseId = null, deployMs = 0 } = {}) {
+  const made = parent.type === "static" ? [] : (parent.linkedDatabaseIds || []).map((_, i) => stagingDb(parent, i));
+  const url = domain ? `${parent.ssl?.enabled ? "https" : "http"}://${domain}` : "";
+  const { env, removed } = stagingVars(parent, url);
+  const c = mkSite({ id: nid("site"), projectId: parent.projectId, name: `${parent.name}-staging`, type: parent.type, domains: domain ? [domain] : [], port: 3001 + db.sites.length + 20, serverIds: [serverId || targets(parent)[0]],
+    healthPath: parent.healthPath, settings: clone(parent.settings), github: null, env, linkedDatabaseIds: made.map((m) => m.d.id), runtime: parent.type === "node" ? "docker" : parent.type === "static" ? "none" : "legacy",
+    container: parent.container ? clone(parent.container) : parent.type === "node" ? { uid: 20100 + db.sites.length, gid: 20100 + db.sites.length, image: "node:20-bookworm-slim", memoryMb: 1024, cpus: 1 } : null,
+    ssl: { enabled: false, status: "none" }, stagingOf: parent.id, currentReleaseId: releaseId, previousReleaseId: null, state: {}, createdAt: iso(Date.now() - deployMs) });
+  parent.stagingSiteId = c.id;
+  return { c, made, removed };
+}
+// Fixture: acme-web has staging running (one release behind live); northwind-api has none.
+{
+  const p = db.sites.find((x) => x.id === "site_acmeweb");
+  const rel = db.releases.filter((r) => r.siteId === p.id)[1];
+  const { c } = makeStaging(p, { domain: "staging-shop.acme.com", serverId: "main", releaseId: rel?.id || null, deployMs: 3 * DAY });
+  c.env = { ...c.env, NODE_ENV: "staging", STRIPE_PUBLIC_KEY: "pk_test_51Hx…" };
+  c.state.main = { running: true, healthy: true, version: rel?.version, releaseId: rel?.id, checkedAt: ago(40e3) };
+}
+R("POST", "/api/sites/:id/staging", (p, b) => {
+  const s = find("sites", p.id);
+  if (s.stagingOf) err(409, "This is already a staging copy.");
+  if (stagingChild(s)) err(409, `${s.name} already has a staging copy.`);
+  const first = String(s.domains?.[0] || "").replace(/^www\./, "");
+  const domain = "domain" in b ? String(b.domain || "").trim().toLowerCase() : first ? `staging.${first}` : "";
+  if (domain && !/^([a-z0-9-]+\.)+[a-z]{2,}$/.test(domain)) err(400, `"${domain}" is not a valid domain name.`);
+  const other = domain && db.sites.find((x) => (x.domains || []).includes(domain));
+  if (other) err(409, `${domain} is already used by website "${other.name}".`);
+  const { c, made, removed } = makeStaging(s, { domain, serverId: b.serverId });
+  activity("site.staging.start", "site", s, `Staging copy ${c.name}${made.length ? ` with ${made.map((m) => m.d.name).join(", ")}` : ""}`);
+  for (const m of made) if (m.created) emit("database", { action: "created", database: dbView(m.d) });
+  const rel = b.deploy !== false && (db.releases.find((r) => r.id === (b.releaseId || s.currentReleaseId)));
+  let job = null;
+  if (rel) {
+    const sid = targets(c)[0];
+    const lines = [`Deploying ${rel.version} to staging (${c.name}) on ${db.servers.find((x) => x.id === sid)?.name || sid}.`, ...linesFor("site.deploy", "").map((l) => l.replace(/^\[[^\]]+\] /, ""))];
+    job = runJob({ type: "site.deploy", title: `Deploy ${c.name} ${rel.version}`, siteId: c.id, projectId: c.projectId, heavy: true, servers: [sid] }, { lines, speed: 140, onDone() {
+      c.currentReleaseId = rel.id; c.state[sid] = { running: true, healthy: true, version: rel.version, releaseId: rel.id, checkedAt: iso(Date.now()) }; emit("site", siteView(c));
+    } });
+  }
+  emit("site", siteView(c)); emit("site", siteView(s));
+  const warnings = [...removed, ...(s.loadBalanced ? [`${s.name} is load balanced; staging runs on one server.`] : []), ...(!rel && b.deploy !== false ? [`${s.name} has no release deployed yet — deploy one to staging from the Deployments tab.`] : [])];
+  return { site: siteView(s), staging: siteView(c), databases: made.map((m, i) => ({ id: m.d.id, name: m.d.name, created: m.created, prefix: i ? `DB${i + 1}_` : "" })), job, warnings };
+});
+R("DELETE", "/api/sites/:id/staging", (p, b, q) => {
+  const s0 = find("sites", p.id);
+  const s = s0.stagingOf ? find("sites", s0.stagingOf) : s0;
+  const c = stagingChild(s) || err(404, `${s.name} has no staging copy.`);
+  busy(c);
+  const drop = q.dropDatabase === "1" ? db.databases.filter((d) => d.stagingOf === s.id && c.linkedDatabaseIds.includes(d.id)) : [];
+  activity("site.staging.remove", "site", s, drop.length ? `and dropped ${drop.map((d) => d.name).join(", ")}` : "database kept");
+  const lines = [`Removing ${c.name}…`, `── ${db.servers.find((x) => x.id === targets(c)[0])?.name || "main"}: removing the website${q.deleteFiles !== "0" ? " and its files" : ""}`, "✓ front door (nginx) entry removed.", `✓ ${c.name} removed.`,
+    ...drop.flatMap((d) => [`Dropping the staging database ${d.name} and its user ${d.user}…`, `✓ ${d.name} dropped.`])];
+  return runJob({ type: "site.staging.remove", title: `Remove staging of ${s.name}`, siteId: s.id, projectId: s.projectId }, { lines, speed: 200, onDone() {
+    db.sites = db.sites.filter((x) => x.id !== c.id); s.stagingSiteId = null;
+    db.databases = db.databases.filter((d) => !drop.includes(d));
+    for (const d of drop) emit("database", { action: "deleted", id: d.id, projectId: d.projectId });
+    emit("site", { id: c.id, deleted: true }); emit("site", siteView(s));
+  } });
 });
 
 function pick(o, keys) { const r = {}; for (const k of keys) if (o && k in o) r[k] = o[k]; return r; }

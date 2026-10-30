@@ -1497,6 +1497,12 @@ export function register(router, ctx) {
     refreshSizes,
     pushEnvForLinkedSites: (id, opts) => pushEnvForLinkedSites(getRec(id), opts),
     publicView: (id) => publicDb(ctx.db.get("databases", id)),
+    // STAGING (panel/lib/staging.mjs): same as POST /api/projects/:id/databases and DELETE /api/databases/:id.
+    /** { projectId, name, user?, password?, remoteAccess?, charset? } → { database, password } (name gets the project prefix). */
+    createDatabase: (opts, admin) => createDatabase(opts || {}, admin),
+    /** Drop the database and its user (callers unlink it from websites first). */
+    dropDatabase: (id, admin) => dropDatabase(getRec(id), admin),
+    projectPrefix: (projectId) => projectPrefix(ctx.db.get("projects", projectId)),
     publicHost,
     mainSitesHost,
     settings: settingsView,

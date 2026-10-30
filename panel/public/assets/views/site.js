@@ -1,20 +1,20 @@
 import { html, raw, mount, $, $$, on, colorOf, ago, fmtDate, fmtBytes, plural, emptyState, errorState, skeletonRows, toast, toastError, confirmDialog, openMenu, debounce, copyText } from "../util.js";
 import { icon } from "../icons.js";
 import { get, post, patch, put, del, upload, MOCK } from "../api.js";
-import { tabsBar, lbBadge, healthChip, updateBadge, siteHealth, typeIco, TYPE_LABEL, METHOD_LABEL, serverKind, jobItem, bindJobClicks, jobStarted, openJobLog, serverPicker, envEditor, dropzone } from "../components.js";
+import { tabsBar, lbBadge, healthChip, updateBadge, siteHealth, typeIco, TYPE_LABEL, METHOD_LABEL, serverKind, jobItem, bindJobClicks, jobStarted, openJobLog, serverPicker, envEditor, dropzone, pager } from "../components.js";
 import { lbMethodSelect, methodHint } from "./wizard.js";
 import { siteUrl } from "./sites.js";
+import { foldCard, moreList } from "../fold.js"; // collapsible cards + "show all" lists
 import { scriptsTab } from "./site-scripts.js";
-import { uptimeTab } from "./monitor.js"; // Uptime tab (monitoring + SMS alerts)
-import { trafficTab } from "./site-traffic.js"; // Traffic tab (visitors, page views — panel/lib/analytics.mjs)
-import { askTestOrDeploy, pullAndTest, startTest, testsTab, testEnvCard, verdictBadge, latestByRelease, runtimeBadge, migrateSite, runtimeCard, bindRuntimeCard } from "./site-tests.js"; // commit testing + Docker runtime
+import { statisticsTab } from "./site-stats.js"; // Statistics tab (traffic + uptime checks, incidents, alerts)
+import { askTestOrDeploy, pullAndTest, startTest, testsTab, testEnvCard, verdictBadge, latestByRelease, runtimeBadge, migrateSite, runtimeCard, bindRuntimeCard, isActive as testActive } from "./site-tests.js"; // commit testing + Docker runtime
+import { environmentTab, stagingStrip, stagingReleaseBtn } from "./site-env.js"; // Environment tab (Live / Test / Staging) + staging bits
 import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts, savedDelivery } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
 const TABS = [
   { id: "overview", label: "Overview", icon: "dashboard" },
-  { id: "traffic", label: "Traffic", icon: "users" },
-  { id: "uptime", label: "Uptime", icon: "activity" },
+  { id: "statistics", label: "Statistics", icon: "activity" },
   { id: "deployments", label: "Deployments", icon: "rocket" },
   { id: "tests", label: "Tests", icon: "flask" },
   { id: "environment", label: "Environment", icon: "key" },
@@ -26,6 +26,8 @@ const TABS = [
 
 export default async function site(ctx) {
   const { root, params } = ctx;
+  // The old Traffic and Uptime tabs are now one Statistics tab; keep their links (alert texts, bookmarks) working.
+  if (params.tab === "traffic" || params.tab === "uptime") { location.replace(`#/sites/${encodeURIComponent(params.id)}/statistics`); return; }
   const tab = TABS.some((t) => t.id === params.tab) ? params.tab : "overview";
   mount(root, html`<div class="row"><div class="skel" style="width:52px;height:52px;border-radius:15px"></div><div style="flex:1"><div class="skel" style="width:260px;height:26px"></div><div class="skel mt-8" style="width:380px;height:16px"></div></div></div>
     <div class="skel mt-24" style="height:40px"></div><div class="mini-stats mt-20">${[1, 2, 3, 4].map(() => html`<div class="skel" style="height:84px;border-radius:16px"></div>`)}</div><div class="skel" style="height:260px;border-radius:18px"></div>`);
@@ -149,12 +151,56 @@ export default async function site(ctx) {
     { label: "Website settings", icon: "settings", onClick: () => (location.hash = `${base}/settings`) },
   ]));
 
-  const jobsCard = async (el, limit = 8) => {
+  const jobsCard = async (el, limit = 8, moreId = "") => {
     let jobs = [];
-    const paint = () => mount(el, jobs.length ? html`${jobs.slice(0, limit).map(jobItem)}` : emptyState({ ico: "rocket", title: "No jobs yet", text: "Deploys, restarts and certificate requests for this website appear here.", sm: true }));
+    const paint = () => mount(el, jobs.length ? (moreId ? moreList(jobs.slice(0, limit), jobItem, { id: moreId, limit: 5, noun: "jobs" }) : html`${jobs.slice(0, limit).map(jobItem)}`) : emptyState({ ico: "rocket", title: "No jobs yet", text: "Deploys, restarts and certificate requests for this website appear here.", sm: true }));
     try { jobs = (await get(`/api/jobs?siteId=${S.id}&limit=${limit}`)).items || []; } catch {}
     paint(); bindJobClicks(el);
     ctx.on("job", (j) => { if (j.siteId !== S.id) return; const i = jobs.findIndex((x) => x.id === j.id); i >= 0 ? (jobs[i] = j) : jobs.unshift(j); paint(); });
+  };
+
+  /** Deploy history: `size` jobs per page with numbered pages (GET /api/jobs?siteId&limit&offset → { items, total }). */
+  const historyCard = async (el, size = 5) => {
+    let page = 1, items = [], total = 0, all = null; // all: an older panel without paging → page through what it returned
+    const pages = () => Math.max(1, Math.ceil(total / size));
+    const paint = () => {
+      const from = (page - 1) * size;
+      const sub = $("[data-histsub]", box);
+      if (sub) sub.textContent = total > size ? `${from + 1}–${Math.min(total, from + items.length)} of ${total} · click a job to see its log` : "Click a job to see its log";
+      mount(el, items.length ? html`<div class="list">${items.map(jobItem)}</div>${total > size ? html`<div class="pager-foot">${pager(page, pages(), { label: "Deploy history pages" })}</div>` : ""}`
+        : emptyState({ ico: "rocket", title: "No jobs yet", text: "Deploys, restarts and certificate requests for this website appear here.", sm: true }));
+    };
+    let seq = 0;
+    const load = async (p = page) => {
+      const my = ++seq;
+      try {
+        if (all) { items = all.slice((p - 1) * size, p * size); page = p; }
+        else {
+          const r = await get(`/api/jobs?siteId=${encodeURIComponent(S.id)}&limit=${size}&offset=${(p - 1) * size}`);
+          if (my !== seq || !ctx.alive()) return;
+          if (r.total == null) { all = (await get(`/api/jobs?siteId=${encodeURIComponent(S.id)}&limit=500`).catch(() => r)).items || []; total = all.length; items = all.slice((p - 1) * size, p * size); }
+          else { items = r.items || []; total = r.total; }
+          page = p;
+          if (!items.length && total && p > pages()) return load(pages()); // the last page emptied
+        }
+      } catch {}
+      if (my === seq && ctx.alive()) paint();
+    };
+    await load(1);
+    bindJobClicks(el);
+    on(el, "click", "[data-page]", (e, b) => {
+      const p = Math.max(1, Math.min(pages(), +b.dataset.page || 1));
+      if (p === page) return;
+      load(p).then(() => el.closest(".card")?.scrollIntoView?.({ block: "nearest", behavior: "smooth" }));
+    });
+    const reload = debounce(() => load(page), 400);
+    ctx.on("job", (j) => {
+      if (j.siteId !== S.id) return;
+      const i = items.findIndex((x) => x.id === j.id);
+      if (i >= 0) { items[i] = j; if (all) all[all.findIndex((x) => x.id === j.id)] = j; paint(); return; }
+      if (all) { all.unshift(j); total = all.length; }
+      reload(); // a new job: everything shifts by one
+    });
   };
 
   const refresh = debounce(async () => {
@@ -181,6 +227,58 @@ export default async function site(ctx) {
       </div>`);
     on(box, "click", "[data-qa]", (e, b) => runAction(b.dataset.qa));
     on(box, "click", "[data-qpull]", (e, b) => pullDeploy(b));
+
+    /* Latest test card: the running test (live from `testrun`), else the newest finished verdict. */
+    let testRuns = null; // null = loading
+    const LT_R = 16, LT_C = 2 * Math.PI * LT_R;
+    const latestTestStat = () => {
+      const runs = testRuns || [];
+      const run = runs.find(testActive) || runs.find((r) => r.status === "done" && r.verdict) || runs[0];
+      const head = html`<div class="ms-l">${icon("flask", "xs")}Latest test</div>`;
+      if (testRuns === null) return html`<div class="mini-stat lt-stat">${head}<div class="ms-v muted">—</div><div class="ms-s">Loading…</div></div>`;
+      if (!run) {
+        const rel = (S.releases || [])[0];
+        return html`<div class="mini-stat lt-stat">${head}<div class="ms-v">Not tested</div><div class="ms-s">${rel
+          ? html`<button class="lt-act" data-ltest="${rel.id}">${icon("flask", "xs")}Test the latest release</button>`
+          : html`<a href="${base}/deployments" class="lt-act">No releases yet →</a>`}</div></div>`;
+      }
+      const commit = run.commit?.shortSha || (run.commit?.sha || "").slice(0, 7) || (run.version ? `v${run.version}` : "");
+      const when = ago(run.finishedAt || run.startedAt || run.createdAt);
+      if (testActive(run)) {
+        return html`<a class="mini-stat lt-stat" href="#/tests/${run.id}" title="Open the running test">${head}
+          <div class="lt-row"><span class="lt-ring run" aria-hidden="true"><svg viewBox="0 0 40 40"><circle class="trk" cx="20" cy="20" r="${LT_R}"/><circle class="arc" cx="20" cy="20" r="${LT_R}" stroke-dasharray="${(LT_C * 0.28).toFixed(2)} ${LT_C.toFixed(2)}"/></svg>${icon("flask", "xs")}</span>
+            <div class="lt-txt"><div class="ms-v">${run.status === "queued" ? "Queued" : "Testing…"}</div><div class="ms-s">${[commit, run.phase || ""].filter(Boolean).join(" · ")}</div></div></div></a>`;
+      }
+      if (run.status !== "done" || !run.verdict) {
+        return html`<a class="mini-stat lt-stat" href="#/tests/${run.id}" title="${run.error || ""}">${head}<div class="ms-v">${run.status === "cancelled" ? "Cancelled" : "Didn't finish"}</div><div class="ms-s">${[commit, when].filter(Boolean).join(" · ")}</div></a>`;
+      }
+      const ok = run.verdict === "ready", score = Math.max(0, Math.min(100, Number(run.score) || 0));
+      return html`<a class="mini-stat lt-stat" href="#/tests/${run.id}" title="Open the test report">${head}
+        <div class="lt-row"><span class="lt-ring ${ok ? "ok" : "err"}" aria-hidden="true"><svg viewBox="0 0 40 40"><circle class="trk" cx="20" cy="20" r="${LT_R}"/><circle class="arc" cx="20" cy="20" r="${LT_R}" stroke-dasharray="${LT_C.toFixed(2)}" stroke-dashoffset="${(LT_C * (1 - score / 100)).toFixed(2)}"/></svg><b class="num">${run.score ?? "—"}</b></span>
+          <div class="lt-txt"><div class="ms-v">${ok ? "Ready" : "Not ready"}</div><div class="ms-s">${[commit, when].filter(Boolean).join(" · ")}</div></div></div></a>`;
+    };
+    const paintLatestTest = () => { const el = $("[data-lt]", box); if (el) mount(el, latestTestStat()); };
+    get(`/api/sites/${S.id}/tests`).then((r) => { testRuns = r.items || []; }).catch(() => { testRuns = []; }).finally(() => ctx.alive() && paintLatestTest());
+    ctx.on("testrun", (d) => {
+      if (!d || d.siteId !== S.id || testRuns === null) return;
+      testRuns = d.deleted ? testRuns.filter((x) => x.id !== d.id) : [d, ...testRuns.filter((x) => x.id !== d.id)].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      paintLatestTest();
+    });
+    on(box, "click", "[data-ltest]", (e, b) => { e.preventDefault(); startTest(S.id, b.dataset.ltest, { btn: b }); });
+
+    /* HTTPS lives in Domains & SSL; the Overview only speaks up when something needs doing. */
+    const sslNote = () => {
+      const ssl = S.ssl || {};
+      const tunnel = S.cloudflare?.enabled ? S.cloudflare.hostnames || [] : [];
+      const direct = (S.domains || []).filter((d) => !tunnel.includes(d));
+      if (!direct.length) return "";
+      const days = ssl.expiresAt ? (Date.parse(ssl.expiresAt) - Date.now()) / 864e5 : null;
+      const mk = (tone, text, btn) => html`<div class="note ${tone} ssl-note">${icon(tone === "warn" ? "alert" : "lock")}<div style="flex:1;min-width:0">${text}</div><a class="btn btn-sm" href="${base}/domains">${btn}</a></div>`;
+      if (ssl.status === "failed") return mk("warn", html`<strong>HTTPS certificate request failed.</strong> <span class="muted">${ssl.error || "certbot reported an error."}</span>`, "Open Domains & SSL");
+      if (ssl.status === "active" && days != null && days < 10) return mk("warn", html`<strong>The HTTPS certificate expires ${days <= 0 ? "today" : `in ${Math.ceil(days)} day${Math.ceil(days) === 1 ? "" : "s"}`}</strong> <span class="muted">(${fmtDate(ssl.expiresAt, false)}) and hasn't renewed yet.</span>`, "Open Domains & SSL");
+      if (ssl.status !== "active" && ssl.status !== "pending" && deployed()) return mk("", html`<strong>No HTTPS certificate yet</strong> <span class="muted">— ${direct.length === 1 ? direct[0] : `${direct.length} domains`} ${direct.length === 1 ? "is" : "are"} served over plain HTTP.</span>`, "Issue a certificate");
+      return "";
+    };
     paintOverview = () => {
       const rel = (S.releases || []).find((r) => r.id === S.currentReleaseId) || S.currentRelease || (S.currentVersion ? { version: S.currentVersion } : null);
       const h = siteHealth(S);
@@ -188,7 +286,27 @@ export default async function site(ctx) {
       const sById = serversById();
       const spread = S.releasesInLine === false ? S.releaseSpread || [] : [];
       const u = S.update;
-      mount($("[data-ov]", box), html`
+      // Load-balanced: the upstream table folds away (sub line keeps the health summary visible).
+      const upRows = ups.length ? ups : (S.serverIds || ["main"]).map((id) => ({ serverId: id, name: sById[id]?.name || id, address: "—", port: S.port, online: sById[id]?.online }));
+      const upTone = (x) => { const st = (S.state || {})[x.serverId] || {}; return !x.online || (!st.releaseId && !st.deployedAt && !st.version) ? "off" : st.running && st.healthy !== false ? "ok" : st.running ? "warn" : "err"; };
+      const upBad = upRows.filter((x) => upTone(x) !== "ok" || x.down).length;
+      const checkBtn = html`<button class="btn btn-sm" data-status>${icon("refresh")}Check now</button>`;
+      const upTable = html`<div class="table-wrap"><table class="table"><thead><tr><th>Server</th><th class="hide-sm">Upstream</th>${S.loadBalanced ? html`<th class="hide-sm">Weight</th>` : ""}<th>Health</th><th class="hide-sm">Version</th><th class="hide-sm">Checked</th>${perServer() ? html`<th></th>` : ""}</tr></thead><tbody>
+          ${upRows.map((u) => {
+            const st = (S.state || {})[u.serverId] || {};
+            const srv = sById[u.serverId];
+            const notDeployed = !st.releaseId && !st.deployedAt && !st.version;
+            const tone = upTone(u);
+            const label = !u.online ? "Server offline" : notDeployed ? "Not deployed" : st.running && st.healthy !== false ? (st.healthy ? "Healthy" : "Running") : st.running ? "Unhealthy" : "Stopped";
+            return html`<tr><td><div class="row"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(74,114,255,.1);color:var(--blue-3)">${icon("server", "sm")}</span><div><div class="t-main">${u.name}</div><div class="t-sub">${serverKind(srv)}</div></div></div></td>
+              <td class="hide-sm mono small">${u.address}:${u.port}</td>
+              ${S.loadBalanced ? html`<td class="hide-sm num">${u.weight ?? srv?.weight ?? 1}</td>` : ""}
+              <td><span class="status" title="${st.error || ""}"><span class="dot ${tone}"></span>${label}</span>${S.loadBalanced && u.down ? html` <span class="badge warn" style="height:20px;font-size:11px" title="nginx is not sending traffic here">out of rotation</span>` : ""}${st.error ? html`<div class="t-sub" style="color:#ff8ea3;max-width:280px">${st.error}</div>` : ""}</td>
+              <td class="hide-sm mono small">${st.version ? "v" + st.version : "—"}</td>
+              <td class="hide-sm muted small">${ago(st.checkedAt)}</td>
+              ${perServer() ? html`<td style="text-align:right">${u.online !== false && !notDeployed ? html`<button class="icon-btn ghost sm" data-srvmenu="${u.serverId}" aria-label="Actions on ${u.name}">${icon("more", "sm")}</button>` : ""}</td>` : ""}</tr>`;
+          })}</tbody></table></div>`;
+      mount($("[data-ov]", box), html`${stagingStrip(S, base)}
         ${u ? html`<div class="note" style="margin-bottom:16px;align-items:center">${icon("arrowUp")}<div style="flex:1;min-width:0">
           <strong>Update available${u.version && u.version !== u.currentVersion ? html` — v${u.version}` : ""}</strong>${u.currentVersion ? html` <span class="muted small">(live: v${u.currentVersion})</span>` : ""}
           <div class="small" style="margin-top:4px">${u.shortSha ? html`${u.htmlUrl ? html`<a class="mono" href="${u.htmlUrl}" target="_blank" rel="noopener noreferrer">${u.shortSha}</a>` : html`<span class="mono">${u.shortSha}</span>`} · ` : ""}${u.message || ""}${u.author ? html` <span class="muted">— ${u.author}</span>` : ""}${u.date ? html` <span class="muted">· ${ago(u.date)}</span>` : ""}${u.ref ? html` <span class="muted">· ${u.ref}</span>` : ""}</div></div>
@@ -200,27 +318,14 @@ export default async function site(ctx) {
           <div class="mini-stat"><div class="ms-l">${icon("rocket", "xs")}Current release</div><div class="ms-v mono">${rel ? (rel.version ? "v" + rel.version : (rel.github?.sha || rel.commit || "").slice(0, 7) || "unversioned") : "—"}</div><div class="ms-s">${rel ? html`${rel.source === "github" ? "GitHub" : "Upload"}${rel.createdAt ? html` · ${ago(rel.createdAt)}` : ""}` : "Nothing deployed yet"}</div></div>
           <div class="mini-stat"><div class="ms-l">${icon("activity", "xs")}Status</div><div class="ms-v row" style="gap:9px"><span class="dot ${h.tone}"></span>${h.text}</div><div class="ms-s">Checked ${ago(Object.values(S.state || {}).map((x) => x?.checkedAt).filter(Boolean).sort().pop())}</div></div>
           <div class="mini-stat"><div class="ms-l">${icon(S.loadBalanced ? "balance" : "server", "xs")}Hosting</div><div class="ms-v">${S.loadBalanced ? `${ups.length} servers` : sById[(S.serverIds || [])[0]]?.name || "main"}</div><div class="ms-s">${S.loadBalanced ? METHOD_LABEL[S.lbMethod] : "Single server"} · port ${S.port || "—"}</div></div>
-          <div class="mini-stat"><div class="ms-l">${icon("lock", "xs")}HTTPS</div><div class="ms-v">${S.ssl?.status === "active" ? "Active" : S.ssl?.status === "failed" ? "Failed" : S.ssl?.status === "pending" ? "Pending" : "Not set up"}</div><div class="ms-s">${S.ssl?.expiresAt ? `Renews before ${fmtDate(S.ssl.expiresAt, false)}` : html`<a href="${base}/domains" style="color:var(--blue-3)">Issue a certificate →</a>`}</div></div>
+          <div data-lt style="display:contents">${latestTestStat()}</div>
         </div>
-        <div class="card">
-          <div class="card-head"><h3>${S.loadBalanced ? "Load balancer upstreams" : "Server"}</h3><span class="sub">${S.loadBalanced ? html`${METHOD_LABEL[S.lbMethod]} · health check ${S.healthPath ? html`<span class="mono">${S.healthPath}</span>` : "off"}` : html`health check ${S.healthPath ? html`<span class="mono">${S.healthPath}</span>` : "off"}`}</span>
-            <div class="right"><button class="btn btn-sm" data-status>${icon("refresh")}Check now</button></div></div>
-          <div class="table-wrap"><table class="table"><thead><tr><th>Server</th><th class="hide-sm">Upstream</th>${S.loadBalanced ? html`<th class="hide-sm">Weight</th>` : ""}<th>Health</th><th class="hide-sm">Version</th><th class="hide-sm">Checked</th>${perServer() ? html`<th></th>` : ""}</tr></thead><tbody>
-          ${(ups.length ? ups : (S.serverIds || ["main"]).map((id) => ({ serverId: id, name: sById[id]?.name || id, address: "—", port: S.port, online: sById[id]?.online }))).map((u) => {
-            const st = (S.state || {})[u.serverId] || {};
-            const srv = sById[u.serverId];
-            const notDeployed = !st.releaseId && !st.deployedAt && !st.version;
-            const tone = !u.online ? "off" : notDeployed ? "off" : st.running && st.healthy !== false ? "ok" : st.running ? "warn" : "err";
-            const label = !u.online ? "Server offline" : notDeployed ? "Not deployed" : st.running && st.healthy !== false ? (st.healthy ? "Healthy" : "Running") : st.running ? "Unhealthy" : "Stopped";
-            return html`<tr><td><div class="row"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(74,114,255,.1);color:var(--blue-3)">${icon("server", "sm")}</span><div><div class="t-main">${u.name}</div><div class="t-sub">${serverKind(srv)}</div></div></div></td>
-              <td class="hide-sm mono small">${u.address}:${u.port}</td>
-              ${S.loadBalanced ? html`<td class="hide-sm num">${u.weight ?? srv?.weight ?? 1}</td>` : ""}
-              <td><span class="status" title="${st.error || ""}"><span class="dot ${tone}"></span>${label}</span>${S.loadBalanced && u.down ? html` <span class="badge warn" style="height:20px;font-size:11px" title="nginx is not sending traffic here">out of rotation</span>` : ""}${st.error ? html`<div class="t-sub" style="color:#ff8ea3;max-width:280px">${st.error}</div>` : ""}</td>
-              <td class="hide-sm mono small">${st.version ? "v" + st.version : "—"}</td>
-              <td class="hide-sm muted small">${ago(st.checkedAt)}</td>
-              ${perServer() ? html`<td style="text-align:right">${u.online !== false && !notDeployed ? html`<button class="icon-btn ghost sm" data-srvmenu="${u.serverId}" aria-label="Actions on ${u.name}">${icon("more", "sm")}</button>` : ""}</td>` : ""}</tr>`;
-          })}</tbody></table></div>
-        </div>`);
+        ${sslNote()}
+        ${S.loadBalanced ? foldCard({ id: "site.upstreams", title: "Load balancer upstreams", count: upRows.length, open: false, actions: checkBtn, body: upTable,
+            sub: html`<span class="status"><span class="dot ${upBad ? "warn" : "ok"}"></span>${upBad ? `${upBad} of ${upRows.length} need attention` : `${upRows.length} of ${upRows.length} healthy`}</span> · ${METHOD_LABEL[S.lbMethod]} · health check ${S.healthPath ? html`<span class="mono">${S.healthPath}</span>` : "off"}` })
+          : html`<div class="card">
+          <div class="card-head"><h3>Server</h3><span class="sub">health check ${S.healthPath ? html`<span class="mono">${S.healthPath}</span>` : "off"}</span>
+            <div class="right">${checkBtn}</div></div>${upTable}</div>`}`);
     };
     paintOverview();
     on(box, "click", "[data-srvmenu]", (e, b) => {
@@ -254,7 +359,7 @@ export default async function site(ctx) {
       </div>
       <div class="section-head mt-24" style="margin-bottom:12px"><div><h2 style="font-size:16px">Releases</h2><p>Pinned releases are never cleaned up. The live release can't be deleted.</p></div></div>
       <div data-rel></div>
-      <div class="card mt-24"><div class="card-head"><h3>Deploy history</h3><span class="sub">Click a job to see its log</span></div><div class="list" data-jobs></div></div>`);
+      <div class="card mt-24"><div class="card-head"><h3>Deploy history</h3><span class="sub" data-histsub>Click a job to see its log</span></div><div data-jobs></div></div>`);
 
     dropzone($("[data-dz]", box), { accept: ".zip,application/zip", title: "Drop a .zip here", hint: "or click to choose — the archive becomes a new release", async onFile(file) {
       if (!/\.zip$/i.test(file.name)) { toast("Releases must be .zip files", "warn"); return; }
@@ -312,8 +417,8 @@ export default async function site(ctx) {
     });
     paintReleases = () => {
       const rels = S.releases || [];
-      mount($("[data-rel]", box), rels.length ? html`<div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Release</th><th>Source</th><th class="hide-sm">Size</th><th class="hide-sm">Created</th><th></th></tr></thead><tbody>
-        ${rels.map((r) => {
+      mount($("[data-rel]", box), rels.length ? html`<div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Release</th><th>Source</th><th class="hide-sm">Size</th><th class="hide-sm">Created</th><th></th></tr></thead>
+        ${moreList(rels, (r) => {
           const live = r.id === S.currentReleaseId, prev = r.id === S.previousReleaseId;
           return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}${runsByRel.get(r.id) ? html`<a href="#/tests/${runsByRel.get(r.id).id}" class="rel-verdict" title="Latest test of this release — open it">${verdictBadge(runsByRel.get(r.id))}</a>` : ""}</div>
             <div class="t-sub mono ellipsis" style="max-width:300px">${r.filename}</div></td>
@@ -322,10 +427,11 @@ export default async function site(ctx) {
             <td class="hide-sm"><div class="small">${fmtDate(r.createdAt)}</div><div class="t-sub">${ago(r.createdAt)}</div></td>
             <td class="actions"><div class="btn-row">
               ${r.available === false ? "" : html`<button class="btn btn-sm" data-rtest="${r.id}" title="Test this release on a throw-away copy" ${runsByRel.get(r.id) && ["queued", "preparing", "testing", "reporting"].includes(runsByRel.get(r.id).status) ? raw("disabled") : ""}>${icon("flask")}<span class="hide-sm">Test</span></button>`}
+              ${stagingReleaseBtn(S, r)}
               ${r.available === false ? "" : live ? html`<button class="btn btn-sm" data-rdeploy="${r.id}">${icon("restart")}Redeploy</button>` : html`<button class="btn btn-sm btn-primary" data-rdeploy="${r.id}">${icon("rocket")}Deploy</button>`}
               <button class="icon-btn sm" data-rpin="${r.id}" title="${r.pinned ? "Unpin" : "Pin"}" style="${r.pinned ? "color:var(--violet)" : ""}">${icon("pin")}</button>
               <button class="icon-btn sm" data-rdel="${r.id}" title="Delete" ${live ? raw("disabled style='opacity:.35;pointer-events:none'") : ""}>${icon("trash")}</button></div></td></tr>`;
-        })}</tbody></table></div></div>`
+        }, { id: "site.releases", limit: 6, table: true, cols: 5, noun: "releases" })}</table></div></div>`
         : html`<div class="card">${emptyState({ ico: "rocket", title: "No releases yet", text: S.github?.repo ? "Pull a branch from GitHub or upload a zip to create the first release." : "Upload a zip to create the first release.", sm: true })}</div>`);
     };
     paintReleases();
@@ -340,62 +446,11 @@ export default async function site(ctx) {
       if (!(await confirmDialog({ title: `Delete v${r.version}?`, message: `${r.filename} is removed from the panel. You won't be able to roll back to it.`, danger: true, confirmText: "Delete release" }))) return;
       try { await del(`/api/releases/${r.id}`); S.releases = S.releases.filter((x) => x.id !== r.id); paintReleases(); toast("Release deleted", "ok"); } catch (ex) { toastError(ex, "Couldn't delete"); }
     });
-    await jobsCard($("[data-jobs]", box), 15);
+    await historyCard($("[data-jobs]", box));
   }
 
-  /* ── environment ── */
-  if (tab === "environment") {
-    mount(box, skeletonRows(4, 44));
-    let envData;
-    try { envData = await get(`/api/sites/${S.id}/env`); } catch (e) { mount(box, errorState(e)); return; }
-    if (!ctx.alive()) return;
-    const linked = Array.isArray(envData.linked) ? envData.linked : Object.entries(envData.linked || {}).map(([k, v]) => ({ name: k, vars: v }));
-    mount(box, html`<div class="grid-main">
-      <div class="card"><div class="card-head"><h3>Environment variables</h3><span class="sub" data-dirty></span><div class="right"><button class="btn btn-primary btn-sm" data-save>${icon("check")}Save & apply</button></div></div>
-        <div class="card-body"><div data-suggest></div><div data-env></div>
-        <div class="note mt-16">${icon("info")}<div>Saved to the app's <span class="mono">.env</span> on ${S.loadBalanced ? `all ${S.serverIds.length} servers` : "its server"} and passed to the process. The app restarts to pick up changes.</div></div></div></div>
-      <div class="stack">
-        ${(envData.managed || []).length ? html`<div class="card"><div class="card-head"><h3>Managed by the panel</h3><span class="sub">read-only</span></div>
-          <div class="card-body"><div class="env-table">${envData.managed.map((m) => html`<div class="env-row ro" style="grid-template-columns:minmax(0,1.2fr) minmax(0,.9fr)"><input class="input mono" value="${m.key}" readonly/><input class="input" value="${m.pending ? "(created on first deploy)" : m.value}" readonly/></div>`)}</div>
-          ${envData.managed.map((m) => html`<div class="note mt-16">${icon("info")}<div>${m.note}</div></div>`)}</div></div>` : ""}
-        <div class="card"><div class="card-head"><h3>From linked databases</h3><span class="sub">read-only</span></div>
-          <div class="card-body">${linked.length ? html`<div class="stack" style="gap:16px">${linked.map((l) => html`<div><div class="row small strong" style="gap:8px;margin-bottom:8px">${icon("database", "sm")}<span class="mono">${l.name}</span>${l.prefix ? html`<span class="badge mono">${l.prefix}*</span>` : ""}</div>
-            ${l.error ? html`<div class="error-box">${icon("alert")}<div>${l.error}</div></div>` : html`<div class="env-table">${Object.entries(l.vars || {}).map(([k, v]) => html`<div class="env-row ro" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.2fr)"><input class="input" value="${k}" readonly/><input class="input" value="${v}" readonly/></div>`)}</div>`}</div>`)}</div>`
-            : html`<p class="muted small">No databases linked. Link one below and its connection variables are added automatically.</p>`}</div></div>
-        <div class="card"><div class="card-head"><h3>Linked databases</h3></div><div class="card-body">
-          ${databases.length ? html`<div class="stack" style="gap:10px">${databases.map((d) => html`<label class="check"><input type="checkbox" data-ldb value="${d.id}" ${(S.linkedDatabaseIds || []).includes(d.id) ? raw("checked") : ""}/><span class="mono">${d.name}</span><span class="dim small">${fmtBytes(d.sizeBytes)}</span></label>`)}</div>
-            <button class="btn btn-sm mt-16" data-savelinks>${icon("link")}Update links</button>`
-          : html`<p class="muted small">This project has no databases. <a href="#/projects/${S.projectId}/databases" style="color:var(--blue-3)">Create one →</a></p>`}
-        </div></div>
-      </div></div>
-      <div class="mt-20" data-testenv></div>`);
-    testEnvCard(ctx, $("[data-testenv]", box), S);
-    const dirty = $("[data-dirty]", box);
-    const ed = envEditor($("[data-env]", box), envData.env || {}, { onDirty: () => (dirty.textContent = "Unsaved changes") });
-    const ex = (S.releases || []).find((r) => r.id === S.currentReleaseId)?.envExample || (S.releases || []).find((r) => r.envExample)?.envExample;
-    const linkedKeys = new Set(linked.flatMap((l) => Object.keys(l.vars || {})));
-    const missing = (ex?.entries || []).filter((x) => x.key && !(x.key in (envData.env || {})) && !linkedKeys.has(x.key) && x.key !== "PORT");
-    if (missing.length) {
-      mount($("[data-suggest]", box), html`<div class="note" style="margin-bottom:16px;align-items:center">${icon("sparkles")}<div style="flex:1"><b>${ex.file || ".env.example"}</b> in the latest release lists ${plural(missing.length, "key")} not set here: <span class="mono small">${missing.slice(0, 6).map((x) => x.key).join(", ")}${missing.length > 6 ? "…" : ""}</span></div><button class="btn btn-sm" data-addex>${icon("plus")}Add them</button></div>`);
-      on(box, "click", "[data-addex]", () => { ed.set({ ...ed.get(), ...Object.fromEntries(missing.map((x) => [x.key, x.value || ""])) }); dirty.textContent = "Unsaved changes"; $("[data-suggest]", box).innerHTML = ""; });
-    }
-    on(box, "click", "[data-save]", async (e, b) => {
-      const err = ed.validate(); if (err) { toast(err, "warn"); return; }
-      b.classList.add("loading");
-      try {
-        const r = await put(`/api/sites/${S.id}/env`, { env: ed.get() }); dirty.textContent = "";
-        if (r?.env) ed.set(r.env);
-        if ((r?.warnings || []).length) toast("Saved with warnings", "warn", { msg: r.warnings.join(" ") });
-        else toast("Environment saved", "ok", { msg: "The app restarts to apply it." });
-        if (r?.job?.id) jobStarted(r.job, "Applying environment");
-      } catch (ex) { toastError(ex, "Couldn't save"); } finally { b.classList.remove("loading"); }
-    });
-    on(box, "click", "[data-savelinks]", async (e, b) => {
-      const ids = $$("[data-ldb]", box).filter((x) => x.checked).map((x) => x.value);
-      b.classList.add("loading");
-      try { await patch(`/api/sites/${S.id}`, { linkedDatabaseIds: ids }); toast("Database links updated", "ok"); ctx.reload(); } catch (ex) { toastError(ex); } finally { b.classList.remove("loading"); }
-    });
-  }
+  /* ── environment: Live / Test / Staging (views/site-env.js) ── */
+  if (tab === "environment") await environmentTab(ctx, box, S, { databases });
 
   /* ── domains & SSL ── */
   if (tab === "domains") {
@@ -416,8 +471,8 @@ export default async function site(ctx) {
         <p class="hint mt-12">Each domain is delivered <b>Direct</b> (DNS A record → the main server) or through a <b>Cloudflare Tunnel</b>. Saving rewrites the nginx config and the tunnel routes.</p></div></div>
       <div class="card"><div class="card-head"><h3>HTTPS certificate</h3><span class="sub" data-sslsub>Let's Encrypt via certbot</span></div><div data-sslcard></div></div>
       </div>
-      <div class="card mt-20"><div class="card-head"><h3>nginx configuration</h3><span class="sub">Generated — read-only</span><div class="right"><button class="btn btn-sm" data-copyconf>${icon("copy")}Copy</button></div></div>
-        <div class="card-body"><pre class="code" data-conf><span class="muted">Loading…</span></pre></div></div>`);
+      ${foldCard({ id: "site.nginx", cls: "mt-20", title: "nginx configuration", sub: "Generated — read-only", open: false, actions: html`<button class="btn btn-sm" data-copyconf>${icon("copy")}Copy</button>`,
+        body: html`<div class="card-body"><pre class="code" data-conf><span class="muted">Loading…</span></pre></div>` })}`);
     const paintSsl = () => { const ssl = S.ssl || {};
       $("[data-sslsub]", box).textContent = tunnelOnly() ? "Handled by Cloudflare" : "Let's Encrypt via certbot";
       if (tunnelOnly()) {
@@ -617,8 +672,7 @@ export default async function site(ctx) {
   /* ── scripts (views/site-scripts.js) ── */
   if (tab === "scripts") await scriptsTab(ctx, box, S);
   if (tab === "tests") await testsTab(ctx, box, S);
-  if (tab === "uptime") await uptimeTab(box, ctx, S);
-  if (tab === "traffic") await trafficTab(ctx, box, S);
+  if (tab === "statistics") await statisticsTab(ctx, box, S);
 
   /* ── logs ── */
   if (tab === "logs") {

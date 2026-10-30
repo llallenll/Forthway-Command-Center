@@ -38,6 +38,7 @@ import {
   DEFAULT_MAX_MINUTES,
   DEFAULT_MAX_TURNS,
   STALE_MS,
+  testDatabasePreview,
 } from "../../shared/testenv.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -539,7 +540,9 @@ export function register(router, ctx) {
     const label = release.version ? `v${release.version}` : run.commit?.shortSha || release.id;
 
     const job = ctx.jobs.start(
-      { type: "site.test", title: `Test ${site.name} ${label}`, projectId: site.projectId, siteId: site.id, serverId, adminId: admin?.id || null },
+      // Heavy for the job queue: a test installs and builds the release (plus a database and the
+      // tester container) on the test server, so it waits for a free slot there like a deploy.
+      { type: "site.test", title: `Test ${site.name} ${label}`, projectId: site.projectId, siteId: site.id, serverId, adminId: admin?.id || null, heavy: true, servers: [serverId] },
       async ({ log, signal }) => {
         run.status = "preparing";
         run.phase = "Getting the test environment ready";
@@ -563,6 +566,7 @@ export function register(router, ctx) {
             runId: run.id,
             siteId: site.id,
             siteName: fresh.name,
+            siteSlug: fresh.slug || fresh.name, // the throw-away database is test_<slug>
             spec,
             release: releaseFor(release, serverId, base),
             linked: linked.map((l) => ({ databaseId: l.databaseId, name: l.name, prefix: l.prefix || "", vars: l.vars || {} })),
@@ -598,8 +602,18 @@ export function register(router, ctx) {
           audit(admin, "test.finish", siteTarget(site), { runId: run.id, status: run.status, verdict: run.verdict, score: run.score });
         }
       },
+      {
+        // Cancelled while waiting in the job queue: nothing ran, so close the run here.
+        onDropped: () => {
+          finalizeRun(run, { cancelled: true });
+          run.phase = "Cancelled before it started.";
+          touch(run, { now: true });
+          live.delete(run.id);
+        },
+      },
     );
     run.jobId = job?.id || null;
+    if (job?.status === "queued" && job.position) run.phase = `Waiting in the job queue (position ${job.position}) for a free slot on ${serverName(serverId)}`;
     touch(run, { now: true });
     pruneRuns(site.id);
     return run;
@@ -659,7 +673,7 @@ export function register(router, ctx) {
     const job = run.jobId ? ctx.jobs?.get?.(run.jobId) : null;
     if (job && (job.status === "queued" || job.status === "running")) {
       ctx.jobs.cancel(run.jobId, { by: admin?.id });
-      run.phase = "Cancelling — removing the test environment…";
+      if (isActive(run)) run.phase = "Cancelling — removing the test environment…"; // a queued one is already closed
       touch(run, { now: true });
     } else {
       // No job behind it (lost in a restart): just close the record.
@@ -707,7 +721,28 @@ export function register(router, ctx) {
       .map((key) => ({ key, set: true })),
   });
 
-  router.get("/api/sites/:id/test-env", async (req, res, { params }) => testEnvView(mustSite(params.id).id));
+  /**
+   * The database a commit test of this site gets (Environment → Test, read-only):
+   * test_<slug> on host db1, user/password random per run — also for a node/php
+   * site without a database (then DATABASE_URL and DB_* are added for the copy).
+   */
+  async function testDatabaseView(site) {
+    if (site.type === "static" && !(site.linkedDatabaseIds || []).length) return null;
+    try {
+      const sid = ctx.sites?.targets?.(site)?.[0];
+      const spec = ctx.sites?.specForAsync ? await ctx.sites.specForAsync(site, sid) : ctx.sites?.specFor?.(site, sid);
+      const linked = ctx.sites?.linkedEnvSources ? (await ctx.sites.linkedEnvSources(site, sid)) || [] : [];
+      const view = testDatabasePreview(spec?.env || {}, linked, { slug: site.slug || site.name, type: site.type });
+      return view.databases.length ? view : null;
+    } catch {
+      return null;
+    }
+  }
+
+  router.get("/api/sites/:id/test-env", async (req, res, { params }) => {
+    const site = mustSite(params.id);
+    return { ...testEnvView(site.id), database: await testDatabaseView(site) };
+  });
 
   router.put("/api/sites/:id/test-env", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);

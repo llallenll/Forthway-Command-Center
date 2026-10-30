@@ -3,6 +3,7 @@ import { html, raw, mount, $, on, initials, toast, toastError, openMenu, errorSt
 import { icon } from "./icons.js";
 import { get, post, MOCK, exitMock, pageUrl, ApiError } from "./api.js";
 import { startEvents, onEvent, onStatus, eventStatus } from "./events.js";
+import { queueChip, initQueue } from "./queue.js"; // job queue: top-bar button + panel
 
 export const state = { me: null, settings: null, version: null };
 const shortName = () => (state.settings?.panelName || "Forthway").replace(/\s*command\s*center\s*$/i, "") || "Forthway";
@@ -16,6 +17,7 @@ const NAV = [
   { id: "databases", label: "Databases", icon: "database", href: "#/databases" },
   { id: "backups", label: "Backups", icon: "archive", href: "#/backups" },
   { id: "servers", label: "Servers", icon: "server", href: "#/servers" },
+  { id: "cloudflare", label: "Cloudflare", icon: "cloud", href: "#/cloudflare" }, // connectors + domains (views/cloudflare-page.js); the account stays in Settings
 ];
 const NAV_BOTTOM = [
   { id: "activity", label: "Activity", icon: "activity", href: "#/activity" },
@@ -37,6 +39,7 @@ const ROUTES = [
   ["/backups", "backups", "backups"],
   ["/backups/:tab", "backups", "backups"],
   ["/servers", "servers", "servers"],
+  ["/cloudflare", "cloudflare-page", "cloudflare"],
   ["/activity", "activity", "activity"],
   ["/settings", "settings", "settings"],
   ["/settings/:tab", "settings", "settings"],
@@ -82,6 +85,7 @@ function paintTop() {
   mount($("#topRight"), html`
     ${MOCK ? html`<button class="mock-chip" id="mockChip" title="Using fixture data. Click to switch to the real API.">${icon("sparkles", "xs")}Mock data</button>` : ""}
     <span id="updateChip" class="update-chip-slot">${updateChip()}</span>
+    ${queueChip()}
     ${liveChip()}
     <button class="account-btn" id="accountBtn" aria-haspopup="menu"><span class="avatar">${initials(me.name)}</span><span class="acc-name">${me.name || "Account"}</span>${icon("chevronDown", "sm")}</button>`);
   $("#mockChip")?.addEventListener("click", exitMock);
@@ -409,6 +413,7 @@ async function boot() {
   initUpdates();
   initHa();
   initTestBadge();
+  initQueue();
   onStatus(paintLive);
   onEvent("lb", debounce(paintSidebarStatus, 500));
   onEvent("job", (j) => {
@@ -420,7 +425,7 @@ async function boot() {
   onEvent("monitor", (d) => {
     // MONITOR: a website went down / came back (uptime checks).
     if (!d || (d.kind !== "down" && d.kind !== "up") || Date.now() - new Date(d.at) > 15000) return;
-    const open = { label: "View uptime →", fn: () => (location.hash = `#/sites/${d.siteId}/uptime`) };
+    const open = { label: "View statistics →", fn: () => (location.hash = `#/sites/${d.siteId}/statistics`) };
     if (d.kind === "down") toast(`${d.siteName} is down`, "err", { msg: d.cause || "", action: open });
     else toast(`${d.siteName} is back up`, "ok", { msg: d.durationMs ? `Down for ${Math.max(1, Math.round(d.durationMs / 60000))} min.` : "", action: open });
   });

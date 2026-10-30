@@ -5,6 +5,7 @@ import { sparkline } from "../charts.js";
 import { pageHead, serverKind, jobStarted, openJobLog, METHOD_LABEL, ubar } from "../components.js";
 import { serverBackupDialog } from "./backups.js";
 import { getReplication, replSummary, replicaBroken, syncBar, syncActive, fmtLagS } from "./databases.js";
+import { foldCard, moreList } from "../fold.js"; // the front-door card folds away; long site lists show "Show all"
 
 function installBlock(cmd, warning) {
   return html`${warning ? html`<div class="note warn" style="margin-bottom:14px">${icon("alert")}<div>${warning} <a href="#/settings/general" style="color:var(--blue-3)">Set the panel URL →</a></div></div>` : ""}<ol class="small" style="margin:0 0 14px;padding-left:18px;color:var(--text-2);line-height:1.8">
@@ -45,7 +46,7 @@ function edgeBody(s) {
     <div class="label mt-20" style="margin-bottom:8px">Tunnel replicas</div>
     ${conns.length ? html`<div class="edge-rows">${conns.map((c) => html`<div class="edge-row"><span class="dot ${c.active && c.readyConnections > 0 ? "ok" : c.active ? "warn" : "err"}"></span>
         <span class="edge-row-name">${c.name || c.id}</span><span class="muted small">${!c.active ? "Not running" : c.readyConnections > 0 ? plural(c.readyConnections, "connection") : "Starting…"}</span></div>`)}</div>`
-      : html`<p class="muted small" style="margin:0">${es ? "No connectors. Add a Cloudflare Tunnel connector in Settings → Cloudflare and it is copied here." : "Shown after the first sync."}</p>`}
+      : html`<p class="muted small" style="margin:0">${es ? "No connectors. Add a Cloudflare Tunnel connector on the Cloudflare page and it is copied here." : "Shown after the first sync."}</p>`}
     ${shims.length ? html`<div class="label mt-20" style="margin-bottom:8px">Port shims to main</div>
       <div class="edge-rows">${shims.map((x) => html`<div class="edge-row"><span class="dot ${x.ok ? "ok" : "err"}"></span>
         <span class="edge-row-name">${x.name} <span class="muted mono small">127.0.0.1:${x.listenPort}</span></span><span class="muted small ${x.ok ? "" : "cf-err"}">${x.ok ? "OK" : x.error || "Not answering"}</span></div>`)}</div>` : ""}
@@ -611,18 +612,20 @@ export default async function servers(ctx) {
   const paintLb = () => {
     if (!lb) return mount(lbBox, html``);
     const sitesLb = (lb.sites || []).filter((x) => x.loadBalanced);
-    mount(lbBox, html`<div class="card"><div class="card-head" style="flex-wrap:wrap">
-        <span class="li-ico" style="width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:${(lb.installed || lb.dryRun) && lb.configOk !== false ? "rgba(61,220,151,.12)" : "rgba(255,93,122,.12)"};color:${(lb.installed || lb.dryRun) && lb.configOk !== false ? "var(--ok)" : "var(--err)"}">${icon("balance")}</span>
-        <div><h3>Front door · nginx ${lb.version ? html`<span class="muted" style="font-weight:500">v${lb.version}</span>` : ""}</h3>
-          <div class="sub">${!lb.installed ? (lb.dryRun ? html`Dry run — configs are written but nginx isn't touched · applied ${ago(lb.lastAppliedAt)}` : "nginx is not installed on the main server") : lb.configOk === false ? "Last config test failed" : html`Config OK · applied ${ago(lb.lastAppliedAt)}`}</div></div>
-        <div class="right"><button class="btn" data-apply>${icon("refresh")}Re-apply load balancer</button></div></div>
+    const lbOk = (lb.installed || lb.dryRun) && lb.configOk !== false;
+    // Folds away (closed by default) — but stays open while nginx reports an error.
+    mount(lbBox, foldCard({ id: "servers.frontDoor", open: false, forceOpen: !!lb.lastError || lb.configOk === false, count: sitesLb.length || null,
+      title: html`<span class="li-ico" style="width:30px;height:30px;border-radius:9px;place-items:center;background:${lbOk ? "rgba(61,220,151,.12)" : "rgba(255,93,122,.12)"};color:${lbOk ? "var(--ok)" : "var(--err)"}">${icon("balance", "sm")}</span>Front door · nginx ${lb.version ? html`<span class="muted" style="font-weight:500">v${lb.version}</span>` : ""}`,
+      sub: html`${!lb.installed ? (lb.dryRun ? html`Dry run — configs are written but nginx isn't touched · applied ${ago(lb.lastAppliedAt)}` : "nginx is not installed on the main server") : lb.configOk === false ? "Last config test failed" : html`Config OK · applied ${ago(lb.lastAppliedAt)}`}${sitesLb.length ? ` · ${plural(sitesLb.length, "load-balanced website")}` : ""}`,
+      actions: html`<button class="btn" data-apply>${icon("refresh")}<span class="hide-sm">Re-apply load balancer</span><span class="show-sm">Re-apply</span></button>`,
+      body: html`
       ${lb.lastError ? html`<div class="card-body" style="padding-bottom:0"><div class="error-box">${icon("alert")}<div class="mono small">${lb.lastError}</div></div></div>` : ""}
       <div class="card-body">${sitesLb.length ? html`<div class="label" style="margin-bottom:10px">Load-balanced websites</div>
-        <div class="stack" style="gap:8px">${sitesLb.map((x) => html`<a class="list-item" href="#/sites/${x.id}" style="border:1px solid var(--line);border-radius:12px;padding:10px 14px">
+        ${moreList(sitesLb, (x) => html`<a class="list-item" href="#/sites/${x.id}" style="border:1px solid var(--line);border-radius:12px;padding:10px 14px">
           <span class="li-ico">${icon("globe", "sm")}</span>
           <div class="li-main"><div class="li-title">${x.name}</div><div class="li-sub">${(x.domains || [])[0] || ""} · ${METHOD_LABEL[x.method] || x.method}</div></div>
-          <div class="li-right">${(x.upstreams || []).map((u) => html`<span class="row tiny" style="gap:5px" title="${u.name}: ${!u.online ? "offline" : u.healthy ? "healthy" : "unhealthy"}"><span class="dot ${!u.online ? "off" : u.healthy ? "ok" : "err"}"></span><span class="hide-sm">${u.name}</span></span>`)}</div></a>`)}</div>`
-        : html`<p class="muted small">No load-balanced websites yet. Turn on load balancing when creating a website or in its Settings tab.</p>`}</div></div>`);
+          <div class="li-right">${(x.upstreams || []).map((u) => html`<span class="row tiny" style="gap:5px" title="${u.name}: ${!u.online ? "offline" : u.healthy ? "healthy" : "unhealthy"}"><span class="dot ${!u.online ? "off" : u.healthy ? "ok" : "err"}"></span><span class="hide-sm">${u.name}</span></span>`)}</div></a>`, { id: "servers.lbSites", limit: 5, cls: "stack lb-site-stack", noun: "websites" })}`
+        : html`<p class="muted small">No load-balanced websites yet. Turn on load balancing when creating a website or in its Settings tab.</p>`}</div>` }));
   };
 
   const paint = () => {

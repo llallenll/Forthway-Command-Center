@@ -1080,7 +1080,7 @@ function createMonitor(ctx) {
     const t = targetFor(site);
     let panelLink = null;
     try {
-      panelLink = `${String(ctx.panelUrl?.() || "").replace(/\/+$/, "")}/#/sites/${encodeURIComponent(site.id)}/uptime`;
+      panelLink = `${String(ctx.panelUrl?.() || "").replace(/\/+$/, "")}/#/sites/${encodeURIComponent(site.id)}/statistics`;
       if (!/^https?:\/\//.test(panelLink)) panelLink = null;
     } catch { /* no panel URL */ }
     const domain = (site.domains || [])[0] || "";

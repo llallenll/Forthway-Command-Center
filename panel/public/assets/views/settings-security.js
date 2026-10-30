@@ -6,6 +6,7 @@ import { icon } from "../icons.js";
 import { get, patch, del, MOCK } from "../api.js";
 import { addPasskey, browserSupport, defaultPasskeyName } from "../passkey.js";
 import { avatarOf } from "./settings-auth.js";
+import { moreList } from "../fold.js"; // long admin lists show "Show all"
 
 const RECOVER_CMD = "sudo node /opt/fcc/panel/recover.mjs --reset-passkeys";
 const who = (a) => a.name || (a.github ? `@${a.github.login}` : a.email) || "Admin";
@@ -64,7 +65,7 @@ export async function passkeySettings(box, ctx) {
         <div class="card-head"><div><h3>Everyone's passkeys</h3><div class="sub">${everyone.canReset
           ? "Someone lost their device? Remove their passkeys: they're signed out and add a new one at their next sign-in."
           : "Only an owner can remove another admin's passkeys."}</div></div></div>
-        <div class="list">${(everyone.items || []).map((a) => {
+        ${moreList(everyone.items || [], (a) => {
           const self = a.id === me().id;
           return html`<div class="list-item">
             ${avatarOf(a)}
@@ -73,7 +74,7 @@ export async function passkeySettings(box, ctx) {
             <div class="li-right">${a.counterWarning ? html`<span class="badge warn">${icon("alert")}Check</span>` : ""}
               ${a.passkeys ? (a.passkeys === 1 ? html`<span class="badge warn" title="No backup passkey">1</span>` : html`<span class="badge ok">${icon("check")}${a.passkeys}</span>`) : html`<span class="badge">None</span>`}
               ${everyone.canReset && !self && a.passkeys ? html`<button class="btn btn-sm btn-ghost" data-reset="${a.id}">Remove passkeys</button>` : ""}</div></div>`;
-        })}</div></div>` : ""}
+        }, { id: "settings.passkeys.everyone", limit: 8, cls: "list", noun: "admins" })}</div>` : ""}
 
       <div class="note">${icon("info")}<div>Locked out for good (lost every passkey, no other owner to help)? On the server run <span class="mono">${mine.recoverCmd || RECOVER_CMD}</span> — its one-time link removes that admin's passkeys and asks for a new one straight away.</div></div>`);
   };

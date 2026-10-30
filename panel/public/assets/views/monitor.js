@@ -1,5 +1,5 @@
 // Uptime monitoring + SMS alerts (server: panel/lib/monitor.mjs).
-//   uptimeTab()              website page → Uptime tab
+//   checkSettingsModal() / alertSettingsModal() / incidentItem()  website page → Statistics tab (views/site-stats.js)
 //   notificationsSettings()  Settings → Notifications (channels: Twilio SMS, Discord webhooks; alert rules; cluster alerts)
 //   bindUptime()             fills [data-uptime="<siteId>"] slots in website rows (Websites list, project page)
 //   downBanner()             dashboard: "N websites down" card (renders nothing while everything is up)
@@ -7,7 +7,7 @@
 import { html, raw, mount, $, $$, on, ago, fmtDate, fmtTime, fmtDuration, plural, toast, toastError, confirmDialog, debounce, emptyState, skeletonRows, copyText, openModal, openMenu } from "../util.js";
 import { icon } from "../icons.js";
 import { get, put, post, patch, del } from "../api.js";
-import { lineChart } from "../charts.js";
+import { moreList } from "../fold.js"; // long incident / sign-up lists show "Show all"
 
 /* ───────── shared bits ───────── */
 
@@ -38,7 +38,7 @@ export function uptimeStrip(values, { labels = [], cls = "" } = {}) {
 }
 
 /** Labels for the 24 clock-hour cells of `bars24h` (the server sends where they start; the last cell is the current hour). */
-function hourLabels(start, n = 24) {
+export function hourLabels(start, n = 24) {
   const s = Date.parse(start) || Math.floor(Date.now() / 3600e3) * 3600e3 - (n - 1) * 3600e3;
   return Array.from({ length: n }, (_, i) => {
     const t = s + i * 3600e3;
@@ -143,7 +143,7 @@ export async function downBanner(el, ctx) {
     mount(el, html`<div class="card up-alert">
       <div class="card-head"><span class="up-alert-ico">${icon("alert")}</span>
         <div style="min-width:0"><h3>${plural(down.length, "website")} down</h3><div class="sub">${r.notifications?.enabled ? "Text alerts are on for websites that have them enabled." : html`Text alerts are off — <a href="#/settings/notifications">turn them on</a>.`}</div></div></div>
-      <div class="list">${down.map((m) => html`<a class="list-item" href="#/sites/${m.siteId}/uptime">
+      <div class="list">${down.map((m) => html`<a class="list-item" href="#/sites/${m.siteId}/statistics">
         <span class="dot err"></span>
         <div class="li-main"><div class="li-title">${m.name}</div><div class="li-sub">${m.domain || m.target || "no address"} · ${m.lastCheck?.error || "failing"}</div></div>
         <div class="li-right">down ${m.since ? ago(m.since).replace(" ago", "") : ""}${icon("chevronRight", "sm")}</div></a>`)}</div></div>`);
@@ -153,13 +153,15 @@ export async function downBanner(el, ctx) {
   await load();
 }
 
-/* ───────── website page → Uptime tab ───────── */
+/* ───────── website page → Statistics tab (views/site-stats.js) ─────────
+   The tab paints the cards; the check and alert settings live in two modals here. */
 
 const INTERVALS = [10, 30, 60, 120, 300, 600, 900, 1800, 3600];
-const intervalLabel = (s) => (s < 60 ? `${s} seconds` : s < 3600 ? `${s / 60} minute${s === 60 ? "" : "s"}` : "1 hour");
+export const intervalLabel = (s) => (s < 60 ? `${s} seconds` : s < 3600 ? `${s / 60} minute${s === 60 ? "" : "s"}` : "1 hour");
 const KIND_LABEL = { down: "Down alert", reminder: "Still down", up: "Recovered" };
+const NOTIF_LINK = "#/settings/notifications";
 
-function incidentItem(i) {
+export function incidentItem(i) {
   const dur = fmtDuration(i.durationMs);
   const sent = (i.alerts || []).filter((a) => !a.skipped);
   const failed = sent.filter((a) => !a.ok).length;
@@ -183,206 +185,128 @@ function incidentItem(i) {
     </div></details>`;
 }
 
-export async function uptimeTab(box, ctx, S) {
-  let range = "24h", D = null, chart = null;
-  mount(box, skeletonRows(3, 90));
-  const load = async () => { D = await get(`/api/sites/${S.id}/monitor?range=${range}`); return D; };
-  try { await load(); } catch (e) { if (ctx.alive()) mount(box, html`<div class="card">${emptyState({ ico: "activity", title: "Uptime monitoring isn't available", text: e.message, sm: true })}</div>`); return; }
-  if (!ctx.alive()) return;
+/** One-line state of a site's text alerts: { tone, text } (tone: ok | warn | off). */
+export function smsState(D) {
+  const n = D.notifications, s = D.settings;
+  if (!n.enabled) return { tone: "off", text: "Off for the whole panel" };
+  if (!s.smsEnabled) return { tone: "off", text: "Off for this website" };
+  if (!D.recipients.length) return { tone: "warn", text: "On, but nobody to text" };
+  if (!n.configured && !n.dryRun) return { tone: "warn", text: `On · ${plural(D.recipients.length, "number")} · Twilio not set up` };
+  return { tone: "ok", text: `On · ${plural(D.recipients.length, "number")}${n.dryRun ? " · dry run" : ""}` };
+}
+/** One-line state of a site's Discord alerts: { tone, text }. */
+export function discordState(D) {
+  const dn = D.notifications.discord || { webhooks: [] };
+  if (!dn.webhooks.length) return { tone: "off", text: "No webhooks set up" };
+  if (D.settings.discordEnabled === false) return { tone: "off", text: "Off for this website" };
+  const t = new Set(D.discordTargets || []);
+  const names = dn.webhooks.filter((w) => t.has(w.id)).map((w) => w.name);
+  return names.length ? { tone: "ok", text: `On · ${names.join(", ")}${D.notifications.dryRun && !dn.testEndpoint ? " · dry run" : ""}` } : { tone: "warn", text: "On, but no enabled webhook is selected" };
+}
 
-  mount(box, html`<div data-up-head></div>
-    <div class="card mt-20"><div class="card-head"><div><h3>Last 90 days</h3><div class="sub" data-up-90sub></div></div></div>
-      <div class="card-body" data-up-90></div></div>
-    <div class="card mt-20 chart-card"><div class="chart-toolbar"><div><h3 style="margin:0">Response time</h3><div class="sub muted small" data-up-csub></div></div>
-      <div class="seg" data-range>${["1h", "24h", "7d", "30d", "90d"].map((r) => html`<button class="${r === range ? "active" : ""}" data-r="${r}">${r}</button>`)}</div></div>
-      <div class="chart" data-up-chart style="height:240px"></div></div>
-    <div class="card mt-20"><div class="card-head"><div><h3>Incidents</h3><div class="sub">Outages and every alert (text or Discord post) sent about them</div></div></div><div class="list" data-up-inc></div></div>
-    <div class="grid-2 mt-20 up-forms" data-up-forms></div>`);
+/** "Check settings" modal. Resolves after a save with the PUT response (or undefined when closed). */
+export function checkSettingsModal(S, D) {
+  const s = D.settings;
+  const ivals = [...new Set([...INTERVALS.filter((x) => x >= (s.minIntervalSec || 10)), s.intervalSec])].sort((a, b) => a - b);
+  const fid = `chk-${Math.random().toString(36).slice(2, 8)}`;
+  const m = openModal({
+    title: "Check settings", sub: `How the panel checks ${S.name}`, ico: "activity", size: "lg",
+    body: html`<form id="${fid}" data-chk novalidate><div class="form-grid">
+      ${field("Check every", html`<select class="select" name="intervalSec">${ivals.map((v) => html`<option value="${v}" ${v === s.intervalSec ? raw("selected") : ""}>${intervalLabel(v)}</option>`)}</select>`)}
+      ${field("Timeout", html`<div class="row" style="gap:8px"><input class="input" type="number" name="timeoutSec" min="1" max="60" value="${s.timeoutSec}" style="max-width:110px"/><span class="muted small">seconds</span></div>`)}
+      ${field("Path", html`<input class="input mono" name="path" value="${s.path || ""}" placeholder="${D.effective.healthPath || "/"}" autocomplete="off" spellcheck="false"/>`, html`Blank = the website's health check path${D.effective.healthPath ? html` (<span class="mono">${D.effective.healthPath}</span>)` : " or /"}.`)}
+      ${field("Expected status", html`<input class="input mono" name="expect" value="${s.expectMin === s.expectMax ? s.expectMin : `${s.expectMin}-${s.expectMax}`}" placeholder="200-399" autocomplete="off"/>`, "Anything else counts as a failed check.")}
+      ${field("Down after", html`<div class="row" style="gap:8px"><input class="input" type="number" name="failThreshold" min="1" max="20" value="${s.failThreshold}" style="max-width:110px"/><span class="muted small">failed checks in a row</span></div>`)}
+      ${field("Up again after", html`<div class="row" style="gap:8px"><input class="input" type="number" name="recoverThreshold" min="1" max="20" value="${s.recoverThreshold}" style="max-width:110px"/><span class="muted small">good checks in a row</span></div>`)}
+      <div class="span-2">${field("Custom URL", html`<input class="input mono" name="url" value="${s.url || ""}" placeholder="${D.effective.how === "custom" ? "" : D.effective.url || "https://example.com/health"}" autocomplete="off" spellcheck="false"/>`, "Optional. Check this exact address instead of the website's first domain.")}</div>
+      <div class="error-box span-2" data-err hidden></div>
+    </div></form>`,
+    foot: html`<button class="btn btn-ghost" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit" form="${fid}" data-save>${icon("check")}Save check settings</button>`,
+    onMount(el, close) {
+      const form = $("form", el), btn = $("[data-save]", el), err = $("[data-err]", el);
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const f = form.elements;
+        showErr(err, ""); setBusy(btn, true);
+        try {
+          const r = await put(`/api/sites/${S.id}/monitor`, { intervalSec: +f.intervalSec.value, timeoutSec: +f.timeoutSec.value, path: f.path.value.trim(), expect: f.expect.value.trim() || "200-399", failThreshold: +f.failThreshold.value, recoverThreshold: +f.recoverThreshold.value, url: f.url.value.trim() });
+          toast("Check settings saved", "ok");
+          close(r);
+        } catch (ex) { showErr(err, ex.message); setBusy(btn, false); }
+      });
+    },
+  });
+  return m.result;
+}
 
-  const paintHead = () => {
-    const m = D.summary, st = monitorState(m), u = m.uptime || {};
-    const lc = m.lastCheck;
-    const servers = m.servers || [];
-    mount($("[data-up-head]", box), html`
-      ${m.paused ? html`<div class="note warn" style="margin-bottom:14px">${icon("info")}<div style="flex:1">Monitoring is paused${m.since ? ` since ${fmtDate(m.since)}` : ""}${m.pauseUntil ? ` until ${fmtDate(m.pauseUntil)}` : ""}${D.settings.pausedBy ? ` by ${D.settings.pausedBy}` : ""} — no checks and no text messages.</div><button class="btn btn-sm" data-resume>${icon("play")}Resume</button></div>` : ""}
-      ${m.state === "pending" ? html`<div class="note" style="margin-bottom:14px">${icon("info")}<div>Monitoring starts after the first deploy (or set a custom URL below).</div></div>` : ""}
-      <div class="mini-stats">
-        <div class="mini-stat"><div class="ms-l">${icon("activity", "xs")}Status</div><div class="ms-v row" style="gap:9px"><span class="dot ${st.tone}"></span>${st.text}</div>
-          <div class="ms-s">${m.since && (m.state === "up" || m.state === "down") ? html`for ${ago(m.since).replace(" ago", "")}` : ""}${lc ? html`${m.since ? " · " : ""}checked ${ago(lc.at)}` : ""}</div></div>
-        <div class="mini-stat"><div class="ms-l">${icon("check", "xs")}Uptime 24h</div><div class="ms-v">${fmtUptime(u.h24)}</div><div class="ms-s">7 days ${fmtUptime(u.d7)}</div></div>
-        <div class="mini-stat"><div class="ms-l">${icon("calendar", "xs")}Uptime 30 days</div><div class="ms-v">${fmtUptime(u.d30)}</div><div class="ms-s">90 days ${fmtUptime(u.d90)}</div></div>
-        <div class="mini-stat"><div class="ms-l">${icon("gauge", "xs")}Response time</div><div class="ms-v">${m.avgMs24h != null ? `${m.avgMs24h} ms` : "—"}</div><div class="ms-s">${lc ? (lc.ok ? `last ${lc.ms} ms · HTTP ${lc.status}` : html`<span style="color:#ff8ea3">${lc.error}</span>`) : "24h average"}</div></div>
-      </div>
-      <div class="card"><div class="card-head" style="flex-wrap:wrap"><div style="min-width:0;flex:1 1 260px"><h3>Checks</h3>
-          <div class="sub">${D.effective.url ? html`<span class="mono">GET ${D.effective.url}</span>` : "No address to check"} · every ${intervalLabel(D.settings.intervalSec)} · expects ${D.settings.expectMin}–${D.settings.expectMax}</div></div>
-        <div class="right btn-row">${m.paused ? html`<button class="btn btn-sm" data-resume>${icon("play")}Resume</button>` : html`<button class="btn btn-sm" data-check ${m.state === "pending" ? raw("disabled") : ""}>${icon("refresh")}Check now</button><button class="btn btn-sm" data-pause>${icon("stop")}Pause</button>`}</div></div>
-        <div class="card-body"><dl class="kv">
-          <dt>Last 24 hours</dt><dd>${uptimeStrip(m.bars24h || [], { labels: hourLabels(m.bars24hStart, (m.bars24h || []).length) })}</dd>
-          ${servers.length ? html`<dt>${servers.length > 1 ? "Servers" : "Server"}</dt><dd class="row wrap" style="gap:12px">${servers.map((x) => html`<span class="status" title="${x.error || ""}"><span class="dot ${x.down || x.healthy === false ? "err" : !x.online ? "off" : x.healthy ? "ok" : "off"}"></span>${x.name}<span class="muted small">${x.down || x.healthy === false ? " unhealthy" : !x.online ? " offline" : x.healthy ? " healthy" : " not checked"}</span></span>`)}</dd>` : ""}
-          <dt>Text alerts</dt><dd>${!D.notifications.enabled ? html`<span class="muted">Off for the whole panel — </span><a href="#/settings/notifications" style="color:var(--blue-3)">Settings → Notifications</a>` : D.settings.smsEnabled ? html`On · ${plural(D.recipients.length, "number")}${D.notifications.dryRun ? html` <span class="badge">dry run: simulated</span>` : !D.notifications.configured ? html` <span class="badge warn">Twilio not set up</span>` : ""}` : html`<span class="muted">Off for this website</span>`}</dd>
-          <dt>Discord</dt><dd>${discordSummary()}</dd>
-        </dl></div></div>`);
-  };
-
-  const discordSummary = () => {
-    const dn = D.notifications.discord || { webhooks: [] };
-    if (!dn.webhooks.length) return html`<span class="muted">No webhooks — </span><a href="#/settings/notifications" style="color:var(--blue-3)">add one in Settings → Notifications</a>`;
-    if (D.settings.discordEnabled === false) return html`<span class="muted">Off for this website</span>`;
-    const t = new Set(D.discordTargets || []);
-    const names = dn.webhooks.filter((w) => t.has(w.id)).map((w) => w.name);
-    return names.length ? html`On · ${names.join(", ")}${D.notifications.dryRun && !dn.testEndpoint ? html` <span class="badge">dry run: simulated</span>` : ""}` : html`<span class="muted">On, but no enabled webhook is selected</span>`;
-  };
-
-  const paint90 = () => {
-    const days = D.days || [];
-    const withData = days.filter((d) => d.uptime != null);
-    mount($("[data-up-90sub]", box), html`${fmtUptime(D.summary.uptime?.d90)} uptime · ${withData.length ? plural(days.reduce((a, d) => a + (d.downMinutes || 0), 0), "minute") + " down" : "no data yet"}`);
-    mount($("[data-up-90]", box), html`${uptimeStrip(days.map((d) => (d.uptime == null ? (d.pausedMinutes ? -1 : null) : d.uptime / 100)), { cls: "big", labels: days.map((d) => `${d.day}${d.downMinutes ? ` · ${d.downMinutes} min down` : ""}${d.avgMs != null ? ` · ${d.avgMs} ms` : ""}`) })}
-      <div class="up-legend"><span>90 days ago</span><span class="row" style="gap:12px"><span><i class="up-b ok"></i>Up</span><span><i class="up-b warn"></i>Partial</span><span><i class="up-b err"></i>Down</span><span><i class="up-b none"></i>No data</span></span><span>Today</span></div>`);
-  };
-
-  const chartData = () => {
-    const pts = (D.series?.points || []).filter((p) => p.ms != null).map((p) => ({ t: p.t, v: p.ms }));
-    return { series: [{ name: "Response time", color: "#33d4c1", gradient: ["#33d4c1", "#6d8dff"], areaColor: "#33d4c1", points: pts, fmt: (v) => `${Math.round(v)} ms` }], range, fmt: (v) => `${Math.round(v)} ms`, empty: "No successful checks in this period", aria: `Response time over the last ${range}` };
-  };
-  const paintChart = () => {
-    const pts = (D.series?.points || []).filter((p) => p.ms != null);
-    const avg = pts.length ? Math.round(pts.reduce((a, p) => a + p.ms, 0) / pts.length) : null;
-    mount($("[data-up-csub]", box), html`${avg != null ? `${avg} ms average` : "—"} · time to first byte from this server`);
-    if (!chart) { chart = lineChart($("[data-up-chart]", box), chartData()); ctx.cleanup(() => chart.destroy()); } else chart.update(chartData());
-  };
-
-  const paintIncidents = () => {
-    const inc = D.incidents || [];
-    const opened = new Set($$("details.inc[open]", box).map((d) => d.dataset.inc)); // keep expanded logs open across live refreshes
-    const gaps = (D.gaps || []).filter((g) => !inc.some((i) => (i.gaps || []).some((x) => x.from === g.from)));
-    mount($("[data-up-inc]", box), inc.length || gaps.length ? html`${inc.map(incidentItem)}${gaps.slice(0, 3).map((g) => html`<div class="list-item"><span class="li-ico">${icon("power", "sm")}</span><div class="li-main"><div class="li-title">No data for ${fmtDuration(Date.parse(g.to) - Date.parse(g.from))}</div><div class="li-sub">${fmtDate(g.from)} → ${fmtDate(g.to)} · the panel was not running, so nothing was checked</div></div></div>`)}`
-      : emptyState({ ico: "check", title: "No incidents", text: "Outages show up here with every alert sent about them.", sm: true }));
-    $$("details.inc", box).forEach((d) => { if (opened.has(d.dataset.inc)) d.open = true; });
-  };
-
-  /* settings forms */
+/** "Alert settings" modal: this website's text (SMS) and Discord alerts. Resolves with the PUT response after a save. */
+export function alertSettingsModal(S, D) {
+  const s = D.settings, n = D.notifications, dn = n.discord || { webhooks: [] };
+  const skip = new Set(s.discordSkip || []);
+  const fid = `alr-${Math.random().toString(36).slice(2, 8)}`;
+  const every = n.repeatMinutes === 60 ? "every hour" : `every ${n.repeatMinutes} min`;
+  const gap = n.minGapMinutes >= 1 ? `${n.minGapMinutes} minutes` : `${Math.round(n.minGapMinutes * 60)} seconds`;
+  const smsWarn = !n.enabled ? html`Text alerts are off for the whole panel, so nothing is sent until they're turned on in <a href="${NOTIF_LINK}" data-close>Settings → Notifications</a>.`
+    : !n.configured && !n.dryRun ? html`Twilio isn't fully set up yet — <a href="${NOTIF_LINK}" data-close>finish it in Settings → Notifications</a>.` : "";
   let rcpEd = null;
-  const paintForms = () => {
-    const s = D.settings, n = D.notifications;
-    const ivals = [...new Set([...INTERVALS.filter((x) => x >= s.minIntervalSec), s.intervalSec])].sort((a, b) => a - b);
-    mount($("[data-up-forms]", box), html`
-      <form class="card" data-chk novalidate>
-        <div class="card-head"><div><h3>Check settings</h3><div class="sub">How this server checks the website</div></div></div>
-        <div class="card-body"><div class="form-grid">
-          ${field("Check every", html`<select class="select" name="intervalSec">${ivals.map((v) => html`<option value="${v}" ${v === s.intervalSec ? raw("selected") : ""}>${intervalLabel(v)}</option>`)}</select>`)}
-          ${field("Timeout", html`<div class="row" style="gap:8px"><input class="input" type="number" name="timeoutSec" min="1" max="60" value="${s.timeoutSec}" style="max-width:110px"/><span class="muted small">seconds</span></div>`)}
-          ${field("Path", html`<input class="input mono" name="path" value="${s.path || ""}" placeholder="${D.effective.healthPath || "/"}" autocomplete="off" spellcheck="false"/>`, html`Blank = the website's health check path${D.effective.healthPath ? html` (<span class="mono">${D.effective.healthPath}</span>)` : " or /"}.`)}
-          ${field("Expected status", html`<input class="input mono" name="expect" value="${s.expectMin === s.expectMax ? s.expectMin : `${s.expectMin}-${s.expectMax}`}" placeholder="200-399" autocomplete="off"/>`, "Anything else counts as a failed check.")}
-          ${field("Down after", html`<div class="row" style="gap:8px"><input class="input" type="number" name="failThreshold" min="1" max="20" value="${s.failThreshold}" style="max-width:110px"/><span class="muted small">failed checks in a row</span></div>`)}
-          ${field("Up again after", html`<div class="row" style="gap:8px"><input class="input" type="number" name="recoverThreshold" min="1" max="20" value="${s.recoverThreshold}" style="max-width:110px"/><span class="muted small">good checks in a row</span></div>`)}
-          <div class="span-2">${field("Custom URL", html`<input class="input mono" name="url" value="${s.url || ""}" placeholder="${D.effective.how === "custom" ? "" : D.effective.url || "https://example.com/health"}" autocomplete="off" spellcheck="false"/>`, "Optional. Check this exact address instead of the website's first domain.")}</div>
-          <div class="error-box span-2" data-err hidden></div>
-        </div></div>
-        <div class="card-foot"><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save check settings</button></div>
-      </form>
-      <form class="card" data-sms novalidate>
-        <div class="card-head"><div><h3>Text alerts</h3><div class="sub">A text when it goes down, ${n.repeatMinutes === 60 ? "every hour" : `every ${n.repeatMinutes} min`} while it stays down${n.notifyRecovery ? ", and one when it's back" : ""}</div></div>
-          <div class="right"><label class="switch"><input type="checkbox" name="smsEnabled" ${s.smsEnabled ? raw("checked") : ""}/><span class="track"></span><span class="hide-sm">Enabled</span></label></div></div>
-        <div class="card-body"><div class="form-stack">
-          ${!n.enabled ? html`<div class="note warn">${icon("info")}<div>Text alerts are turned off for the whole panel. Turn them on in <a href="#/settings/notifications" style="color:var(--text);font-weight:600">Settings → Notifications</a>.</div></div>` : !n.configured && !n.dryRun ? html`<div class="note warn">${icon("info")}<div>Twilio isn't fully set up yet — <a href="#/settings/notifications" style="color:var(--text);font-weight:600">finish it in Settings → Notifications</a>.</div></div>` : ""}
+  const m = openModal({
+    title: "Alert settings", sub: `Who hears about it when ${S.name} goes down`, ico: "bell", size: "lg",
+    body: html`<form id="${fid}" class="al-form" novalidate>
+      <section class="al-sec" data-sec="sms">
+        <div class="al-head"><span class="li-ico nch-tile">${icon("message", "sm")}</span>
+          <div class="al-title"><b>Text messages</b><span class="muted small">A text when it goes down, ${every} while it stays down${n.notifyRecovery ? ", and one when it's back" : ""}.</span></div>
+          <label class="switch"><input type="checkbox" name="smsEnabled" ${s.smsEnabled ? raw("checked") : ""}/><span class="track"></span><span class="sr-only">Send text alerts for this website</span></label></div>
+        ${smsWarn ? html`<div class="note warn al-note">${icon("info")}<div>${smsWarn}</div></div>` : ""}
+        <div class="al-body form-stack">
           ${field("Numbers for this website", html`<div data-rcp></div>`, "International format (E.164), like +15551234567.")}
-          <label class="switch"><input type="checkbox" name="includeDefaults" ${s.includeDefaults !== false ? raw("checked") : ""}/><span class="track"></span>Also text the default numbers ${n.defaults?.length ? html`<span class="muted">(${n.defaults.map((d) => d.name || d.phone).join(", ")})</span>` : html`<span class="muted">(none set)</span>`}</label>
-          ${field("Repeat while down", html`<div class="row" style="gap:8px"><input class="input" type="number" name="repeatMinutes" min="1" max="1440" value="${s.repeatMinutes ?? ""}" placeholder="${n.repeatMinutes}" style="max-width:110px"/><span class="muted small">minutes (blank = panel default, ${n.repeatMinutes})</span></div>`, `Each number gets at most one text per ${n.minGapMinutes >= 1 ? `${n.minGapMinutes} minutes` : `${Math.round(n.minGapMinutes * 60)} seconds`} for this website (the "back up" text is always sent).`)}
-          <div class="error-box" data-err hidden></div>
-        </div></div>
-        <div class="card-foot"><span class="muted small">${D.recipients.length ? `${plural(D.recipients.length, "number")} will be texted` : "Nobody will be texted"}</span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save>${icon("check")}Save alerts</button></div>
-      </form>
-      ${discordForm()}`);
-    rcpEd = recipientsEditor($("[data-rcp]", box), s.recipients || []);
-  };
-
-  const discordForm = () => {
-    const s = D.settings, n = D.notifications, dn = n.discord || { webhooks: [] };
-    const skip = new Set(s.discordSkip || []);
-    return html`<form class="card" data-dsc novalidate>
-        <div class="card-head"><div><h3>Discord alerts</h3><div class="sub">Posts to Discord channels on the same schedule as texts</div></div>
-          <div class="right"><label class="switch"><input type="checkbox" name="discordEnabled" ${s.discordEnabled !== false ? raw("checked") : ""}/><span class="track"></span><span class="hide-sm">Post to Discord</span></label></div></div>
-        <div class="card-body"><div class="form-stack">
+          <label class="switch"><input type="checkbox" name="includeDefaults" ${s.includeDefaults !== false ? raw("checked") : ""}/><span class="track"></span><span>Also text the default numbers ${n.defaults?.length ? html`<span class="muted">(${n.defaults.map((d) => d.name || d.phone).join(", ")})</span>` : html`<span class="muted">(none set)</span>`}</span></label>
+          ${field("Repeat while down", html`<div class="row" style="gap:8px;flex-wrap:wrap"><input class="input" type="number" name="repeatMinutes" min="1" max="1440" value="${s.repeatMinutes ?? ""}" placeholder="${n.repeatMinutes}" style="max-width:110px"/><span class="muted small">minutes (blank = panel default, ${n.repeatMinutes})</span></div>`, `Each number gets at most one text per ${gap} for this website (the "back up" text is always sent).`)}
+        </div>
+      </section>
+      <section class="al-sec" data-sec="discord">
+        <div class="al-head"><span class="li-ico nch-tile discord">${icon("discord", "sm")}</span>
+          <div class="al-title"><b>Discord</b><span class="muted small">Posts to Discord channels on the same schedule as the texts.</span></div>
+          <label class="switch"><input type="checkbox" name="discordEnabled" ${s.discordEnabled !== false ? raw("checked") : ""} ${dn.webhooks.length ? "" : raw("disabled")}/><span class="track"></span><span class="sr-only">Post Discord alerts for this website</span></label></div>
+        <div class="al-body">
           ${dn.webhooks.length ? html`<div class="field"><label>Channels</label><div class="dsc-hooks">${dn.webhooks.map((w) => html`<label class="check dsc-hook"><input type="checkbox" name="hook" value="${w.id}" ${skip.has(w.id) ? "" : raw("checked")}/><span class="dsc-ico">${icon("discord", "sm")}</span><span>${w.name}${!w.enabled ? html` <span class="badge">off in Settings</span>` : !w.ready ? html` <span class="badge warn">no URL</span>` : ""}${w.mention ? html` <span class="muted small">pings on DOWN</span>` : ""}</span></label>`)}</div>
             <div class="hint">Webhooks added later in Settings are included automatically unless you untick them here.</div></div>`
-          : html`<div class="note">${icon("info")}<div>No Discord webhooks yet — <a href="#/settings/notifications" style="color:var(--text);font-weight:600">add one in Settings → Notifications</a>.</div></div>`}
-          <div class="error-box" data-err hidden></div>
-        </div></div>
-        <div class="card-foot"><span class="muted small">${(D.discordTargets || []).length ? `Posts to ${plural(D.discordTargets.length, "channel")}` : "Nothing will be posted"}</span><span class="spacer"></span><button class="btn btn-primary" type="submit" data-save ${dn.webhooks.length ? "" : raw("disabled")}>${icon("check")}Save Discord alerts</button></div>
-      </form>`;
-  };
-
-  const paintAll = () => { paintHead(); paint90(); paintChart(); paintIncidents(); };
-  paintAll(); paintForms();
-
-  const refresh = debounce(async () => { try { await load(); if (ctx.alive()) paintAll(); } catch {} }, 400);
-
-  on(box, "submit", "[data-chk]", async (e, form) => {
-    e.preventDefault();
-    const err = $("[data-err]", form), btn = $("[data-save]", form), f = form.elements;
-    showErr(err, ""); setBusy(btn, true);
-    try {
-      const r = await put(`/api/sites/${S.id}/monitor`, { intervalSec: +f.intervalSec.value, timeoutSec: +f.timeoutSec.value, path: f.path.value.trim(), expect: f.expect.value.trim() || "200-399", failThreshold: +f.failThreshold.value, recoverThreshold: +f.recoverThreshold.value, url: f.url.value.trim() });
-      D.settings = r.settings; D.summary = r.summary;
-      toast("Check settings saved", "ok");
-      await load(); if (ctx.alive()) { paintAll(); paintForms(); }
-    } catch (ex) { showErr(err, ex.message); } finally { setBusy(btn, false); }
+          : html`<div class="note">${icon("info")}<div>No Discord webhooks yet — <a href="${NOTIF_LINK}" data-close>add one in Settings → Notifications</a>.</div></div>`}
+        </div>
+      </section>
+      <p class="hint al-global">${icon("info", "xs")} The Twilio account, default numbers, Discord webhooks and the panel-wide rules (repeat interval, "back up" alerts) are shared by every website — change them in <a href="${NOTIF_LINK}" data-close>Settings → Notifications</a>.</p>
+      <div class="error-box" data-err hidden></div>
+    </form>`,
+    foot: html`<span class="muted small left" data-al-sum></span><button class="btn btn-ghost" type="button" data-close>Cancel</button><button class="btn btn-primary" type="submit" form="${fid}" data-save>${icon("check")}Save alerts</button>`,
+    onMount(el, close) {
+      const form = $("form", el), btn = $("[data-save]", el), err = $("[data-err]", el), f = form.elements;
+      rcpEd = recipientsEditor($("[data-rcp]", el), s.recipients || []);
+      const sync = () => {
+        $('[data-sec="sms"]', el).classList.toggle("is-off", !f.smsEnabled.checked);
+        $('[data-sec="discord"]', el).classList.toggle("is-off", !f.discordEnabled.checked || !dn.webhooks.length);
+        const parts = [f.smsEnabled.checked ? "Texts on" : "Texts off", dn.webhooks.length ? (f.discordEnabled.checked ? "Discord on" : "Discord off") : ""].filter(Boolean);
+        $("[data-al-sum]", el).textContent = parts.join(" · ");
+      };
+      sync();
+      form.addEventListener("change", sync);
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        showErr(err, "");
+        let recipients;
+        try { recipients = rcpEd.value(); } catch (ex) { showErr(err, ex.message); return; }
+        if (f.smsEnabled.checked && !recipients.length && !(f.includeDefaults.checked && n.defaults?.length)) { showErr(err, "Add at least one number, or include the default numbers."); return; }
+        const rv = f.repeatMinutes.value.trim();
+        const body = { smsEnabled: f.smsEnabled.checked, includeDefaults: f.includeDefaults.checked, recipients, repeatMinutes: rv ? +rv : null };
+        if (dn.webhooks.length) Object.assign(body, { discordEnabled: f.discordEnabled.checked, discordSkip: $$('input[name="hook"]', form).filter((c) => !c.checked).map((c) => c.value) });
+        setBusy(btn, true);
+        try {
+          const r = await put(`/api/sites/${S.id}/monitor`, body);
+          toast("Alert settings saved", "ok", { msg: [r.settings.smsEnabled ? `Texts on · ${plural((r.recipients || []).length, "number")}` : "Texts off", dn.webhooks.length ? (r.settings.discordEnabled !== false ? "Discord on" : "Discord off") : ""].filter(Boolean).join(" · ") });
+          close(r);
+        } catch (ex) { showErr(err, ex.message); setBusy(btn, false); }
+      });
+    },
   });
-  on(box, "submit", "[data-sms]", async (e, form) => {
-    e.preventDefault();
-    const err = $("[data-err]", form), btn = $("[data-save]", form), f = form.elements;
-    showErr(err, "");
-    let recipients;
-    try { recipients = rcpEd.value(); } catch (ex) { showErr(err, ex.message); return; }
-    if (f.smsEnabled.checked && !recipients.length && !(f.includeDefaults.checked && D.notifications.defaults?.length)) { showErr(err, "Add at least one number, or include the default numbers."); return; }
-    setBusy(btn, true);
-    try {
-      const rv = f.repeatMinutes.value.trim();
-      const r = await put(`/api/sites/${S.id}/monitor`, { smsEnabled: f.smsEnabled.checked, includeDefaults: f.includeDefaults.checked, recipients, repeatMinutes: rv ? +rv : null });
-      D.settings = r.settings; D.summary = r.summary; D.recipients = r.recipients;
-      toast(r.settings.smsEnabled ? "Text alerts saved" : "Text alerts turned off", "ok");
-      paintHead(); paintForms();
-    } catch (ex) { showErr(err, ex.message); } finally { setBusy(btn, false); }
-  });
-  on(box, "submit", "[data-dsc]", async (e, form) => {
-    e.preventDefault();
-    const err = $("[data-err]", form), btn = $("[data-save]", form);
-    showErr(err, ""); setBusy(btn, true);
-    try {
-      const discordSkip = $$('input[name="hook"]', form).filter((c) => !c.checked).map((c) => c.value);
-      const r = await put(`/api/sites/${S.id}/monitor`, { discordEnabled: form.elements.discordEnabled.checked, discordSkip });
-      toast(r.settings.discordEnabled ? "Discord alerts saved" : "Discord alerts turned off", "ok");
-      await load(); if (ctx.alive()) { paintHead(); paintForms(); }
-    } catch (ex) { showErr(err, ex.message); } finally { setBusy(btn, false); }
-  });
-  on(box, "click", "[data-check]", async (e, b) => {
-    setBusy(b, true);
-    try { const r = await post(`/api/sites/${S.id}/monitor/check`); D.summary = r.summary; paintHead(); const lc = r.summary.lastCheck; toast(lc?.ok ? `Responded in ${lc.ms} ms` : `Check failed: ${lc?.error || "unknown"}`, lc?.ok ? "ok" : "err"); refresh(); }
-    catch (ex) { toastError(ex, "Couldn't run the check"); setBusy(b, false); }
-  });
-  on(box, "click", "[data-pause]", async () => {
-    const ok = await confirmDialog({ title: `Pause monitoring of ${S.name}?`, ico: "stop", confirmText: "Pause monitoring",
-      message: "For maintenance: no checks and no text messages until you resume. An ongoing incident is closed without a \"back up\" text. Paused time doesn't count against uptime." });
-    if (!ok) return;
-    try { await post(`/api/sites/${S.id}/monitor/pause`, {}); toast("Monitoring paused", "ok"); await load(); if (ctx.alive()) paintAll(); }
-    catch (ex) { toastError(ex, "Couldn't pause monitoring"); }
-  });
-  on(box, "click", "[data-resume]", async () => {
-    try { await post(`/api/sites/${S.id}/monitor/resume`); toast("Monitoring resumed", "ok"); await load(); if (ctx.alive()) paintAll(); }
-    catch (ex) { toastError(ex, "Couldn't resume monitoring"); }
-  });
-  on(box, "click", "[data-r]", async (e, b) => {
-    range = b.dataset.r;
-    $$("[data-r]", box).forEach((x) => x.classList.toggle("active", x === b));
-    try { await load(); if (ctx.alive()) paintChart(); } catch {}
-  });
-  ctx.on("monitor", (d) => {
-    if (d?.kind === "update") { const it = (d.items || []).find((x) => x.siteId === S.id); if (it) refresh(); }
-    else if (!d?.siteId || d.siteId === S.id) refresh();
-  });
-  const t = setInterval(refresh, 60_000);
-  ctx.cleanup(() => clearInterval(t));
+  return m.result;
 }
 
 /* ───────── Settings → Notifications ───────── */
@@ -522,7 +446,7 @@ export async function notificationsSettings(box, ctx) {
 
   mount(box, html`
     <div class="card">
-      <div class="card-head"><div><h3>Notification channels</h3><div class="sub">Where uptime alerts go. Each website picks which channels it uses in its Uptime tab.</div></div></div>
+      <div class="card-head"><div><h3>Notification channels</h3><div class="sub">Where uptime alerts go. Each website picks which channels it uses under Statistics → Alert settings.</div></div></div>
       <div class="list nch-list">${CHANNELS.map((c) => html`<div class="nch" data-ch="${c.id}">
         <button type="button" class="list-item nch-head" id="nch-h-${c.id}" aria-expanded="false" aria-controls="nch-p-${c.id}" data-nch="${c.id}"></button>
         <div class="nch-panel" id="nch-p-${c.id}" role="region" aria-labelledby="nch-h-${c.id}" inert><div class="nch-inner"><div class="nch-body" data-body="${c.id}"></div></div></div>
@@ -661,7 +585,7 @@ export async function notificationsSettings(box, ctx) {
       ${link("Terms & Conditions", l.termsUrl)}
       ${link("Opt-in (sign-up) page", l.optInUrl)}
       <div class="span-2 hint">For Twilio's <b>opt-in method proof</b>, give the sign-up page link (or a screenshot of it). Sample confirmation text: <span class="mono">${l.brandShown}: You're signed up for website alerts. Msg frequency varies. Msg &amp; data rates may apply. Reply HELP for help, STOP to opt out.</span></div>
-      ${local ? html`<div class="note warn span-2">${icon("alert")}<div>These links use a local address, so Twilio can't open them. Publish the panel on a hostname (Settings → Cloudflare → Publish this panel) or set the Panel URL in Settings → General, then copy them again.</div></div>` : ""}
+      ${local ? html`<div class="note warn span-2">${icon("alert")}<div>These links use a local address, so Twilio can't open them. Give the panel a public hostname or set the Panel URL in Settings → General, then copy them again.</div></div>` : ""}
       <div class="error-box span-2" data-err hidden></div></div>`);
   };
   paintLegal();
@@ -673,7 +597,9 @@ export async function notificationsSettings(box, ctx) {
     const el = $("[data-optins-body]", box);
     if (!optins) return;
     if (!optins.length) return mount(el, html`<div class="card-body">${emptyState({ ico: "message", title: "No sign-ups yet", text: "Share the sign-up page link above with the people who should get alert texts.", sm: true })}</div>`);
-    mount(el, html`<div class="list">${optins.map((r) => {
+    // Ones waiting for approval first, so they never end up behind "Show all".
+    const ordered = [...optins.filter((r) => r.status === "pending"), ...optins.filter((r) => r.status !== "pending")];
+    mount(el, moreList(ordered, (r) => {
       const [tone, label] = OPT_BADGE[r.status] || ["", r.status];
       const conf = r.confirmation;
       return html`<div class="list-item cf-row">
@@ -685,7 +611,7 @@ export async function notificationsSettings(box, ctx) {
           ${r.status === "pending" ? html`<button class="btn btn-sm btn-primary" data-optapprove="${r.id}">${icon("check")}Approve</button><button class="btn btn-sm" data-optdecline="${r.id}">Decline</button>` : ""}
           <button class="icon-btn ghost sm" data-optmenu="${r.id}" aria-label="More for ${r.name || r.phone}">${icon("more", "sm")}</button>
         </div></div>`;
-    })}</div>`);
+    }, { id: "notify.optins", limit: 6, cls: "list", noun: "sign-ups" }));
   };
   const loadOptins = async () => {
     try { const r = await get("/api/notifications/optins"); optins = r.items || []; if (ctx.alive()) paintOptins(); }

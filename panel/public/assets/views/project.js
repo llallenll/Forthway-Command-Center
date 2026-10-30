@@ -5,6 +5,7 @@ import { tabsBar, databasesTable, dbMenu, revealCredentials, createDatabase, bac
 import { siteRow, bindSiteRows } from "./sites.js";
 import { bindUptime } from "./monitor.js"; // MONITOR: uptime in website rows
 import { projectDialog } from "./projects.js";
+import { moreList } from "../fold.js"; // "show all" for long tabs
 
 export default async function project(ctx) {
   const { root, params } = ctx;
@@ -82,7 +83,7 @@ export default async function project(ctx) {
         items = r.items || []; mysql = my;
         if (!ctx.alive()) return;
         mount(box, html`<div class="toolbar"><span class="muted small">${items.length} database${items.length === 1 ? "" : "s"} on the main server's MySQL</span><span class="grow"></span><button class="btn btn-primary" data-newdb>${icon("plus")}New database</button></div>
-          ${items.length ? databasesTable(items, { showProject: false, mysql }) : html`<div class="card">${emptyState({ ico: "database", title: "No databases yet", text: "Create a MySQL database and link it to a website — its credentials are injected as environment variables.", sm: true })}</div>`}`);
+          ${items.length ? databasesTable(items, { showProject: false, mysql, moreId: "project.databases" }) : html`<div class="card">${emptyState({ ico: "database", title: "No databases yet", text: "Create a MySQL database and link it to a website — its credentials are injected as environment variables.", sm: true })}</div>`}`);
       } catch (e) { mount(box, errorState(e)); }
     };
     mount(box, skeletonRows(3, 56));
@@ -115,7 +116,7 @@ export default async function project(ctx) {
       try {
         const items = (await get(`/api/activity?projectId=${p.id}&limit=100`)).items || [];
         if (!ctx.alive()) return;
-        mount(box, html`<div class="card">${items.length ? html`<div class="list">${items.map((a) => activityItem(a))}</div>` : emptyState({ ico: "activity", title: "No activity yet", sm: true })}</div>`);
+        mount(box, html`<div class="card">${items.length ? moreList(items, (a) => activityItem(a), { id: "project.activity", limit: 10, cls: "list", noun: "entries" }) : emptyState({ ico: "activity", title: "No activity yet", sm: true })}</div>`);
       } catch (e) { mount(box, errorState(e)); }
     };
     mount(box, skeletonRows(5, 52));

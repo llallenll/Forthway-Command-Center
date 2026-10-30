@@ -12,6 +12,8 @@ import { fmtBytes as updFmtBytes } from "../util.js"; // Updates section (aliase
 import { admins, security, account } from "./settings-auth.js"; // Admins + Security + Account (Sign in with GitHub)
 import { testerSettings } from "./settings-tester.js"; // Website testing (commit tests with Claude Code)
 import { passkeySettings } from "./settings-security.js"; // Passkeys (the second sign-in step)
+import { queueSettings } from "./settings-queue.js"; // Job queue (heavy jobs per server)
+import { foldCard, moreList } from "../fold.js"; // collapsible lists (Load balancer, Updates)
 
 const SECTIONS = [
   { id: "general", label: "General", icon: "settings", render: general },
@@ -19,6 +21,7 @@ const SECTIONS = [
   { id: "security", label: "Security", icon: "shield", render: security },
   { id: "passkeys", label: "Passkeys", icon: "key", render: passkeySettings },
   { id: "servers", label: "Servers & load balancing", icon: "balance", render: serversLb },
+  { id: "queue", label: "Job queue", icon: "layers", render: queueSettings },
   { id: "backups", label: "Backups", icon: "archive", render: backups },
   { id: "databases", label: "Databases", icon: "database", render: mysqlSettings },
   { id: "phpmyadmin", label: "phpMyAdmin", icon: "layers", render: phpMyAdminSettings },
@@ -143,25 +146,23 @@ async function serversLb(box, ctx) {
         <p class="hint mt-16">Re-applying rewrites every website's nginx file from the panel's records, tests it with <span class="mono">nginx -t</span> and reloads only if the test passes. Use it after editing nginx by hand or if a site's routing looks wrong.</p></div>
       </div>
 
-      <div class="card">
-        <div class="card-head"><div><h3>Load-balanced websites</h3><div class="sub">${lbSites.length ? `${plural(lbSites.length, "website")} spread across several servers` : "None yet"}</div></div></div>
-        ${lbSites.length ? html`<div class="list">${lbSites.map((x) => html`<a class="list-item" href="#/sites/${x.id}">
+      ${foldCard({ id: "settings.lb.sites", title: "Load-balanced websites", count: lbSites.length, open: false,
+        sub: lbSites.length ? `${plural(lbSites.length, "website")} spread across several servers` : "None yet",
+        body: html`${lbSites.length ? moreList(lbSites, (x) => html`<a class="list-item" href="#/sites/${x.id}">
             <span class="li-ico">${icon("globe", "sm")}</span>
             <div class="li-main"><div class="li-title">${x.name}</div><div class="li-sub">${(x.domains || [])[0] || "no domain"} · ${METHOD_LABEL[x.method] || x.method || ""}</div></div>
-            <div class="li-right">${(x.upstreams || []).map((u) => html`<span class="row tiny" style="gap:5px" title="${u.name}: ${u.down ? "taken out of rotation" : !u.online ? "offline" : u.healthy === false ? "unhealthy" : u.healthy ? "healthy" : "not checked yet"}"><span class="dot ${u.down || u.healthy === false ? "err" : !u.online ? "off" : u.healthy ? "ok" : "off"}"></span><span class="hide-sm">${u.name}</span></span>`)}</div></a>`)}</div>`
-          : html`<div class="card-body"><p class="muted small">Turn on load balancing when creating a website, or later from its Settings tab. You need at least two servers marked “Available for load balancing”.</p></div>`}
-      </div>
+            <div class="li-right">${(x.upstreams || []).map((u) => html`<span class="row tiny" style="gap:5px" title="${u.name}: ${u.down ? "taken out of rotation" : !u.online ? "offline" : u.healthy === false ? "unhealthy" : u.healthy ? "healthy" : "not checked yet"}"><span class="dot ${u.down || u.healthy === false ? "err" : !u.online ? "off" : u.healthy ? "ok" : "off"}"></span><span class="hide-sm">${u.name}</span></span>`)}</div></a>`, { id: "settings.lb.sitesAll", limit: 5, cls: "list", noun: "websites" })
+          : html`<div class="card-body"><p class="muted small">Turn on load balancing when creating a website, or later from its Settings tab. You need at least two servers marked “Available for load balancing”.</p></div>`}` })}
 
-      <div class="card">
-        <div class="card-head"><div><h3>Servers</h3><div class="sub">${servers.length ? `${online} of ${servers.length} online · ${servers.filter((x) => x.lbEligible !== false).length} available for load balancing` : "Loading…"}</div></div>
-          <div class="right"><a class="btn btn-sm" href="#/servers">${icon("server")}Manage servers</a></div></div>
-        ${servers.length ? html`<div class="list">${servers.map((x) => html`<a class="list-item" href="#/servers">
+      ${foldCard({ id: "settings.lb.servers", title: "Servers", count: servers.length || null, open: false,
+        sub: servers.length ? `${online} of ${servers.length} online · ${servers.filter((x) => x.lbEligible !== false).length} available for load balancing` : "Loading…",
+        actions: html`<a class="btn btn-sm" href="#/servers">${icon("server")}Manage servers</a>`,
+        body: html`${servers.length ? moreList(servers, (x) => html`<a class="list-item" href="#/servers">
             <span class="li-ico">${icon("server", "sm")}</span>
             <div class="li-main"><div class="li-title">${x.name}</div><div class="li-sub">${serverKind(x)}${x.host ? html` · <span class="mono">${x.host}</span>` : ""} · ${plural(x.siteCount || 0, "site")}</div></div>
             <div class="li-right">${x.lbEligible !== false ? html`<span class="badge badge-lb hide-sm">${icon("balance")}LB pool</span>` : ""}${x.enabled === false ? html`<span class="badge warn">Disabled</span>` : ""}
-              <span class="status"><span class="dot ${x.online ? "ok" : "off"}"></span>${x.online ? "Online" : x.lastSeenAt ? `Seen ${ago(x.lastSeenAt)}` : "Offline"}</span></div></a>`)}</div>`
-          : html`<div class="card-body"><p class="muted small">Add agent servers, rotate tokens and choose which servers join load-balanced pools on the Servers page.</p></div>`}
-      </div>`);
+              <span class="status"><span class="dot ${x.online ? "ok" : "off"}"></span>${x.online ? "Online" : x.lastSeenAt ? `Seen ${ago(x.lastSeenAt)}` : "Offline"}</span></div></a>`, { id: "settings.lb.serversAll", limit: 8, cls: "list", noun: "servers" })
+          : html`<div class="card-body"><p class="muted small">Add agent servers, rotate tokens and choose which servers join load-balanced pools on the Servers page.</p></div>`}` })}`);
   };
   await load();
   on(box, "click", "[data-apply]", async (e, b) => {
@@ -293,10 +294,10 @@ async function updates(box, ctx) {
           ? html`${u.totalChanges && u.totalChanges > u.changes.length ? `${u.totalChanges} commits (newest ${u.changes.length} shown)` : plural(u.changes.length, "new commit")} since ${inst.shortCommit || "your version"}`
           : `Updating to ${L.version ? `v${L.version} · ` : ""}${L.shortCommit}`}</div></div>
           ${u.compareUrl ? html`<div class="right"><a class="btn btn-sm" href="${u.compareUrl}" target="_blank" rel="noopener noreferrer">${icon("external")}Compare on GitHub</a></div>` : ""}</div>
-        ${u.changes.length ? html`<div class="list">${u.changes.map((c) => html`<a class="list-item" href="${c.url}" target="_blank" rel="noopener noreferrer">
+        ${u.changes.length ? moreList(u.changes, (c) => html`<a class="list-item" href="${c.url}" target="_blank" rel="noopener noreferrer">
             <span class="li-ico">${icon("branch", "sm")}</span>
             <div class="li-main"><div class="li-title" style="white-space:normal">${c.message}</div><div class="li-sub"><span class="mono">${c.shortSha}</span>${c.author ? ` · ${c.author}` : ""}${c.date ? ` · ${ago(c.date)}` : ""}</div></div>
-            <div class="li-right">${icon("external", "sm")}</div></a>`)}</div>`
+            <div class="li-right">${icon("external", "sm")}</div></a>`, { id: "settings.update.changes", limit: 6, cls: "list", noun: "commits" })
           : html`<div class="card-body"><p class="muted small">GitHub can't list the commits between this install and ${L.shortCommit} (the installed commit is unknown to it). The newest commit is: <b style="color:var(--text)">${L.message}</b>.</p></div>`}
         <div class="card-foot" style="flex-wrap:wrap"><span class="muted small" style="flex:1 1 260px">${RESTART_HINT[u.restartMode] || ""} Agent servers pick up their new files automatically when they reconnect.</span>
           ${busy ? html`<button class="btn" type="button" data-view-job>${icon("fileText")}View progress</button>`

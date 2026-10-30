@@ -4,6 +4,7 @@ import { html, raw, mount, $, on, ago, initials, plural, toast, toastError, conf
 import { icon } from "../icons.js";
 import { get, post, patch, del } from "../api.js";
 import { loginError } from "../login-errors.js";
+import { moreList } from "../fold.js"; // long admin lists show "Show all"
 
 const RECOVER_CMD = "sudo node /opt/fcc/panel/recover.mjs";
 
@@ -45,7 +46,7 @@ export async function admins(box, ctx) {
     mount(box, html`<div class="card">
       <div class="card-head"><div><h3>Admins</h3><div class="sub">${plural(items.length, "person", "people")} can sign in to this panel with GitHub. Every admin has full access.</div></div>
         <div class="right"><button class="btn btn-primary btn-sm" data-add>${icon("plus")}Add admin</button></div></div>
-      ${items.length ? html`<div class="list">${items.map((a) => {
+      ${items.length ? moreList(items, (a) => {
         const self = a.id === me().id;
         return html`<div class="list-item" data-admin="${a.id}">
           ${avatarOf(a)}
@@ -54,7 +55,7 @@ export async function admins(box, ctx) {
           <div class="li-right">${!a.github ? html`<span class="badge warn" title="${ghOnly ? "Can't sign in until a GitHub account is set." : "Still signs in with a password. Set their GitHub account before switching to GitHub-only."}">${icon("alert")}No GitHub</span>` : ""}
             ${a.role === "owner" ? html`<span class="badge blue" title="Owners can change roles, edit and remove other owners. There's always at least one.">${icon("shield")}Owner</span>` : html`<span class="badge">Admin</span>`}
             <button class="icon-btn ghost sm" data-amenu="${a.id}" aria-label="Actions for ${who(a)}">${icon("more", "sm")}</button></div></div>`;
-      })}</div>` : emptyState({ ico: "users", title: "No admins", sm: true })}
+      }, { id: "settings.admins", limit: 8, cls: "list", noun: "admins" }) : emptyState({ ico: "users", title: "No admins", sm: true })}
       <div class="card-foot"><span class="muted small">${iAmOwner ? "You're an owner: you can make other admins owners, or step an owner (yourself included) back to admin — there's always at least one owner." : "Only owners can change roles or edit owners."}
         ${!ghOnly && unlinked ? html` ${plural(unlinked, "admin")} still ${unlinked === 1 ? "signs" : "sign"} in with a password — see <a href="#/settings/security" style="color:var(--text);font-weight:600">Security</a>.` : ""}</span></div>
     </div>`);
@@ -218,11 +219,11 @@ export async function security(box, ctx) {
       <div class="card">
         <div class="card-head"><div><h3>Linked accounts</h3><div class="sub">${s.admins.filter((a) => a.github).length} of ${plural(s.admins.length, "admin")} can sign in with GitHub.</div></div>
           <div class="right"><a class="btn btn-sm" href="#/settings/admins">${icon("users")}Manage admins</a></div></div>
-        <div class="list">${s.admins.map((a) => html`<div class="list-item">
+        ${moreList(s.admins, (a) => html`<div class="list-item">
           ${avatarOf(a)}
           <div class="li-main"><div class="li-title">${a.name || a.email}${a.id === me().id ? html` <span class="dim" style="font-weight:500">(you)</span>` : ""}</div>
             <div class="li-sub">${a.github ? html`<span class="gh-login">@${a.github.login}</span> · GitHub id ${a.github.id}` : s.githubOnly ? "No GitHub account — can't sign in" : "Not linked — signs in with a password"}</div></div>
-          <div class="li-right">${a.github ? html`<span class="badge ok">${icon("github")}Linked</span>` : html`<span class="badge warn">${icon("alert")}Not linked</span>`}</div></div>`)}</div>
+          <div class="li-right">${a.github ? html`<span class="badge ok">${icon("github")}Linked</span>` : html`<span class="badge warn">${icon("alert")}Not linked</span>`}</div></div>`, { id: "settings.linkedAccounts", limit: 8, cls: "list", noun: "admins" })}
       </div>
       <div class="note">${icon("info")}<div>Break-glass: if GitHub sign-in ever stops working, run <span class="mono">${RECOVER_CMD}</span> on the server for a one-time owner sign-in link (15 minutes, single use). The passkey step still follows; if the passkey is lost too, add <span class="mono">--reset-passkeys</span> (see <a href="#/settings/passkeys" style="color:var(--text);font-weight:600">Passkeys</a>).</div></div>`);
   };
