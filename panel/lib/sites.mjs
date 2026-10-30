@@ -15,6 +15,13 @@
  * Logs are read-only. Things run in a site's folder only through the Scripts
  * tab (POST /api/sites/:id/scripts/run → task site.script): `npm run <script>`
  * for a script the deployed package.json defines, or an admin's own command.
+ *
+ * Runtime (docs/DOCKER-AND-TESTS.md): a node website runs either in its own
+ * container as its own non-root user (`runtime: "docker"`, the default for new
+ * sites) or the old way as root under pm2 (`"legacy"`, every site made before
+ * Docker). POST /api/sites/:id/migrate moves one site at a time, either way.
+ * PHP sites stay on the server's own PHP-FPM ("legacy"); static sites have no
+ * code running at all ("none").
  */
 
 import fs from "node:fs";
@@ -37,6 +44,7 @@ import { inspectZip, readZipFile } from "../../shared/zip.mjs";
 import { isEnvKey, cleanEnvValue, parseEnvText } from "../../shared/env.mjs";
 import { ensureDir, humanBytes } from "../../shared/fsx.mjs";
 import { validScriptName, validCommand } from "../../shared/tasks.mjs";
+import { DEFAULT_NODE_IMAGE, DEFAULT_LIMITS, nextUid, validImage } from "../../shared/docker.mjs";
 
 export const SITE_TYPES = ["node", "static", "php"];
 export const LB_METHODS = ["round_robin", "least_conn", "ip_hash"];
@@ -417,6 +425,52 @@ export function register(router, ctx) {
   const pm2Name = (site) => `fcc-${site.id}`;
   const docRoot = (site) => path.posix.join(site.appDir, site.settings?.publicDir || "");
 
+  // ---------------------------------------------------------- runtime
+
+  /** "docker" | "legacy" | "none". A record without `runtime` predates Docker: legacy. */
+  function runtimeOf(site) {
+    if (!site || site.type === "static") return "none";
+    return site.type === "node" && site.runtime === "docker" ? "docker" : "legacy";
+  }
+
+  /** A fresh container record with the next free uid (unique across every website). */
+  function newContainer(exceptId = null) {
+    const used = db.list("sites").filter((s) => s.id !== exceptId).map((s) => s.container?.uid);
+    const uid = nextUid(used);
+    return { uid, gid: uid, image: DEFAULT_NODE_IMAGE, memoryMb: DEFAULT_LIMITS.memoryMb, cpus: DEFAULT_LIMITS.cpus };
+  }
+
+  /** Give a site its container record (uid etc.) if it has none yet; returns the fresh site. */
+  function ensureContainer(siteId) {
+    const site = getSite(siteId);
+    if (!site || Number.isInteger(site.container?.uid)) return site;
+    const fresh = newContainer(siteId);
+    // Keep any image/limits already chosen; only the user ids are new.
+    return db.update("sites", siteId, { container: { ...fresh, ...(site.container || {}), uid: fresh.uid, gid: fresh.gid } });
+  }
+
+  /** PATCH container: { image?, memoryMb?, cpus? } over the current record. */
+  function sanitizeContainer(input, prev) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw httpError(400, "container must be an object like { image, memoryMb, cpus }.");
+    const out = { ...prev };
+    if ("image" in input) {
+      const v = String(input.image ?? "").trim();
+      if (v && !validImage(v)) throw httpError(400, `"${v.slice(0, 80)}" is not a valid Docker image name (for example ${DEFAULT_NODE_IMAGE}).`);
+      out.image = v || DEFAULT_NODE_IMAGE;
+    }
+    if ("memoryMb" in input) {
+      const n = Number(input.memoryMb);
+      if (!Number.isInteger(n) || (n !== 0 && (n < 128 || n > 262_144))) throw httpError(400, "The memory limit is in MB: 0 for no limit, or 128 to 262144.");
+      out.memoryMb = n;
+    }
+    if ("cpus" in input) {
+      const n = Number(input.cpus);
+      if (!Number.isFinite(n) || n < 0 || n > 256) throw httpError(400, "The CPU limit is a number of cores: 0 for no limit, up to 256 (0.5 is half a core).");
+      out.cpus = Math.round(n * 100) / 100;
+    }
+    return out;
+  }
+
   function publicSite(site) {
     if (!site) return null;
     const t = targets(site);
@@ -443,6 +497,13 @@ export function register(router, ctx) {
       github: { repo: github.repo || "", branch: github.branch || "", hasToken: !!github.tokenEnc },
       envCount: Object.keys(env).length,
       linkedDatabaseIds: site.linkedDatabaseIds || [],
+      runtime: runtimeOf(site),
+      container:
+        site.type === "node" && site.container
+          ? { uid: site.container.uid ?? null, image: site.container.image || DEFAULT_NODE_IMAGE, memoryMb: site.container.memoryMb ?? DEFAULT_LIMITS.memoryMb, cpus: site.container.cpus ?? DEFAULT_LIMITS.cpus }
+          : null,
+      // PHP stays on the host's PHP-FPM (see the RUNTIME notes in docs/DOCKER-AND-TESTS.md).
+      canMigrate: site.type === "node" && runtimeOf(site) === "legacy" && !site.deleting,
       ssl: site.ssl || { enabled: false, status: "none" },
       cloudflare: site.cloudflare || { enabled: false, tunnelId: "", hostnames: [] }, // CLOUDFLARE
       currentReleaseId: site.currentReleaseId || null,
@@ -795,6 +856,8 @@ export function register(router, ctx) {
       domains: site.domains || [],
       healthPath: site.healthPath ?? "",
       phpVersion: site.type === "php" ? site.settings?.phpVersion || "" : undefined,
+      runtime: runtimeOf(site),
+      container: runtimeOf(site) === "docker" && site.container ? { ...site.container } : null,
       serverId,
       settings,
       env,
@@ -952,6 +1015,8 @@ export function register(router, ctx) {
       build: st.build,
       root: st.root || "",
       env: Object.keys(env).sort().map((k) => [k, env[k]]),
+      // Only for docker sites, so the builds of every legacy site stay valid.
+      ...(runtimeOf(site) === "docker" ? { runtime: "docker", image: site.container?.image || DEFAULT_NODE_IMAGE } : {}),
     });
     return crypto.createHash("sha256").update(body).digest("hex").slice(0, 32);
   }
@@ -1046,6 +1111,7 @@ export function register(router, ctx) {
       let res;
       try {
         assertOnline(sid);
+        if (runtimeOf(site) === "docker") await ensureDockerOn(sid, site, { log: prefixed(log, sid, multi), signal });
         const spec = await specForAsync(site, sid);
         const payload = { spec, release: releasePayload(art || release, sid, base) };
         if (packaging) {
@@ -1101,6 +1167,22 @@ export function register(router, ctx) {
       }
     }
     return done;
+  }
+
+  /**
+   * Docker installed and running on `sid`, and the site's image pulled
+   * (task server.docker — idempotent, a few seconds when all is in place).
+   */
+  async function ensureDockerOn(sid, site, { log, signal }) {
+    const image = site.container?.image || DEFAULT_NODE_IMAGE;
+    try {
+      await runTask(sid, "server.docker", { image }, { log, signal });
+    } catch (err) {
+      if (/Unknown task type/i.test(err.message)) {
+        throw new Error(`${serverName(sid)}'s agent is too old to run websites in Docker. Update it from the Servers page, then try again.`);
+      }
+      throw new Error(`Docker is not ready on ${serverName(sid)}: ${err.message}`);
+    }
   }
 
   /**
@@ -1589,6 +1671,28 @@ export function register(router, ctx) {
     },
     refreshStatus: (id) => refreshStatus(id),
     checkUpdate: (id, o) => checkUpdate(id, o),
+    // docs/DOCKER-AND-TESTS.md — for commit testing (panel/lib/site-tests.mjs)
+    /** The release object a site.deploy task gets (download URL + token, or the local file on main). */
+    releasePayload: (release, serverId, base) => releasePayload(release, serverId, base),
+    /** Linked database variables, per database: [{ databaseId, name, prefix, vars }]. */
+    linkedEnvSources: async (siteOrId, serverId) => {
+      const site = typeof siteOrId === "string" ? getSite(siteOrId) : siteOrId;
+      if (!site) return [];
+      const { sources } = await linkedEnvAsync(site, serverId || targets(site)[0]);
+      return sources.map(({ databaseId, name, prefix, vars }) => ({ databaseId, name, prefix, vars }));
+    },
+    /** Same as POST /api/sites/:id/deploy → job. Throws an httpError when it can't start. */
+    deploy: (siteId, releaseId, { admin = null, base } = {}) => {
+      const site = mustSite(siteId);
+      const release = releaseId ? db.get("releases", releaseId) : listReleases(site.id)[0];
+      if (!release || release.siteId !== site.id) throw httpError(404, "Release not found.");
+      if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
+      return startDeployJob(site, release, admin, base || panelBase(null));
+    },
+    /** Base URL servers download releases from. */
+    panelBase: (req) => panelBase(req),
+    /** "docker" | "legacy" | "none" */
+    runtime: (siteOrId) => runtimeOf(typeof siteOrId === "string" ? getSite(siteOrId) : siteOrId),
   };
 
   function startEnvJob(site, admin, { restart = true } = {}) {
@@ -1686,6 +1790,14 @@ export function register(router, ctx) {
 
     const settings = sanitizeSettings(body.settings, defaultSiteSettings(type));
     const healthPath = body.healthPath !== undefined ? sanitizeHealthPath(body.healthPath) : type === "node" ? "/api/health" : "";
+    // New node websites run in Docker; `runtime: "legacy"` opts out (pm2 as before).
+    if (body.runtime != null && !["docker", "legacy"].includes(body.runtime)) throw httpError(400, 'runtime must be "docker" or "legacy".');
+    const runtime = type === "static" ? "none" : type === "node" && body.runtime !== "legacy" ? "docker" : "legacy";
+    let container = null;
+    if (type === "node") {
+      container = newContainer();
+      if (body.container != null) container = sanitizeContainer(body.container, container);
+    }
     const site = {
       id: newId("site"),
       projectId: project.id,
@@ -1703,6 +1815,8 @@ export function register(router, ctx) {
       github: sanitizeGithub(body.github),
       env: sanitizeEnv(body.env),
       linkedDatabaseIds: validateLinkedDatabases(body.linkedDatabaseIds, project.id),
+      runtime,
+      ...(container ? { container } : {}),
       ssl: { enabled: false, status: "none", issuedAt: null, error: null },
       cloudflare, // CLOUDFLARE
       currentReleaseId: null,
@@ -1711,7 +1825,7 @@ export function register(router, ctx) {
       createdAt: now(),
     };
     db.insert("sites", site);
-    audit(admin, "site.create", site, { type, domains, loadBalanced, serverIds });
+    audit(admin, "site.create", site, { type, domains, loadBalanced, serverIds, runtime });
     emit(site);
     cloudflareSync(site, admin); // CLOUDFLARE
     return publicSite(site);
@@ -1735,6 +1849,13 @@ export function register(router, ctx) {
       if (deployed) throw httpError(409, "The type of a website cannot change after it has been deployed. Create a new website instead.");
       patch.type = b.type;
       patch.settings = sanitizeSettings(b.settings, defaultSiteSettings(b.type));
+      // Nothing runs yet, so the runtime simply follows the new type.
+      patch.runtime = b.type === "static" ? "none" : b.type === "node" ? "docker" : "legacy";
+      if (b.type === "node" && !Number.isInteger(site.container?.uid)) patch.container = newContainer(site.id);
+    }
+    if ("container" in b && b.container != null) {
+      if ((patch.type || site.type) !== "node") throw httpError(400, "Only node websites run in a container.");
+      patch.container = sanitizeContainer(b.container, patch.container || site.container || newContainer(site.id));
     }
     if ("appDir" in b && b.appDir !== site.appDir) {
       if (deployed) throw httpError(409, "The app directory cannot change after the website has been deployed.");
@@ -1778,8 +1899,12 @@ export function register(router, ctx) {
     const portChanged = changed("port");
     const frontDoorChanged = changed("domains") || changed("lbMethod") || changed("loadBalanced") || added.length || removed.length || portChanged;
     const envChanged = changed("env") || changed("linkedDatabaseIds");
+    // Container settings only matter to a docker site that is running somewhere.
+    const inDocker = runtimeOf({ ...site, ...patch }) === "docker";
+    const imageChanged = inDocker && changed("container") && (patch.container?.image || DEFAULT_NODE_IMAGE) !== (site.container?.image || DEFAULT_NODE_IMAGE);
+    const containerChanged = inDocker && changed("container");
     const cloudflareChanged = changed("cloudflare") || changed("domains"); // CLOUDFLARE (before db.update mutates `site`)
-    const needsJob = deployed && (frontDoorChanged || envChanged);
+    const needsJob = deployed && (frontDoorChanged || envChanged || containerChanged);
     if (needsJob) assertIdle(site.id);
 
     const changedKeys = Object.keys(patch).filter(changed); // before db.update mutates `site`
@@ -1811,12 +1936,21 @@ export function register(router, ctx) {
             log(`Putting ${releaseLabel(rel.id)} on ${deployToIds.map(serverName).join(", ")}${art ? ` — the build made on ${art.builtOn}, not rebuilt` : ""}…`);
             await deployTo(site.id, rel, deployToIds, { log, signal, base, multi: deployToIds.length > 1, ship: art ? { artifact: art } : null });
           }
-        } else if (envChanged) {
-          log("Environment changed — writing it to every server and restarting.");
-          for (const sid of targets(cur)) {
-            assertOnline(sid);
-            const spec = await specForAsync(cur, sid);
-            await runTask(sid, "site.env", { spec, env: spec.env }, { log: prefixed(log, sid, targets(cur).length > 1), signal });
+        } else if (imageChanged && rel && fs.existsSync(releaseFile(rel.id))) {
+          // Another image means another Node.js: packages (native modules) and
+          // the build are made again inside it, then swapped in.
+          log(`The container image is now ${cur.container?.image || DEFAULT_NODE_IMAGE} — rebuilding ${releaseLabel(rel.id)} inside it.`);
+          await deployRelease(site.id, rel, { log, signal, base });
+        } else if (envChanged || containerChanged) {
+          if (envChanged) {
+            log("Environment changed — writing it to every server and restarting.");
+            for (const sid of targets(cur)) {
+              assertOnline(sid);
+              const spec = await specForAsync(cur, sid);
+              await runTask(sid, "site.env", { spec, env: spec.env }, { log: prefixed(log, sid, targets(cur).length > 1), signal });
+            }
+          } else {
+            log("Container limits changed — restarting so they apply.");
           }
           if (cur.type === "node") await fanOut(site.id, "site.restart", { log, signal, stopOnError: true });
         }
@@ -1910,12 +2044,140 @@ export function register(router, ctx) {
       throw httpError(body.releaseId ? 404 : 409, body.releaseId ? "Release not found." : "This website has no releases yet. Upload a zip or pull from GitHub first.");
     }
     if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
-    const base = panelBase(req);
+    return startDeployJob(site, release, admin, panelBase(req));
+  });
+
+  /** POST /api/sites/:id/deploy, and ctx.sites.deploy. */
+  function startDeployJob(site, release, admin, base) {
     const job = siteJob(site, admin, { type: "site.deploy", title: `Deploy ${site.name} ${release.version ? `v${release.version}` : release.id}` }, ({ log, signal }) =>
       deployRelease(site.id, release, { log, signal, base, afterDeploy: true }),
     );
     audit(admin, "site.deploy", site, { releaseId: release.id, version: release.version });
     return job;
+  }
+
+  // ---- runtime: Docker or the old way (pm2)
+
+  /**
+   * Move one website between runtimes (docs/DOCKER-AND-TESTS.md, "Migrating
+   * to docker"). The current release is rebuilt the new way with the normal
+   * deploy pipeline: the old app keeps serving through install and build, and
+   * the engine only stops it (and, going to Docker, deletes its pm2 process)
+   * at the swap — so the downtime is the swap and the start.
+   *
+   * On failure the site is put back: runtime restored, and every server
+   * either restarted the old way (the new build never went live there — a
+   * restart also removes any half-made container or pm2 process) or, where
+   * the new way already went live, redeployed the old way.
+   */
+  async function migrateSite(siteId, to, { log, signal, base }) {
+    const site = getSite(siteId);
+    const from = runtimeOf(site);
+    const ids = targets(site);
+    const multi = ids.length > 1;
+    const word = (r) => (r === "docker" ? "Docker" : "pm2 (the legacy way)");
+    const rel = site.currentReleaseId ? db.get("releases", site.currentReleaseId) : null;
+    const live = isDeployed(site);
+    if (live && (!rel || !fs.existsSync(releaseFile(rel.id)))) {
+      throw new Error("The archive of the release this website runs is missing, so it can't be rebuilt the new way. Deploy a release first, then move it.");
+    }
+
+    if (to === "docker") {
+      // 1. Docker on every server first — nothing about the site changes if this fails.
+      const image = site.container?.image || DEFAULT_NODE_IMAGE;
+      for (const sid of ids) {
+        if (signal?.aborted) throw new Error("Cancelled.");
+        log(`── ${serverName(sid)}: making sure Docker is installed and ${image} is there`);
+        assertOnline(sid);
+        await ensureDockerOn(sid, site, { log: prefixed(log, sid, multi), signal });
+      }
+      // 2. Its own user.
+      const c = ensureContainer(siteId).container;
+      log(`The website runs as its own user: uid ${c.uid}, image ${c.image}${c.memoryMb ? `, memory limit ${c.memoryMb} MB` : ""}.`);
+    }
+    db.update("sites", siteId, { runtime: to });
+    emit(siteId);
+
+    if (!live) {
+      log(`Nothing is deployed yet, so there is nothing to rebuild — the next deploy runs it in ${word(to)}.`);
+      return { runtime: to, servers: ids, rebuilt: false };
+    }
+
+    // 3. Rebuild + swap the current release the new way.
+    const before = Object.fromEntries(ids.map((sid) => [sid, site.state?.[sid]?.deployedAt || null]));
+    log(
+      `Rebuilding ${releaseLabel(rel.id)} ${to === "docker" ? "inside a container, as the website's own user" : "on the server itself, as before Docker"}. ` +
+        `The website keeps running the old way until the new build is ready; then there is a brief restart.`,
+    );
+    try {
+      await deployRelease(siteId, rel, { log, signal, base });
+    } catch (err) {
+      // 4. Put it back.
+      log(`!! Moving to ${word(to)} failed: ${err.message}`);
+      log(`Putting ${site.name} back on ${word(from)}…`);
+      db.update("sites", siteId, { runtime: from });
+      emit(siteId);
+      const after = getSite(siteId);
+      const moved = ids.filter((sid) => {
+        const st = after?.state?.[sid];
+        return st?.deployedAt && st.deployedAt !== before[sid] && !st.error;
+      });
+      try {
+        if (moved.length) {
+          log(`${moved.map(serverName).join(", ")} already ran the new way — redeploying ${releaseLabel(rel.id)} the old way everywhere.`);
+          await deployRelease(siteId, rel, { log, signal: null, base });
+        } else {
+          await fanOut(siteId, "site.restart", { log, signal: null });
+        }
+      } catch (back) {
+        log(`!! Putting it back failed too: ${back.message}`);
+        throw new Error(`Moving ${site.name} to ${word(to)} failed (${err.message}), and restarting it on ${word(from)} failed too (${back.message}). Check its logs, then deploy it again.`);
+      }
+      throw new Error(`Moving ${site.name} to ${word(to)} failed, so it was put back on ${word(from)} and is running again. What went wrong: ${err.message}`);
+    }
+    log(`✓ ${site.name} now runs in ${word(to)} on ${ids.map(serverName).join(", ")}.`);
+    return { runtime: to, servers: ids, rebuilt: true, releaseId: rel.id };
+  }
+
+  router.post("/api/sites/:id/migrate", async (req, res, { params, body, admin }) => {
+    const site = mustSite(params.id);
+    const to = String(body?.to || "");
+    if (!["docker", "legacy"].includes(to)) throw httpError(400, 'Say where to move the website: "docker" or "legacy".');
+    if (site.type === "static") throw httpError(400, "Static websites run no code of their own — nginx serves their files — so there is nothing to move.");
+    if (site.type === "php") {
+      throw httpError(
+        409,
+        "PHP websites stay on the server's own PHP-FPM for now: the stock PHP images have no MySQL drivers, and nginx must read the site's files directly.",
+      );
+    }
+    const from = runtimeOf(site);
+    if (from === to) throw httpError(409, `This website already runs ${to === "docker" ? "in Docker" : "the legacy way (pm2)"}.`);
+    assertIdle(site.id);
+    const base = panelBase(req);
+    const title = `Move ${site.name} to ${to === "docker" ? "Docker" : "pm2 (legacy)"}`;
+    const job = siteJob(site, admin, { type: "site.migrate", title }, ({ log, signal }) => migrateSite(site.id, to, { log, signal, base }));
+    audit(admin, "site.migrate", site, { from, to });
+    return job;
+  });
+
+  router.get("/api/servers/:id/docker", async (req, res, { params }) => {
+    const srv = getServer(params.id);
+    if (!srv) throw httpError(404, "Server not found.");
+    if (!isOnline(srv.id)) return { installed: null, running: false, version: null, error: `${serverName(srv.id)} is offline.` };
+    const t = withTimeout(null, 30_000);
+    try {
+      const r = await runTask(srv.id, "server.docker", { check: true }, { log: () => {}, signal: t.signal });
+      return { installed: !!r?.installed, running: !!r?.running, version: r?.version || null, ...(r?.error ? { error: r.error } : {}) };
+    } catch (err) {
+      const error = t.signal.aborted
+        ? "Checking Docker timed out."
+        : /Unknown task type/i.test(err.message)
+          ? "This server's agent is too old to report on Docker. Update it from the Servers page."
+          : err.message;
+      return { installed: null, running: false, version: null, error };
+    } finally {
+      t.done();
+    }
   });
 
   // `serverId` (optional): only that one of the website's servers, e.g. one upstream of a load-balanced site.

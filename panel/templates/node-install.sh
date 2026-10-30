@@ -7,7 +7,8 @@
 #
 #   curl -fsSL "<panel>/install/node.sh?server=…&token=…" | sudo bash
 #
-# It installs Node.js 20 (if needed), pm2, nginx and openssl, downloads the
+# It installs Node.js 20 (if needed), pm2, nginx, openssl and Docker (docker.io,
+# for websites that run in their own containers), downloads the
 # agent from the panel into /opt/fcc-node, writes /etc/fcc-node/config.json
 # (mode 600) and runs the agent as the systemd service fcc-node. The agent only
 # makes outbound connections to the panel. Safe to re-run (it updates in place).
@@ -25,6 +26,7 @@
 # script installs (Node.js, pm2, nginx, openssl, tar, gzip).
 #
 # Options (environment):  FCC_PHP=1  also install php-fpm for PHP websites
+#                         FCC_DOCKER=0  do not install Docker (node websites then need the legacy runtime)
 #                         FCC_SKIP_UFW=1  do not touch the firewall
 #
 set -euo pipefail
@@ -74,6 +76,18 @@ have nginx || NEED="$NEED nginx"
 have openssl || NEED="$NEED openssl"
 [ -n "$NEED" ] && apt_install $NEED
 ok "curl, tar, nginx, openssl"
+
+# Node websites run in their own containers (docs/DOCKER-AND-TESTS.md). An
+# existing Docker (docker-ce) is left alone.
+if [ "${FCC_DOCKER:-1}" = "1" ]; then
+  have docker || apt_install docker.io
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  if docker info >/dev/null 2>&1; then
+    ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+  else
+    warn "Docker is installed but not running (systemctl status docker) — the panel retries when it deploys a website."
+  fi
+fi
 
 if [ "${FCC_PHP:-0}" = "1" ]; then
   if ! ls /run/php/php*-fpm.sock >/dev/null 2>&1; then

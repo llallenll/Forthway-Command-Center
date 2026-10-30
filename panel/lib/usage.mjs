@@ -86,7 +86,19 @@ export function createUsage(ctx, { now: clock = () => Date.now() } = {}) {
   /** What the agent needs to find a website's processes — nothing secret. */
   function leanSpec(site) {
     const node = (site.type || "node") === "node";
-    return { siteId: site.id, type: site.type || "node", appDir: site.appDir, port: site.port, pm2Name: `fcc-${site.id}`, restart: { mode: node ? "pm2" : "none" } };
+    // Docker websites (docs/DOCKER-AND-TESTS.md): the agent finds the processes
+    // through the container's main pid instead of pm2.
+    const docker = node && site.runtime === "docker";
+    return {
+      siteId: site.id,
+      type: site.type || "node",
+      appDir: site.appDir,
+      port: site.port,
+      pm2Name: `fcc-${site.id}`,
+      runtime: docker ? "docker" : node ? "legacy" : "none",
+      ...(docker ? { container: `fcc-${site.id}` } : {}),
+      restart: { mode: docker ? "docker" : node ? "pm2" : "none" },
+    };
   }
 
   // ------------------------------------------------------------ record

@@ -30,6 +30,16 @@ export function exists(p) {
   }
 }
 
+/** Like exists, but a dangling symlink counts too (it is still something at that path). */
+export function lexists(p) {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function readJson(p, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(p, "utf8"));
@@ -104,10 +114,14 @@ export function walk(dir, { skip = () => false, base = dir, out = [] } = {}) {
 function sameFile(a, b) {
   let sa, sb;
   try {
-    sa = fs.statSync(a);
-    sb = fs.statSync(b);
+    sa = fs.lstatSync(a);
+    sb = fs.lstatSync(b);
   } catch {
     return false;
+  }
+  // A link is compared as a link (where it points), never by the file behind it.
+  if (sa.isSymbolicLink() || sb.isSymbolicLink()) {
+    return sa.isSymbolicLink() && sb.isSymbolicLink() && fs.readlinkSync(a) === fs.readlinkSync(b);
   }
   if (sa.size !== sb.size) return false;
   // Same size — compare content. Cheap enough: this only runs for files that
@@ -116,11 +130,64 @@ function sameFile(a, b) {
   return sha1File(a) === sha1File(b);
 }
 
-export function copyFilePreserve(src, dest) {
+/**
+ * Is `p` inside `root` once symlinks are resolved? The engine runs as root
+ * and copies folders an app (a container user, since runtime docker) can
+ * write to. A link the app planted — `public -> /etc`, `.env -> /root/x` —
+ * must not turn a copy into a root write (or read) somewhere else. `p` need
+ * not exist yet: its nearest existing ancestor is what gets resolved.
+ */
+export function insideRoot(root, p) {
+  const realRoot = resolveReal(root);
+  const real = resolveReal(p);
+  return real === realRoot || real.startsWith(realRoot + path.sep);
+}
+
+/** realpath of the nearest existing ancestor, with the not-yet-existing rest appended. */
+function resolveReal(p) {
+  let probe = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(probe), ...rest);
+    } catch {
+      const up = path.dirname(probe);
+      if (up === probe) return path.resolve(p);
+      rest.unshift(path.basename(probe));
+      probe = up;
+    }
+  }
+}
+
+/**
+ * Copy one file, preserving its mode. A symlink is copied as a symlink (its
+ * target is never read), anything that is neither is skipped, and a link
+ * sitting at `dest` is replaced rather than written through. With `root`,
+ * a destination whose folder resolves outside `root` is refused.
+ */
+export function copyFilePreserve(src, dest, root = null) {
+  if (root && !insideRoot(root, path.dirname(dest))) {
+    throw new Error(`Refusing to write ${dest}: a symlink in its path leads outside ${root}.`);
+  }
+  const st = fs.lstatSync(src);
   ensureDir(path.dirname(dest));
+  try {
+    if (fs.lstatSync(dest).isSymbolicLink()) fs.unlinkSync(dest);
+  } catch {
+    /* nothing there yet */
+  }
+  if (st.isSymbolicLink()) {
+    try {
+      fs.unlinkSync(dest);
+    } catch {
+      /* nothing there */
+    }
+    fs.symlinkSync(fs.readlinkSync(src), dest);
+    return;
+  }
+  if (!st.isFile()) return;
   fs.copyFileSync(src, dest);
   try {
-    const st = fs.statSync(src);
     fs.chmodSync(dest, st.mode & 0o777);
   } catch {
     /* non-fatal */
@@ -131,7 +198,7 @@ export function copyFilePreserve(src, dest) {
 export function copyDir(src, dest, { skip = () => false } = {}) {
   const files = walk(src, { skip });
   for (const rel of files) {
-    copyFilePreserve(path.join(src, rel), path.join(dest, rel));
+    copyFilePreserve(path.join(src, rel), path.join(dest, rel), dest);
   }
   return files;
 }
@@ -155,7 +222,7 @@ export function hardlinkDir(src, dest) {
       linked++;
     } catch {
       try {
-        fs.copyFileSync(s, d);
+        copyFilePreserve(s, d, dest);
         copied++;
       } catch {
         /* skip unreadable file */
@@ -185,11 +252,11 @@ export function mirror(srcDir, destDir, { prevManifest = [], protect = () => fal
     manifest.push(rel);
     const s = path.join(srcDir, rel);
     const d = path.join(destDir, rel);
-    if (!exists(d)) {
-      copyFilePreserve(s, d);
+    if (!lexists(d)) {
+      copyFilePreserve(s, d, destDir);
       added++;
     } else if (!sameFile(s, d)) {
-      copyFilePreserve(s, d);
+      copyFilePreserve(s, d, destDir);
       updated++;
     } else {
       unchanged++;
@@ -203,7 +270,7 @@ export function mirror(srcDir, destDir, { prevManifest = [], protect = () => fal
     if (nowHas.has(rel)) continue;
     if (protect(rel)) continue;
     const d = path.join(destDir, rel);
-    if (exists(d)) {
+    if (lexists(d) && insideRoot(destDir, path.dirname(d))) {
       try {
         fs.rmSync(d);
         removed.push(rel);

@@ -30,6 +30,7 @@ const ROUTES = [
   ["/sites/new", "wizard", "sites"],
   ["/sites/:id", "site", "sites"],
   ["/sites/:id/:tab", "site", "sites"],
+  ["/tests/:id", "test-run", "sites"], // commit test page (views/test-run.js)
   ["/databases", "databases", "databases"],
   ["/backups", "backups", "backups"],
   ["/backups/:tab", "backups", "backups"],

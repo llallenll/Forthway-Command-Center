@@ -11,7 +11,7 @@
 #   1. preflight (root, OS, architecture) and base packages
 #   2. Node.js 20 (NodeSource) if Node is missing or older than 18, and pm2
 #   3. nginx, with a catch-all that drops requests for hostnames it does not know
-#   4. MySQL (or MariaDB) with a safe baseline, certbot
+#   4. MySQL (or MariaDB) with a safe baseline, certbot, Docker (docker.io) for websites
 #   5. optional ufw firewall
 #   6. the panel code in /opt/fcc, its data in /var/lib/fcc, sites in /srv/fcc/sites
 #   7. a systemd unit, fcc.service, started and enabled
@@ -36,6 +36,7 @@
 #   FCC_PHPMYADMIN=1               also install the PHP packages phpMyAdmin needs and allow its port
 #                                  (8081) in ufw; then install it from Settings → phpMyAdmin
 #   FCC_SMB=1                      also install smbclient (backups to a Windows/Samba share)
+#   FCC_DOCKER=0                   do not install Docker (node websites then run the legacy way, under pm2)
 #   FCC_REPO=owner/repo            fetch the source from GitHub instead of this folder
 #   FCC_REF=standalone             branch or tag to fetch
 #   FCC_GITHUB_TOKEN=…             token for a private repository
@@ -96,7 +97,7 @@ apt_install() {
 }
 pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
 
-usage() { sed -n '2,49p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
+usage() { sed -n '2,50p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
 
 # ------------------------------------------------------------------- flags
 
@@ -122,7 +123,7 @@ load_saved() {
   local k v
   while IFS='=' read -r k v || [ -n "$k" ]; do
     case "$k" in
-      FCC_DIR|FCC_DATA_DIR|FCC_SITES_DIR|FCC_PORT|FCC_HOST|FCC_PANEL_DOMAIN|FCC_EMAIL|FCC_DB|FCC_MYSQL_REMOTE|FCC_FIREWALL|FCC_PHP|FCC_PHPMYADMIN|FCC_SMB|FCC_REPO|FCC_REF)
+      FCC_DIR|FCC_DATA_DIR|FCC_SITES_DIR|FCC_PORT|FCC_HOST|FCC_PANEL_DOMAIN|FCC_EMAIL|FCC_DB|FCC_MYSQL_REMOTE|FCC_FIREWALL|FCC_PHP|FCC_PHPMYADMIN|FCC_SMB|FCC_DOCKER|FCC_REPO|FCC_REF)
         if [ -z "${!k+x}" ]; then printf -v "$k" '%s' "$v"; export "${k?}"; fi ;;
     esac
   done <"$SAVED_ENV"
@@ -143,6 +144,7 @@ FCC_FIREWALL="${FCC_FIREWALL:-0}"
 FCC_PHP="${FCC_PHP:-0}"
 FCC_PHPMYADMIN="${FCC_PHPMYADMIN:-0}"
 FCC_SMB="${FCC_SMB:-0}"
+FCC_DOCKER="${FCC_DOCKER:-1}"
 FCC_REPO="${FCC_REPO:-}"
 FCC_REF="${FCC_REF:-$DEFAULT_REF}"
 
@@ -429,6 +431,21 @@ install_certbot() {
   ok "certbot $(certbot --version 2>&1 | awk '{print $2}')"
 }
 
+# Node websites run in their own containers, as their own user (docs/DOCKER-AND-TESTS.md).
+# docker.io is the distribution's own package; an existing Docker (docker-ce) is left alone.
+install_docker() {
+  if ! have docker; then
+    apt_install docker.io
+    hash -r
+  fi
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  if docker info >/dev/null 2>&1; then
+    ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+  else
+    warn "Docker is installed but not running (see: systemctl status docker). Websites can still run the legacy way (pm2)."
+  fi
+}
+
 install_php() {
   [ "$FCC_PHP" = "1" ] || [ "$FCC_PHPMYADMIN" = "1" ] || return 0
   apt_install php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl
@@ -592,7 +609,7 @@ save_answers() {
   {
     echo "# Written by install.sh — the choices a plain re-run reuses. Environment variables override."
     local k
-    for k in FCC_DIR FCC_DATA_DIR FCC_SITES_DIR FCC_PORT FCC_HOST FCC_PANEL_DOMAIN FCC_EMAIL FCC_DB FCC_MYSQL_REMOTE FCC_FIREWALL FCC_PHP FCC_PHPMYADMIN FCC_SMB FCC_REPO FCC_REF; do
+    for k in FCC_DIR FCC_DATA_DIR FCC_SITES_DIR FCC_PORT FCC_HOST FCC_PANEL_DOMAIN FCC_EMAIL FCC_DB FCC_MYSQL_REMOTE FCC_FIREWALL FCC_PHP FCC_PHPMYADMIN FCC_SMB FCC_DOCKER FCC_REPO FCC_REF; do
       printf '%s=%s\n' "$k" "${!k:-}"
     done
   } >"${SAVED_ENV}.tmp"
@@ -884,6 +901,7 @@ step "Fetching the Command Center";  find_source
 step "nginx";                        install_nginx
 step "Database server";              install_db
 step "certbot";                      install_certbot
+if [ "$FCC_DOCKER" = "1" ]; then step "Docker";  install_docker; fi
 if [ "$FCC_PHP" = "1" ] || [ "$FCC_PHPMYADMIN" = "1" ]; then step "PHP"; install_php; fi
 if [ "$FCC_SMB" = "1" ]; then step "smbclient (SMB backups)"; pkg_installed smbclient || apt_install smbclient; ok "$(smbclient --version 2>/dev/null | head -1)"; fi
 step "Firewall";                     setup_firewall

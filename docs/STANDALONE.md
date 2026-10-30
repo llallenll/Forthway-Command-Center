@@ -1210,3 +1210,16 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
   75 and comes back as main. After that boot, `shared/edge.mjs retireEdge(agentDataDir)` takes
   down the connector replicas, catch-all and shims fcc-node had set up (marker
   `<dataDir>/main-switch.json`). UI: server menu → **Make main server**.
+
+- **Docker websites and commit testing** (tasks 3.7.0, engine 2.1.0; full contract in
+  `docs/DOCKER-AND-TESTS.md`). `site.runtime: "docker" | "legacy" | "none"` and
+  `site.container { uid, gid, image, memoryMb, cpus }`; new node sites start on docker, existing
+  ones move with `POST /api/sites/:id/migrate { to }` (job; rolls back to legacy on failure). A
+  docker site runs as container `fcc-<siteId>` under its own non-root uid (`shared/docker.mjs`),
+  host network, read-only root, only its own variables; install/build/scripts run in one-off
+  containers. PHP stays on the host's php-fpm for now. New tasks `server.docker` and `site.test`
+  (`shared/testenv.mjs`); new module `site-tests` (collections `testRuns`, `testSettings`; routes
+  under `/api/sites/:id/tests`, `/api/tests/:id`, `/api/tester`; SSE `testrun`). `ctx.sites`
+  gains `releasePayload`, `linkedEnvSources`, `deploy`, `panelBase`, `runtime`. `shared/fsx.mjs`
+  copy/mirror now copy symlinks as links and refuse writes whose path resolves outside the
+  destination (the root engine copies folders a container can write to).
