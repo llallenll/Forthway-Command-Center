@@ -54,7 +54,7 @@ const PUBLIC_DIR = path.join(HERE, "public");
 const VERSION = "3.12.0";
 
 /** Contract order (docs/STANDALONE.md §3). core-routes is required; the rest are optional. */
-const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "site-tests", "mysql", "mysql-ha", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "cluster-alerts", "analytics", "usage", "main-switch"];
+const MODULES = ["core-routes", "cluster", "loadbalancer", "sites", "site-tests", "staging", "mysql", "mysql-ha", "backups", "cloudflare", "updates", "phpmyadmin", "monitor", "cluster-alerts", "analytics", "usage", "main-switch"];
 const START_TIMEOUT_MS = 15_000;
 const SSE_PING_MS = 15_000;
 const SSE_PAD = `:${" ".repeat(2048)}\n\n`; // pushes the first bytes past proxy buffer thresholds
@@ -318,7 +318,7 @@ try {
 }
 let secrets = createSecrets(config.secretKey);
 const events = createEvents(db);
-const jobs = createJobs({ db, dataDir: DATA_DIR, events });
+const jobs = createJobs({ db, dataDir: DATA_DIR, events, config }); // config.queue.perServer: the job queue
 // A standby never writes db.json; the jobs are failed when (if) it takes over.
 let interrupted = HA_STANDBY_BOOT ? 0 : jobs.recover();
 const auth = createAuth({ db, config });
@@ -632,7 +632,7 @@ async function promote() {
   ha._registerRoutes(router);
   await loadModules();
   mode = "leader";
-  console.log(`[fcc] active panel now — modules ${loaded.map((m) => m.name).join(", ")} (${((Date.now() - t0) / 1000).toFixed(1)} s)${interrupted ? `; ${interrupted} interrupted job(s) marked failed` : ""}`);
+  console.log(`[fcc] active panel now — modules ${loaded.map((m) => m.name).join(", ")} (${((Date.now() - t0) / 1000).toFixed(1)} s)${interrupted ? `; ${interrupted} interrupted job(s) marked failed (waiting in the job queue: cancelled)` : ""}`);
 }
 
 /**
@@ -754,7 +754,7 @@ server.listen(PORT, HOST, () => {
   if (HA_STANDBY_BOOT) console.log(`  ha    standby panel node "${ha.localServerId}" (${ha.directUrl()}) — proxying to the active panel`);
   else console.log(`  mods  ${loaded.map((m) => m.name).join(", ")}`);
   if (sys.DRY_RUN) console.log("  mode  DRY RUN — system commands are logged, not run");
-  if (interrupted) console.log(`  jobs  ${interrupted} interrupted job(s) marked failed (panel restarted)`);
+  if (interrupted) console.log(`  jobs  ${interrupted} interrupted job(s) marked failed — ones still waiting in the job queue cancelled (panel restarted)`);
   if (!HA_STANDBY_BOOT && !db.list("admins").length) console.log(`\n  Not set up yet — open the address above; it asks for the setup code in ${path.join(DATA_DIR, "setup-code")}.`);
   console.log("");
 });

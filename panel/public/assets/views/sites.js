@@ -3,6 +3,7 @@ import { icon } from "../icons.js";
 import { get } from "../api.js";
 import { pageHead, lbBadge, healthChip, typeIco, TYPE_LABEL, updateBadge } from "../components.js";
 import { bindUptime } from "./monitor.js"; // MONITOR: fills the [data-uptime] slots below
+import { foldCard } from "../fold.js"; // one collapsible group per project
 
 /** Public URL of a site: https only once its certificate is active. */
 export function siteUrl(s, domain) {
@@ -54,7 +55,23 @@ export default async function sites(ctx) {
     const f = items.filter((s) => pick(s) && (!q || (s.name + " " + (s.domains || []).join(" ")).toLowerCase().includes(q)));
     if (!items.length) return mount(list, html`<div class="card">${emptyState({ ico: "globe", title: "No websites yet", text: "Create a website, point a domain at this server, then deploy from GitHub or a zip upload.", action: html`<a class="btn btn-primary" href="#/sites/new">${icon("plus")}New website</a>` })}</div>`);
     if (!f.length) return mount(list, html`<div class="card">${emptyState({ ico: "search", title: "No matches", text: "Try a different search or filter.", sm: true })}</div>`);
-    mount(list, html`<div class="site-list">${f.map((s) => siteRow(s, { serversById, projectsById }))}</div>`);
+    // Grouped by project, each group folds away (remembered). A search shows one flat list so no match hides in a folded group.
+    const groups = [];
+    for (const s of f) {
+      const key = projectsById[s.projectId] ? s.projectId : "";
+      let g = groups.find((x) => x.key === key);
+      if (!g) groups.push((g = { key, p: projectsById[key], items: [] }));
+      g.items.push(s);
+    }
+    if (q || groups.length < 2) return mount(list, html`<div class="site-list">${f.map((s) => siteRow(s, { serversById, projectsById }))}</div>`);
+    const order = Object.keys(projectsById);
+    groups.sort((a, b) => (a.p ? order.indexOf(a.key) : 1e9) - (b.p ? order.indexOf(b.key) : 1e9));
+    mount(list, html`<div class="stack site-groups">${groups.map((g) => foldCard({
+      id: `sites.project.${g.key || "none"}`, count: g.items.length, cls: "site-group",
+      title: g.p ? html`<span class="dot" style="width:8px;height:8px;background:${colorOf(g.p.color)}"></span><a href="#/projects/${g.p.id}">${g.p.name}</a>` : "No project",
+      sub: g.p?.description || "",
+      body: html`<div class="card-body"><div class="site-list">${g.items.map((s) => siteRow(s, { serversById, projectsById, showProject: false }))}</div></div>`,
+    }))}</div>`);
   };
   const load = async () => {
     try {

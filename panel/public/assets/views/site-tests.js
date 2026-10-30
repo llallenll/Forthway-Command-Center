@@ -197,7 +197,7 @@ export async function testEnvCard(ctx, el, S) {
   let keys = [];
   const load = async () => { keys = (await get(`/api/sites/${S.id}/test-env`)).items || []; };
   const paint = () => mount(el, html`<div class="card"><div class="card-head"><div><h3 class="row" style="gap:8px">${icon("flask", "sm")}Test-only variables</h3>
-      <div class="sub">Used only by commit tests, on top of the variables above — e.g. Stripe <span class="mono">sk_test_…</span> keys. Values are write-only.</div></div></div>
+      <div class="sub">Used only by commit tests, on top of the live variables — e.g. Stripe <span class="mono">sk_test_…</span> keys. Values are write-only.</div></div></div>
     <div class="card-body">
       ${keys.length ? html`<div class="te-list">${keys.map((k) => html`<div class="te-row"><span class="mono strong ellipsis">${k.key}</span><span class="badge ok">${icon("lock")}Set</span>
         <span class="spacer"></span><button class="btn btn-sm btn-ghost" data-tereplace="${k.key}">${icon("edit")}Replace</button><button class="icon-btn sm" data-tedel="${k.key}" aria-label="Remove ${k.key}">${icon("trash")}</button></div>`)}</div>`

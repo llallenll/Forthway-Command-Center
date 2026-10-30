@@ -12,6 +12,9 @@ import {
   computeScore,
   rewriteEnv,
   planDatabases,
+  testDatabaseName,
+  testDatabasePreview,
+  STANDARD_DB_KEYS,
   isLivePaymentValue,
   makeRedactor,
   streamJsonEvents,
@@ -126,6 +129,63 @@ test("database settings typed into the site's own variables are re-pointed too",
   // Without a throw-away database, nothing may keep pointing at production.
   const none = rewriteEnv({ env: { DATABASE_URL: "mysql://root:pw@prod:3306/shop", DB_HOST: "prod" } });
   assert.deepEqual(Object.keys(none.env).sort(), ["NODE_ENV"]);
+});
+
+test("the throw-away database is named test_<site slug>, MySQL-safe", () => {
+  assert.equal(testDatabaseName("acme-web"), "test_acme_web");
+  assert.equal(testDatabaseName("Acme Web!!"), "test_acme_web");
+  assert.equal(testDatabaseName("shop", 1), "test_shop_2");
+  assert.equal(testDatabaseName(""), "test_site");
+  const long = testDatabaseName("x".repeat(90), 2);
+  assert.ok(long.length <= 64 && long.endsWith("_3") && /^[a-z0-9_]+$/.test(long));
+});
+
+test("with a slug every database is test_<slug>; linked prefixes are kept", () => {
+  const linked = [
+    { prefix: "", name: "acme_prod", vars: { DB_HOST: "h", DB_NAME: "acme_prod", DATABASE_URL: "mysql://a:b@h:3306/acme_prod" } },
+    { prefix: "QUEUE_", name: "acme_queue", vars: { QUEUE_DB_HOST: "h", QUEUE_DB_NAME: "acme_queue" } },
+  ];
+  const plan = planDatabases({ ...linked[0].vars, ...linked[1].vars }, linked, { slug: "acme-web", type: "node" });
+  assert.deepEqual(plan.map((p) => [p.prefix, p.name]), [["", "test_acme_web"], ["QUEUE_", "test_acme_web_2"]]);
+  assert.ok(plan.every((p) => !p.add));
+  // Own variables: re-pointed, named after the site now.
+  assert.deepEqual(planDatabases({ DATABASE_URL: "mysql://r:p@prod:3306/shop" }, [], { slug: "shop-site", type: "php" }).map((p) => p.name), ["test_shop_site"]);
+  // Older callers (no slug/type): the production name, as before.
+  assert.deepEqual(planDatabases({ DATABASE_URL: "mysql://r:p@prod:3306/shop" }, []).map((p) => p.name), ["shop"]);
+});
+
+test("a node/php site without any database still gets test_<slug> and the standard variables", () => {
+  const plan = planDatabases({ APP_NAME: "Blog" }, [], { slug: "blog", type: "node" });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].name, "test_blog");
+  assert.equal(plan[0].add, true);
+  assert.deepEqual(planDatabases({}, [], { slug: "landing", type: "static" }), [], "static sites get none");
+  assert.deepEqual(planDatabases({}, []), [], "older callers: none");
+  const d = { ...DB, name: "test_blog", add: true };
+  const r = rewriteEnv({ env: { APP_NAME: "Blog", DB_PORT: "3307" }, databases: [d] });
+  for (const k of STANDARD_DB_KEYS) assert.ok(k in r.env, `${k} added`);
+  assert.equal(r.env.DB_NAME, "test_blog");
+  assert.equal(r.env.DB_HOST, "db1");
+  assert.equal(r.env.DATABASE_URL, "mysql://t_abc:throwaway-pw@db1:3306/test_blog");
+  assert.equal(r.env.DB_PORT, "3306", "an own DB_PORT is re-pointed too");
+  assert.equal(r.env.APP_NAME, "Blog");
+  // Test-only variables still win over the added ones.
+  assert.equal(rewriteEnv({ env: {}, databases: [d], testEnv: { DB_NAME: "mine" } }).env.DB_NAME, "mine");
+});
+
+test("the Test view's database preview: host and name filled in, credentials random per run", () => {
+  const none = testDatabasePreview({ APP: "x" }, [], { slug: "acme-web", type: "node" });
+  assert.deepEqual(none.databases.map((d) => [d.name, d.host, d.added]), [["test_acme_web", "db1", true]]);
+  const byKey = Object.fromEntries(none.vars.map((v) => [v.key, v]));
+  assert.deepEqual(Object.keys(byKey).sort(), [...STANDARD_DB_KEYS].sort());
+  assert.equal(byKey.DB_NAME.value, "test_acme_web");
+  assert.equal(byKey.DB_HOST.value, "db1");
+  assert.ok(byKey.DB_USER.random && byKey.DB_PASSWORD.random && byKey.DATABASE_URL.random);
+  assert.ok(!byKey.DB_NAME.random);
+  const linked = [{ prefix: "", name: "p", vars: { DB_HOST: "10.0.0.5", DB_PASSWORD: "prod-secret" } }];
+  const one = testDatabasePreview(linked[0].vars, linked, { slug: "shop", type: "node" });
+  assert.ok(!JSON.stringify(one).includes("prod-secret") && !JSON.stringify(one).includes("10.0.0.5"));
+  assert.equal(one.databases[0].added, false);
 });
 
 test("live payment keys are removed; test-only variables applied on top", () => {

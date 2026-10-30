@@ -292,6 +292,7 @@ GET    /api/dashboard                             { admin, counts: { projects, s
 GET    /api/settings     PATCH /api/settings      { panelName, panelUrl, githubTokenSet, githubTokenHint }
 GET    /api/jobs?siteId&projectId&serverId&databaseId&limit
 GET    /api/jobs/:id     GET /api/jobs/:id/log (text/plain)   POST /api/jobs/:id/cancel
+GET    /api/jobs/queue   PATCH /api/jobs/queue { perServer 1–8 }   POST /api/jobs/:id/move { to: top|bottom|up|down | index }   POST /api/jobs/:id/force
 GET    /api/activity?projectId&limit
 GET    /api/events                                SSE: job, job.log, site, server, database, backup, project, lb
 ```
@@ -1264,3 +1265,62 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     notice), driven by assets/auth.js with `assets/passkey.js` (also used in Settings); Settings →
     **Passkeys** (`views/settings-security.js`; your passkeys + everyone's, owner reset). Styles in
     auth.css. Activity verbs for the new actions.
+- **CORE — job queue for heavy jobs (server overload from parallel builds).** `ctx.jobs.start(meta, fn, { onDropped })`:
+  `meta.heavy: true` + `meta.servers: [serverId…]` (default `[serverId || "main"]`) admits the job only while each of
+  those servers has a free slot — `config.queue.perServer` (1–8, default 1; Settings → **Job queue**,
+  `views/settings-queue.js`). Waiting heavy jobs form one ordered queue (order kept per server and per lock; nothing is
+  held while waiting); light jobs never wait in it, only behind their lock as before. A heavy job started inside a
+  running heavy job runs under its parent's slots (no wait, no claim). Job record gains `heavy, servers, position
+  (1-based while waiting), forced, parentJobId?`. `onDropped(reason)` runs when a job is cancelled (or the panel stops)
+  before its function ran. Restart: waiting heavy jobs → `cancelled` with a "panel restarted while … waiting" error.
+  New: `ctx.jobs.queue()`, `move(id, { to | index })`, `forceStart(id)` (runs now past the limit; 409 when another
+  job holds the same lock), `setPerServer(n)`. Routes above; SSE `queue` = `{ perServer, maxPerServer, running,
+  waiting }` (items `{ id, type, title, status, siteId, projectId, adminId, servers, forced, position, createdAt,
+  startedAt, lastLine, waitingFor }`; the route adds `adminName, siteName, serverNames`). Activity verb `job.force`.
+  **Heavy:** deploys and rollbacks to a release (claims the build server: the first server of a build-once LB site,
+  else every target; a static site with nothing to build is light), GitHub pull **and deploy**, migrate to/from Docker
+  (every server), a reconfigure that builds (new image, or the release put on added servers), rollback to the previous
+  release only when it redeploys (build once), commit tests (the test server), full server backups. Light: restart /
+  stop / start, env, scripts, delete, a pull without deploy, database backups. UI: `assets/queue.js` + `queue.css`
+  (top-bar **Queue** button with waiting count + running dot; panel with Running now / Waiting, drag or ↑↓ to reorder,
+  Start now with a confirm, Cancel); `jobStarted()` toasts "Queued: … (position n)". Dev only: with `FCC_DRY_RUN=1`,
+  `FCC_DRY_RUN_DEPLOY_MS=<ms>` stretches each simulated deploy so the queue can be watched. Tests:
+  `scripts/jobs-queue.test.mjs`.
+- **SITES/UI — Environment tab: Live / Test / Staging, test_<slug> test databases, per-website staging.**
+  - **Environment tab** (`views/site-env.js`, called from `views/site.js`): a segmented switch **Live** (variables,
+    managed by the panel, from linked databases, linked databases — as before) / **Test** (the test-only variables
+    card, moved here, plus a read-only "Test database" block) / **Staging**. The view is kept in the URL
+    (`#/sites/:id/environment?view=test|staging`) and remembered in localStorage (`fcc.env.view`).
+  - **Test databases** (`shared/testenv.mjs`): `planDatabases(env, linked, { slug, type })` names every throw-away
+    database `test_<slug>` (`testDatabaseName`: lower-case `[a-z0-9_]`, ≤ 64; further linked databases `_2`, `_3`…,
+    their prefixes kept). A node/php site with no database at all gets one too (`add: true`): `rewriteEnv` then adds
+    `STANDARD_DB_KEYS` (DATABASE_URL, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD) where not set. Without
+    `{ slug, type }` the old behaviour holds. The `site.test` payload gains `siteSlug`. New `testDatabasePreview()`;
+    `GET /api/sites/:id/test-env` adds `database: { databases: [{ name, host, port, source, added }], vars: [{ key,
+    value, random }] } | null`. The dry-run simulation names the database in its phase and log.
+  - **Staging** (`panel/lib/staging.mjs`, module `staging` after `site-tests`): a staging copy is an ordinary site
+    record with `stagingOf: <parentId>`; the parent gets `stagingSiteId`. `POST /api/sites/:id/staging { domain?,
+    serverId?, deploy?, releaseId? }` → `{ site, staging, databases, job, warnings }` creates it (domain
+    `staging.<first domain>` by default, own port/appDir, not load balanced — the parent's first server, runtime
+    docker for node / legacy php / none static, the parent's settings, container limits and Cloudflare delivery);
+    when the parent uses a database, one MySQL database per parent database `<prefix>_staging_<slug>` (+`_2`…) with
+    its own user, tagged `database.stagingOf`, linked with the parent's prefixes (`site.linkPrefixes {dbId: prefix}`,
+    honoured by `collectLinked`), an unlinked one of that name is reused; the parent's own variables copied once
+    (`stagingEnv`: live payment keys stripped, MySQL settings → the staging database, URLs on its domains → the
+    staging URL); then the parent's current release deployed with the normal deploy job (heavy metadata as any
+    deploy). `DELETE /api/sites/:id/staging?dropDatabase=1&deleteFiles=0|1` → job (removes the copy; with
+    dropDatabase also the databases tagged for it). Everything else uses the copy's own routes.
+  - `sites.mjs`: `publicSite` adds `stagingOf, stagingSiteId, staging` (parent: `{ role: "parent", id, name, url,
+    domains, port, serverId, serverName, currentReleaseId, currentVersion, running, healthy, deploying, error,
+    busyJobId, deleting, databaseIds, ssl, createdAt }`; copy: `{ role: "staging", parentId, parentName }`);
+    `GET /api/sites` hides copies (`?includeStaging=1` shows them); a copy's releases are its parent's (GET site /
+    releases, deploy, rollback accept them; upload/GitHub pull on a copy → 409); the parent's release pruning keeps
+    what the copy runs and a release the copy runs can't be deleted; a copy's change also broadcasts its parent.
+    **Deleting a website that has a staging copy → 409** (remove staging first — that dialog decides about the
+    staging database); deleting a copy clears the parent's `stagingSiteId`. `ctx.sites` gains `create(projectId,
+    body, { admin, extra })`, `remove(siteId, { admin, deleteFiles })`, `busyJob(siteId)`.
+  - `mysql.mjs`: `ctx.mysql.createDatabase(opts, admin)`, `dropDatabase(id, admin)`, `projectPrefix(projectId)`.
+  - UI: staging strip at the top of the Overview, "To staging" button on release rows, Staging view (status, Open,
+    Deploy a release, Stop/Start, domain + HTTPS, staging variables, staging database vars, jobs, Remove staging with
+    typed confirm + "also drop the database"). Activity verbs `site.staging.start|remove`. Tests:
+    `scripts/staging.test.mjs`, new cases in `scripts/site-tests.test.mjs`.

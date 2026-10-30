@@ -284,18 +284,18 @@ export function computeScore({ checks = [], findings = [], reported = null, verd
 
 // ------------------------------------------------------- variable rewrite
 
-const DB_URL_RE = /^(mysql|mysql2|mariadb)(\+[a-z0-9]+)?:\/\//i;
+export const DB_URL_RE = /^(mysql|mysql2|mariadb)(\+[a-z0-9]+)?:\/\//i;
 const OTHER_DATA_URL_RE = /^(postgres|postgresql|mongodb(\+srv)?|redis|rediss|amqp|amqps|mssql|sqlserver):\/\//i;
-const DB_KEY_RE = /^(.*?)(?:DB|MYSQL|DATABASE|MARIADB)_(HOST|HOSTNAME|SERVER|PORT|NAME|DATABASE|DB|USER|USERNAME|PASS|PASSWORD|PWD)$/;
+export const DB_KEY_RE = /^(.*?)(?:DB|MYSQL|DATABASE|MARIADB)_(HOST|HOSTNAME|SERVER|PORT|NAME|DATABASE|DB|USER|USERNAME|PASS|PASSWORD|PWD)$/;
 const MAIL_KEY_RE = /^(?:.*_)?(?:SMTP|MAIL|EMAIL|MAILER)_(HOST|HOSTNAME|SERVER|PORT|USER|USERNAME|LOGIN|PASS|PASSWORD|SECURE|TLS|SSL|ENCRYPTION|SCHEME)$/;
 const MAIL_URL_KEY_RE = /^(?:.*_)?(?:SMTP|MAIL|EMAIL|MAILER)_(URL|DSN|SERVER|TRANSPORT|CONNECTION)$/;
 const SMTP_URL_RE = /^smtps?:\/\//i;
 const MAIL_API_RE = /(SENDGRID|RESEND|POSTMARK|MAILGUN|MAILJET|SPARKPOST|BREVO|SENDINBLUE|MANDRILL|MAILERSEND|MAILCHIMP|LOOPS|PLUNK|CUSTOMERIO|CUSTOMER_IO)/;
 const MESSAGING_RE = /^(TWILIO|VONAGE|NEXMO|MESSAGEBIRD|PLIVO|SINCH|TELNYX|PUSHOVER|ONESIGNAL)_/;
-const SECRETISH_RE = /(KEY|TOKEN|SECRET|PASSWORD|PASS|SID|AUTH)/;
+export const SECRETISH_RE = /(KEY|TOKEN|SECRET|PASSWORD|PASS|SID|AUTH)/;
 const WEBHOOK_URL_RE = /(hooks\.slack\.com|discord(app)?\.com\/api\/webhooks|outlook\.office\.com\/webhook|webhook\.office\.com|api\.telegram\.org\/bot)/i;
 const LIVE_PAY_VALUE_RE = /^(sk|pk|rk)_live_/;
-const PAY_ENV_KEY_RE = /^(PAYPAL|BRAINTREE|SQUARE|ADYEN|MOLLIE|PADDLE|LEMONSQUEEZY|RAZORPAY|AUTHORIZE(?:NET)?|CHECKOUT|KLARNA)_(MODE|ENV|ENVIRONMENT|SANDBOX|LIVE)$/;
+export const PAY_ENV_KEY_RE = /^(PAYPAL|BRAINTREE|SQUARE|ADYEN|MOLLIE|PADDLE|LEMONSQUEEZY|RAZORPAY|AUTHORIZE(?:NET)?|CHECKOUT|KLARNA)_(MODE|ENV|ENVIRONMENT|SANDBOX|LIVE)$/;
 
 /** Is a variable value a live payment key, whatever the variable is called? */
 export function isLivePaymentValue(v) {
@@ -303,21 +303,52 @@ export function isLivePaymentValue(v) {
   return LIVE_PAY_VALUE_RE.test(s) || /^live_[A-Za-z0-9]{20,}$/.test(s); // Stripe; Mollie live_…
 }
 
+/** The variables a test copy gets when the site has no database of its own (prefix-less). */
+export const STANDARD_DB_KEYS = ["DATABASE_URL", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"];
+
+/**
+ * MySQL-safe name of a site's throw-away test database: `test_<slug>` for the
+ * first (or only) one, `test_<slug>_2`, `test_<slug>_3`… for further linked
+ * databases. Lower-case letters, digits and `_`, at most 64 characters.
+ */
+export function testDatabaseName(slug, index = 0) {
+  const s =
+    String(slug || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9_]+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "") || "site";
+  const tail = index > 0 ? `_${index + 1}` : "";
+  return `test_${s.slice(0, 64 - 5 - tail.length).replace(/_+$/, "")}${tail}`;
+}
+
 /**
  * Which throw-away databases a run needs: one per linked database, or one for
  * a site that carries its own MySQL settings in its variables.
  * linked: [{ databaseId, name, prefix, vars }] from ctx.sites.linkedEnvSources.
+ *
+ * With `{ slug, type }` (what the panel sends since staging/test-database
+ * naming): every database is named `test_<slug>` (see testDatabaseName), and a
+ * node/php site with no database at all still gets one — `add: true`, meaning
+ * rewriteEnv adds the standard variables (STANDARD_DB_KEYS) for it. Without
+ * them (older callers) the names come from the production database as before
+ * and a site without a database gets none.
  */
-export function planDatabases(env = {}, linked = []) {
+export function planDatabases(env = {}, linked = [], { slug = null, type = null } = {}) {
+  const named = slug != null || type != null;
   const safeName = (n) => (/^[A-Za-z0-9_]{1,64}$/.test(String(n || "")) ? String(n) : "app");
-  if (linked.length) return linked.map((l, i) => ({ index: i, prefix: String(l.prefix || ""), name: safeName(l.vars?.[`${l.prefix || ""}DB_NAME`] || l.name), source: l.name || l.databaseId }));
+  const nameFor = (i, fallback) => (named ? testDatabaseName(slug || "site", i) : safeName(fallback));
+  if (linked.length) return linked.map((l, i) => ({ index: i, prefix: String(l.prefix || ""), name: nameFor(i, l.vars?.[`${l.prefix || ""}DB_NAME`] || l.name), source: l.name || l.databaseId }));
   const keys = Object.keys(env);
   const url = keys.find((k) => DB_URL_RE.test(String(env[k] || "")));
   const hostKey = keys.find((k) => {
     const m = DB_KEY_RE.exec(k);
     return m && (m[2] === "HOST" || m[2] === "HOSTNAME" || m[2] === "SERVER");
   });
-  if (!url && !hostKey) return [];
+  if (!url && !hostKey) {
+    if (!named || type === "static") return [];
+    return [{ index: 0, prefix: "", name: testDatabaseName(slug || "site", 0), source: "the test run (this website has no database of its own)", add: true }];
+  }
   let name = "app";
   if (url) {
     try {
@@ -329,7 +360,32 @@ export function planDatabases(env = {}, linked = []) {
     const nameKey = keys.find((k) => /(?:DB|MYSQL|DATABASE)_(NAME|DATABASE|DB)$/.test(k));
     if (nameKey) name = env[nameKey];
   }
-  return [{ index: 0, prefix: "", name: safeName(name), source: "the site's own variables" }];
+  return [{ index: 0, prefix: "", name: nameFor(0, name), source: "the site's own variables" }];
+}
+
+/**
+ * What the Environment tab's Test view shows, read-only: the database
+ * variables a commit test of this site gets (host and name filled in; user
+ * and password are random per run). `env` is the site's deployed variables
+ * (own + linked database vars), `linked` as for planDatabases.
+ * Returns { databases: [{ name, host, port, source, added }], vars: [{ key, value, random }] }.
+ */
+export function testDatabasePreview(env = {}, linked = [], { slug = null, type = null } = {}) {
+  const U = "__random_user__";
+  const P = "__random_password__";
+  const plan = planDatabases(env, linked, { slug: slug || "site", type });
+  const databases = plan.map((p) => ({ prefix: p.prefix, host: `db${p.index + 1}`, port: "3306", name: p.name, user: U, password: P, add: !!p.add }));
+  const r = rewriteEnv({ env, linked, databases });
+  const linkedKeys = new Set(linked.flatMap((l) => Object.keys(l.vars || {})));
+  const vars = r.repointed
+    .filter((k) => k in r.env && (linkedKeys.has(k) || DB_KEY_RE.test(k) || DB_URL_RE.test(String(r.env[k])) || STANDARD_DB_KEYS.some((s) => k.endsWith(s))))
+    .sort()
+    .map((key) => {
+      const v = String(r.env[key]);
+      const random = v.includes(U) || v.includes(P);
+      return { key, value: v.split(U).join("‹random›").split(P).join("‹random›"), random };
+    });
+  return { databases: databases.map((d, i) => ({ name: d.name, host: d.host, port: d.port, source: plan[i].source, added: d.add })), vars };
 }
 
 function dbUrl(scheme, d) {
@@ -472,6 +528,17 @@ export function rewriteEnv({ env = {}, linked = [], databases = [], mail = null,
   // A webhook signing secret that belongs to a live Stripe account goes with its keys.
   if (liveStripe) {
     for (const k of Object.keys(out)) if (/^whsec_/.test(String(out[k]).trim())) drop(k, "webhook secret of the live payment account");
+  }
+
+  // 4b. A site without a database of its own still gets one for the test
+  // (planDatabases `add: true`): the standard variables, where not set already.
+  for (const d of databases) {
+    if (!d?.add) continue;
+    const p = String(d.prefix || "");
+    const vals = { DATABASE_URL: dbUrl("mysql", d), DB_HOST: d.host, DB_PORT: d.port, DB_NAME: d.name, DB_USER: d.user, DB_PASSWORD: d.password };
+    const added = STANDARD_DB_KEYS.filter((k) => !(p + k in out));
+    for (const k of added) set(p + k, vals[k]);
+    if (added.length) notes.push(`Throw-away database ${d.name} added for the test (${added.map((k) => p + k).join(", ")}).`);
   }
 
   // 5. The site's own address → the test copy.
@@ -876,8 +943,9 @@ async function realRun(payload, o) {
 
     // --- databases
     const linked = Array.isArray(payload.linked) ? payload.linked : [];
-    const plan = planDatabases(spec.env || {}, linked);
-    const databases = plan.map((p) => ({ prefix: p.prefix, host: `db${p.index + 1}`, port: "3306", name: p.name, user: `t_${randomSecret(4).replace(/[^A-Za-z0-9]/g, "x")}`, password: randomSecret(18), rootPassword: randomSecret(18), source: p.source, container: names.db(p.index) }));
+    // test_<site slug> for every node/php site, even one without a database (then DATABASE_URL, DB_* are added).
+    const plan = planDatabases(spec.env || {}, linked, { slug: payload.siteSlug || payload.siteName || spec.name || "site", type });
+    const databases = plan.map((p) => ({ prefix: p.prefix, host: `db${p.index + 1}`, port: "3306", name: p.name, add: !!p.add, user: `t_${randomSecret(4).replace(/[^A-Za-z0-9]/g, "x")}`, password: randomSecret(18), rootPassword: randomSecret(18), source: p.source, container: names.db(p.index) }));
     for (const d of databases) secrets.push(d.password, d.rootPassword);
     redact = makeRedactor(secrets);
     if (databases.length) phase("preparing", `Starting ${databases.length === 1 ? "an empty throw-away database" : `${databases.length} empty throw-away databases`}`);
@@ -1286,10 +1354,17 @@ async function simulateRun(payload, { emit, log, signal }) {
   log("[dry-run] simulating a commit test — nothing is built or run.");
   phase("preparing", "Creating an isolated network for this test");
   await step(1200);
-  phase("preparing", "Starting an empty throw-away database");
-  await step(1500);
+  const spec = payload.spec || {};
+  const plan = planDatabases(spec.env || {}, Array.isArray(payload.linked) ? payload.linked : [], { slug: payload.siteSlug || payload.siteName || spec.name || "site", type: spec.type || "node" });
+  if (plan.length) {
+    phase("preparing", `Starting an empty throw-away database: ${plan.map((p) => p.name).join(", ")}`);
+    for (const [i, p] of plan.entries()) {
+      log(`[dry-run] database ${p.name} on host db${i + 1}:3306 (random user and password) — for ${p.source}${p.add ? "; DATABASE_URL and DB_* added for the copy" : ""}`);
+    }
+    await step(1500);
+  }
   phase("preparing", "Starting the mail catcher");
-  emit({ t: "env", url, database: true, mail: true });
+  emit({ t: "env", url, database: plan.length > 0, mail: true });
   await step(800);
   for (const [id, title] of [["install", "Dependencies install"], ["build", "Build"]]) {
     phase("preparing", `${title}`);

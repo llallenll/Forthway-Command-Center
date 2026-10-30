@@ -131,7 +131,7 @@ async function initPasskey() {
     const port = Number(location.port) || (location.protocol === "https:" ? 443 : 4000);
     box.innerHTML = `${iconHTML("lock")}<div><b>${esc(msg || "Passkeys can't be used on this address.")}</b><br/>${link
       ? `<a class="btn btn-primary btn-sm pk-go" href="${esc(link)}/login">Open ${esc(link)}</a>`
-      : "Set the panel up with a domain name and HTTPS (install.sh with a panel domain, or Settings → Cloudflare → Publish this panel). Until then, an SSH tunnel works: <code>ssh -L ${port}:127.0.0.1:${port} root@&lt;server&gt;</code>, then open <code>http://localhost:${port}</code>."}</div>`;
+      : "Set the panel up with a domain name and HTTPS (install.sh with a panel domain). Until then, an SSH tunnel works: <code>ssh -L ${port}:127.0.0.1:${port} root@&lt;server&gt;</code>, then open <code>http://localhost:${port}</code>."}</div>`;
     box.hidden = false;
     $("#title").textContent = st.needs === "setup" ? "Add a passkey" : "Confirm it's you";
     $("#sub").textContent = "This panel asks for a passkey after GitHub sign-in.";

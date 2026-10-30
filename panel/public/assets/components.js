@@ -4,6 +4,7 @@ import { html, raw, $, $$, on, frag, mount, ago, fmtDate, fmtBytes, fmtUsage, fm
 import { icon } from "./icons.js";
 import { api, get, post, patch, del, upload, uploadChunked, getText, download } from "./api.js";
 import { onEvent } from "./events.js";
+import { moreList } from "./fold.js"; // long tables show the first rows, then "Show all"
 
 /* ───────── badges & small markup ───────── */
 
@@ -69,7 +70,7 @@ export function jobItem(j) {
   return html`<div class="list-item clickable" data-job="${j.id}" role="button" tabindex="0">
     <span class="job-ico ${j.status}">${icon(ico, "sm")}</span>
     <div class="li-main"><div class="li-title">${j.title || j.type}</div>
-      <div class="li-sub">${j.status === "failed" && j.error ? j.error : html`${ago(j.startedAt)}${dur ? html` · ${dur}` : ""}`}</div></div>
+      <div class="li-sub">${j.status === "failed" && j.error ? j.error : j.status === "queued" ? (j.heavy && j.position ? `Waiting in the job queue · position ${j.position}` : "Waiting to start") : html`${ago(j.startedAt)}${dur ? html` · ${dur}` : ""}`}</div></div>
     <div class="li-right">${jobStatusBadge(j.status)}</div></div>`;
 }
 
@@ -84,7 +85,7 @@ const ACT_VERB = {
   "server.token.rotate": "rotated the token of", "database.credentials.reveal": "revealed credentials for", "database.password.rotate": "rotated the password of",
   "database.update": "updated database", "mysql.root.update": "updated the MySQL root login", "backup.database": "backed up", "backup.server": "backed up server",
   "backup.delete": "deleted a backup of", "backup.download": "downloaded a backup of", "backup.restore.start": "started restoring", "backup.update": "updated a backup of",
-  "release.delete": "deleted a release of", "release.github": "pulled a release for", "job.cancel": "cancelled",
+  "release.delete": "deleted a release of", "release.github": "pulled a release for", "job.cancel": "cancelled", "job.force": "force-started",
   "database.phpmyadmin.open": "opened phpMyAdmin for", "database.phpmyadmin.signon": "signed in to phpMyAdmin for", "phpmyadmin.install": "installed", "phpmyadmin.update": "updated",
   "monitor.sms": "texted an alert about", "monitor.discord": "posted a Discord alert about",
   "phpmyadmin.uninstall": "removed", "phpmyadmin.settings.update": "changed settings of", "mysql.settings.update": "changed the database host settings", "mysql.bind.update": "changed the MySQL listen address",
@@ -212,6 +213,11 @@ export async function openJobLog(jobId) {
 /** Toast for a started job, with a link to its log. */
 export function jobStarted(job, title) {
   if (!job?.id) { toast(title || "Done", "ok"); return; }
+  if (job.status === "queued" && job.heavy && job.position) {
+    // Waiting in the job queue for a free server slot (panel/lib/jobs.mjs): say so, not "running".
+    toast(`Queued: ${job.title || title || "job"}`, "info", { msg: `Position ${job.position} in the job queue — it starts when the server is free.`, action: { label: "Open queue →", fn: () => window.dispatchEvent(new Event("fcc:queue-open")) } });
+    return;
+  }
   toast(title || job.title || "Job started", "info", { msg: "Running in the background.", action: { label: "View log →", fn: () => openJobLog(job.id) } });
 }
 
@@ -531,11 +537,11 @@ export function dbMenu(anchor, d, after) {
   ]);
 }
 
-export function databasesTable(items, { projectsById = {}, showProject = true, mysql = null } = {}) {
+export function databasesTable(items, { projectsById = {}, showProject = true, mysql = null, moreId = "" } = {}) {
   const bindLocal = mysql && /^(127\.|localhost|::1)/.test(mysql.bindAddress || "");
   return html`<div class="card"><div class="table-wrap"><table class="table">
     <thead><tr><th>Database</th>${showProject ? html`<th class="hide-sm">Project</th>` : ""}<th class="hide-sm">User</th><th>Size</th><th class="hide-sm">Last backup</th><th class="hide-sm">Used by</th><th></th></tr></thead>
-    <tbody>${items.map((d) => {
+    ${moreList(items, (d) => {
       const p = projectsById[d.projectId];
       return html`<tr>
         <td><div class="row"><span class="li-ico" style="width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:rgba(51,212,193,.1);color:#5fe0cf">${icon("database", "sm")}</span>
@@ -548,7 +554,7 @@ export function databasesTable(items, { projectsById = {}, showProject = true, m
         <td class="hide-sm">${(d.linkedSites || []).length ? html`<div class="chips">${d.linkedSites.slice(0, 2).map((s) => html`<a class="badge" href="#/sites/${s.id}">${icon("globe")}${s.name}</a>`)}${d.linkedSites.length > 2 ? html`<span class="badge">+${d.linkedSites.length - 2}</span>` : ""}</div>` : html`<span class="dim small">Not linked</span>`}</td>
         <td class="actions"><div class="btn-row"><button class="icon-btn sm hide-sm" data-db-pma="${d.id}" title="Open in phpMyAdmin (signs you in as this database's user)" aria-label="Open ${d.name} in phpMyAdmin">${icon("external", "sm")}</button><button class="btn btn-sm hide-sm" data-db-creds="${d.id}">${icon("eye")}Credentials</button><button class="icon-btn sm" data-db-menu="${d.id}" aria-label="More actions">${icon("more")}</button></div></td>
       </tr>`;
-    })}</tbody></table></div></div>`;
+    }, { id: moreId, limit: moreId ? 10 : Infinity, table: true, cols: showProject ? 7 : 6, noun: "databases" })}</table></div></div>`;
 }
 
 /* ───────── backups ───────── */
@@ -584,7 +590,7 @@ export function backupsTable(items, { serversById = {}, dbsById = {}, kind } = {
           <div style="min-width:0"><div class="t-main row" style="gap:8px">${src}${b.pinned ? html`<span class="badge violet" title="Pinned — never removed by retention">${icon("pin")}Pinned</span>` : ""}</div>
           <div class="t-sub mono ellipsis" style="max-width:340px">${b.filename || String(b.file || "").split("/").pop()}${inc.length ? html` · <span style="font-family:var(--font)">${inc.join(", ")}</span>` : ""}</div>${b.note ? html`<div class="t-sub">“${b.note}”</div>` : ""}
           ${more ? html`<button type="button" class="bk-stack" data-bk-stack="${k}" aria-expanded="${open ? "true" : "false"}">${icon(open ? "chevronDown" : "chevronRight", "xs")}<span>${open ? "Hide older" : `+${more} older · ${fmtBytes(olderBytes)}`}</span>${missing && !open ? html`<span class="bk-stack-warn" title="${missing} older archive(s) are no longer on this server">${icon("alert", "xs")}${missing} missing</span>` : ""}</button>` : ""}</div></div></td>
-        <td>${b.status === "ok" && b.available === false ? html`<span class="badge warn" title="The archive is no longer on disk">${icon("alert")}File missing</span>` : b.status === "ok" ? html`<span class="badge ok">${icon("check")}OK</span>` : b.status === "running" ? html`<span class="badge blue"><span class="dot run" style="width:6px;height:6px"></span>Running</span>` : html`<span class="badge err" title="${b.error || ""}">${icon("alert")}Failed</span>`}</td>
+        <td>${b.status === "ok" && b.available === false ? html`<span class="badge warn" title="The archive is no longer on disk">${icon("alert")}File missing</span>` : b.status === "ok" ? html`<span class="badge ok">${icon("check")}OK</span>` : b.status === "running" ? html`<span class="badge blue"><span class="dot run" style="width:6px;height:6px"></span>Running</span>` : b.status === "queued" ? html`<span class="badge" title="Waiting in the job queue — open Queue in the top bar to move it or start it now">${icon("clock")}Queued</span>` : html`<span class="badge err" title="${b.error || ""}">${icon("alert")}Failed</span>`}</td>
         <td class="num">${b.status === "ok" ? fmtBytes(b.size) : html`<span class="dim">—</span>`}</td>
         <td class="hide-sm"><span class="muted small">${b.trigger === "schedule" ? "Scheduled" : b.trigger === "safety" ? "Safety copy" : "Manual"}</span>${b.remote?.type && !b.remote.error && b.remote.key ? html`<div class="t-sub row" style="gap:5px;white-space:nowrap" title="${b.remote.location || ""}${b.remote.uploadedAt ? ` · uploaded ${fmtDate(b.remote.uploadedAt)}` : ""}${b.remote.dryRun ? " (dry run)" : ""}">${icon(b.remote.type === "smb" ? "folder" : "cloud", "xs")}${b.remote.type === "smb" ? "SMB copy" : "Off-site"}</div>` : b.remote?.error ? html`<div class="t-sub" style="color:#ffc46b" title="${b.remote.error}">Upload failed</div>` : ""}</td>
         <td class="hide-sm"><div class="small">${fmtDate(b.createdAt)}</div><div class="t-sub">${ago(b.createdAt)}</div></td>
@@ -646,6 +652,28 @@ export function bindBackupActions(root, getItems, { dbsById = () => ({}), server
 
 export function tabsBar(items, active, base) {
   return html`<nav class="tabs" role="tablist">${items.map((t) => html`<a class="tab ${t.id === active ? "active" : ""}" role="tab" href="${base}/${t.id}">${t.icon ? icon(t.icon, "sm") : ""}${t.label}${t.count != null ? html`<span class="n">${t.count}</span>` : ""}</a>`)}</nav>`;
+}
+/**
+ * Numbered page buttons: ‹ 1 2 3 … 9 ›. Buttons carry data-page="<n>"; the caller handles the click.
+ * Shows the first and last page, the current one and its neighbours; gaps collapse to "…".
+ */
+export function pager(page, pages, { label = "Pages" } = {}) {
+  if (pages <= 1) return html``;
+  const want = new Set([1, pages, page - 1, page, page + 1].filter((n) => n >= 1 && n <= pages));
+  if (page <= 3) [2, 3, 4].forEach((n) => n < pages && want.add(n));
+  if (page >= pages - 2) [pages - 3, pages - 2, pages - 1].forEach((n) => n > 1 && want.add(n));
+  const nums = [...want].sort((a, b) => a - b);
+  const cells = [];
+  nums.forEach((n, i) => {
+    if (i && n - nums[i - 1] === 2) cells.push(n - 1); // a gap of one page: show it rather than "…"
+    else if (i && n - nums[i - 1] > 2) cells.push(null);
+    cells.push(n);
+  });
+  return html`<nav class="pager" aria-label="${label}">
+    <button type="button" class="pg pg-step" data-page="${page - 1}" ${page <= 1 ? raw("disabled") : ""} aria-label="Previous page">${icon("chevronLeft", "sm")}</button>
+    ${cells.map((n) => (n == null ? html`<span class="pg-gap" aria-hidden="true">…</span>` : html`<button type="button" class="pg ${n === page ? "active" : ""}" data-page="${n}" ${n === page ? raw('aria-current="page"') : ""} aria-label="Page ${n}">${n}</button>`))}
+    <button type="button" class="pg pg-step" data-page="${page + 1}" ${page >= pages ? raw("disabled") : ""} aria-label="Next page">${icon("chevronRight", "sm")}</button>
+  </nav>`;
 }
 export function pageHead(title, sub, right) {
   return html`<div class="page-head"><div><h1>${title}</h1>${sub ? html`<p>${sub}</p>` : ""}</div>${right ? html`<div class="right">${right}</div>` : ""}</div>`;

@@ -517,8 +517,50 @@ export function register(router, ctx) {
       update: updateFor(site),
       busyJobId: busyJob(site.id),
       deleting: !!site.deleting,
+      // STAGING (panel/lib/staging.mjs): a staging copy is a child site record of its parent.
+      stagingOf: site.stagingOf || null,
+      stagingSiteId: site.stagingSiteId || null,
+      staging: stagingSummary(site),
       createdAt: site.createdAt,
       updatedAt: site.updatedAt || null,
+    };
+  }
+
+  /** STAGING: the site whose releases this one deploys (a staging copy deploys its parent's). */
+  const releaseOwner = (site) => site?.stagingOf || site?.id;
+
+  /** STAGING: a parent's view of its staging copy, or a staging copy's pointer to its parent. */
+  function stagingSummary(site) {
+    if (site.stagingOf) {
+      const p = getSite(site.stagingOf);
+      return { role: "staging", parentId: site.stagingOf, parentName: p?.name || null };
+    }
+    const c = site.stagingSiteId ? getSite(site.stagingSiteId) : null;
+    if (!c) return null;
+    const sid = targets(c)[0];
+    const st = c.state?.[sid] || {};
+    const rel = c.currentReleaseId ? db.get("releases", c.currentReleaseId) : null;
+    const tls = c.ssl?.enabled || (c.cloudflare?.enabled && c.cloudflare.hostnames?.includes(c.domains?.[0]));
+    return {
+      role: "parent",
+      id: c.id,
+      name: c.name,
+      url: c.domains?.[0] ? `${tls ? "https" : "http"}://${c.domains[0]}` : null,
+      domains: c.domains || [],
+      port: c.port,
+      serverId: sid,
+      serverName: serverName(sid),
+      currentReleaseId: c.currentReleaseId || null,
+      currentVersion: rel?.version || null,
+      running: st.running ?? null,
+      healthy: st.healthy ?? null,
+      deploying: !!st.deploying,
+      error: st.error || null,
+      busyJobId: busyJob(c.id),
+      deleting: !!c.deleting,
+      databaseIds: c.linkedDatabaseIds || [],
+      ssl: c.ssl || { enabled: false, status: "none" },
+      createdAt: c.createdAt,
     };
   }
 
@@ -572,6 +614,9 @@ export function register(router, ctx) {
     if (!site) return;
     try {
       ctx.events?.broadcast?.("site", publicSite(site));
+      // STAGING: the parent page shows its staging copy's state too.
+      const parent = site.stagingOf ? getSite(site.stagingOf) : null;
+      if (parent) ctx.events?.broadcast?.("site", publicSite(parent));
     } catch {
       /* never let an SSE hiccup break an operation */
     }
@@ -737,7 +782,8 @@ export function register(router, ctx) {
     const sources = [];
     (site.linkedDatabaseIds || []).forEach((id, i) => {
       const rec = db.get("databases", id);
-      const prefix = linkedPrefix(rec, i);
+      // STAGING: a staging copy keeps its parent's variable prefixes (site.linkPrefixes { databaseId: prefix }).
+      const prefix = typeof site.linkPrefixes?.[id] === "string" ? site.linkPrefixes[id] : linkedPrefix(rec, i);
       const v = values[i];
       const vars = {};
       if (v && typeof v === "object" && !v.then) for (const [k, val] of Object.entries(v)) if (val != null) vars[prefix + k] = String(val);
@@ -1003,6 +1049,26 @@ export function register(router, ctx) {
   }
 
   /**
+   * JOB QUEUE (panel/lib/jobs.mjs): which servers a deploy of `release` loads
+   * hard enough to count against their heavy-job slot, or null when it is
+   * light. Installing packages and building is what eats CPU and memory:
+   *  - build once, ship everywhere (load-balanced + a build step): only the
+   *    first server builds; the others unpack the package it made — claim the
+   *    first server only;
+   *  - any other deploy installs on each of its servers (rolling, one at a
+   *    time, but each server takes its turn within the job) — claim them all;
+   *  - a static site with nothing to build only unpacks files: light.
+   * `ids` narrows it to some servers (e.g. the ones a reconfigure adds).
+   */
+  function heavyServers(site, release, ids = targets(site)) {
+    if (!site || !ids.length) return null;
+    if (site.type === "static" && !needsBuild(site, release)) return null;
+    if (buildsOnce(site, release) && ids.length === targets(site).length) return [ids[0]];
+    return [...ids];
+  }
+  const heavyMeta = (servers) => (servers?.length ? { heavy: true, servers } : {});
+
+  /**
    * What a build depends on besides the archive: the site's variables
    * (NEXT_PUBLIC_* are inlined at build time) and its build settings. A stored
    * build made under different ones is not reused.
@@ -1243,6 +1309,16 @@ export function register(router, ctx) {
       `Deploying ${releaseLabel(release.id)} of ${site.name} to ${ids.length} server${ids.length === 1 ? "" : "s"}` +
         (site.loadBalanced ? " — rolling, one server at a time." : "."),
     );
+    // DEV ONLY (dry run): FCC_DRY_RUN_DEPLOY_MS=<ms> stretches each simulated deploy so the
+    // job queue can be watched in the browser. Never read outside FCC_DRY_RUN=1.
+    const devStretch = process.env.FCC_DRY_RUN === "1" ? Math.min(600_000, Number(process.env.FCC_DRY_RUN_DEPLOY_MS) || 0) : 0;
+    if (devStretch > 0) {
+      log(`[dry run] FCC_DRY_RUN_DEPLOY_MS: pretending to build for ${Math.round(devStretch / 1000)} s…`);
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, devStretch);
+        signal?.addEventListener("abort", () => (clearTimeout(t), reject(new Error("Cancelled."))), { once: true });
+      });
+    }
     // Build once, ship everywhere (multi-server sites with a build step).
     let ship = null;
     if (buildsOnce(site, release)) {
@@ -1357,12 +1433,13 @@ export function register(router, ctx) {
   }
 
   /** Start a job for a site. `lock` makes it exclusive with other locking jobs. */
-  function siteJob(site, admin, { type, title, serverId }, fn, { lock = true } = {}) {
+  function siteJob(site, admin, { type, title, serverId, heavy = null }, fn, { lock = true } = {}) {
     if (!ctx.jobs?.start) throw httpError(503, "The jobs module is not available.");
     if (lock) assertIdle(site.id);
     let jobId = null;
     const job = ctx.jobs.start(
-      { type, title, projectId: site.projectId, siteId: site.id, serverId: serverId || null, adminId: admin?.id || null },
+      // heavy: the servers it builds on (heavyServers) — it waits in the job queue for a free slot there.
+      { type, title, projectId: site.projectId, siteId: site.id, serverId: serverId || null, adminId: admin?.id || null, ...heavyMeta(heavy) },
       async (args) => {
         try {
           return await fn(args);
@@ -1370,6 +1447,13 @@ export function register(router, ctx) {
           if (lock && busy.get(site.id) === (jobId || args?.job?.id)) busy.delete(site.id);
           emit(site.id);
         }
+      },
+      {
+        // Cancelled while still waiting in the queue: the function never ran, so free the site here.
+        onDropped: () => {
+          if (lock && busy.get(site.id) === jobId) busy.delete(site.id);
+          emit(site.id);
+        },
       },
     );
     jobId = job?.id || null;
@@ -1500,6 +1584,9 @@ export function register(router, ctx) {
     if (!site) return [];
     const keep = site.settings?.keepReleases ?? ctx.config?.keepReleases ?? DEFAULT_KEEP_RELEASES;
     const live = new Set([site.currentReleaseId, site.previousReleaseId, ...Object.values(site.state || {}).map((s) => s?.releaseId)].filter(Boolean));
+    // STAGING: what the staging copy runs (it deploys this site's releases) is kept too.
+    const stg = site.stagingSiteId ? getSite(site.stagingSiteId) : null;
+    if (stg) for (const id of [stg.currentReleaseId, stg.previousReleaseId, ...Object.values(stg.state || {}).map((s) => s?.releaseId)]) if (id) live.add(id);
     const removed = [];
     listReleases(siteId).forEach((r, i) => {
       if (i < keep || r.pinned || live.has(r.id)) return;
@@ -1684,8 +1771,8 @@ export function register(router, ctx) {
     /** Same as POST /api/sites/:id/deploy → job. Throws an httpError when it can't start. */
     deploy: (siteId, releaseId, { admin = null, base } = {}) => {
       const site = mustSite(siteId);
-      const release = releaseId ? db.get("releases", releaseId) : listReleases(site.id)[0];
-      if (!release || release.siteId !== site.id) throw httpError(404, "Release not found.");
+      const release = releaseId ? db.get("releases", releaseId) : listReleases(releaseOwner(site))[0];
+      if (!release || release.siteId !== releaseOwner(site)) throw httpError(404, "Release not found.");
       if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
       return startDeployJob(site, release, admin, base || panelBase(null));
     },
@@ -1693,6 +1780,13 @@ export function register(router, ctx) {
     panelBase: (req) => panelBase(req),
     /** "docker" | "legacy" | "none" */
     runtime: (siteOrId) => runtimeOf(typeof siteOrId === "string" ? getSite(siteOrId) : siteOrId),
+    // STAGING (panel/lib/staging.mjs)
+    /** Same as POST /api/projects/:projectId/sites (+ `extra` fields on the record) → public site. */
+    create: (projectId, body, { admin = null, extra = {} } = {}) => createSite(projectId, body, admin, extra),
+    /** Same as DELETE /api/sites/:id (without the staging check) → job. */
+    remove: (siteId, { admin = null, deleteFiles = false } = {}) => removeSite(mustSite(siteId), admin, { deleteFiles }),
+    /** The job holding the site's lock, or null. */
+    busyJob: (siteId) => busyJob(siteId),
   };
 
   function startEnvJob(site, admin, { restart = true } = {}) {
@@ -1726,7 +1820,8 @@ export function register(router, ctx) {
   // ---- list / read
 
   router.get("/api/sites", async (req, res, { query }) => {
-    return { items: listSites({ projectId: query.projectId }).filter((s) => !s.deleting).map(publicSite) };
+    // STAGING: staging copies are shown inside their parent, not as websites of their own.
+    return { items: listSites({ projectId: query.projectId }).filter((s) => !s.deleting && (!s.stagingOf || query.includeStaging === "1")).map(publicSite) };
   });
 
   router.get("/api/sites/:id", async (req, res, { params }) => {
@@ -1751,14 +1846,21 @@ export function register(router, ctx) {
     return {
       ...publicSite(site),
       upstreams,
-      releases: listReleases(site.id).slice(0, 20).map((r) => publicRelease(r, site)),
+      releases: listReleases(releaseOwner(site)).slice(0, 20).map((r) => publicRelease(r, site)),
     };
   });
 
   // ---- create
 
-  router.post("/api/projects/:projectId/sites", async (req, res, { params, body, admin }) => {
-    const project = db.get("projects", params.projectId);
+  router.post("/api/projects/:projectId/sites", async (req, res, { params, body, admin }) => createSite(params.projectId, body || {}, admin));
+
+  /**
+   * POST /api/projects/:projectId/sites, and ctx.sites.create (STAGING makes its
+   * copies with it). `extra` is merged into the record as is (e.g. stagingOf,
+   * linkPrefixes) — callers validate it.
+   */
+  async function createSite(projectId, body, admin, extra = {}) {
+    const project = db.get("projects", projectId);
     if (!project) throw httpError(404, "Project not found.");
     const name = String(body.name || "").trim().slice(0, 60);
     if (!name) throw httpError(400, "A website needs a name.");
@@ -1822,14 +1924,15 @@ export function register(router, ctx) {
       currentReleaseId: null,
       previousReleaseId: null,
       state: {},
+      ...extra,
       createdAt: now(),
     };
     db.insert("sites", site);
-    audit(admin, "site.create", site, { type, domains, loadBalanced, serverIds, runtime });
+    audit(admin, "site.create", site, { type, domains, loadBalanced, serverIds, runtime, ...(extra.stagingOf ? { stagingOf: extra.stagingOf } : {}) });
     emit(site);
     cloudflareSync(site, admin); // CLOUDFLARE
     return publicSite(site);
-  });
+  }
 
   // ---- edit
 
@@ -1917,7 +2020,11 @@ export function register(router, ctx) {
     if (needsJob) {
       const base = panelBase(req);
       const removeFiles = !!b.removeFilesFromOldServers;
-      job = siteJob(updated, admin, { type: "site.reconfigure", title: `Apply changes to ${updated.name}` }, async ({ log, signal }) => {
+      // Heavy when it builds: a new image (rebuild everywhere) or the release put on added servers.
+      const curRel = updated.currentReleaseId ? db.get("releases", updated.currentReleaseId) : null;
+      const newIds = portChanged ? targets(updated) : added;
+      const reHeavy = !curRel ? null : newIds.length ? (buildsOnce(updated, curRel) && !usableBuilt(updated, curRel) ? heavyServers(updated, curRel) : heavyServers(updated, curRel, newIds)) : imageChanged ? heavyServers(updated, curRel) : null;
+      job = siteJob(updated, admin, { type: "site.reconfigure", title: `Apply changes to ${updated.name}`, heavy: reHeavy }, async ({ log, signal }) => {
         const cur = getSite(site.id);
         const rel = cur.currentReleaseId ? db.get("releases", cur.currentReleaseId) : null;
         // 1. New servers (and, on a port change, all servers) get the current release first.
@@ -1982,8 +2089,16 @@ export function register(router, ctx) {
 
   router.delete("/api/sites/:id", async (req, res, { params, query, admin }) => {
     const site = mustSite(params.id);
+    // STAGING: a website with a staging copy is not deleted behind its back — remove staging first
+    // (its own button asks whether to drop the staging database too).
+    const stg = site.stagingSiteId ? getSite(site.stagingSiteId) : null;
+    if (stg) throw httpError(409, `${site.name} has a staging copy (${stg.name}). Remove staging first (Environment → Staging → Remove staging), then delete the website.`, { stagingSiteId: stg.id });
+    return removeSite(site, admin, { deleteFiles: query.deleteFiles === "1" || query.deleteFiles === "true" });
+  });
+
+  /** DELETE /api/sites/:id, and ctx.sites.remove (STAGING removes its copies with it) → job. */
+  function removeSite(site, admin, { deleteFiles = false } = {}) {
     assertIdle(site.id);
-    const deleteFiles = query.deleteFiles === "1" || query.deleteFiles === "true";
     const job = siteJob(site, admin, { type: "site.delete", title: `Delete ${site.name}` }, async ({ log, signal }) => {
       const cur = getSite(site.id);
       const servers = [...new Set([...targets(cur), ...Object.keys(cur.state || {})])];
@@ -2023,24 +2138,28 @@ export function register(router, ctx) {
       log(`Deleted ${rels.length} release archive${rels.length === 1 ? "" : "s"}.`);
       db.remove("sites", site.id);
       busy.delete(site.id);
+      // STAGING: the parent no longer has a staging copy.
+      const parent = site.stagingOf ? getSite(site.stagingOf) : null;
+      if (parent?.stagingSiteId === site.id) db.update("sites", parent.id, { stagingSiteId: null });
       try {
-        ctx.events?.broadcast?.("site", { id: site.id, projectId: site.projectId, deleted: true });
+        ctx.events?.broadcast?.("site", { id: site.id, projectId: site.projectId, deleted: true, ...(site.stagingOf ? { stagingOf: site.stagingOf } : {}) });
       } catch {
         /* ignore */
       }
+      if (parent) emit(parent.id);
       return { deleted: site.id };
     });
     db.update("sites", site.id, { deleting: true });
     audit(admin, "site.delete", site, { deleteFiles });
     return job;
-  });
+  }
 
   // ---- operations
 
   router.post("/api/sites/:id/deploy", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
-    const release = body.releaseId ? db.get("releases", body.releaseId) : listReleases(site.id)[0];
-    if (!release || release.siteId !== site.id) {
+    const release = body.releaseId ? db.get("releases", body.releaseId) : listReleases(releaseOwner(site))[0];
+    if (!release || release.siteId !== releaseOwner(site)) {
       throw httpError(body.releaseId ? 404 : 409, body.releaseId ? "Release not found." : "This website has no releases yet. Upload a zip or pull from GitHub first.");
     }
     if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
@@ -2049,7 +2168,7 @@ export function register(router, ctx) {
 
   /** POST /api/sites/:id/deploy, and ctx.sites.deploy. */
   function startDeployJob(site, release, admin, base) {
-    const job = siteJob(site, admin, { type: "site.deploy", title: `Deploy ${site.name} ${release.version ? `v${release.version}` : release.id}` }, ({ log, signal }) =>
+    const job = siteJob(site, admin, { type: "site.deploy", title: `Deploy ${site.name} ${release.version ? `v${release.version}` : release.id}`, heavy: heavyServers(site, release) }, ({ log, signal }) =>
       deployRelease(site.id, release, { log, signal, base, afterDeploy: true }),
     );
     audit(admin, "site.deploy", site, { releaseId: release.id, version: release.version });
@@ -2155,7 +2274,8 @@ export function register(router, ctx) {
     assertIdle(site.id);
     const base = panelBase(req);
     const title = `Move ${site.name} to ${to === "docker" ? "Docker" : "pm2 (legacy)"}`;
-    const job = siteJob(site, admin, { type: "site.migrate", title }, ({ log, signal }) => migrateSite(site.id, to, { log, signal, base }));
+    // Heavy: installs Docker / pulls the image on every server, then rebuilds the current release there.
+    const job = siteJob(site, admin, { type: "site.migrate", title, heavy: targets(site) }, ({ log, signal }) => migrateSite(site.id, to, { log, signal, base }));
     audit(admin, "site.migrate", site, { from, to });
     return job;
   });
@@ -2201,9 +2321,9 @@ export function register(router, ctx) {
     const base = panelBase(req);
     if (body.releaseId) {
       const rel = db.get("releases", body.releaseId);
-      if (!rel || rel.siteId !== site.id) throw httpError(404, "Release not found.");
+      if (!rel || rel.siteId !== releaseOwner(site)) throw httpError(404, "Release not found.");
       if (!fs.existsSync(releaseFile(rel.id))) throw httpError(409, "That release's archive is missing.");
-      const job = siteJob(site, admin, { type: "site.rollback", title: `Roll ${site.name} back to ${rel.version ? `v${rel.version}` : rel.id}` }, ({ log, signal }) =>
+      const job = siteJob(site, admin, { type: "site.rollback", title: `Roll ${site.name} back to ${rel.version ? `v${rel.version}` : rel.id}`, heavy: heavyServers(site, rel) }, ({ log, signal }) =>
         deployRelease(site.id, rel, { log, signal, base }),
       );
       audit(admin, "site.rollback", site, { releaseId: rel.id });
@@ -2211,7 +2331,10 @@ export function register(router, ctx) {
     }
     if (!site.previousReleaseId) throw httpError(409, "There is no previous release to roll back to.");
     const prevId = site.previousReleaseId;
-    const job = siteJob(site, admin, { type: "site.rollback", title: `Roll back ${site.name}` }, async ({ log, signal }) => {
+    const prevRel = db.get("releases", prevId);
+    // Swapping each server back to its snapshot is light; the build-once case redeploys (heavy).
+    const rollHeavy = prevRel && buildsOnce(site, prevRel) && fs.existsSync(releaseFile(prevId)) ? heavyServers(site, prevRel) : null;
+    const job = siteJob(site, admin, { type: "site.rollback", title: `Roll back ${site.name}`, heavy: rollHeavy }, async ({ log, signal }) => {
       const cur = getSite(site.id);
       const prev = db.get("releases", prevId);
       // Load-balanced with a build step: each server's own snapshot could hold
@@ -2362,6 +2485,8 @@ export function register(router, ctx) {
     const multi = run.length > 1;
     const where = multi ? `all ${run.length} servers` : serverName(run[0]);
     const label = command != null ? (command.length > 60 ? command.slice(0, 57) + "…" : command) : `npm run ${name}`;
+    // Light for the job queue: scripts are the owner's own short tasks (migrations, seeds, cache
+    // clears) run in the deployed app — no install or build — and they are often needed right away.
     const job = siteJob(site, admin, { type: "site.script", title: `${label} on ${where}`, serverId: multi ? null : run[0] }, async ({ log, signal }) => {
       if (multi) log(`Running ${label} on ${run.map(serverName).join(", ")} — one server at a time.`);
       const results = [];
@@ -2442,11 +2567,12 @@ export function register(router, ctx) {
 
   router.get("/api/sites/:id/releases", async (req, res, { params }) => {
     const site = mustSite(params.id);
-    return { items: listReleases(site.id).map((r) => publicRelease(r, site)) };
+    return { items: listReleases(releaseOwner(site)).map((r) => publicRelease(r, site)) };
   });
 
   router.post("/api/sites/:id/releases/upload", { raw: true }, async (req, res, { params, query, admin }) => {
     const site = mustSite(params.id);
+    if (site.stagingOf) throw httpError(409, "A staging copy deploys its website's releases — upload the release to the website itself.");
     req.res = res;
     const rec = await receiveUpload(req, site.id, cleanFilename(query.filename), admin);
     audit(admin, "release.upload", site, { releaseId: rec.id, version: rec.version, size: rec.size });
@@ -2463,6 +2589,7 @@ export function register(router, ctx) {
 
   router.post("/api/sites/:id/releases/github", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
+    if (site.stagingOf) throw httpError(409, "A staging copy deploys its website's releases — pull from GitHub on the website itself.");
     const repo = normalizeRepo(body.repo || site.github?.repo);
     if (!repo) throw httpError(400, "This website has no GitHub repository set. Add one in its settings first.");
     const ref = cleanRef(body.ref);
@@ -2473,7 +2600,8 @@ export function register(router, ctx) {
     const job = siteJob(
       site,
       admin,
-      { type: "site.github", title: `Pull ${repo}${ref ? `@${ref}` : ""} for ${site.name}${deploy ? " and deploy" : ""}` },
+      // Only "and deploy" builds (heavy); a pull alone downloads an archive.
+      { type: "site.github", title: `Pull ${repo}${ref ? `@${ref}` : ""} for ${site.name}${deploy ? " and deploy" : ""}`, heavy: deploy ? heavyServers(site, null) : null },
       async ({ log, signal }) => {
         let useRef = ref || getSite(site.id)?.github?.branch || "";
         if (!useRef) {
@@ -2534,6 +2662,9 @@ export function register(router, ctx) {
     if (site.currentReleaseId === rel.id) throw httpError(409, "That is the release the website is running. Deploy another one first.");
     const onServer = Object.entries(site.state || {}).find(([sid, st]) => st?.releaseId === rel.id && targets(site).includes(sid));
     if (onServer) throw httpError(409, `${serverName(onServer[0])} is still running that release.`);
+    // STAGING: the staging copy runs this site's releases too.
+    const stg = site.stagingSiteId ? getSite(site.stagingSiteId) : null;
+    if (stg && (stg.currentReleaseId === rel.id || Object.values(stg.state || {}).some((st) => st?.releaseId === rel.id))) throw httpError(409, `The staging copy (${stg.name}) is running that release.`);
     deleteReleaseRecord(rel);
     if (site.previousReleaseId === rel.id) db.update("sites", site.id, { previousReleaseId: null });
     audit(admin, "release.delete", site, { releaseId: rel.id, version: rel.version });

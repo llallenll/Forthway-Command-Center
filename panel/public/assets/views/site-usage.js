@@ -1,4 +1,4 @@
-// "Resource usage" card on the website Traffic tab: CPU, memory and disk of the website's app (panel/lib/usage.mjs).
+// "Resource usage" card on the website Statistics tab: CPU, memory and disk of the website's app (panel/lib/usage.mjs).
 // Data: GET /api/sites/:id/usage?range=1h|24h|7d|30d — sampled every minute on each server that runs the website.
 import { html, mount, $, on, fmtBytes, ago, plural } from "../util.js";
 import { icon } from "../icons.js";

@@ -805,7 +805,7 @@ export function register(router, ctx) {
     const panelTunnel = panelTunnelHost();
     if (installed && !tunnel && panelTunnel)
       warnings.push(
-        `The panel is reached through a Cloudflare Tunnel (${panelTunnel}). A tunnel only carries hostnames, not extra ports, so ${panelTunnel}:${portOf()} can't reach phpMyAdmin. Publish phpMyAdmin on a hostname of its own under Settings → Cloudflare → Publish phpMyAdmin.`,
+        `The panel is reached through a Cloudflare Tunnel (${panelTunnel}). A tunnel only carries hostnames, not extra ports, so ${panelTunnel}:${portOf()} can't reach phpMyAdmin. Reach it on the server's own address instead, or give it a hostname of its own through the tunnel (a public hostname in the Cloudflare dashboard pointing at http://localhost:${portOf()}).`,
       );
     if (installed && !c.vhost?.tls && !tunnel)
       warnings.push(

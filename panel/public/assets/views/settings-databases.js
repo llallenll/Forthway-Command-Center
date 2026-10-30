@@ -366,7 +366,7 @@ export async function phpMyAdminSettings(box, ctx) {
         <div class="card-head"><div><h3>Where it's served</h3><div class="sub">A separate nginx site on the main server, on its own port.</div></div></div>
         ${s.tunnel || s.panelTunnel ? html`<div class="card-body" style="padding-bottom:0"><div class="note">${icon("cloud")}<div>${s.tunnel
           ? html`Published through Cloudflare Tunnel on <span class="mono">${s.tunnel.hostname}</span> — links use that hostname, and the port below is only where the tunnel reaches it on this server.`
-          : html`The panel is reached through a Cloudflare Tunnel, which can't carry port ${s.port}. Give phpMyAdmin its own hostname under <a href="#/settings/cloudflare">Settings → Cloudflare → Publish phpMyAdmin</a>.`}</div></div></div>` : ""}
+          : html`The panel is reached through a Cloudflare Tunnel, which only carries hostnames — not port ${s.port}. phpMyAdmin is reachable on this port from your own network (or over an SSH tunnel), not through Cloudflare.`}</div></div></div>` : ""}
         <div class="card-body"><div class="form-grid">
           ${field("Port", html`<input class="input mono" name="port" inputmode="numeric" value="${s.port}" autocomplete="off"/>`, html`Allow it in your firewall: <span class="mono">ufw allow ${s.port}/tcp</span>`)}
           ${field("Hostname (optional)", html`<input class="input mono" name="hostname" value="${s.hostname || ""}" placeholder="${s.tlsName || "any"}" autocomplete="off" spellcheck="false"/>`,

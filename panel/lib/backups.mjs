@@ -406,7 +406,7 @@ export function register(router, ctx) {
 
   async function removeBackup(id, { reason } = {}) {
     const b = getBackup(id);
-    if (b.status === "running") throw httpError(409, "That backup is still running.");
+    if (b.status === "running" || b.status === "queued") throw httpError(409, b.status === "queued" ? "That backup is waiting in the job queue. Cancel its job first." : "That backup is still running.");
     if (b.file) {
       try {
         fs.rmSync(absOf(b.file), { force: true });
@@ -733,7 +733,7 @@ export function register(router, ctx) {
         file: rel,
         size: 0,
         sha256: null,
-        status: "running",
+        status: "queued", // until the job queue lets it start (heavy job, see below)
         trigger,
         pinned: false,
         note: String(note || "").slice(0, 500),
@@ -742,9 +742,12 @@ export function register(router, ctx) {
       });
       broadcast("backup", { action: "created", backup: publicView(b) });
       const job = ctx.jobs.start(
-        { type: "backup.server", title: `Back up server ${name}`, serverId, adminId: adminId || admin?.id || null },
+        // Heavy for the job queue: a full server archive (tar + gzip of every site, nginx, the
+        // database dump) keeps that server's CPU and disk busy for minutes, like a build.
+        { type: "backup.server", title: `Back up server ${name}`, serverId, adminId: adminId || admin?.id || null, heavy: true, servers: [serverId] },
         async ({ log, signal }) => {
           const abs = absOf(rel);
+          update(b.id, { status: "running" });
           try {
             if (serverId === MAIN_ID && mainLocalOf(ctx)) await buildMainArchive(b, abs, inc, { log, signal });
             else {
@@ -765,6 +768,13 @@ export function register(router, ctx) {
           } finally {
             active.delete(key);
           }
+        },
+        {
+          // Cancelled (or dropped by a restart) while waiting in the job queue: nothing ran.
+          onDropped: (why) => {
+            failRecord(b.id, new Error(why || "Cancelled before it started."));
+            active.delete(key);
+          },
         },
       );
       update(b.id, { jobId: job.id });
@@ -1239,8 +1249,8 @@ export async function start(ctx) {
   const root = path.join(ctx.dataDir, "backups");
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
 
-  // Anything still "running" was interrupted by a restart.
-  for (const b of ctx.db.list("backups", (x) => x.status === "running")) {
+  // Anything still "running" (or waiting in the job queue) was interrupted by a restart.
+  for (const b of ctx.db.list("backups", (x) => x.status === "running" || x.status === "queued")) {
     ctx.db.update("backups", b.id, { status: "failed", error: "Interrupted by a panel restart.", finishedAt: new Date().toISOString() });
   }
   // Leftover staging dirs and partial files.

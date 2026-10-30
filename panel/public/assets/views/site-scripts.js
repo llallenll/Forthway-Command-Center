@@ -7,6 +7,7 @@ import { html, raw, mount, $, on, plural, emptyState, errorState, skeletonRows, 
 import { icon } from "../icons.js";
 import { get, post } from "../api.js";
 import { jobItem, bindJobClicks, openJobLog } from "../components.js";
+import { moreList } from "../fold.js"; // recent runs: first 5, then "Show all"
 
 const SEL = "height:32px;width:auto;font-size:12.5px";
 const MAX_COMMAND = 2000;
@@ -138,7 +139,7 @@ export async function scriptsTab(ctx, box, S) {
   // recent runs
   const jobsEl = $("[data-jobs]", box);
   let jobs = [];
-  const paintJobs = () => mount(jobsEl, jobs.length ? html`${jobs.slice(0, 10).map(jobItem)}` : emptyState({ ico: "zap", title: "No script runs yet", text: "Each run's output is kept here.", sm: true }));
+  const paintJobs = () => mount(jobsEl, jobs.length ? moreList(jobs.slice(0, 10), jobItem, { id: "site.scriptRuns", limit: 5, noun: "runs" }) : emptyState({ ico: "zap", title: "No script runs yet", text: "Each run's output is kept here.", sm: true }));
   bindJobClicks(jobsEl);
   ctx.on("job", (j) => { if (j.siteId !== S.id || j.type !== "site.script") return; const i = jobs.findIndex((x) => x.id === j.id); i >= 0 ? (jobs[i] = j) : jobs.unshift(j); paintJobs(); });
   get(`/api/jobs?siteId=${S.id}&type=site.script&limit=10`).then((r) => { jobs = r.items || []; if (ctx.alive()) paintJobs(); }).catch(() => paintJobs());

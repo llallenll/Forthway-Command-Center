@@ -145,7 +145,7 @@ export default async function databases(ctx) {
     const f = items.filter((d) => (!projectFilter || d.projectId === projectFilter) && (!q || (d.name + " " + d.user).toLowerCase().includes(q)));
     if (!items.length) return mount(list, html`<div class="card">${emptyState({ ico: "database", title: "No databases yet", text: "Create a MySQL database inside a project, then link it to a website — credentials are injected as environment variables.", action: html`<button class="btn btn-primary" data-new>${icon("plus")}New database</button>` })}</div>`);
     if (!f.length) return mount(list, html`<div class="card">${emptyState({ ico: "search", title: "No matches", sm: true })}</div>`);
-    mount(list, databasesTable(f, { projectsById, mysql }));
+    mount(list, databasesTable(f, { projectsById, mysql, moreId: "databases.all" }));
   };
   const load = async () => {
     try {
