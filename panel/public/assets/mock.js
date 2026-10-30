@@ -1182,21 +1182,21 @@ const TEST_PLAN = [
 ];
 const FINDINGS = {
   bad: [
-    { severity: "high", category: "payments", title: "Stripe webhook rejects every event", location: "app/api/stripe/webhook/route.ts:18",
+    { severity: "high", category: "payments", title: "Paid orders never get marked as paid", plain: "Customers can pay, but the shop never hears back from Stripe that the money arrived. Their orders stay stuck on \u201cpending\u201d, so they won't get confirmations and you won't know which orders to fulfil.", location: "app/api/stripe/webhook/route.ts:18",
       detail: "The webhook reads the raw body after it has been parsed as JSON, so the signature check always fails. Orders stay “pending” after a successful payment.",
       fix: "Read the body with `await req.text()` before `stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET)`, and don't JSON-parse it first." },
-    { severity: "medium", category: "security", title: "No rate limit on sign-in", location: "app/api/login/route.ts",
+    { severity: "medium", category: "security", title: "Anyone can guess passwords as fast as they like", plain: "The sign-in page never slows down repeated wrong passwords. Someone could try thousands of guesses and break into accounts that use weak passwords.", location: "app/api/login/route.ts",
       detail: "50 wrong passwords in 8 seconds were all answered, so passwords can be guessed quickly.",
       fix: "Limit attempts per IP and per email (e.g. 10 per minute) and answer 429 above that. A small in-memory or MySQL counter is enough for one server." },
-    { severity: "low", category: "auth", title: "Password reset links never expire", location: "lib/auth/reset.ts:41",
+    { severity: "low", category: "auth", title: "Old password-reset links keep working", plain: "A password-reset link still works even after it has been used. If an old reset email ever falls into the wrong hands, it could be used to take over that account.", location: "lib/auth/reset.ts:41",
       detail: "A reset link from the test still worked after the password had been changed.",
       fix: "Store an expiry (e.g. 1 hour) with the token and delete it once used." },
-    { severity: "info", category: "features", title: "Product images load at full size on phones", location: "components/ProductCard.tsx",
+    { severity: "info", category: "features", title: "Product images are bigger than phones need", plain: "Phones download full-size product photos, which makes the shop slower on mobile data. Not a safety problem, just speed.", location: "components/ProductCard.tsx",
       detail: "Each card downloads a 1600 px image even at 375 px wide.", fix: "Use next/image with `sizes=\"(max-width: 640px) 50vw, 25vw\"`." },
   ],
   good: [
-    { severity: "low", category: "security", title: "Sign-in limit is generous", location: "middleware.ts", detail: "Sign-in allows 30 attempts a minute per IP.", fix: "10 a minute is plenty for people and slows down guessing." },
-    { severity: "info", category: "features", title: "Product images load at full size on phones", location: "components/ProductCard.tsx",
+    { severity: "low", category: "security", title: "Sign-in allows quite a lot of attempts", plain: "The sign-in page does slow down guessing, but it allows more tries than a real person needs. Tightening it makes password guessing even harder.", location: "middleware.ts", detail: "Sign-in allows 30 attempts a minute per IP.", fix: "10 a minute is plenty for people and slows down guessing." },
+    { severity: "info", category: "features", title: "Product images are bigger than phones need", plain: "Phones download full-size product photos, which makes the shop slower on mobile data. Not a safety problem, just speed.", location: "components/ProductCard.tsx",
       detail: "Each card downloads a 1600 px image even at 375 px wide.", fix: "Use next/image with `sizes=\"(max-width: 640px) 50vw, 25vw\"`." },
   ],
 };
@@ -1273,6 +1273,9 @@ function testScript(r, variant) {
     r.summary = variant === "bad"
       ? "The site builds, signs people in and takes card payments, but the Stripe webhook rejects every event, so paid orders stay pending. Sign-in also has no rate limit."
       : "Sign-up, sign-in, the cart, checkout and Stripe test payments all work end to end on a fresh database. Two small improvements below; nothing blocks production.";
+    r.plainSummary = variant === "bad"
+      ? "Don't put this version live yet. The site works and customers can pay, but the shop never finds out the payment went through, so orders stay stuck as \u201cpending\u201d. Fix that first; the sign-in limit is the next most important thing."
+      : "This version looks safe to put live. Customers can sign up, shop and pay (tested with Stripe's test cards), and nothing serious turned up. There are two small improvements you can do later.";
     r.usage = { turns: variant === "bad" ? 58 : 47, durationMs: new Date(at) - new Date(r.startedAt) };
     say(at, "info", `Verdict: ${r.verdict === "ready" ? "ready for production" : "not ready"} (${r.score}/100). Test copy removed.`);
   });

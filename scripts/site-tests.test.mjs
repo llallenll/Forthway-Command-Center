@@ -449,3 +449,25 @@ test("testStats: last 7 days, ready rate and average over judged runs, active an
   assert.equal(empty.readyRate, null);
   assert.equal(empty.avgScore, null);
 });
+
+// ---- plain-English findings (owner) next to the technical detail (agent)
+
+test("findings and reports carry the owner's plain-English text", async () => {
+  const { cleanEvent, cleanReport, plainFallback } = await import("../shared/testenv.mjs");
+  const f = cleanEvent({ t: "finding", severity: "high", category: "auth", title: "Old reset links keep working", plain: "A used reset link still works.", detail: "GET /reset/abc → 200 after use", fix: "Delete the token once used." });
+  assert.equal(f.plain, "A used reset link still works.");
+  assert.equal(f.fix, "Delete the token once used.");
+  const r = cleanReport({ verdict: "not_ready", score: 40, summary: "Tokens are not invalidated.", plainSummary: "Don't put this live yet.", findings: [{ severity: "low", category: "config", title: "x", plain: "y", fix: "z" }] });
+  assert.equal(r.plainSummary, "Don't put this live yet.");
+  assert.equal(r.findings[0].plain, "y");
+  assert.match(plainFallback("not_ready", [{ severity: "low", title: "Small thing" }, { severity: "critical", title: "Big thing" }]), /Big thing; Small thing/);
+  assert.match(plainFallback("ready", []), /safe to put live/);
+});
+
+test("the run keeps the plain summary from the report event", async () => {
+  const { applyEvent } = await import("../panel/lib/site-tests.mjs");
+  const run = { status: "testing", checks: [], findings: [], activity: [] };
+  applyEvent(run, { t: "report", verdict: "ready", score: 90, summary: "tech", plainSummary: "plain", complete: true });
+  assert.equal(run.plainSummary, "plain");
+  assert.equal(run.summary, "tech");
+});

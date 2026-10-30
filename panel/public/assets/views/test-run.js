@@ -228,17 +228,39 @@ export default async function testRun(ctx) {
     if ($("[data-follow]", root).checked || atBottom || first) feedEl.scrollTop = feedEl.scrollHeight;
   };
 
+  // Each finding has two halves (PROMPT.md): `plain` for the owner, in everyday words, and
+  // detail / location / fix for whoever fixes it — copyable as one block for a coding agent.
   const findingHTML = (f, isNew) => {
     const cat = catOf(f.category);
+    const dev = f.detail || f.location || f.fix;
     return html`<details class="tr-find sev-${f.severity}${isNew ? " tr-new" : ""}" data-fid="${f.id}">
-      <summary><span class="sev-pill sev-${f.severity}">${SEV.find((s) => s.id === f.severity)?.label || f.severity}</span><span class="tr-find-t">${f.title}</span>
+      <summary><span class="sev-pill sev-${f.severity}">${SEV.find((s) => s.id === f.severity)?.label || f.severity}</span><span class="tr-find-tt"><span class="tr-find-t">${f.title}</span>${f.plain ? html`<span class="tr-find-peek">${f.plain}</span>` : ""}</span>
         <span class="tr-find-cat" style="--c:${cat.color}">${icon(cat.icon, "xs")}<span class="hide-sm">${cat.label}</span></span><span class="tr-find-chev">${icon("chevronDown", "sm")}</span></summary>
-      <div class="tr-find-b">${f.detail ? html`<p>${f.detail}</p>` : ""}${f.location ? html`<div class="tr-loc">${icon("file", "xs")}<span class="mono">${f.location}</span></div>` : ""}
-        ${f.fix ? html`<div class="tr-fix"><div class="tr-fix-h">${icon("wand", "sm")}How to fix</div><p>${f.fix}</p></div>` : ""}</div></details>`;
+      <div class="tr-find-b">
+        ${f.plain ? html`<div class="tr-plain"><div class="tr-plain-h">${icon("info", "sm")}What this means</div><p>${f.plain}</p></div>` : f.detail ? html`<p>${f.detail}</p>` : ""}
+        ${dev ? html`<div class="tr-dev"><div class="tr-dev-h"><span>${icon("code", "sm")}For the developer</span>
+            <button type="button" class="btn btn-sm btn-ghost" data-copy="${agentBrief([f])}" title="Copy the problem and the fix, ready to paste to a coding agent">${icon("copy", "sm")}Copy for an agent</button></div>
+          ${f.plain && f.detail ? html`<p class="tr-dev-what">${f.detail}</p>` : ""}${f.location ? html`<div class="tr-loc">${icon("file", "xs")}<span class="mono">${f.location}</span></div>` : ""}
+          ${f.fix ? html`<div class="tr-fix"><div class="tr-fix-h">${icon("wand", "sm")}How to fix</div><p>${f.fix}</p></div>` : ""}</div>` : ""}</div></details>`;
+  };
+  /** Findings as a Markdown task list a coding agent can act on. */
+  const agentBrief = (list) => {
+    const site = S?.name || run.siteName || "the website";
+    const where = [run.commit?.shortSha && `commit ${run.commit.shortSha}`, run.version && `v${run.version}`].filter(Boolean).join(", ");
+    const one = (f) => [
+      `### [${String(f.severity).toUpperCase()}] ${f.title}`,
+      f.location && `Location: ${f.location}`,
+      f.detail && `What was observed:\n${f.detail}`,
+      f.fix && `Fix:\n${f.fix}`,
+    ].filter(Boolean).join("\n\n");
+    return [
+      `Fix the following ${list.length === 1 ? "issue" : `${list.length} issues`} found by an automated test of ${site}${where ? ` (${where})` : ""}. Keep each fix minimal, add or update tests where it makes sense, and don't change unrelated behaviour.`,
+      ...list.map(one),
+    ].join("\n\n");
   };
   const paintFindings = () => {
     const fs = run.findings || [];
-    const sig = `${isActive(run)}|${run.status}|` + fs.map((f) => `${f.id}:${f.severity}:${f.title}:${(f.fix || "").length}`).join("|");
+    const sig = `${isActive(run)}|${run.status}|` + fs.map((f) => `${f.id}:${f.severity}:${f.title}:${(f.fix || "").length}:${(f.plain || "").length}`).join("|");
     if (sig === findSig) return;
     findSig = sig;
     const box = $("[data-findings]", root);
@@ -246,7 +268,8 @@ export default async function testRun(ctx) {
     if (!fs.length) { mount(box, run.status === "done" ? html`<div class="card tr-findings"><div class="card-head"><h3>Findings</h3></div><div class="card-body"><div class="tr-nofind">${icon("check")}<span>Claude found nothing to fix.</span></div></div></div>` : html``); return; }
     const groups = SEV.map((s) => ({ ...s, items: fs.filter((f) => f.severity === s.id) })).filter((g) => g.items.length);
     mount(box, html`<div class="card tr-findings"><div class="card-head" style="flex-wrap:wrap"><h3>Findings</h3><span class="sub">${plural(fs.length, "thing")} to look at${isActive(run) ? " so far" : ""}</span>
-        <div class="right tr-sevcounts">${groups.map((g) => html`<span class="sev-pill sev-${g.id}">${g.items.length} ${g.label.toLowerCase()}</span>`)}</div></div>
+        <div class="right tr-sevcounts">${groups.map((g) => html`<span class="sev-pill sev-${g.id}">${g.items.length} ${g.label.toLowerCase()}</span>`)}
+          ${isActive(run) ? "" : html`<button type="button" class="btn btn-sm" data-copy="${agentBrief(groups.flatMap((g) => g.items).filter((f) => f.severity !== "info"))}" title="Every finding except info, with its fix, as one block to paste to a coding agent">${icon("copy", "sm")}Copy all fixes</button>`}</div></div>
       <div class="card-body tr-find-groups">${groups.map((g) => html`<div class="tr-find-group"><div class="tr-find-gh"><span class="sev-dot sev-${g.id}"></span>${g.label}<span class="dim num">${g.items.length}</span></div>
         ${g.items.map((f) => findingHTML(f, !seenFindings.has(f.id)))}</div>`)}</div></div>`);
     for (const f of fs) seenFindings.add(f.id);
@@ -256,7 +279,7 @@ export default async function testRun(ctx) {
 
   const paintVerdict = () => {
     const box = $("[data-verdict]", root);
-    const key = `${run.status}|${run.verdict}|${run.score}`;
+    const key = `${run.status}|${run.verdict}|${run.score}|${(run.plainSummary || "").length}`;
     if (verdictShown === key) return;
     const wasLive = verdictShown !== null && verdictShown.startsWith("live");
     verdictShown = isActive(run) ? "live" : key;
@@ -282,7 +305,8 @@ export default async function testRun(ctx) {
       <div class="tr-v-text">
         <div class="tr-v-eyebrow">${icon(ready ? "shield" : "alert", "xs")}Verdict</div>
         <h2>${ready ? "Ready for production" : "Not ready"}</h2>
-        <p>${run.summary || (ready ? "Every check that matters passed." : "Fix the findings below, then test again.")}</p>
+        <p>${run.plainSummary || run.summary || (ready ? "Every check that matters passed." : "Fix the findings below, then test again.")}</p>
+        ${run.plainSummary && run.summary ? html`<details class="tr-v-tech"><summary>Technical summary</summary><p>${run.summary}</p></details>` : ""}
         <div class="tr-v-stats">
           <span class="tr-chip on ok">${icon("check", "xs")}${c.pass} passed</span>
           ${c.warn ? html`<span class="tr-chip on warn">${icon("alert", "xs")}${plural(c.warn, "warning")}</span>` : ""}

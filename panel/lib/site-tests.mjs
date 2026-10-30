@@ -79,6 +79,7 @@ export function newRun({ site, release, serverId, adminId }) {
     verdict: null,
     score: null,
     summary: "",
+    plainSummary: "", // the verdict in everyday words, for the owner (PROMPT.md)
     checks: [],
     findings: [],
     activity: [],
@@ -152,6 +153,7 @@ export function applyEvent(run, ev, at = now()) {
       run.verdict = verdict;
       run.score = computeScore({ checks: run.checks, findings: run.findings, reported: ev.score, verdict });
       run.summary = ev.summary || run.summary;
+      run.plainSummary = ev.plainSummary || run.plainSummary || "";
       run.complete = ev.complete;
       run.status = "reporting";
       break;
@@ -195,6 +197,7 @@ export function finalizeRun(run, { error = null, cancelled = false, result = nul
     run.verdict = verdict;
     run.score = computeScore({ checks: run.checks, findings: run.findings, reported: Number.isFinite(result?.score) ? result.score : null, verdict });
     run.summary = run.summary || result?.summary || (verdict === "ready" ? "No blocking problems were found." : `Not ready: ${reasons.join("; ")}.`);
+    run.plainSummary = run.plainSummary || result?.plainSummary || "";
     run.complete = complete;
   }
   if (result?.usage && !run.usage) run.usage = { turns: Number(result.usage.turns) || 0, durationMs: Number(result.usage.durationMs) || 0 };
@@ -221,6 +224,7 @@ export function runSummary(run) {
     verdict: run.verdict,
     score: run.score,
     summary: run.summary,
+    plainSummary: run.plainSummary || "",
     counts: {
       checks: cs.length,
       passed: cs.filter((c) => c.status === "pass").length,

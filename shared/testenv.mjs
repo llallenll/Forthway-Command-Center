@@ -152,10 +152,10 @@ const EVENT_FIELDS = {
   phase: ["status", "phase"],
   env: ["url", "database", "mail"],
   check: ["id", "category", "title", "status", "detail"],
-  finding: ["id", "severity", "category", "title", "detail", "fix", "location"],
+  finding: ["id", "severity", "category", "title", "plain", "detail", "fix", "location"],
   activity: ["kind", "text"],
   usage: ["turns", "durationMs"],
-  report: ["verdict", "score", "summary", "complete"],
+  report: ["verdict", "score", "summary", "plainSummary", "complete"],
 };
 
 const pick = (v, list, dflt) => (list.includes(v) ? v : dflt);
@@ -203,6 +203,7 @@ export function cleanEvent(raw) {
         severity: pick(String(raw.severity || "").toLowerCase(), SEVERITIES, "medium"),
         category,
         title,
+        plain: clip(raw.plain, 1500), // for the owner, in everyday words (PROMPT.md)
         detail: clip(raw.detail, 4000),
         fix: clip(raw.fix, 4000),
         location: oneLine(raw.location, 300),
@@ -217,7 +218,7 @@ export function cleanEvent(raw) {
       return { t, turns: Math.max(0, Math.round(Number(raw.turns) || 0)), durationMs: Math.max(0, Math.round(Number(raw.durationMs) || 0)) };
     case "report": {
       const score = raw.score == null || raw.score === "" || !Number.isFinite(Number(raw.score)) ? null : Math.max(0, Math.min(100, Math.round(Number(raw.score))));
-      return { t, verdict: pick(raw.verdict, ["ready", "not_ready"], null), score, summary: clip(raw.summary, 4000), complete: raw.complete !== false };
+      return { t, verdict: pick(raw.verdict, ["ready", "not_ready"], null), score, summary: clip(raw.summary, 4000), plainSummary: clip(raw.plainSummary, 3000), complete: raw.complete !== false };
     }
   }
   return null;
@@ -606,8 +607,8 @@ export function cleanReport(raw) {
   if (!raw || typeof raw !== "object") return null;
   const checks = (Array.isArray(raw.checks) ? raw.checks : []).slice(0, 200).map((c) => cleanEvent({ ...c, t: "check" })).filter(Boolean);
   const findings = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 150).map((f) => cleanEvent({ ...f, t: "finding" })).filter(Boolean);
-  const head = cleanEvent({ t: "report", verdict: raw.verdict, score: raw.score, summary: raw.summary });
-  return { verdict: head.verdict, score: head.score, summary: head.summary, checks, findings };
+  const head = cleanEvent({ t: "report", verdict: raw.verdict, score: raw.score, summary: raw.summary, plainSummary: raw.plainSummary });
+  return { verdict: head.verdict, score: head.score, summary: head.summary, plainSummary: head.plainSummary, checks, findings };
 }
 
 // ------------------------------------------------------- argument builders
@@ -698,6 +699,20 @@ export function schemaSteps(afterDeployScripts, appDir, type) {
   return hasMigrations
     ? [["migrate", "Database migrations", "npx prisma migrate deploy", "schema"]]
     : [["migrate", "Database schema", "npx prisma db push --skip-generate", "schema"]];
+}
+
+/**
+ * The owner's summary when Claude did not write one (it stopped early, or the
+ * run ended before it started): the verdict and the worst findings' titles,
+ * which PROMPT.md asks to be in everyday words.
+ */
+export function plainFallback(verdict, findings = []) {
+  if (verdict === "ready") return "No serious problems were found. This version looks safe to put live.";
+  const order = ["critical", "high", "medium", "low", "info"];
+  const worst = [...findings].sort((a, b) => order.indexOf(a.severity) - order.indexOf(b.severity)).slice(0, 3).map((f) => f.title);
+  return worst.length
+    ? `This version isn't ready to go live yet. The most important things to fix first: ${worst.join("; ")}.`
+    : "This version isn't ready to go live yet: some of the checks failed.";
 }
 
 export async function sweepTestLeftovers({ dataDir, olderThanMs = STALE_MS, runIds = [], log = NOOP } = {}) {
@@ -806,7 +821,7 @@ async function realRun(payload, o) {
     emit(ev);
   };
   const finding = (f) => {
-    const ev = cleanEvent({ t: "finding", ...f, detail: redact(f.detail), fix: redact(f.fix) });
+    const ev = cleanEvent({ t: "finding", ...f, plain: redact(f.plain), detail: redact(f.detail), fix: redact(f.fix) });
     if (!ev) return;
     findings.set(ev.id, ev);
     emit(ev);
@@ -942,10 +957,10 @@ async function realRun(payload, o) {
           check(`setup.${id}`, "setup", title, "fail", err.message);
           if (kind === "schema") {
             // The copy may still run (and show what breaks without its tables).
-            finding({ id: `setup.${id}`, severity: "high", category: "setup", title: `${title} fails on an empty database`, detail: clip(redact(err.message), 1500), fix: "Make the migrations work from an empty database — a new server or a restore would hit the same error.", location: cmd });
+            finding({ id: `setup.${id}`, severity: "high", category: "setup", title: `${title} fails on an empty database`, plain: "The step that creates the website's database tables failed on a brand-new, empty database. The site may not work at all on a fresh server, or after restoring from a backup.", detail: clip(redact(err.message), 1500), fix: "Make the migrations work from an empty database — a new server or a restore would hit the same error.", location: cmd });
             continue;
           }
-          finding({ id: `setup.${id}`, severity: "critical", category: "setup", title: `${title} fails for this commit`, detail: clip(redact(err.message), 1500), fix: `Run \`${cmd}\` locally on a clean checkout of this commit and fix the error before deploying.`, location: "build" });
+          finding({ id: `setup.${id}`, severity: "critical", category: "setup", title: `${title} fails for this commit`, plain: "This version of the website could not be built, so it can't go live. Deploying it would fail the same way, and the site would stay on the old version.", detail: clip(redact(err.message), 1500), fix: `Run \`${cmd}\` locally on a clean checkout of this commit and fix the error before deploying.`, location: "build" });
           return finish({ complete: true, reportedSummary: `${title} failed, so the commit could not be tested. It would also fail to deploy.` });
         }
       }
@@ -983,7 +998,7 @@ async function realRun(payload, o) {
     if (!up.ok) {
       const tail = redact(await docker.logs(names.site, 60));
       check("setup.start", "setup", "Site starts and answers", "fail", `${up.error}\n${tail}`);
-      finding({ id: "setup.start", severity: "critical", category: "setup", title: "The commit does not start", detail: clip(`${up.error}\n\nLast lines it printed:\n${tail}`, 3000), fix: "Start this commit locally with production settings (NODE_ENV=production, an empty database) and fix the startup error.", location: "start" });
+      finding({ id: "setup.start", severity: "critical", category: "setup", title: "The commit does not start", plain: "This version of the website was built, but it crashed or never answered when started. Putting it live would take the website down.", detail: clip(`${up.error}\n\nLast lines it printed:\n${tail}`, 3000), fix: "Start this commit locally with production settings (NODE_ENV=production, an empty database) and fix the startup error.", location: "start" });
       return finish({ complete: true, reportedSummary: "The website did not start from this commit, so nothing else could be tested. Deploying it would take the site down." });
     }
     check("setup.start", "setup", "Site starts and answers", "pass", `${testUrl} answered with HTTP ${up.status}.`);
@@ -1091,7 +1106,7 @@ async function realRun(payload, o) {
     if (!report) activity("error", "Claude did not write a readable /out/report.json — the result below is built from the checks it reported.");
     for (const c of report?.checks || []) check(c.id, c.category, c.title, c.status, c.detail);
     for (const f of report?.findings || []) finding(f);
-    return finish({ complete: !!report && claudeResult?.subtype !== "error_max_turns", reportedVerdict: report?.verdict, reportedScore: report?.score, reportedSummary: report?.summary });
+    return finish({ complete: !!report && claudeResult?.subtype !== "error_max_turns", reportedVerdict: report?.verdict, reportedScore: report?.score, reportedSummary: report?.summary, reportedPlainSummary: report?.plainSummary });
   } finally {
     // Teardown always runs — success, error or cancel.
     const steps = [
@@ -1110,14 +1125,15 @@ async function realRun(payload, o) {
     if (steps.length) log("Test environment removed.");
   }
 
-  function finish({ complete, reportedVerdict = null, reportedScore = null, reportedSummary = "" }) {
+  function finish({ complete, reportedVerdict = null, reportedScore = null, reportedSummary = "", reportedPlainSummary = "" }) {
     const cs = [...checks.values()];
     const fs_ = [...findings.values()];
     const { verdict, reasons } = decideVerdict({ checks: cs, findings: fs_, reported: reportedVerdict, complete });
     const score = computeScore({ checks: cs, findings: fs_, reported: reportedScore, verdict });
     const summary = reportedSummary || (verdict === "ready" ? "No blocking problems were found." : `Not ready: ${reasons.join("; ")}.`);
-    emit({ t: "report", verdict, score, summary, complete });
-    return { verdict, score, summary, complete, checks: cs.length, findings: fs_.length, usage };
+    const plainSummary = reportedPlainSummary || plainFallback(verdict, fs_);
+    emit({ t: "report", verdict, score, summary, plainSummary, complete });
+    return { verdict, score, summary, plainSummary, complete, checks: cs.length, findings: fs_.length, usage };
   }
 }
 
@@ -1344,13 +1360,13 @@ async function simulateRun(payload, { emit, log, signal }) {
     await step(per);
   }
   const fl = [
-    { id: "security.csp", severity: "medium", category: "security", title: "No Content-Security-Policy header", detail: "Pages are served without a CSP, so an injected script would run unrestricted.", fix: "Add a Content-Security-Policy in next.config.js headers(), starting with default-src 'self' and the Stripe domains you load.", location: "next.config.js" },
-    { id: "config.rate-limit", severity: "low", category: "config", title: "Login has no rate limit", detail: "20 wrong passwords in a row were all answered normally.", fix: "Limit /api/auth/login to ~5 attempts per minute per IP and per account (e.g. a small in-memory or Redis token bucket).", location: "src/app/api/auth/login/route.ts" },
+    { id: "security.csp", severity: "medium", category: "security", title: "No Content-Security-Policy header", plain: "The site doesn't tell browsers which scripts it trusts. If an attacker ever slipped a script onto a page, nothing would stop it running for your customers. It's an extra safety net rather than an open door.", detail: "Pages are served without a CSP, so an injected script would run unrestricted.", fix: "Add a Content-Security-Policy in next.config.js headers(), starting with default-src 'self' and the Stripe domains you load.", location: "next.config.js" },
+    { id: "config.rate-limit", severity: "low", category: "config", title: "Login has no rate limit", plain: "Anyone can try passwords on the sign-in page as fast as they like. That makes it easier to guess weak passwords and break into customer accounts.", detail: "20 wrong passwords in a row were all answered normally.", fix: "Limit /api/auth/login to ~5 attempts per minute per IP and per account (e.g. a small in-memory or Redis token bucket).", location: "src/app/api/auth/login/route.ts" },
   ];
   if (!ready) {
     fl.unshift(
-      { id: "payments.client-price", severity: "critical", category: "payments", title: "The browser decides how much is charged", detail: "POST /api/checkout uses `amount` from the request body; changing it to 1 charged €0.01 for a €49 order (test mode).", fix: "Ignore client amounts: load the cart's products from the database on the server and compute line items and total there before creating the Stripe session.", location: "src/app/api/checkout/route.ts:18" },
-      { id: "auth.cookie-httponly", severity: "high", category: "auth", title: "Session cookie readable by JavaScript", detail: "The `session` cookie is set without HttpOnly, so any XSS can steal sessions.", fix: "Set httpOnly: true (and secure: true, sameSite: 'lax') where the session cookie is created.", location: "src/lib/session.ts:41" },
+      { id: "payments.client-price", severity: "critical", category: "payments", title: "The browser decides how much is charged", plain: "The checkout takes the price from the customer's own browser. Anyone with a little know-how can change it and pay one cent for a €49 order. This would cost you real money as soon as someone notices.", detail: "POST /api/checkout uses `amount` from the request body; changing it to 1 charged €0.01 for a €49 order (test mode).", fix: "Ignore client amounts: load the cart's products from the database on the server and compute line items and total there before creating the Stripe session.", location: "src/app/api/checkout/route.ts:18" },
+      { id: "auth.cookie-httponly", severity: "high", category: "auth", title: "Session cookie readable by JavaScript", plain: "The pass that keeps a customer signed in can be read by scripts on the page. If any script ever got onto the site, it could steal those passes and use customers' accounts.", detail: "The `session` cookie is set without HttpOnly, so any XSS can steal sessions.", fix: "Set httpOnly: true (and secure: true, sameSite: 'lax') where the session cookie is created.", location: "src/lib/session.ts:41" },
     );
   }
   for (const f of fl) {
@@ -1370,7 +1386,10 @@ async function simulateRun(payload, { emit, log, signal }) {
   const summary = verdict === "ready"
     ? "Checkout, accounts and the shop work end to end in test mode and no blocking problems were found. Two hardening improvements are listed."
     : "Not ready: the checkout trusts a price sent by the browser and session cookies are readable by scripts. Fix those two before deploying.";
-  emit({ t: "report", verdict, score, summary, complete: true });
+  const plainSummary = verdict === "ready"
+    ? "This version looks safe to put live. Customers can sign up, shop and pay (with test cards), and nothing serious turned up. There are two smaller safety improvements worth doing when you have time."
+    : "Don't put this version live yet. Most of the site works, but customers can change the price they pay at checkout, and the way sign-ins are stored makes accounts easier to steal. Fix those two first; the rest can wait.";
+  emit({ t: "report", verdict, score, summary, plainSummary, complete: true });
   log("[dry-run] simulated test finished.");
-  return { verdict, score, summary, complete: true, checks: cs.length, findings: fs_.length, usage: { turns: 64, durationMs: 31_000 }, simulated: true };
+  return { verdict, score, summary, plainSummary, complete: true, checks: cs.length, findings: fs_.length, usage: { turns: 64, durationMs: 31_000 }, simulated: true };
 }
