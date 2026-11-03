@@ -287,6 +287,16 @@ function envUnquote(v) {
   return v;
 }
 
+/** KEY=value lines (export prefixes, quotes, # comments) → { KEY: value }; a later line wins. */
+export function parseEnvPaste(text) {
+  const out = {};
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const mt = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (mt) out[mt[1]] = envUnquote(mt[2]);
+  }
+  return out;
+}
+
 export function envEditor(container, env = {}, { onDirty } = {}) {
   let rows = Object.entries(env || {}).map(([k, v]) => ({ k, v: String(v ?? "") }));
   let reveal = false;
@@ -322,15 +332,7 @@ export function envEditor(container, env = {}, { onDirty } = {}) {
         onMount(el, close) {
           $("[data-copyenv]", el).onclick = () => copyText($("textarea", el).value);
           $("[data-ok]", el).onclick = () => {
-            const next = [];
-            for (const line of $("textarea", el).value.split(/\r?\n/)) {
-              const mt = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-              if (!mt) continue;
-              const v = envUnquote(mt[2]);
-              const ex = next.find((r) => r.k === mt[1]);
-              ex ? (ex.v = v) : next.push({ k: mt[1], v });
-            }
-            rows = next;
+            rows = Object.entries(parseEnvPaste($("textarea", el).value)).map(([k, v]) => ({ k, v }));
             close(true); render(); onDirty?.();
           };
         } });
@@ -339,6 +341,7 @@ export function envEditor(container, env = {}, { onDirty } = {}) {
   });
   render();
   return {
+    paste() { $("[data-paste]", container)?.click(); },
     get() {
       const out = {};
       for (const r of rows) if (r.k) out[r.k] = r.v;

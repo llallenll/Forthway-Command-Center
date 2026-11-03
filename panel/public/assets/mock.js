@@ -689,7 +689,8 @@ R("POST", "/api/sites/:id/scripts/run", (p, b) => {
 });
 R("GET", "/api/sites/:id/env", (p) => {
   const s = find("sites", p.id);
-  return { env: clone(s.env), linked: s.linkedDatabaseIds.map((id) => db.databases.find((d) => d.id === id)).filter(Boolean).map((d) => ({ databaseId: d.id, name: d.name,
+  const managed = s.runtime === "docker" && !("FCC_DATA_DIR" in (s.env || {})) ? [{ key: "FCC_DATA_DIR", value: `/srv/fcc/data/${s.id}`, note: `The website's permanent data folder on its server. Files written there outlive deploys and restarts (the app folder is replaced on every deploy). Point upload paths at it, for example UPLOAD_DIR=/srv/fcc/data/${s.id}/uploads.` }] : [];
+  return { env: clone(s.env), managed, linked: s.linkedDatabaseIds.map((id) => db.databases.find((d) => d.id === id)).filter(Boolean).map((d) => ({ databaseId: d.id, name: d.name,
     vars: { DB_HOST: "127.0.0.1", DB_PORT: "3306", DB_NAME: d.name, DB_USER: d.user, DB_PASSWORD: "••••••••", DATABASE_URL: `mysql://${d.user}:••••@127.0.0.1:3306/${d.name}` } })) };
 });
 R("PUT", "/api/sites/:id/env", (p, b) => { const s = find("sites", p.id); s.env = b.env || {}; activity("site.env", "site", s, `${Object.keys(s.env).length} variables`); return { env: clone(s.env) }; });

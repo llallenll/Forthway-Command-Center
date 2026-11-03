@@ -24,13 +24,43 @@ import * as sys from "../panel/lib/sys.mjs";
 /** Default image for node websites: Debian with build tools, so native modules and prisma work. */
 export const DEFAULT_NODE_IMAGE = "node:24-bookworm";
 
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/;
+
 /** Per-site uids start here (well clear of real users and Debian's system range). */
 export const UID_BASE = 20000;
 
 /** Running app limits when the site sets none. */
 export const DEFAULT_LIMITS = { memoryMb: 1024, cpus: 0, pids: 1024 };
 
-const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/;
+/**
+ * Where docker websites keep files that must outlive deploys and restarts
+ * (uploads, generated files): <root>/<siteId>, outside the app folder so a
+ * release swap never touches it. The panel can move the root with
+ * FCC_SITE_DATA_DIR.
+ */
+export const DEFAULT_DATA_ROOT = "/srv/fcc/data";
+
+/** The site's data folder under `root`. */
+export function dataDirOf(siteId, root = DEFAULT_DATA_ROOT) {
+  if (!NAME_RE.test(String(siteId || ""))) throw new Error(`"${siteId}" can't be used as a data folder name.`);
+  return `${String(root).replace(/\/+$/, "")}/${siteId}`;
+}
+
+/**
+ * A data folder an agent is willing to create, mount and (on removal) delete:
+ * absolute, at least three levels deep, ending in the site's own id, and not
+ * inside or around the app folder.
+ */
+export function validDataDir(dir, siteId, appDir = "") {
+  const s = String(dir || "");
+  if (!s.startsWith("/") || /[\0\n:,]/.test(s) || s.includes("/../") || s.endsWith("/..")) return false;
+  const parts = s.split("/").filter(Boolean);
+  if (parts.length < 3 || parts[parts.length - 1] !== String(siteId)) return false;
+  const a = String(appDir || "").replace(/\/+$/, "");
+  if (a && (s === a || s.startsWith(a + "/") || a.startsWith(s + "/"))) return false;
+  return true;
+}
+
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Container name of a website: fcc-<siteId>. */

@@ -87,7 +87,7 @@ async function liveView(ctx, el, S, { databases, alive }) {
   if (!alive()) return;
   const linked = Array.isArray(envData.linked) ? envData.linked : Object.entries(envData.linked || {}).map(([k, v]) => ({ name: k, vars: v }));
   mount(el, html`<div class="grid-main">
-    <div class="card"><div class="card-head"><h3>${S.stagingOf ? "Staging variables" : "Environment variables"}</h3><span class="sub" data-dirty></span><div class="right"><button class="btn btn-primary btn-sm" data-save>${icon("check")}Save & apply</button></div></div>
+    <div class="card"><div class="card-head"><h3>${S.stagingOf ? "Staging variables" : "Environment variables"}</h3><span class="sub" data-dirty></span><div class="right btn-row">${S.stagingOf ? html`<button class="btn btn-sm" type="button" data-pasteenv>${icon("fileText")}Paste .env</button>` : ""}<button class="btn btn-primary btn-sm" data-save>${icon("check")}Save & apply</button></div></div>
       <div class="card-body"><div data-suggest></div><div data-env></div>
       <div class="note mt-16">${icon("info")}<div>Saved to the app's <span class="mono">.env</span> on ${S.loadBalanced ? `all ${S.serverIds.length} servers` : "its server"} and passed to the process. The app restarts to pick up changes.</div></div></div></div>
     <div class="stack">
@@ -106,6 +106,7 @@ async function liveView(ctx, el, S, { databases, alive }) {
     </div></div>`);
   const dirty = $("[data-dirty]", el);
   const ed = envEditor($("[data-env]", el), envData.env || {}, { onDirty: () => (dirty.textContent = "Unsaved changes") });
+  on(el, "click", "[data-pasteenv]", () => ed.paste());
   const ex = (S.releases || []).find((r) => r.id === S.currentReleaseId)?.envExample || (S.releases || []).find((r) => r.envExample)?.envExample;
   const linkedKeys = new Set(linked.flatMap((l) => Object.keys(l.vars || {})));
   const missing = (ex?.entries || []).filter((x) => x.key && !(x.key in (envData.env || {})) && !linkedKeys.has(x.key) && x.key !== "PORT");
@@ -167,11 +168,12 @@ async function stagingView(ctx, el, S, { alive, servers }) {
   try { envData = await get(`/api/sites/${st.id}/env`); } catch (e) { if (alive()) mount(el, errorState(e, false)); return; }
   if (!alive()) return;
   mount(el, html`<div class="card"><div class="card-head" style="flex-wrap:wrap"><h3>Staging variables</h3><span class="sub" data-dirty></span>
-      <div class="right btn-row"><a class="btn btn-sm btn-ghost" href="#/sites/${st.id}/environment">${icon("layers")}Open staging build</a><button class="btn btn-primary btn-sm" data-stgsave>${icon("check")}Save & apply</button></div></div>
+      <div class="right btn-row"><a class="btn btn-sm btn-ghost" href="#/sites/${st.id}/environment">${icon("layers")}Open staging build</a><button class="btn btn-sm" type="button" data-pasteenv>${icon("fileText")}Paste .env</button><button class="btn btn-primary btn-sm" data-stgsave>${icon("check")}Save & apply</button></div></div>
     <div class="card-body"><div data-env></div>
       <div class="note mt-16">${icon("info")}<div>Copied from Live when the staging build was created (live payment keys left out, database settings pointed at the staging database) and edited separately since. Saving restarts the staging app only — the live site is not touched.${st.url ? html` Staging answers at <a class="mono" href="${st.url}" target="_blank" rel="noopener noreferrer" style="color:var(--blue-3)">${st.url.replace(/^https?:\/\//, "")}</a>.` : ""}</div></div></div></div>`);
   const dirty = $("[data-dirty]", el);
   const ed = envEditor($("[data-env]", el), envData.env || {}, { onDirty: () => (dirty.textContent = "Unsaved changes") });
+  on(el, "click", "[data-pasteenv]", () => ed.paste());
   on(el, "click", "[data-stgsave]", async (e, b) => {
     const err = ed.validate(); if (err) { toast(err, "warn"); return; }
     b.classList.add("loading");

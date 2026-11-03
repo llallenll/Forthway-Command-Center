@@ -153,10 +153,39 @@ test("engineSettings: a docker node site runs in its container as its own uid", 
   assert.equal(s.restart.service, "fcc-site_abc");
   assert.equal(s.restart.start, "npm start");
   assert.deepEqual(s.restart.env, { DATABASE_URL: "mysql://x" });
-  assert.deepEqual(s.docker, { image: "node:22-bookworm", uid: 20007, gid: 20007, memoryMb: 768, cpus: 2, legacyPm2: "fcc-site_abc" });
+  assert.deepEqual(s.docker, { image: "node:22-bookworm", uid: 20007, gid: 20007, memoryMb: 768, cpus: 2, legacyPm2: "fcc-site_abc", dataDir: "" });
   assert.equal(s.leftoverContainer, "");
   assert.equal(s.healthUrl, "http://127.0.0.1:3001/api/health");
   assert.ok(RESTART_MODES.includes("docker"));
+});
+
+test("data folder: <root>/<siteId>, mounted and exposed as FCC_DATA_DIR; unsafe paths refused", () => {
+  assert.equal(docker.dataDirOf("site_abc"), "/srv/fcc/data/site_abc");
+  assert.equal(docker.dataDirOf("site_abc", "/data/fcc/"), "/data/fcc/site_abc");
+  assert.throws(() => docker.dataDirOf("../etc"));
+
+  assert.ok(docker.validDataDir("/srv/fcc/data/site_abc", "site_abc", APP));
+  assert.ok(!docker.validDataDir("/srv/fcc/data/other", "site_abc", APP), "must end in the site's own id");
+  assert.ok(!docker.validDataDir("/data/site_abc", "site_abc", APP), "too shallow");
+  assert.ok(!docker.validDataDir("relative/x/site_abc", "site_abc", APP));
+  assert.ok(!docker.validDataDir(`${APP}/data/site_abc`, "site_abc", APP), "not inside the app folder");
+  assert.ok(!docker.validDataDir("/srv/fcc/../x/site_abc", "site_abc", APP));
+
+  const c = { uid: 20007, gid: 20007 };
+  const s = engineSettings(spec({ runtime: "docker", container: c, dataDir: "/srv/fcc/data/site_abc" }));
+  assert.equal(s.docker.dataDir, "/srv/fcc/data/site_abc");
+  assert.deepEqual(s.restart.env, { FCC_DATA_DIR: "/srv/fcc/data/site_abc", DATABASE_URL: "mysql://x" });
+  // The site's own FCC_DATA_DIR wins.
+  const own = engineSettings(spec({ runtime: "docker", container: c, dataDir: "/srv/fcc/data/site_abc", env: { FCC_DATA_DIR: "/mine" } }));
+  assert.equal(own.restart.env.FCC_DATA_DIR, "/mine");
+  // Unsafe or legacy: no folder, no variable.
+  const bad = engineSettings(spec({ runtime: "docker", container: c, dataDir: "/srv/site_abc" }));
+  assert.equal(bad.docker.dataDir, "");
+  assert.ok(!("FCC_DATA_DIR" in bad.restart.env));
+  assert.ok(!("FCC_DATA_DIR" in engineSettings(spec({ dataDir: "/srv/fcc/data/site_abc" })).restart.env));
+
+  const flags = docker.baseFlags({ uid: 20007, mounts: [{ src: APP }, { src: "/srv/fcc/data/site_abc" }] });
+  assert.ok(flags.includes("type=bind,src=/srv/fcc/data/site_abc,dst=/srv/fcc/data/site_abc"));
 });
 
 test("engineSettings: a legacy node site stays on pm2 and cleans up a leftover container", () => {

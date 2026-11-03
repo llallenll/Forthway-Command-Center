@@ -93,6 +93,7 @@ export function defaultSettings() {
       cpus: docker.DEFAULT_LIMITS.cpus, // 0 = no limit
       pids: docker.DEFAULT_LIMITS.pids,
       legacyPm2: "", // pm2 process this site ran as before it moved to docker — deleted on stop
+      dataDir: "", // the site's permanent data folder (docker.dataDirOf), mounted at the same path
     },
     // Any other mode: a container this site ran as before it moved back from
     // docker — removed before the app starts, so the two never fight for the port.
@@ -282,6 +283,29 @@ export class Deployer {
     return { uid, gid };
   }
 
+  /**
+   * The site's permanent data folder, created and handed to the site's user,
+   * or null when it has none. `deep`: chown everything inside too (files an
+   * admin copied in as root), done when the app starts — not on every build.
+   */
+  async _dataMount({ deep = false, log = this.log } = {}) {
+    const dir = this.S.docker?.dataDir;
+    if (!dir) return null;
+    if (!docker.validDataDir(dir, path.basename(dir), this.S.appDir)) {
+      log?.line(`(not mounting the data folder ${dir} — it is not a safe place for one)`);
+      return null;
+    }
+    if (sys.DRY_RUN) return { src: dir };
+    const { uid, gid } = this._dockerUser();
+    const made = !exists(dir);
+    ensureDir(dir);
+    if (deep) await docker.own(dir, uid, gid, { log: null });
+    else fs.chownSync(dir, uid, gid);
+    fs.chmodSync(dir, 0o750);
+    if (made) log?.line(`Created the website's data folder ${dir} (kept across deploys and restarts).`);
+    return { src: dir };
+  }
+
   _containerName() {
     const name = this.S.restart.service;
     if (!docker.validName(name)) throw new Error('Restart mode is "docker" but no valid container name is set for this site.');
@@ -340,6 +364,7 @@ export class Deployer {
       }
     }
     const work = cwd || this.S.appDir;
+    const data = await this._dataMount({ log });
     // A name, so a cancelled or timed-out command can be removed for certain:
     // killing the docker CLI alone does not stop the container behind it.
     const name = `${this._containerName()}-job-${crypto.randomBytes(3).toString("hex")}`;
@@ -350,7 +375,7 @@ export class Deployer {
       name,
       uid,
       gid,
-      mounts: [{ src: this.S.appDir }],
+      mounts: [{ src: this.S.appDir }, ...(data ? [data] : [])],
       workdir: work,
       network: "host", // same view as the running app: MySQL on 127.0.0.1, the registry for npm
       pids: this.S.docker.pids,
@@ -377,6 +402,7 @@ export class Deployer {
     const D = this.S.docker;
     await docker.remove(name, { log: null, graceSec: Math.max(1, Math.round((this.S.stopGraceMs ?? 10_000) / 1000)) });
     const cmd = this.S.restart.start || this.S.restart.pm2Start || "npm start";
+    const data = await this._dataMount({ deep: true, log });
     const b = docker.appArgs({
       image: D.image || docker.DEFAULT_NODE_IMAGE,
       name,
@@ -384,7 +410,7 @@ export class Deployer {
       env: this._appEnv(), // + NODE_ENV=production unless the site sets its own (appArgs)
       uid,
       gid,
-      mounts: [{ src: this.S.appDir }],
+      mounts: [{ src: this.S.appDir }, ...(data ? [data] : [])],
       workdir: this.S.appDir,
       network: "host", // the server firewall still applies; -p publishing would bypass ufw
       memoryMb: D.memoryMb,
