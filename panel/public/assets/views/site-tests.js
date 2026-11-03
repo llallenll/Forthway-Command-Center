@@ -6,7 +6,7 @@ import { html, mount, $, $$, on, ago, fmtDate, fmtDuration, emptyState, errorSta
 import { icon } from "../icons.js";
 import { get, post, put, del } from "../api.js";
 import { onEvent } from "../events.js";
-import { jobStarted, openJobLog } from "../components.js";
+import { jobStarted, openJobLog, parseEnvPaste } from "../components.js";
 
 /* ───────── shared vocabulary ───────── */
 
@@ -197,7 +197,8 @@ export async function testEnvCard(ctx, el, S) {
   let keys = [];
   const load = async () => { keys = (await get(`/api/sites/${S.id}/test-env`)).items || []; };
   const paint = () => mount(el, html`<div class="card"><div class="card-head"><div><h3 class="row" style="gap:8px">${icon("flask", "sm")}Test-only variables</h3>
-      <div class="sub">Used only by commit tests, on top of the live variables — e.g. Stripe <span class="mono">sk_test_…</span> keys. Values are write-only.</div></div></div>
+      <div class="sub">Used only by commit tests, on top of the live variables — e.g. Stripe <span class="mono">sk_test_…</span> keys. Values are write-only.</div></div>
+      <div class="right"><button class="btn btn-sm" type="button" data-tepaste>${icon("fileText")}Paste .env</button></div></div>
     <div class="card-body">
       ${keys.length ? html`<div class="te-list">${keys.map((k) => html`<div class="te-row"><span class="mono strong ellipsis">${k.key}</span><span class="badge ok">${icon("lock")}Set</span>
         <span class="spacer"></span><button class="btn btn-sm btn-ghost" data-tereplace="${k.key}">${icon("edit")}Replace</button><button class="icon-btn sm" data-tedel="${k.key}" aria-label="Remove ${k.key}">${icon("trash")}</button></div>`)}</div>`
@@ -224,6 +225,28 @@ export async function testEnvCard(ctx, el, S) {
     const btn = $("button[type=submit]", form); btn.classList.add("loading");
     await save({ [key]: value }, `${key} saved for tests`);
     btn.classList.remove("loading");
+  });
+  on(el, "click", "[data-tepaste]", () => {
+    openModal({ title: "Paste .env for tests", sub: "KEY=value lines. Each key is added, or replaces the test value it already has; keys not in the box are kept.", ico: "fileText", size: "lg",
+      body: html`<textarea class="textarea mono" style="min-height:260px" spellcheck="false" autocomplete="off" placeholder="STRIPE_SECRET_KEY=sk_test_…&#10;STRIPE_PUBLISHABLE_KEY=pk_test_…" aria-label=".env contents"></textarea>
+        <p class="hint mt-12">Live payment keys (<span class="mono">sk_live_</span>, <span class="mono">pk_live_</span>, <span class="mono">rk_live_</span>) are skipped.</p>`,
+      foot: html`<span class="spacer"></span><button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" data-ok>Import</button>`,
+      onMount(m, close) {
+        const ta = $("textarea", m);
+        ta.focus();
+        const btn = $("[data-ok]", m);
+        btn.onclick = async () => {
+          const all = parseEnvPaste(ta.value);
+          const skipped = Object.keys(all).filter((k) => /^(sk|pk|rk)_live_/.test(all[k].trim()));
+          const env = Object.fromEntries(Object.entries(all).filter(([k]) => !skipped.includes(k)));
+          const n = Object.keys(env).length;
+          if (!n) { toast(skipped.length ? "Only live payment keys in the box — nothing imported" : "No KEY=value lines found", "warn"); return; }
+          btn.classList.add("loading");
+          const ok = await save(env, `${n} test ${n === 1 ? "variable" : "variables"} saved${skipped.length ? ` · skipped ${skipped.join(", ")} (live keys)` : ""}`);
+          btn.classList.remove("loading");
+          if (ok) close(true);
+        };
+      } });
   });
   on(el, "click", "[data-tereplace]", (e, b) => {
     const f = $("[data-teadd]", el);

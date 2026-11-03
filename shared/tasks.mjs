@@ -46,7 +46,7 @@ import { makeZip } from "./zipwrite.mjs";
 import { ensureDir, rmrf, exists } from "./fsx.mjs";
 import * as sys from "../panel/lib/sys.mjs";
 
-export const TASKS_VERSION = "3.8.0";
+export const TASKS_VERSION = "3.9.0";
 
 export const TASK_TYPES = [
   "site.deploy",
@@ -332,6 +332,21 @@ function containerOf(spec) {
   }
 }
 
+/**
+ * The docker website's permanent data folder (spec.dataDir, chosen by the
+ * panel), or "" when it has none or the path is not a safe one.
+ */
+export function dataDirOf(spec) {
+  const d = spec?.dataDir;
+  return d && runtimeOf(spec) === "docker" && docker.validDataDir(d, spec.siteId, spec.appDir) ? d : "";
+}
+
+/** The site's variables plus FCC_DATA_DIR when it has a data folder (its own value wins). */
+function withDataEnv(spec, env) {
+  const d = dataDirOf(spec);
+  return d && !("FCC_DATA_DIR" in env) ? { FCC_DATA_DIR: d, ...env } : env;
+}
+
 /** Deployer settings for this spec. */
 export function engineSettings(spec) {
   const s = spec.settings || {};
@@ -355,9 +370,9 @@ export function engineSettings(spec) {
         service: name,
         start: restart.start || restart.pm2Start || "npm start",
         pm2Start: "",
-        env,
+        env: withDataEnv(spec, env),
       },
-      docker: { image: c.image, uid: c.uid, gid: c.gid, memoryMb: c.memoryMb, cpus: c.cpus, legacyPm2: pm2NameOf(spec) },
+      docker: { image: c.image, uid: c.uid, gid: c.gid, memoryMb: c.memoryMb, cpus: c.cpus, legacyPm2: pm2NameOf(spec), dataDir: dataDirOf(spec) },
       leftoverContainer: "",
     };
   }
@@ -556,7 +571,7 @@ async function siteAction(type, payload, o) {
       }
       case "site.env": {
         const env = payload.env || {};
-        d.setSettings({ ...engineSettings(spec), writeEnvFile: spec.type !== "static", restart: { ...engineSettings(spec).restart, env } });
+        d.setSettings({ ...engineSettings(spec), writeEnvFile: spec.type !== "static", restart: { ...engineSettings(spec).restart, env: withDataEnv(spec, env) } });
         if (spec.type === "static") {
           log("Static sites have no server-side environment — nothing written.");
           return { written: false };
@@ -585,6 +600,10 @@ async function siteAction(type, payload, o) {
         if (payload.deleteFiles) {
           log(`Deleting ${spec.appDir}`);
           rmrf(spec.appDir);
+          if (dataDirOf(spec)) {
+            log(`Deleting the data folder ${dataDirOf(spec)}`);
+            rmrf(dataDirOf(spec));
+          }
         } else {
           log(`Files left in place at ${spec.appDir}`);
         }
@@ -873,7 +892,7 @@ async function siteScript(payload, o) {
     // as a variable (FCC_COMMAND), so it is never re-quoted into a shell string.
     const c = docker.containerSettings(spec.container);
     if (!c.uid) throw new Error("This website runs in Docker but has no container user yet — redeploy it from the panel.");
-    const cenv = { ...(spec.settings?.restart?.env || {}), ...(spec.env || {}), PORT: String(spec.port) };
+    const cenv = withDataEnv(spec, { ...(spec.settings?.restart?.env || {}), ...(spec.env || {}), PORT: String(spec.port) });
     if (!cenv.NODE_ENV) cenv.NODE_ENV = "production";
     if (command != null) cenv.FCC_COMMAND = command;
     jobContainer = `${containerOf(spec)}-job-${crypto.randomBytes(3).toString("hex")}`;
@@ -884,7 +903,8 @@ async function siteScript(payload, o) {
       name: jobContainer,
       uid: c.uid,
       gid: c.gid,
-      mounts: [{ src: spec.appDir }],
+      // The data folder only when it is already there: the app's start creates it.
+      mounts: [{ src: spec.appDir }, ...(dataDirOf(spec) && exists(dataDirOf(spec)) ? [{ src: dataDirOf(spec) }] : [])],
       workdir: spec.appDir,
       network: "host",
       tmpfsMb: 1024,

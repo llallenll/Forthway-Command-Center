@@ -26,10 +26,14 @@ import zlib from "node:zlib";
 import { pipeline } from "node:stream/promises";
 
 import { httpError } from "./http.mjs";
+import { DEFAULT_DATA_ROOT } from "../../shared/docker.mjs";
 import { run, which, forgetWhich, DRY_RUN } from "./sys.mjs";
 import { projectPrefix, DB_REMOTE } from "./mysql.mjs";
 import { createS3 } from "./s3.mjs";
 import { createSmb, smbInstalled, validServer, validShare, validFolder, validUsername, validPassword, validDomain, validPort, validMinProtocol } from "./smb.mjs";
+
+/** Where docker websites keep their permanent data folders (same as panel/lib/sites.mjs). */
+const SITE_DATA_ROOT = () => path.resolve(process.env.FCC_SITE_DATA_DIR || DEFAULT_DATA_ROOT);
 
 const MAIN_ID = "main";
 // Panel failover (docs/HA.md Phase 2): database backups need MySQL on main, and a
@@ -577,6 +581,7 @@ export function register(router, ctx) {
       roots.push(r);
     };
     add(ctx.config.sitesRoot || process.env.FCC_SITES_DIR || "/srv/fcc/sites");
+    add(SITE_DATA_ROOT()); // docker websites' permanent data folders (uploads…)
     for (const s of ctx.db.list("sites")) {
       const ids = Array.isArray(s.serverIds) && s.serverIds.length ? (s.loadBalanced ? s.serverIds : [s.serverIds[0]]) : [MAIN_ID];
       if (ids.includes(MAIN_ID) && typeof s.appDir === "string" && path.isAbsolute(s.appDir)) add(s.appDir);
@@ -686,7 +691,7 @@ export function register(router, ctx) {
     if (!ctx.cluster?.runTask) throw new Error("The cluster module is not loaded.");
     const appDirs = ctx.db
       .list("sites", (s) => (Array.isArray(s.serverIds) ? (s.loadBalanced ? s.serverIds : s.serverIds.slice(0, 1)) : []).includes(serverId))
-      .map((s) => s.appDir)
+      .flatMap((s) => [s.appDir, s.runtime === "docker" && s.type === "node" ? path.join(SITE_DATA_ROOT(), s.id) : null])
       .filter((d) => typeof d === "string" && path.isAbsolute(d));
     log?.(`Asking ${serverName(serverId)} to build the archive…`);
     const result = await ctx.cluster.runTask(

@@ -83,6 +83,16 @@ Migrating to docker, per target server, as one site job:
   mode 0750; nothing else of the host is mounted.
 - Env: the site's own variables + PORT + NODE_ENV only — never the panel's
   `process.env`.
+- Permanent data folder: `/srv/fcc/data/<siteId>` (`docker.dataDirOf`; the
+  panel's `FCC_SITE_DATA_DIR` moves the root), sent as `spec.dataDir`. Created
+  and chowned to the site uid when the app starts, bind-mounted at the same
+  path into the app, build and script containers, and passed as
+  `FCC_DATA_DIR` (the site's own value wins; shown read-only under "Managed by
+  the panel"). The app folder is replaced on every deploy; this folder is not —
+  point `UPLOAD_DIR` and the like at it. One per server (not shared on a
+  load-balanced site), included in server backups, deleted only when the site
+  is removed with its files. Agents check it ends in the site id and sits
+  outside the app folder (`validDataDir`). Needs tasks 3.9.0 on the agent.
 - `--read-only` root filesystem, `/tmp` tmpfs, memory/pids limits from
   `site.container` (defaults in `DEFAULT_LIMITS`).
 - Status / logs / usage / scripts (`site.script` runs inside a one-off
