@@ -9,7 +9,7 @@ import { scriptsTab } from "./site-scripts.js";
 import { statisticsTab } from "./site-stats.js"; // Statistics tab (traffic + uptime checks, incidents, alerts)
 import { askTestOrDeploy, pullAndTest, startTest, testsTab, testEnvCard, verdictBadge, latestByRelease, runtimeBadge, migrateSite, runtimeCard, bindRuntimeCard, isActive as testActive } from "./site-tests.js"; // commit testing + Docker runtime
 import { environmentTab } from "./site-env.js"; // Environment tab (Live / Test / Staging)
-import { buildSwitch, openBuildMenu, stagingBadge, stagingReleaseBtn, removeStaging, isStaging } from "./site-staging.js"; // Live build / Staging build switcher
+import { buildSwitch, openBuildMenu, stagingBadge, removeStaging, isStaging } from "./site-staging.js"; // Live build / Staging build switcher
 import { loadCfOptions, pickDefaultTunnel, cfPanel, domainRows, dnsNote, bindDelivery, validateDelivery, deliveryPayload, tunnelHosts, savedDelivery } from "./cloudflare.js";
 
 export const refName = (x) => (typeof x === "string" ? x : x?.name || "");
@@ -101,8 +101,7 @@ export default async function site(ctx) {
       if (!(await confirmDialog({ title: stg ? "Roll back the staging build?" : "Roll back?", message: prev ? `Switch back to v${prev.version} ${where}.` : `Switch back to the previous release ${where}.`, confirmText: "Roll back", ico: "rollback" }))) return;
     }
     if (act === "deploy" && !opts.releaseId && !S.currentReleaseId && !(S.releases || []).length) {
-      toast("Nothing to deploy yet", "warn", stg ? { msg: `Upload or pull a release on ${parentName()} first — the staging build deploys its releases.`, action: { label: `Open ${parentName()} →`, fn: () => (location.hash = `#/sites/${S.stagingOf}/deployments`) } }
-        : { msg: "Upload a zip or pull from GitHub first.", action: { label: "Open Deployments →", fn: () => (location.hash = `${base}/deployments`) } });
+      toast("Nothing to deploy yet", "warn", { msg: stg ? "Upload a zip or pull from GitHub on the staging build first." : "Upload a zip or pull from GitHub first.", action: { label: "Open Deployments →", fn: () => (location.hash = `${base}/deployments`) } });
       return;
     }
     try {
@@ -241,8 +240,7 @@ export default async function site(ctx) {
         <div class="card"><div class="card-head"><h3>Recent jobs</h3><div class="right"><a class="btn btn-sm btn-ghost" href="${base}/deployments">Deployments ${icon("arrowRight", "sm")}</a></div></div><div class="list" data-jobs></div></div>
         <div class="card"><div class="card-head"><h3>Quick actions</h3></div><div class="card-body">
           <div class="stack" style="gap:10px">
-            ${stg ? html`<a class="btn btn-primary btn-block" href="${base}/deployments">${icon("rocket")}Deploy a release to staging</a>`
-              : S.github?.repo ? html`<button class="btn btn-primary btn-block" data-qpull>${icon("github")}Pull & deploy</button>`
+            ${S.github?.repo ? html`<button class="btn btn-primary btn-block" data-qpull>${icon("github")}Pull & deploy</button>`
               : html`<a class="btn btn-primary btn-block" href="${base}/deployments">${icon("upload")}Upload a release</a>`}
             <div class="grid-2" style="gap:10px"><button class="btn" data-qa="restart">${icon("restart")}Restart</button><button class="btn" data-qa="rollback" ${S.previousReleaseId ? "" : raw("disabled")}>${icon("rollback")}Roll back</button>
             <button class="btn" data-qa="start">${icon("play")}Start</button><button class="btn btn-danger" data-qa="stop">${icon("stop")}Stop</button></div>
@@ -370,12 +368,7 @@ export default async function site(ctx) {
 
   /* ── deployments ── */
   if (tab === "deployments") {
-    mount(box, html`${stg ? html`<div class="card stg-src"><div class="card-body row" style="gap:14px;flex-wrap:wrap">
-          <span class="type-ico ${S.type || "node"} staging">${icon("layers")}</span>
-          <div style="flex:1;min-width:220px"><div class="strong">Releases come from ${parentName()}</div>
-            <div class="muted small mt-8">The staging build deploys the live site's releases. Upload a zip or pull from GitHub on ${parentName()}, then deploy any release here — deploying to staging never changes what the live site runs.</div></div>
-          <a class="btn btn-sm" href="#/sites/${S.stagingOf}/deployments">${icon("upload")}Upload or pull on ${parentName()}</a></div></div>`
-      : html`<div class="grid-2">
+    mount(box, html`<div class="grid-2">
         <div class="card"><div class="card-head"><h3>Upload a release</h3><span class="sub">.zip, up to 500 MB</span></div><div class="card-body"><div data-dz></div>
           <div data-up hidden><div class="row small" style="justify-content:space-between;margin-bottom:8px"><span class="strong ellipsis" data-upname></span><span class="muted num" data-uppct>0%</span></div><div class="progress"><div style="width:0%"></div></div></div></div></div>
         <div class="card"><div class="card-head"><h3>Pull from GitHub</h3>${S.github?.repo ? html`<span class="sub mono">${S.github.repo}</span>` : ""}</div><div class="card-body">
@@ -384,12 +377,12 @@ export default async function site(ctx) {
             <p class="hint row" style="margin:0;gap:7px;align-items:flex-start">${icon("flask", "xs")}<span>After the download you choose: test the commit on a throw-away copy first, or deploy it right away.</span></p></div>`
           : emptyState({ ico: "github", title: "No repository set", text: "Connect a GitHub repository in Settings to pull releases.", sm: true, action: html`<a class="btn btn-sm" href="${base}/settings">${icon("settings")}Open settings</a>` })}
         </div></div>
-      </div>`}
-      <div class="section-head mt-24" style="margin-bottom:12px"><div><h2 style="font-size:16px">Releases</h2><p>${stg ? `${parentName()}'s releases. Deploy or roll back here to change only the staging build.` : "Pinned releases are never cleaned up. The live release can't be deleted."}</p></div></div>
+      </div>
+      <div class="section-head mt-24" style="margin-bottom:12px"><div><h2 style="font-size:16px">Releases</h2><p>${stg ? "The staging build's own releases. Pinned releases are never cleaned up; the one staging runs can't be deleted." : "Pinned releases are never cleaned up. The live release can't be deleted."}</p></div></div>
       <div data-rel></div>
       <div class="card mt-24"><div class="card-head"><h3>Deploy history</h3><span class="sub" data-histsub>Click a job to see its log</span></div><div data-jobs></div></div>`);
 
-    if (!stg) dropzone($("[data-dz]", box), { accept: ".zip,application/zip", title: "Drop a .zip here", hint: "or click to choose — the archive becomes a new release", async onFile(file) {
+    dropzone($("[data-dz]", box), { accept: ".zip,application/zip", title: "Drop a .zip here", hint: "or click to choose — the archive becomes a new release", async onFile(file) {
       if (!/\.zip$/i.test(file.name)) { toast("Releases must be .zip files", "warn"); return; }
       if (file.size > 500 * 1024 * 1024) { toast("That file is over 500 MB", "warn"); return; }
       const up = $("[data-up]", box), dz = $("[data-dz]", box);
@@ -402,7 +395,7 @@ export default async function site(ctx) {
       finally { up.hidden = true; dz.hidden = false; $(".progress > div", up).style.width = "0%"; }
     } });
 
-    if (!stg && S.github?.repo) {
+    if (S.github?.repo) {
       get(`/api/github/refs?repo=${encodeURIComponent(S.github.repo)}`).then((r) => {
         const dl = $("#refs_dl", box); if (!dl) return;
         mount(dl, html`${[...(r.branches || []), ...(r.tags || [])].map(refName).map((b) => html`<option value="${b}"></option>`)}`);
@@ -448,21 +441,18 @@ export default async function site(ctx) {
       mount($("[data-rel]", box), rels.length ? html`<div class="card"><div class="table-wrap"><table class="table"><thead><tr><th>Release</th><th>Source</th><th class="hide-sm">Size</th><th class="hide-sm">Created</th><th></th></tr></thead>
         ${moreList(rels, (r) => {
           const live = r.id === S.currentReleaseId, prev = r.id === S.previousReleaseId;
-          // STAGING: "On staging" is what this staging build runs; "Live" is what the live site runs.
-          const onLive = stg && parent?.currentReleaseId === r.id;
-          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? (stg ? html`<span class="badge stg-badge"><span class="dot" style="width:6px;height:6px;background:currentColor"></span>On staging</span>` : html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>`) : ""}${onLive ? html`<span class="badge ok" title="What ${parentName()} runs"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>` : ""}${!stg && S.staging?.role === "parent" && S.staging.currentReleaseId === r.id ? html`<a class="badge stg-badge" href="#/sites/${S.staging.id}" title="The staging build runs this release — open it">${icon("layers")}On staging</a>` : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}${runsByRel.get(r.id) ? html`<a href="#/tests/${runsByRel.get(r.id).id}" class="rel-verdict" title="Latest test of this release — open it">${verdictBadge(runsByRel.get(r.id))}</a>` : ""}</div>
+          return html`<tr><td><div class="row" style="gap:8px;flex-wrap:wrap"><span class="t-main mono">v${r.version || "—"}</span>${live ? (stg ? html`<span class="badge stg-badge"><span class="dot" style="width:6px;height:6px;background:currentColor"></span>On staging</span>` : html`<span class="badge ok"><span class="dot ok" style="width:6px;height:6px"></span>Live</span>`) : ""}${prev ? html`<span class="badge">Previous</span>` : ""}${r.available === false ? html`<span class="badge err" title="The zip for this release is no longer on the panel">${icon("alert")}Archive missing</span>` : ""}${r.pinned ? html`<span class="badge violet">${icon("pin")}Pinned</span>` : ""}${r.built?.available ? html`<span class="badge" title="Built once on ${r.built.builtOnName}; the other servers deploy this same build (${r.built.sizeHuman})">Shared build</span>` : ""}${(r.warnings || []).length ? html`<span class="badge warn" title="${r.warnings.join("\n")}">${icon("alert")}${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}</span>` : ""}${runsByRel.get(r.id) ? html`<a href="#/tests/${runsByRel.get(r.id).id}" class="rel-verdict" title="Latest test of this release — open it">${verdictBadge(runsByRel.get(r.id))}</a>` : ""}</div>
             <div class="t-sub mono ellipsis" style="max-width:300px">${r.filename}</div></td>
             <td>${r.source === "github" ? html`<span class="row small" style="gap:7px">${icon("github", "sm")}<span class="mono">${r.commit || "—"}</span></span>` : html`<span class="row small" style="gap:7px">${icon("upload", "sm")}Upload</span>`}</td>
             <td class="hide-sm num">${fmtBytes(r.size)}</td>
             <td class="hide-sm"><div class="small">${fmtDate(r.createdAt)}</div><div class="t-sub">${ago(r.createdAt)}</div></td>
             <td class="actions"><div class="btn-row">
               ${r.available === false ? "" : html`<button class="btn btn-sm" data-rtest="${r.id}" title="Test this release on a throw-away copy" ${runsByRel.get(r.id) && ["queued", "preparing", "testing", "reporting"].includes(runsByRel.get(r.id).status) ? raw("disabled") : ""}>${icon("flask")}<span class="hide-sm">Test</span></button>`}
-              ${stagingReleaseBtn(S, r)}
               ${r.available === false ? "" : live ? html`<button class="btn btn-sm" data-rdeploy="${r.id}" title="${stg ? "Deploy it to the staging build again" : ""}">${icon("restart")}Redeploy</button>` : html`<button class="btn btn-sm btn-primary" data-rdeploy="${r.id}" title="${stg ? "Deploy this release to the staging build only" : ""}">${icon("rocket")}Deploy${stg ? html`<span class="hide-sm"> to staging</span>` : ""}</button>`}
-              ${stg ? "" : html`<button class="icon-btn sm" data-rpin="${r.id}" title="${r.pinned ? "Unpin" : "Pin"}" style="${r.pinned ? "color:var(--violet)" : ""}">${icon("pin")}</button>
+              ${r.siteId !== S.id ? "" : html`<button class="icon-btn sm" data-rpin="${r.id}" title="${r.pinned ? "Unpin" : "Pin"}" style="${r.pinned ? "color:var(--violet)" : ""}">${icon("pin")}</button>
               <button class="icon-btn sm" data-rdel="${r.id}" title="Delete" ${live ? raw("disabled style='opacity:.35;pointer-events:none'") : ""}>${icon("trash")}</button>`}</div></td></tr>`;
         }, { id: "site.releases", limit: 6, table: true, cols: 5, noun: "releases" })}</table></div></div>`
-        : html`<div class="card">${emptyState({ ico: "rocket", title: "No releases yet", text: stg ? `${parentName()} has no releases yet — upload or pull one there, then deploy it here.` : S.github?.repo ? "Pull a branch from GitHub or upload a zip to create the first release." : "Upload a zip to create the first release.", sm: true })}</div>`);
+        : html`<div class="card">${emptyState({ ico: "rocket", title: "No releases yet", text: S.github?.repo ? "Pull a branch from GitHub or upload a zip to create the first release." : "Upload a zip to create the first release.", sm: true })}</div>`);
     };
     paintReleases();
     on(box, "click", "[data-rdeploy]", (e, b) => runAction("deploy", { releaseId: b.dataset.rdeploy }));
@@ -602,10 +592,10 @@ export default async function site(ctx) {
       <div class="card"><div class="card-head"><h3>General</h3></div><div class="card-body"><div class="form-grid">
         <div class="field"><label>Name</label><input class="input mono" data-g="name" value="${S.name}"/></div>
         <div class="field"><label>Type</label><select class="select" data-g="type" ${deployed() ? raw("disabled title='Fixed after the first deploy'") : ""}>${Object.entries(TYPE_LABEL).map(([k, l]) => html`<option value="${k}" ${k === S.type ? raw("selected") : ""}>${l}</option>`)}</select></div>
-        ${stg ? html`<div class="field span-2"><label>Releases</label><div class="note" style="margin:0">${icon("layers")}<div>This staging build deploys the releases of <a href="#/sites/${S.stagingOf}/settings" style="color:var(--blue-3)">${parentName()}</a> — its GitHub repository and branch are set there.</div></div></div>`
-        : html`<div class="field"><label>GitHub repository</label><input class="input mono" data-g="repo" value="${S.github?.repo || ""}" placeholder="owner/name"/></div>
+        <div class="field"><label>GitHub repository</label><input class="input mono" data-g="repo" value="${S.github?.repo || ""}" placeholder="owner/name"/></div>
         <div class="field"><label>Default branch</label><input class="input mono" data-g="branch" value="${S.github?.branch || ""}" placeholder="main"/></div>
-        <div class="field span-2"><label>GitHub access token <span class="dim">(optional, for this repo only)</span></label><div class="input-group"><input class="input mono" type="password" data-g="token" placeholder="${S.github?.hasToken ? "•••••••• saved — leave blank to keep" : "Uses the panel-wide token from Settings → GitHub when empty"}" autocomplete="new-password"/>${S.github?.hasToken ? html`<button class="btn" data-cleartoken type="button">Remove</button>` : ""}</div></div>`}
+        <div class="field span-2"><label>GitHub access token <span class="dim">(optional, for this repo only)</span></label><div class="input-group"><input class="input mono" type="password" data-g="token" placeholder="${S.github?.hasToken ? "•••••••• saved — leave blank to keep" : "Uses the panel-wide token from Settings → GitHub when empty"}" autocomplete="new-password"/>${S.github?.hasToken ? html`<button class="btn" data-cleartoken type="button">Remove</button>` : ""}</div></div>
+${stg ? html`<div class="field span-2"><div class="hint" style="margin:0">${icon("layers", "xs")} The staging build's own repository and branch — pull and deploy here to update staging. ${parentName()} has its own settings and is never changed from here.</div></div>` : ""}
         <div class="field"><label>App port</label><input class="input mono" value="${S.port || ""}" readonly/><div class="hint">Assigned by the panel; the app gets it as <span class="mono">$PORT</span>.</div></div>
         <div class="field"><label>App directory</label><input class="input mono" value="${S.appDir || ""}" readonly/></div>
       </div></div><div class="card-foot"><span class="spacer"></span><button class="btn btn-primary btn-sm" data-save-general>${icon("check")}Save</button></div></div>
@@ -638,7 +628,7 @@ export default async function site(ctx) {
         <p class="muted small" style="max-width:560px">Stops and removes this staging build from its server and nginx. You choose whether its database is dropped too. ${parentName()} is not touched.</p>
         <button class="btn btn-danger" data-rmstaging>${icon("trash")}Remove staging</button></div></div>`
       : html`<div class="card danger-zone"><div class="card-head"><h3>Delete website</h3></div><div class="card-body row wrap" style="justify-content:space-between;gap:16px">
-        <p class="muted small" style="max-width:560px">Removes the nginx config, stops the app on ${plural((S.serverIds || []).length || 1, "server")} and deletes its releases. Linked databases are kept.${S.staging?.role === "parent" ? html` <b style="color:var(--text)">Remove its <a href="#/sites/${S.staging.id}/settings" style="color:var(--blue-3)">staging build</a> first.</b>` : ""}</p>
+        <p class="muted small" style="max-width:560px">Removes the nginx config, stops the app on ${plural((S.serverIds || []).length || 1, "server")} and deletes its releases. Linked databases are kept.${S.staging?.role === "parent" ? html` <b style="color:var(--text)">Remove its staging build first (switch to it with the header's type icon).</b>` : ""}</p>
         <button class="btn btn-danger" data-delete>${icon("trash")}Delete website</button></div></div>`}
     </div>`);
     const picker = serverPicker($("[data-picker]", box), { servers, mode: lb ? "multi" : "single", selected: lb ? S.serverIds : [(S.serverIds || [])[0] || "main"] });
@@ -666,7 +656,7 @@ export default async function site(ctx) {
     on(box, "click", "[data-save-general]", (e, btn) => {
       const v = (k) => $(`[data-g=${k}]`, box).value.trim();
       const body = { name: v("name") };
-      if (!stg) body.github = { repo: v("repo"), branch: v("repo") ? v("branch") || "main" : "", ...(v("token") ? { token: v("token") } : {}) };
+      body.github = { repo: v("repo"), branch: v("repo") ? v("branch") || "main" : "", ...(v("token") ? { token: v("token") } : {}) };
       if (!deployed()) body.type = v("type");
       save(btn, body, "Settings saved").then((ok) => { const t = $(`[data-g=token]`, box); if (ok && t) t.value = ""; });
     });

@@ -1374,3 +1374,22 @@ Vanilla JS ES modules + CSS, no build step. No terminal / command box anywhere.
     the job queue behind builds on that server). The newest cloudflared comes from GitHub's releases API (the GitHub
     token is used when set). State is kept in `<dataDir>/software-state.json`; SSE event `software`. Updating
     cloudflared on main restarts the connectors the panel runs (`ctx.cloudflare.restartConnectors`).
+
+- **SITES/STAGING — live and staging are fully separate builds.** Nothing on the live site's page shows or changes
+  staging, and nothing on the staging build's page shows or changes the live site; you switch between them with the
+  header's type icon.
+  - **Own releases and GitHub** (`sites.mjs`): a staging copy owns its releases like any website — upload and
+    `POST /api/sites/<copy>/releases/github` work on it (the old 409s are gone), and GET site / releases, deploy,
+    rollback and `ctx.sites.deploy` use the copy's own releases (`ownsRelease` / `releasesOf`). Copies made earlier
+    still list and can redeploy / roll back the parent release they run now or ran before, until they deploy their
+    own. `site-tests.mjs` tests the copy's own releases. The GitHub pull is `startGithubJob`, also exposed as
+    `ctx.sites.pullGithub(siteId, { ref, deploy, admin, base })`.
+  - **Create** (`staging.mjs`): `POST /api/sites/:id/staging { domain?, serverId?, branch?, deploy? }` — `releaseId` is
+    gone. The copy gets the parent's GitHub repository and token with its own `branch` (default the parent's); with a
+    repository and `deploy !== false` it pulls that branch and deploys it (`ctx.sites.pullGithub`). Without a
+    repository it starts empty. The dialog asks for the staging branch and "pull and deploy now".
+  - **UI**: Environment on a live site is **Live / Test** only (the Staging segment is gone); on the staging build it
+    stays **Staging / Test**, with no link back into the live variables. The live site's release rows lose **To
+    staging** and the **On staging** badge; the staging build's rows lose the **Live** badge. The staging build's
+    Deployments tab has Upload and Pull from GitHub like a live site, its Settings show its own GitHub repository,
+    branch and token, and pin / delete work on its own releases.

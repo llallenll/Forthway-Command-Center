@@ -4,13 +4,10 @@
 //   Live     the website's own variables, what the panel manages, linked databases.
 //   Test     the test-only variables commit tests use (views/site-tests.js testEnvCard)
 //            and, read-only, the throw-away database every test run gets (test_<slug>).
-//   Staging  ONLY the staging build's own variables (saved to the staging build), or
-//            "Create staging build" when there is none. Everything else about staging
-//            (address, deploys, start/stop, database, remove) is on the staging build's
-//            own page — the header's type icon switches to it (views/site-staging.js).
 // On a staging build the switch is Staging / Test: its own variables (shown exactly like
-// a live site's) and its own test-only variables. There is no "Live" segment there, so
-// nothing on the staging page can change the live site's variables by accident.
+// a live site's) and its own test-only variables.
+// Live and staging never show each other's variables: to edit staging's, switch to the
+// staging build with the header's type icon (views/site-staging.js), and back.
 //
 // The chosen view is kept in the URL (#/sites/:id/environment?view=test) and
 // remembered in this browser.
@@ -20,12 +17,10 @@ import { get, patch, put } from "../api.js";
 import { envEditor, jobStarted } from "../components.js";
 import { foldCard } from "../fold.js";
 import { testEnvCard } from "./site-tests.js";
-import { createStagingDialog } from "./site-staging.js";
 
 const VIEWS = [
   { id: "live", label: "Live", icon: "globe" },
   { id: "test", label: "Test", icon: "flask" },
-  { id: "staging", label: "Staging", icon: "layers" },
 ];
 // On a staging build: its own variables (the "live" pane, relabelled) and its test-only variables.
 const COPY_VIEWS = [
@@ -38,7 +33,7 @@ const remember = (v) => { try { localStorage.setItem(VIEW_KEY, v); } catch { /* 
 
 /* ───────── the tab ───────── */
 
-export async function environmentTab(ctx, box, S, { databases = [], servers = [] } = {}) {
+export async function environmentTab(ctx, box, S, { databases = [] } = {}) {
   const base = `#/sites/${S.id}`;
   const isCopy = !!S.stagingOf;
   const views = isCopy ? COPY_VIEWS : VIEWS;
@@ -51,8 +46,8 @@ export async function environmentTab(ctx, box, S, { databases = [], servers = []
     <div data-envpane></div>`);
   const pane = $("[data-envpane]", box);
   const SUB = isCopy
-    ? { live: html`What this staging build runs with — its own copy, separate from <a href="#/sites/${S.stagingOf}/environment" style="color:var(--blue-3)">${S.staging?.parentName || "the live site"}</a>.`, test: "Extra variables and the throw-away database every commit test of the staging build gets." }
-    : { live: "What the website runs with in production.", test: "Extra variables and the throw-away database every commit test gets.", staging: "The staging build's own variables. Changing them never touches the live site." };
+    ? { live: "What this staging build runs with — its own variables, separate from the live site's.", test: "Extra variables and the throw-away database every commit test of the staging build gets." }
+    : { live: "What the website runs with in production.", test: "Extra variables and the throw-away database every commit test gets." };
   let gen = 0; // ignore a slow load when the view was switched meanwhile
   const show = async (v) => {
     view = v; if (!isCopy) remember(v);
@@ -65,16 +60,12 @@ export async function environmentTab(ctx, box, S, { databases = [], servers = []
     mount(el, skeletonRows(3, 44));
     const alive = () => ctx.alive() && my === gen;
     if (v === "live") await liveView(ctx, el, cur, { databases, alive });
-    else if (v === "test") await testView(ctx, el, cur, { alive });
-    else await stagingView(ctx, el, cur, { alive, servers });
+    else await testView(ctx, el, cur, { alive });
   };
   on(box, "click", "[data-envview]", (e, b) => { if (b.dataset.envview !== view) show(b.dataset.envview); });
   ctx.on("site", (d) => {
     if (!d || d.deleted || d.id !== S.id) return;
-    const had = cur.staging?.role === "parent" ? cur.staging.id : null;
     cur = { ...cur, ...d };
-    const has = cur.staging?.role === "parent" ? cur.staging.id : null;
-    if (view === "staging" && had !== has) show("staging"); // staging was created or removed meanwhile
   });
   await show(view);
 }
@@ -150,39 +141,4 @@ async function testView(ctx, el, S, { alive }) {
         <div class="env-table mt-16">${d.vars.map((v) => html`<div class="env-row ro" style="grid-template-columns:minmax(0,.9fr) minmax(0,1.2fr)"><input class="input" value="${v.key}" readonly aria-label="Variable"/>${v.random && !/:\/\//.test(v.value) ? html`<input class="input env-random" value="random per run" readonly aria-label="${v.key} value"/>` : html`<input class="input" value="${v.value.replace(/‹random›/g, "…")}" title="${v.random ? "User and password are random for every run" : ""}" readonly aria-label="${v.key} value"/>`}</div>`)}</div>
         <p class="hint mt-12">An empty MySQL database with random credentials, on the test's own network — it never sees production data. Your schema comes from the release's after-deploy scripts or migrations.${d.databases.some((x) => x.added) ? " The website has no database of its own, so these standard variables are added for the copy." : ""}</p>`}
     </div></div>`);
-}
-
-/* ───────── Staging (on the live site): only the staging build's variables ───────── */
-
-async function stagingView(ctx, el, S, { alive, servers }) {
-  const st = S.staging?.role === "parent" ? S.staging : null;
-  if (!st) {
-    mount(el, html`<div class="card"><div class="card-body stg-none">
-      <span class="type-ico ${S.type || "node"} staging">${icon("layers")}</span>
-      <p class="muted small" style="margin:0;flex:1;min-width:200px">${S.name} has no staging build yet — a separate copy with its own address, variables and database to try changes on before they go live.</p>
-      <button class="btn btn-primary btn-sm" data-stgcreate>${icon("plus")}Create staging build</button></div></div>`);
-    on(el, "click", "[data-stgcreate]", () => createStagingDialog(S, { servers }));
-    return;
-  }
-  let envData;
-  try { envData = await get(`/api/sites/${st.id}/env`); } catch (e) { if (alive()) mount(el, errorState(e, false)); return; }
-  if (!alive()) return;
-  mount(el, html`<div class="card"><div class="card-head" style="flex-wrap:wrap"><h3>Staging variables</h3><span class="sub" data-dirty></span>
-      <div class="right btn-row"><a class="btn btn-sm btn-ghost" href="#/sites/${st.id}/environment">${icon("layers")}Open staging build</a><button class="btn btn-sm" type="button" data-pasteenv>${icon("fileText")}Paste .env</button><button class="btn btn-primary btn-sm" data-stgsave>${icon("check")}Save & apply</button></div></div>
-    <div class="card-body"><div data-env></div>
-      <div class="note mt-16">${icon("info")}<div>Copied from Live when the staging build was created (live payment keys left out, database settings pointed at the staging database) and edited separately since. Saving restarts the staging app only — the live site is not touched.${st.url ? html` Staging answers at <a class="mono" href="${st.url}" target="_blank" rel="noopener noreferrer" style="color:var(--blue-3)">${st.url.replace(/^https?:\/\//, "")}</a>.` : ""}</div></div></div></div>`);
-  const dirty = $("[data-dirty]", el);
-  const ed = envEditor($("[data-env]", el), envData.env || {}, { onDirty: () => (dirty.textContent = "Unsaved changes") });
-  on(el, "click", "[data-pasteenv]", () => ed.paste());
-  on(el, "click", "[data-stgsave]", async (e, b) => {
-    const err = ed.validate(); if (err) { toast(err, "warn"); return; }
-    b.classList.add("loading");
-    try {
-      const r = await put(`/api/sites/${st.id}/env`, { env: ed.get() }); dirty.textContent = "";
-      if (r?.env) ed.set(r.env);
-      if ((r?.warnings || []).length) toast("Saved with warnings", "warn", { msg: r.warnings.join(" ") });
-      else toast("Staging variables saved", "ok", { msg: r?.job ? "The staging app restarts to apply them." : "They apply on the next staging deploy." });
-      if (r?.job?.id) jobStarted(r.job, "Applying staging variables");
-    } catch (ex) { toastError(ex, "Couldn't save"); } finally { b.classList.remove("loading"); }
-  });
 }

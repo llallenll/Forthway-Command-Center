@@ -538,8 +538,23 @@ export function register(router, ctx) {
     };
   }
 
-  /** STAGING: the site whose releases this one deploys (a staging copy deploys its parent's). */
-  const releaseOwner = (site) => site?.stagingOf || site?.id;
+  /**
+   * STAGING: a staging copy has its own releases (uploaded or pulled from GitHub on the
+   * staging build itself), exactly like a live site. Copies made before that ran their
+   * parent's releases, so the one they run now (and the one before) still counts as theirs
+   * until they deploy one of their own.
+   */
+  const ownsRelease = (site, rel) =>
+    !!site && !!rel && (rel.siteId === site.id || (!!site.stagingOf && rel.siteId === site.stagingOf && [site.currentReleaseId, site.previousReleaseId].includes(rel.id)));
+  function releasesOf(site) {
+    const own = listReleases(site.id);
+    if (!site.stagingOf) return own;
+    const legacy = [site.currentReleaseId, site.previousReleaseId]
+      .filter((id) => id && !own.some((r) => r.id === id))
+      .map((id) => db.get("releases", id))
+      .filter((r) => r && r.siteId === site.stagingOf);
+    return [...own, ...legacy].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  }
 
   /** STAGING: a parent's view of its staging copy, or a staging copy's pointer to its parent. */
   function stagingSummary(site) {
@@ -1788,8 +1803,8 @@ export function register(router, ctx) {
     /** Same as POST /api/sites/:id/deploy → job. Throws an httpError when it can't start. */
     deploy: (siteId, releaseId, { admin = null, base } = {}) => {
       const site = mustSite(siteId);
-      const release = releaseId ? db.get("releases", releaseId) : listReleases(releaseOwner(site))[0];
-      if (!release || release.siteId !== releaseOwner(site)) throw httpError(404, "Release not found.");
+      const release = releaseId ? db.get("releases", releaseId) : listReleases(site.id)[0];
+      if (!ownsRelease(site, release)) throw httpError(404, "Release not found.");
       if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
       return startDeployJob(site, release, admin, base || panelBase(null));
     },
@@ -1797,6 +1812,8 @@ export function register(router, ctx) {
     panelBase: (req) => panelBase(req),
     /** "docker" | "legacy" | "none" */
     runtime: (siteOrId) => runtimeOf(typeof siteOrId === "string" ? getSite(siteOrId) : siteOrId),
+    /** Same as POST /api/sites/:id/releases/github → job. */
+    pullGithub: (siteId, { ref = "", deploy = false, admin = null, base } = {}) => startGithubJob(mustSite(siteId), { ref, deploy, admin, base: base || panelBase(null) }),
     // STAGING (panel/lib/staging.mjs)
     /** Same as POST /api/projects/:projectId/sites (+ `extra` fields on the record) → public site. */
     create: (projectId, body, { admin = null, extra = {} } = {}) => createSite(projectId, body, admin, extra),
@@ -1863,7 +1880,7 @@ export function register(router, ctx) {
     return {
       ...publicSite(site),
       upstreams,
-      releases: listReleases(releaseOwner(site)).slice(0, 20).map((r) => publicRelease(r, site)),
+      releases: releasesOf(site).slice(0, 20).map((r) => publicRelease(r, site)),
     };
   });
 
@@ -2181,8 +2198,8 @@ export function register(router, ctx) {
 
   router.post("/api/sites/:id/deploy", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
-    const release = body.releaseId ? db.get("releases", body.releaseId) : listReleases(releaseOwner(site))[0];
-    if (!release || release.siteId !== releaseOwner(site)) {
+    const release = body.releaseId ? db.get("releases", body.releaseId) : listReleases(site.id)[0];
+    if (!ownsRelease(site, release)) {
       throw httpError(body.releaseId ? 404 : 409, body.releaseId ? "Release not found." : "This website has no releases yet. Upload a zip or pull from GitHub first.");
     }
     if (!fs.existsSync(releaseFile(release.id))) throw httpError(409, "That release's archive is missing.");
@@ -2344,7 +2361,7 @@ export function register(router, ctx) {
     const base = panelBase(req);
     if (body.releaseId) {
       const rel = db.get("releases", body.releaseId);
-      if (!rel || rel.siteId !== releaseOwner(site)) throw httpError(404, "Release not found.");
+      if (!ownsRelease(site, rel)) throw httpError(404, "Release not found.");
       if (!fs.existsSync(releaseFile(rel.id))) throw httpError(409, "That release's archive is missing.");
       const job = siteJob(site, admin, { type: "site.rollback", title: `Roll ${site.name} back to ${rel.version ? `v${rel.version}` : rel.id}`, heavy: heavyServers(site, rel) }, ({ log, signal }) =>
         deployRelease(site.id, rel, { log, signal, base }),
@@ -2598,12 +2615,11 @@ export function register(router, ctx) {
 
   router.get("/api/sites/:id/releases", async (req, res, { params }) => {
     const site = mustSite(params.id);
-    return { items: listReleases(releaseOwner(site)).map((r) => publicRelease(r, site)) };
+    return { items: releasesOf(site).map((r) => publicRelease(r, site)) };
   });
 
   router.post("/api/sites/:id/releases/upload", { raw: true }, async (req, res, { params, query, admin }) => {
     const site = mustSite(params.id);
-    if (site.stagingOf) throw httpError(409, "A staging copy deploys its website's releases — upload the release to the website itself.");
     req.res = res;
     const rec = await receiveUpload(req, site.id, cleanFilename(query.filename), admin);
     audit(admin, "release.upload", site, { releaseId: rec.id, version: rec.version, size: rec.size });
@@ -2620,13 +2636,15 @@ export function register(router, ctx) {
 
   router.post("/api/sites/:id/releases/github", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
-    if (site.stagingOf) throw httpError(409, "A staging copy deploys its website's releases — pull from GitHub on the website itself.");
-    const repo = normalizeRepo(body.repo || site.github?.repo);
+    return startGithubJob(site, { repo: body.repo, ref: body.ref, deploy: !!body.deploy, admin, base: panelBase(req) });
+  });
+
+  /** POST /api/sites/:id/releases/github, and ctx.sites.pullGithub (staging's first deploy). */
+  function startGithubJob(site, { repo: wantRepo = "", ref: wantRef = "", deploy = false, admin = null, base } = {}) {
+    const repo = normalizeRepo(wantRepo || site.github?.repo);
     if (!repo) throw httpError(400, "This website has no GitHub repository set. Add one in its settings first.");
-    const ref = cleanRef(body.ref);
+    const ref = cleanRef(wantRef);
     if (ref === null) throw httpError(400, "That branch, tag or commit name is not valid.");
-    const deploy = !!body.deploy;
-    const base = panelBase(req);
     const token = githubToken(site);
     const job = siteJob(
       site,
@@ -2670,7 +2688,7 @@ export function register(router, ctx) {
     );
     audit(admin, "release.github", site, { repo, ref: ref || null, deploy });
     return job;
-  });
+  }
 
   router.patch("/api/releases/:id", async (req, res, { params, body, admin }) => {
     const rel = db.get("releases", params.id);
