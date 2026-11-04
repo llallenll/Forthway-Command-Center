@@ -8,7 +8,7 @@
  * the job queue's heavy-job metadata — is the existing machinery in
  * panel/lib/sites.mjs. What this module adds:
  *
- *   POST   /api/sites/:id/staging  { domain?, serverId?, deploy?: true, releaseId? }
+ *   POST   /api/sites/:id/staging  { domain?, serverId?, branch?, deploy?: true }
  *          → { site, staging, databases, job, warnings }
  *          Creates the copy: its own port and appDir (sites.mjs defaults),
  *          domain staging.<first domain> (editable; "" = none), not load
@@ -25,17 +25,20 @@
  *          settings re-pointed at the staging database, URLs on the parent's
  *          domains re-pointed at the staging URL. From then on the staging
  *          variables are the copy's own (GET/PUT /api/sites/<copy>/env).
- *          Then the parent's current release (or `releaseId`) is deployed to
- *          the copy with the normal deploy job (ctx.sites.deploy — heavy, so it
- *          waits in the job queue like any deploy).
+ *          The parent's GitHub repository (and token) is copied too, with its
+ *          own branch (`branch`, default the parent's) — from then on it is the
+ *          copy's own setting. With a repository and deploy !== false, the copy
+ *          pulls that branch and deploys it (ctx.sites.pullGithub — the normal
+ *          GitHub job). Staging never deploys the live site's releases.
  *   DELETE /api/sites/:id/staging?dropDatabase=1&deleteFiles=1  → job
  *          Removes the copy (ctx.sites.remove) and, with dropDatabase=1, the
  *          databases this module made for it (tagged stagingOf; anything else
  *          linked by hand is kept).
  *
- * Everything else uses the copy's own website routes: deploy a release
- * (releases belong to the parent; sites.mjs lets a copy deploy its parent's),
- * stop / start / restart, env, PATCH domains, SSL.
+ * Everything else uses the copy's own website routes, exactly like a live
+ * site: its own releases (upload, pull from GitHub, deploy, roll back), its
+ * GitHub repository and branch, stop / start / restart, env, PATCH domains, SSL.
+ * Nothing on the live site changes the copy and nothing on the copy changes it.
  *
  * A parent with a staging copy cannot be deleted (409) until staging is
  * removed — deleting it silently would also have to decide about the staging
@@ -271,7 +274,11 @@ export function register(router, ctx) {
       ...(parent.type === "node" && parent.container ? { container: { image: parent.container.image, memoryMb: parent.container.memoryMb, cpus: parent.container.cpus } } : {}),
       ...(cf ? { cloudflare: cf } : {}),
     };
-    const extra = { stagingOf: parent.id, linkPrefixes: Object.fromEntries(made.map((m) => [m.id, m.prefix])) };
+    // Its own GitHub settings, starting from the parent's repository (and token) on the branch asked for.
+    const branch = "branch" in b ? String(b.branch || "").trim() : parent.github?.branch || "";
+    if (branch && !/^[A-Za-z0-9._\/-]{1,200}$/.test(branch)) throw httpError(400, "That branch name is not valid.");
+    const github = parent.github?.repo ? { repo: parent.github.repo, branch, tokenEnc: parent.github.tokenEnc || "" } : { repo: "", branch: "", tokenEnc: "" };
+    const extra = { stagingOf: parent.id, github, linkPrefixes: Object.fromEntries(made.map((m) => [m.id, m.prefix])) };
     let child;
     try {
       try {
@@ -291,19 +298,18 @@ export function register(router, ctx) {
     if (parent.loadBalanced) warnings.push(`${parent.name} is load balanced; staging runs on one server (${child.serverIds?.[0] || serverId}).`);
     if (parent.ssl?.enabled && !cf && domain) warnings.push(`Point ${domain} at the server, then issue its HTTPS certificate on the staging site's Domains & SSL.`);
 
-    // 4. Deploy the parent's release to it (normal deploy job — heavy, queued like any deploy).
+    // 4. Its first deploy: pull its own branch from GitHub and deploy it (the normal GitHub job — heavy, queued like any deploy).
     let job = null;
-    const releaseId = b.releaseId || parent.currentReleaseId || null;
-    if (b.deploy !== false && releaseId) {
+    if (b.deploy !== false && github.repo && S.pullGithub) {
       try {
-        job = S.deploy(child.id, releaseId, { admin, base: S.panelBase(req) });
+        job = S.pullGithub(child.id, { ref: branch, deploy: true, admin, base: S.panelBase(req) });
       } catch (err) {
         warnings.push(`Staging was created but its first deploy didn't start: ${err.message}`);
       }
-    } else if (b.deploy !== false) {
-      warnings.push(`${parent.name} has no release deployed yet — deploy one to staging from the Deployments tab.`);
+    } else if (b.deploy !== false && !github.repo) {
+      warnings.push(`${parent.name} has no GitHub repository — upload a release or set a repository on the staging build's Deployments tab.`);
     }
-    audit(admin, "site.staging.start", parent, { stagingSiteId: child.id, domain: domain || null, databases: made.map((m) => m.name), releaseId: job ? releaseId : null });
+    audit(admin, "site.staging.start", parent, { stagingSiteId: child.id, domain: domain || null, databases: made.map((m) => m.name), branch: github.repo ? branch || null : null, deployed: !!job });
     return {
       site: S.publicSite(getSite(parent.id)),
       staging: S.publicSite(getSite(child.id)),

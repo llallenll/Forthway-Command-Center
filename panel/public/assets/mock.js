@@ -603,7 +603,7 @@ R("GET", "/api/sites/:id/usage", (p, b, q) => { // USAGE (panel/lib/usage.mjs)
 });
 R("GET", "/api/sites/:id", (p) => {
   const s = find("sites", p.id);
-  return { ...siteView(s), upstreams: upstreams(s), releases: clone(db.releases.filter((r) => r.siteId === (s.stagingOf || s.id)).slice(0, 20)) }; // STAGING: a copy deploys its parent's releases
+  return { ...siteView(s), upstreams: upstreams(s), releases: clone(db.releases.filter((r) => r.siteId === s.id).slice(0, 20)) }; // STAGING: a copy has its own releases
 });
 R("PATCH", "/api/sites/:id", (p, b) => {
   const s = find("sites", p.id);
@@ -697,13 +697,11 @@ R("PUT", "/api/sites/:id/env", (p, b) => { const s = find("sites", p.id); s.env 
 R("GET", "/api/sites/:id/releases", (p) => ({ items: clone(db.releases.filter((r) => r.siteId === p.id)) }));
 R("POST", "/api/sites/:id/releases/upload", (p, b, q) => {
   const s = find("sites", p.id);
-  if (s.stagingOf) err(409, "A staging copy deploys its website's releases — upload the release to the website itself.");
   const r = { id: nid("rel"), siteId: s.id, filename: q.filename || b?.name || "upload.zip", size: b?.size || 12 * MB, sha256: hex(64), version: (q.filename || "upload").replace(/\.zip$/, "").split("-").pop() || "upload", commit: null, source: "upload", pinned: false, createdAt: iso(Date.now()) };
   db.releases.unshift(r); activity("release.upload", "site", s, r.filename); emit("site", siteView(s)); return r;
 });
 R("POST", "/api/sites/:id/releases/github", (p, b) => {
   const s = find("sites", p.id);
-  if (s.stagingOf) err(409, "A staging copy deploys its website's releases — pull from GitHub on the website itself.");
   if (!s.github?.repo) err(400, "Set a GitHub repository in Settings first.");
   const ref = b.ref || s.github.branch || "main";
   const sha = /^[0-9a-f]{40}$/.test(ref) ? ref : hex(40), message = COMMIT_MSGS[Math.floor(Math.random() * COMMIT_MSGS.length)];
@@ -1577,7 +1575,7 @@ const activeRun = (siteId) => db.testRuns.find((x) => x.siteId === siteId && ["q
 R("GET", "/api/sites/:id/tests", (p) => { find("sites", p.id); return { items: db.testRuns.filter((x) => x.siteId === p.id).map(testSummary) }; });
 R("POST", "/api/sites/:id/tests", (p, b) => {
   const s = find("sites", p.id);
-  const owner = s.stagingOf || s.id; // STAGING: a staging copy tests its parent's releases
+  const owner = s.id; // STAGING: a staging copy has its own releases
   const rel = b.releaseId ? find("releases", b.releaseId) : db.releases.find((x) => x.siteId === owner);
   if (!rel || rel.siteId !== owner) err(400, "Pick a release of this website to test.");
   const a = activeRun(s.id);
@@ -1910,12 +1908,12 @@ function stagingVars(parent, url) {
   }
   return { env: out, removed };
 }
-function makeStaging(parent, { domain, serverId, releaseId = null, deployMs = 0 } = {}) {
+function makeStaging(parent, { domain, serverId, releaseId = null, branch, deployMs = 0 } = {}) {
   const made = parent.type === "static" ? [] : (parent.linkedDatabaseIds || []).map((_, i) => stagingDb(parent, i));
   const url = domain ? `${parent.ssl?.enabled ? "https" : "http"}://${domain}` : "";
   const { env, removed } = stagingVars(parent, url);
   const c = mkSite({ id: nid("site"), projectId: parent.projectId, name: `${parent.name}-staging`, type: parent.type, domains: domain ? [domain] : [], port: 3001 + db.sites.length + 20, serverIds: [serverId || targets(parent)[0]],
-    healthPath: parent.healthPath, settings: clone(parent.settings), github: null, env, linkedDatabaseIds: made.map((m) => m.d.id), runtime: parent.type === "node" ? "docker" : parent.type === "static" ? "none" : "legacy",
+    healthPath: parent.healthPath, settings: clone(parent.settings), github: parent.github?.repo ? { repo: parent.github.repo, branch: branch ?? parent.github.branch ?? "" } : null, env, linkedDatabaseIds: made.map((m) => m.d.id), runtime: parent.type === "node" ? "docker" : parent.type === "static" ? "none" : "legacy",
     container: parent.container ? clone(parent.container) : parent.type === "node" ? { uid: 20100 + db.sites.length, gid: 20100 + db.sites.length, image: "node:20-bookworm-slim", memoryMb: 1024, cpus: 1 } : null,
     ssl: { enabled: false, status: "none" }, stagingOf: parent.id, currentReleaseId: releaseId, previousReleaseId: null, state: {}, createdAt: iso(Date.now() - deployMs) });
   parent.stagingSiteId = c.id;
@@ -1924,8 +1922,11 @@ function makeStaging(parent, { domain, serverId, releaseId = null, deployMs = 0 
 // Fixture: acme-web has staging running (one release behind live); northwind-api has none.
 {
   const p = db.sites.find((x) => x.id === "site_acmeweb");
-  const rel = db.releases.filter((r) => r.siteId === p.id)[1];
-  const { c } = makeStaging(p, { domain: "staging-shop.acme.com", serverId: "main", releaseId: rel?.id || null, deployMs: 3 * DAY });
+  const src = db.releases.filter((r) => r.siteId === p.id)[1];
+  const { c } = makeStaging(p, { domain: "staging-shop.acme.com", serverId: "main", branch: "develop", deployMs: 3 * DAY });
+  // Staging's own release, pulled from its own branch.
+  const rel = src ? { ...clone(src), id: nid("rel"), siteId: c.id, pinned: false, github: src.github ? { ...src.github, ref: "develop" } : src.github, createdAt: iso(NOW - 3 * DAY) } : null;
+  if (rel) { db.releases.push(rel); c.currentReleaseId = rel.id; }
   c.env = { ...c.env, NODE_ENV: "staging", STRIPE_PUBLIC_KEY: "pk_test_51Hx…" };
   c.state.main = { running: true, healthy: true, version: rel?.version, releaseId: rel?.id, checkedAt: ago(40e3) };
 }
@@ -1938,20 +1939,22 @@ R("POST", "/api/sites/:id/staging", (p, b) => {
   if (domain && !/^([a-z0-9-]+\.)+[a-z]{2,}$/.test(domain)) err(400, `"${domain}" is not a valid domain name.`);
   const other = domain && db.sites.find((x) => (x.domains || []).includes(domain));
   if (other) err(409, `${domain} is already used by website "${other.name}".`);
-  const { c, made, removed } = makeStaging(s, { domain, serverId: b.serverId });
+  const { c, made, removed } = makeStaging(s, { domain, serverId: b.serverId, ...("branch" in b ? { branch: String(b.branch || "") } : {}) });
   activity("site.staging.start", "site", s, `Staging copy ${c.name}${made.length ? ` with ${made.map((m) => m.d.name).join(", ")}` : ""}`);
   for (const m of made) if (m.created) emit("database", { action: "created", database: dbView(m.d) });
-  const rel = b.deploy !== false && (db.releases.find((r) => r.id === (b.releaseId || s.currentReleaseId)));
+  // Its first deploy: pull its own branch and deploy it — never the live site's releases.
   let job = null;
-  if (rel) {
-    const sid = targets(c)[0];
-    const lines = [`Deploying ${rel.version} to staging (${c.name}) on ${db.servers.find((x) => x.id === sid)?.name || sid}.`, ...linesFor("site.deploy", "").map((l) => l.replace(/^\[[^\]]+\] /, ""))];
-    job = runJob({ type: "site.deploy", title: `Deploy ${c.name} ${rel.version}`, siteId: c.id, projectId: c.projectId, heavy: true, servers: [sid] }, { lines, speed: 140, onDone() {
-      c.currentReleaseId = rel.id; c.state[sid] = { running: true, healthy: true, version: rel.version, releaseId: rel.id, checkedAt: iso(Date.now()) }; emit("site", siteView(c));
+  if (b.deploy !== false && c.github?.repo) {
+    const sid = targets(c)[0], ref = c.github.branch || "main", sha = hex(40);
+    const lines = [`▸ Resolving ${ref}`, `  ${ref} → ${sha.slice(0, 7)}`, "▸ Downloading archive from GitHub", "  14.8 MB", "✓ Release created", ...linesFor("site.deploy", "").map((l) => l.replace(/^\[[^\]]+\] /, ""))];
+    job = runJob({ type: "release.github", title: `Pull ${c.github.repo}@${ref} for ${c.name} and deploy`, siteId: c.id, projectId: c.projectId, heavy: true, servers: [sid] }, { lines, speed: 140, onDone() {
+      const rel = { id: nid("rel"), siteId: c.id, filename: `${c.github.repo.split("/")[1]}-${sha.slice(0, 7)}.zip`, size: 14.8 * MB, sha256: hex(64), version: null, commit: sha.slice(0, 7), source: "github", github: { repo: c.github.repo, ref, sha }, pinned: false, createdAt: iso(Date.now()) };
+      db.releases.unshift(rel);
+      c.currentReleaseId = rel.id; c.state[sid] = { running: true, healthy: true, releaseId: rel.id, checkedAt: iso(Date.now()) }; emit("site", siteView(c));
     } });
   }
   emit("site", siteView(c)); emit("site", siteView(s));
-  const warnings = [...removed, ...(s.loadBalanced ? [`${s.name} is load balanced; staging runs on one server.`] : []), ...(!rel && b.deploy !== false ? [`${s.name} has no release deployed yet — deploy one to staging from the Deployments tab.`] : [])];
+  const warnings = [...removed, ...(s.loadBalanced ? [`${s.name} is load balanced; staging runs on one server.`] : []), ...(!c.github?.repo && b.deploy !== false ? [`${s.name} has no GitHub repository — upload a release or set a repository on the staging build's Deployments tab.`] : [])];
   return { site: siteView(s), staging: siteView(c), databases: made.map((m, i) => ({ id: m.d.id, name: m.d.name, created: m.created, prefix: i ? `DB${i + 1}_` : "" })), job, warnings };
 });
 R("DELETE", "/api/sites/:id/staging", (p, b, q) => {

@@ -629,8 +629,8 @@ export function register(router, ctx) {
   router.post("/api/sites/:id/tests", async (req, res, { params, body, admin }) => {
     const site = mustSite(params.id);
     const releaseId = body?.releaseId ? String(body.releaseId) : null;
-    // STAGING (panel/lib/staging.mjs): a staging copy tests its parent's releases (with its own variables).
-    const owner = site.stagingOf || site.id;
+    // STAGING (panel/lib/staging.mjs): a staging copy has its own releases, like any website.
+    const owner = site.id;
     const release = releaseId
       ? db.get("releases", releaseId)
       : db.list("releases", { siteId: owner }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
